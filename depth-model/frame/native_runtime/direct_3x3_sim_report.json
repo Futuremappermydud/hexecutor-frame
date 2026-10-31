@@ -1,0 +1,28 @@
+{
+  "passed": true,
+  "offline_only": true,
+  "sequence": 247,
+  "input_pages": 108,
+  "output_pages": 32,
+  "direct_equals_staged": true,
+  "workspace_tensor_staging_bytes": 0,
+  "output_page_byte_delta_histogram": {
+    "0": 64863,
+    "1": 673
+  },
+  "direct_output_sha256": "cfec6dbed3eb2e88544d5c0371c8c50915ce90e6b14f44be7c4411c19bf5e15f",
+  "staged_output_sha256": "cfec6dbed3eb2e88544d5c0371c8c50915ce90e6b14f44be7c4411c19bf5e15f",
+  "cpu_prefix_expected_sha256": "73771b84d6f64bc5654e60ac840af2c9bc08f0db177438d79b986d1fa8ee80a6",
+  "fixture_sha256": "e7f6f22a833befb58114a4ead798bcd399811cdf6ec7c3164a38fb34f66ca132",
+  "source_sha256": {
+    "qd_native_direct.c": "3f136cced492f44115f56b23c292813702d6795633a44a47636eb892a7455b30",
+    "qd_native_direct.h": "933c72b9f6f1072b40b78258460139c51dddcec3abc2110ffe6c41613c96469b",
+    "direct_3x3_sim.c": "68d693d93c4f1c333413bb1724be16bd3868e1d382bb3a04346b7f7b94a36f25"
+  },
+  "frozen_v1_proof_sha256": {
+    "qd_native_direct.c": "6622e8126839081fa781736019f8605702e684a30bb6f75ad2b155676b955ce8",
+    "qd_native_direct.h": "933c72b9f6f1072b40b78258460139c51dddcec3abc2110ffe6c41613c96469b"
+  },
+  "simulator": "Hexagon SDK 6.6.0.0 V75 simulator; 512 KiB simulated VTCM, 384 KiB active + 128 KiB tail",
+  "checks": "staged/direct active pointer-table and leaf ABI comparison; CPU-prefix [0,+1]; exact staged output; source graph pool unchanged; VTCM outside direct Y pages and A5/zero guards preserved"
+}

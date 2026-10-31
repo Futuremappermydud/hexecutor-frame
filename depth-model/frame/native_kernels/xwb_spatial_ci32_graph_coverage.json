@@ -1,0 +1,54 @@
+{
+  "source": "recovered/primary/graph.json",
+  "source_sha256": "6d296c18b8ccb36a12bc9d408e1b08d3a300d9b0e5b473868129173f97736feb",
+  "filter": "3x3 stride-1 Xwb, CB input/output, CI=CO=32",
+  "matched_graph_nodes": 120,
+  "parameter_pairs": {
+    "W960/Fi933": 40,
+    "W4178/Fi4160": 40,
+    "W4206/Fi4180": 40
+  },
+  "logical_input": [
+    1,
+    10,
+    258,
+    32
+  ],
+  "input_max": [
+    1,
+    24,
+    272,
+    32
+  ],
+  "input_origin": [
+    0,
+    7,
+    7,
+    0
+  ],
+  "input_physical_pages": 102,
+  "input_physical_bytes": 208896,
+  "input_endcoords_for_leaf": [
+    265,
+    17
+  ],
+  "logical_output": [
+    1,
+    8,
+    256,
+    32
+  ],
+  "output_max": [
+    1,
+    8,
+    256,
+    32
+  ],
+  "output_physical_pages": 32,
+  "output_bytes": 65536,
+  "validated_footprint_conditions": "Input table has 102 active pages with slice offset 0; output logical/max shape exactly 8x256x32 (32 active pages), each output table slice has all 32 addresses, output active pages are distinct and do not alias input active pages; no output padding/crop-external bytes.",
+  "invalid_rows": [],
+  "all_footprints_pass": true,
+  "covered_sequence_by_specific_actual_weight_FI_pair": 1022,
+  "coverage_scope": "Shape/footprint inventory only; simulator full-oracle proof is sequence 1022 pair W960/Fi933. Other weight/FI parameter pairs share geometry but were not numerically run."
+}

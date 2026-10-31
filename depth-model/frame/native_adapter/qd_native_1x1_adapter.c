@@ -1,0 +1,310 @@
+#include "qd_native_1x1_adapter.h"
+#include <string.h>
+
+#if defined(__hexagon__)
+#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
+typedef unsigned char QdVec128 __attribute__((vector_size(128), aligned(128)));
+typedef unsigned char QdVec32 __attribute__((vector_size(32), aligned(32)));
+static void copy_aligned(void *dst, const void *src, uint32_t bytes) {
+    QdVec128 *d=(QdVec128 *)dst;
+    const QdVec128 *s=(const QdVec128 *)src;
+    for(uint32_t i=0;i<bytes;i+=128)d[i/128]=s[i/128];
+}
+static void copy_lane32(void *dst,const void *src) { *(QdVec32 *)dst=*(const QdVec32 *)src; }
+static int bytes_match(uint8_t *p,uint32_t bytes,uint8_t value) {
+    HVX_Vector expected=Q6_V_vsplat_R((uint32_t)value*0x01010101u);
+    HVX_Vector diff=Q6_V_vzero();
+    uint32_t aligned_bytes=bytes&~127u;
+    for(uint32_t i=0;i<aligned_bytes;i+=128)
+        diff=Q6_V_vor_VV(diff,Q6_V_vxor_VV(*(const HVX_Vector *)(p+i),expected));
+    uint32_t any=0;
+    /* Extract from the vector register into scalar registers; storing the
+     * reduction vector to the scalar-cached worker stack is not coherent. */
+    for(uint32_t lane=0;lane<32;lane++)
+        any|=(uint32_t)Q6_R_vextract_VR(diff,lane*4u);
+    if(any)return 0;
+    for(uint32_t i=aligned_bytes;i<bytes;i++)if(p[i]!=value)return 0;
+    return 1;
+}
+#else
+static void copy_aligned(void *dst, const void *src, uint32_t bytes) {
+    memcpy(dst,src,bytes);
+}
+static void copy_lane32(void *dst,const void *src) { memcpy(dst,src,32); }
+static int bytes_match(uint8_t *p,uint32_t bytes,uint8_t value) {
+    for(uint32_t i=0;i<bytes;i++)if(p[i]!=value)return 0;
+    return 1;
+}
+#endif
+
+static uint32_t ceil8(uint32_t n) { return (n+7u)&~7u; }
+static uint32_t ptr32(const void *p) { return (uint32_t)(uintptr_t)p; }
+
+static int resolve_block(const QdN1x1Request *r, const QdN1x1Blocked *t,
+                         uint32_t index, const uint8_t **out) {
+    if(index>=t->block_count || !t->blocks)return QD_N1X1_RANGE;
+    uint32_t e=t->blocks[index],pool=e&127u,off=e&~127u;
+    if(pool>=r->pool_count || pool>=7 || !r->pool[pool] ||
+       !r->pool_bytes || off%QD_N1X1_BLOCK_BYTES ||
+       off>r->pool_bytes[pool] || QD_N1X1_BLOCK_BYTES>r->pool_bytes[pool]-off)
+        return QD_N1X1_RANGE;
+    *out=r->pool[pool]+off;
+    if((uintptr_t)*out&127u)return QD_N1X1_RANGE;
+    return QD_N1X1_OK;
+}
+
+static int ranges_overlap(const void *left,uint32_t left_bytes,const void *right,uint32_t right_bytes) {
+    uintptr_t a=(uintptr_t)left,b=a+left_bytes,q=(uintptr_t)right,z=q+right_bytes;
+    if(b<a || z<q)return 1;
+    return q<b && a<z;
+}
+static int overlaps_workspace(const QdN1x1Request *r,const void *ptr,uint32_t bytes) {
+    return ranges_overlap(r->workspace,r->workspace_bytes,ptr,bytes);
+}
+
+static int block_index(const QdN1x1Blocked *t, uint32_t y, uint32_t x,
+                       uint32_t cb, uint32_t *index) {
+    uint32_t nbd=(t->max_dims[3]+31u)/32u;
+    uint32_t nbw=(t->max_dims[2]+7u)/8u;
+    uint64_t i=((uint64_t)(y/8u)*nbw+x/8u)*nbd+t->slice_offset+cb;
+    if(cb>=nbd || i>=t->block_count || i>0xffffffffu)
+        return QD_N1X1_RANGE;
+    *index=(uint32_t)i;
+    return QD_N1X1_OK;
+}
+
+int qd_native_1x1_prepare(const QdN1x1Request *r, QdN1x1Prepared *p) {
+    if(!r || !p || !r->workspace || !r->pool_bytes || r->pool_count<7 ||
+       r->workspace_bytes>QD_N1X1_WORKSPACE_MAX || r->workspace_bytes<4096 ||
+       ((uintptr_t)r->workspace&127u) ||
+       (r->table_storage && (r->table_storage_bytes<2048 ||
+        ((uintptr_t)r->table_storage&127u))) ||
+       (r->abi_storage && (r->abi_storage_bytes<120 ||
+        ((uintptr_t)r->abi_storage&3u))))return QD_N1X1_UNSUPPORTED;
+    memset(p,0,sizeof *p);
+    const QdN1x1Blocked *x=&r->input,*y=&r->output;
+    uint32_t native_ci=r->weight_ci;
+#if QDS_NATIVE_PADDED_1X1
+    if(r->weight_native_ci)native_ci=r->weight_native_ci;
+#endif
+    int padded_ci=0;
+#if QDS_NATIVE_PADDED_1X1
+    padded_ci=(native_ci==32u && (r->weight_ci==12u || r->weight_ci==20u) &&
+               r->weight_format==QD_N1X1_WEIGHT_XPB &&
+               x->max_dims[3]==32u && x->dims[3]==(r->weight_ci==12u?9u:18u) &&
+               x->padding[3]==0);
+#endif
+    int channel_shape_ok=(native_ci==r->weight_ci && x->dims[3]==r->weight_ci &&
+                          x->max_dims[3]==r->weight_ci) || padded_ci;
+    uint64_t staged_weight_bytes=(uint64_t)native_ci*r->weight_co;
+    if(x->dims[0]!=1 || y->dims[0]!=1 || !channel_shape_ok ||
+       y->max_dims[3]!=r->weight_co || !r->weight_ci || !r->weight_co ||
+       r->weight_kernel_h!=1 || r->weight_kernel_w!=1 ||
+       (native_ci&31u) || (r->weight_ci&3u) || (r->weight_co&31u) ||
+       r->input_dtype!=QD_N1X1_DTYPE_U8 || r->output_dtype!=QD_N1X1_DTYPE_U8 ||
+       r->weight_dtype!=QD_N1X1_DTYPE_I8 || r->fi_dtype!=QD_N1X1_DTYPE_I32 ||
+       (r->weight_format!=QD_N1X1_WEIGHT_XPB && r->weight_format!=QD_N1X1_WEIGHT_XWB) ||
+       (native_ci!=r->weight_ci && !padded_ci) ||
+       !r->weights || !r->fi ||
+       ((uintptr_t)r->weights&127u) || ((uintptr_t)r->fi&127u) ||
+       r->weights_bytes!=(uint64_t)r->weight_ci*r->weight_co ||
+       r->fi_bytes!=(uint64_t)r->weight_co*8u ||
+       x->padding[1]%8u || x->padding[2]%8u ||
+       y->padding[1]%8u || y->padding[2]%8u ||
+       !x->blocks || !y->blocks)
+        return QD_N1X1_UNSUPPORTED;
+
+    uint32_t oh=ceil8(y->dims[1]),ow=ceil8(y->dims[2]);
+    uint32_t xh=x->max_dims[1]-x->padding[1],xw=x->max_dims[2]-x->padding[2];
+    if(oh>y->max_dims[1])oh=y->max_dims[1];
+    if(ow>y->max_dims[2])ow=y->max_dims[2];
+    if(oh>xh)oh=xh;if(ow>xw)ow=xw;
+    if(!oh || !ow || x->max_dims[1]==0 || x->max_dims[2]==0 ||
+       y->dims[1]>y->max_dims[1] || y->dims[2]>y->max_dims[2] ||
+       x->padding[1]>x->max_dims[1] || x->padding[2]>x->max_dims[2] ||
+       y->padding[1]>y->max_dims[1] || y->padding[2]>y->max_dims[2] ||
+       oh>y->max_dims[1]-y->padding[1] || ow>y->max_dims[2]-y->padding[2] ||
+       x->dims[1]>x->max_dims[1] || x->dims[2]>x->max_dims[2] ||
+       x->max_dims[1]>0xffffu || x->max_dims[2]>0xffffu ||
+       y->max_dims[1]>0xffffu || y->max_dims[2]>0xffffu)
+        return QD_N1X1_RANGE;
+    uint32_t ph=ceil8(oh),pw=ceil8(ow),icb=native_ci/32u,ocb=r->weight_co/32u;
+    uint64_t ib=(uint64_t)(ph/8u)*(pw/8u)*icb;
+    uint64_t ob=(uint64_t)(ph/8u)*(pw/8u)*ocb;
+    if(ib>QD_N1X1_TABLE_ENTRIES || ob>QD_N1X1_TABLE_ENTRIES)
+        return QD_N1X1_UNSUPPORTED;
+    const uint8_t *input_refs[QD_N1X1_TABLE_ENTRIES];
+    const uint8_t *output_refs[QD_N1X1_TABLE_ENTRIES];
+    uint32_t output_indices[QD_N1X1_TABLE_ENTRIES];
+    uint32_t out_seen[QD_N1X1_TABLE_ENTRIES],out_seen_n=0;
+    int e;
+    /* Validate every physical access and alias before the first workspace
+     * store, so malformed metadata cannot corrupt a live source through an
+     * overlapping upper-VTCM range. */
+    for(uint32_t ty=0;ty<ph/8u;ty++)for(uint32_t tx=0;tx<pw/8u;tx++)
+    for(uint32_t cb=0;cb<icb;cb++) {
+        uint32_t logical=((ty*(pw/8u)+tx)*icb+cb),sy=ty*8u+x->padding[1],sx=tx*8u+x->padding[2];
+        uint32_t index;
+        if((e=block_index(x,sy,sx,cb,&index)) ||
+           (e=resolve_block(r,x,index,&input_refs[logical])))return e;
+        if(overlaps_workspace(r,input_refs[logical],QD_N1X1_BLOCK_BYTES))return QD_N1X1_ALIAS;
+    }
+    for(uint32_t ty=0;ty<ph/8u;ty++)for(uint32_t tx=0;tx<pw/8u;tx++)
+    for(uint32_t cb=0;cb<ocb;cb++) {
+        uint32_t logical=((ty*(pw/8u)+tx)*ocb+cb),dy=ty*8u+y->padding[1],dx=tx*8u+y->padding[2];
+        if((e=block_index(y,dy,dx,cb,&output_indices[logical])) ||
+           (e=resolve_block(r,y,output_indices[logical],&output_refs[logical])))return e;
+        if(overlaps_workspace(r,output_refs[logical],QD_N1X1_BLOCK_BYTES))return QD_N1X1_ALIAS;
+        for(uint32_t k=0;k<out_seen_n;k++)if(out_seen[k]==ptr32(output_refs[logical]))return QD_N1X1_ALIAS;
+        out_seen[out_seen_n++]=ptr32(output_refs[logical]);
+    }
+    if(overlaps_workspace(r,r->weights,r->weights_bytes) ||
+       overlaps_workspace(r,r->fi,r->fi_bytes))return QD_N1X1_ALIAS;
+    if(r->table_storage) {
+        if(overlaps_workspace(r,r->table_storage,2048) ||
+           ranges_overlap(r->weights,r->weights_bytes,r->table_storage,2048) ||
+           ranges_overlap(r->fi,r->fi_bytes,r->table_storage,2048))return QD_N1X1_ALIAS;
+        for(uint32_t i=0;i<(uint32_t)ib;i++)
+            if(ranges_overlap(input_refs[i],QD_N1X1_BLOCK_BYTES,r->table_storage,2048))return QD_N1X1_ALIAS;
+        for(uint32_t i=0;i<(uint32_t)ob;i++)
+            if(ranges_overlap(output_refs[i],QD_N1X1_BLOCK_BYTES,r->table_storage,2048))return QD_N1X1_ALIAS;
+    }
+    if(r->abi_storage) {
+        if(overlaps_workspace(r,r->abi_storage,120) ||
+           ranges_overlap(r->weights,r->weights_bytes,r->abi_storage,120) ||
+           ranges_overlap(r->fi,r->fi_bytes,r->abi_storage,120) ||
+           (r->table_storage && ranges_overlap(r->table_storage,2048,r->abi_storage,120)))
+            return QD_N1X1_ALIAS;
+        for(uint32_t i=0;i<(uint32_t)ib;i++)
+            if(ranges_overlap(input_refs[i],QD_N1X1_BLOCK_BYTES,r->abi_storage,120))return QD_N1X1_ALIAS;
+        for(uint32_t i=0;i<(uint32_t)ob;i++)
+            if(ranges_overlap(output_refs[i],QD_N1X1_BLOCK_BYTES,r->abi_storage,120))return QD_N1X1_ALIAS;
+    }
+
+    /* These offsets match the simulator-proven QNN descriptor partition:
+     * X=0x10000, Y=0x20000, W=0x40000, FI=0x50000, zero=0x51000,
+     * descriptor/config=0x52000, guarded tail=0x54000. */
+    uint32_t off_in_table=0,off_out_table=QD_N1X1_TABLE_ENTRIES*4u;
+    uint32_t off_guard=0x54000u,off_input_guard=0x56000u;
+    uint32_t off_in=r->table_storage?0u:0x10000u,off_out=0x20000u;
+    uint32_t off_w=0x40000u,off_fi=0x50000u,off_zero=0x51000u;
+    uint32_t cursor=0x52000u;
+    if(!r->table_storage && off_out_table+QD_N1X1_TABLE_ENTRIES*4u>off_in)
+        return QD_N1X1_WORKSPACE;
+    if((uint64_t)ib*QD_N1X1_BLOCK_BYTES>off_out-off_in ||
+       (uint64_t)ob*QD_N1X1_BLOCK_BYTES>off_w-off_out ||
+       staged_weight_bytes>off_fi-off_w || r->fi_bytes>off_zero-off_fi ||
+       r->workspace_bytes<off_input_guard+QD_N1X1_BLOCK_BYTES)
+        return QD_N1X1_WORKSPACE;
+
+    uint8_t *base=(uint8_t *)r->workspace;
+    p->request=r;p->effective_h=oh;p->effective_w=ow;p->physical_h=ph;p->physical_w=pw;
+    p->input_blocks=(uint32_t)ib;p->output_blocks=(uint32_t)ob;
+    p->input_channels=native_ci;p->output_channels=r->weight_co;p->workspace_used=cursor;
+    p->input_table=r->table_storage?(uint32_t *)r->table_storage:(uint32_t *)(base+off_in_table);
+    p->output_table=r->table_storage?p->input_table+QD_N1X1_TABLE_ENTRIES:(uint32_t *)(base+off_out_table);
+    p->guard_block=base+off_guard;p->input_guard_block=base+off_input_guard;
+    p->input_data=base+off_in;p->output_data=base+off_out;
+    memset(p->guard_block,0xa5,QD_N1X1_BLOCK_BYTES);
+    memset(p->input_guard_block,0,QD_N1X1_BLOCK_BYTES);
+
+    for(uint32_t ty=0;ty<ph/8u;ty++)for(uint32_t tx=0;tx<pw/8u;tx++)
+    for(uint32_t cb=0;cb<icb;cb++) {
+        uint32_t logical=((ty*(pw/8u)+tx)*icb+cb),slot=(uint32_t)ib-1u-logical;
+        const uint8_t *src=input_refs[logical];
+        uint8_t *dst=base+off_in+slot*QD_N1X1_BLOCK_BYTES;
+        copy_aligned(dst,src,QD_N1X1_BLOCK_BYTES);
+        /* Zero padded logical rows/columns inside the physical 8x8 tile. */
+        uint32_t valid_h=oh,valid_w=ow;
+        for(uint32_t ry=0;ry<8;ry++)for(uint32_t rx=0;rx<8;rx++)
+            if(ty*8u+ry>=valid_h || tx*8u+rx>=valid_w)
+                memset(dst+ry*256u+rx*32u,0,32);
+        p->input_table[logical]=ptr32(dst);
+    }
+
+    for(uint32_t ty=0;ty<ph/8u;ty++)for(uint32_t tx=0;tx<pw/8u;tx++)
+    for(uint32_t cb=0;cb<ocb;cb++) {
+        uint32_t logical=((ty*(pw/8u)+tx)*ocb+cb),slot=(uint32_t)ob-1u-logical;
+        const uint8_t *src=output_refs[logical];
+        uint8_t *dst=base+off_out+slot*QD_N1X1_BLOCK_BYTES;
+        copy_aligned(dst,src,QD_N1X1_BLOCK_BYTES);
+        p->output_table[logical]=ptr32(dst);
+    }
+    /* Active entries were assigned above; write only the guarded table tails. */
+    for(uint32_t i=(uint32_t)ib;i<QD_N1X1_TABLE_ENTRIES;i++)
+        p->input_table[i]=ptr32(p->input_guard_block);
+    for(uint32_t i=(uint32_t)ob;i<QD_N1X1_TABLE_ENTRIES;i++)
+        p->output_table[i]=ptr32(p->guard_block);
+    if(padded_ci) {
+        /* Xpb 1x1 is grouped as [O/32][I/4][O%32][I%4]. Expand only the
+         * supported CI12/20 cases to eight input groups; zeroing the output
+         * first makes every synthetic input channel contribute exactly zero. */
+        memset(base+off_w,0,(uint32_t)staged_weight_bytes);
+        uint32_t input_groups=r->weight_ci/4u;
+        uint32_t output_groups=r->weight_co/32u;
+        for(uint32_t oblock=0;oblock<output_groups;oblock++)
+            for(uint32_t igroup=0;igroup<input_groups;igroup++) {
+                const uint8_t *src=r->weights+((uint64_t)oblock*input_groups+igroup)*128u;
+                uint8_t *dst=base+off_w+((uint64_t)oblock*(native_ci/4u)+igroup)*128u;
+                copy_aligned(dst,src,128u);
+            }
+    } else {
+        copy_aligned(base+off_w,r->weights,r->weights_bytes);
+    }
+    copy_aligned(base+off_fi,r->fi,r->fi_bytes);
+    p->weights=base+off_w;p->fi=base+off_fi;p->zero_words=base+off_zero;
+    /* The native finish sequence consumes 64 int32 words. The latter half is
+     * the bias vector and must be initialized even when the leaf has no bias. */
+    for(uint32_t i=0;i<64;i++)((uint32_t *)p->zero_words)[i]=i<32?0x404000u:0u;
+    p->input_desc=r->abi_storage?(uint32_t *)r->abi_storage:(uint32_t *)(base+cursor);
+    p->output_desc=p->input_desc+6;
+    p->cfg=p->output_desc+6;p->mode=p->cfg+16;
+    p->input_desc[0]=ptr32(p->input_table);p->input_desc[1]=icb;p->input_desc[2]=(uint32_t)ib;
+    p->input_desc[3]=(ph/8u)*(pw/8u);p->input_desc[4]=64;p->input_desc[5]=native_ci;
+    p->output_desc[0]=ptr32(p->output_table);p->output_desc[1]=ocb;p->output_desc[2]=(uint32_t)ob;
+    p->output_desc[3]=(ph/8u)*(pw/8u);p->output_desc[4]=64;p->output_desc[5]=r->weight_co;
+    memset(p->cfg,0,16u*4u);p->cfg[3]=2047u;p->cfg[6]=1023u;
+    p->mode[0]=1;p->mode[1]=0;
+    p->workspace_used=off_input_guard+QD_N1X1_BLOCK_BYTES;
+    return QD_N1X1_OK;
+}
+
+int qd_native_1x1_finish(const QdN1x1Prepared *p) {
+    if(!p || !p->request || !p->guard_block || !p->input_guard_block)return QD_N1X1_UNSUPPORTED;
+    const QdN1x1Request *r=p->request;const QdN1x1Blocked *y=&r->output;
+    if(!bytes_match(p->guard_block,QD_N1X1_BLOCK_BYTES,0xa5) ||
+       !bytes_match(p->input_guard_block,QD_N1X1_BLOCK_BYTES,0))return QD_N1X1_GUARD;
+    for(uint32_t i=p->input_blocks;i<QD_N1X1_TABLE_ENTRIES;i++)
+        if(p->input_table[i]!=ptr32(p->input_guard_block))return QD_N1X1_GUARD;
+    for(uint32_t i=p->output_blocks;i<QD_N1X1_TABLE_ENTRIES;i++)
+        if(p->output_table[i]!=ptr32(p->guard_block))return QD_N1X1_GUARD;
+    for(uint32_t i=0;i<p->input_blocks;i++)
+        if(p->input_table[i]!=ptr32(p->input_data+(p->input_blocks-1u-i)*QD_N1X1_BLOCK_BYTES))
+            return QD_N1X1_GUARD;
+    for(uint32_t i=0;i<p->output_blocks;i++)
+        if(p->output_table[i]!=ptr32(p->output_data+(p->output_blocks-1u-i)*QD_N1X1_BLOCK_BYTES))
+            return QD_N1X1_GUARD;
+    uint32_t ocb=p->output_channels/32u,pw=p->physical_w;
+    for(uint32_t ty=0;ty<p->physical_h/8u;ty++)for(uint32_t tx=0;tx<pw/8u;tx++)
+    for(uint32_t cb=0;cb<ocb;cb++) {
+        uint32_t logical=((ty*(pw/8u)+tx)*ocb+cb),dstidx;
+        uint32_t dy=ty*8u+y->padding[1],dx=tx*8u+y->padding[2];
+        int e=block_index(y,dy,dx,cb,&dstidx);if(e)return e;
+        const uint8_t *target;if((e=resolve_block(r,y,dstidx,&target)))return e;
+        const uint8_t *src=(const uint8_t *)(uintptr_t)p->output_table[logical];
+        if (ty*8u+8u<=p->effective_h && tx*8u+8u<=p->effective_w) {
+            /* Full effective tiles need no byte mask: publish one 2 KiB
+             * crouton with the adapter's aligned HVX copy path. Edge tiles
+             * stay lane-masked so graph bytes outside the write footprint
+             * retain their prior values. */
+            copy_aligned((void *)target,src,QD_N1X1_BLOCK_BYTES);
+            continue;
+        }
+        for(uint32_t ry=0;ry<8;ry++)if(ty*8u+ry<p->effective_h)
+            for(uint32_t rx=0;rx<8;rx++)if(tx*8u+rx<p->effective_w)
+                copy_lane32((uint8_t *)target+ry*256u+rx*32u,
+                            src+ry*256u+rx*32u);
+    }
+    return QD_N1X1_OK;
+}

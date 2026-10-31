@@ -1,0 +1,8 @@
+{
+  "qdrx_sequence": 1022,
+  "command_index": 836,
+  "bytes": 65536,
+  "layout": "physical 32-page crouton output, row-major page table",
+  "sha256": "865cee388e871029fca5f6310d92f977b966e72db3a320195f000790e86b11fa",
+  "sim_log_sha256": "e44753fa965ca617a20f91c3ad90fdc73388e128fe4a354986de4d73296fead3"
+}

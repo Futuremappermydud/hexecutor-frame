@@ -1,0 +1,231 @@
+{
+  "0x1a0e9e8": [
+    "*InputSlice@Ff.s4*6."
+  ],
+  "0xf5fec0": [
+    "@DmaCheckpointSet"
+  ],
+  "0x1821eda": [
+    "ConvLayer.opt.weights_to_vtcm@Xpb.xpb."
+  ],
+  "0x1823cf8": [
+    "ConvLayer.opt.weights_to_vtcm@Fi.fi."
+  ],
+  "0x1824818": [
+    "ConvLayer.opt.activations_to_vtcm_dma@CB.cB."
+  ],
+  "0x1823796": [
+    "ConvLayer.opt.weights_to_vtcm@FH.fH."
+  ],
+  "0x1821984": [
+    "ConvLayer.opt.weights_to_vtcm@Xwb.xwb."
+  ],
+  "0xf5fe40": [
+    "@DmaCheckpointWait"
+  ],
+  "0x1a0fe04": [
+    "*InputSlicePad@FB.s4*3.t.s4*3."
+  ],
+  "0x17b2b82": [
+    "ConvLayer.opt.inconv_im2col.tcm@CB.FB.s4.t"
+  ],
+  "0x239e884": [
+    "Quantize@FH.Ff"
+  ],
+  "0x178acfe": [
+    "ConvLayer_s1.opt@CB*2.Xpb.Fi.t",
+    "ConvLayer_s1.opt@CB*2.Xwb.Fi.t"
+  ],
+  "0xf86360": [
+    "@SyncOp"
+  ],
+  "0x1ad1446": [
+    "linearclip_simple_rq@CB*2.fi"
+  ],
+  "0x161cd0a": [
+    "Abs@FH*2"
+  ],
+  "0x23d387e": [
+    "Mean@FH*2.fi.t"
+  ],
+  "0xebc680": [
+    "*InputSlicePad@FB.s4*3.t.s4*3."
+  ],
+  "0x17acace": [
+    "ConvLayer_SpaceToDepth_stride2.tcm@CB*2.s4"
+  ],
+  "0x238d89c": [
+    "addsub_op_flat@FH*3.fi"
+  ],
+  "0x18c737a": [
+    "ElementWiseSign@FH*2"
+  ],
+  "0x2390834": [
+    "mul_op_flat@FH*2.fH.fi"
+  ],
+  "0x178f201": [
+    "ConvLayer_s2.opt@CB*2.Xwb.Fi"
+  ],
+  "0x178acdd": [
+    "ConvLayer_s1.opt@CB*2.Xwb.Fi.t"
+  ],
+  "0x1819a44": [
+    "flat_from_vtcm@fH.FH."
+  ],
+  "0x1b2c084": [
+    "ForceFormat_Crouton_f2c@CH.FH"
+  ],
+  "0x238b45a": [
+    "addsub_op@CH.cH.CH.fi"
+  ],
+  "0xf5f220": [
+    "@Spill"
+  ],
+  "0x18213c6": [
+    "ConvLayer.opt.activations_from_vtcm@cH.CH."
+  ],
+  "0xf5f700": [
+    "@Fill"
+  ],
+  "0x1b2c90e": [
+    "ForceFormat_Crouton@CB*2"
+  ],
+  "0x2620a7a": [
+    "Transpose.2D@CB*2.t"
+  ],
+  "0x1b2a248": [
+    "ForceFormat_Flat_c2f@FB.CB"
+  ],
+  "0x179fe7a": [
+    "ConvLayer.opt.conv_scale_from_weights@ff.FB"
+  ],
+  "0x17a4904": [
+    "invscale_to_qi32@fs.ff"
+  ],
+  "0x17a096c": [
+    "ConvLayer.opt.combine_scales@ff*3.t"
+  ],
+  "0x17a12fe": [
+    "ConvLayer.opt.convert_weights_to_signed.packed@xpb.FB.t.fs.t"
+  ],
+  "0x17a4b9a": [
+    "ConvLayer.opt.scale_convert@fi.ff.t"
+  ],
+  "0x181b23a": [
+    "flat_to_vtcm@Ff.ff."
+  ],
+  "0x17a611e": [
+    "ConvLayer.opt.convert_bias.simple@Fs.s4.Ff*2.t.ni"
+  ],
+  "0x2433892": [
+    "Reshape.hw@CB*2"
+  ],
+  "0x17a7b4a": [
+    "ConvLayer.opt.bias_scale_shuff@Fi.fi.Fs.t"
+  ],
+  "0x242fc6e": [
+    "Reshape@FB.CB"
+  ],
+  "0x172dcce": [
+    "Concat@FB.t.FB*2"
+  ],
+  "0x261b79c": [
+    "Transpose_impl@FB*2.fi.t"
+  ],
+  "0x18e849e": [
+    "Gather@FB*2.fi*3"
+  ],
+  "0x2312e6c": [
+    "SlicePad_shape_inplace@FB*2.s4*3.cB"
+  ],
+  "0x1acc8d4": [
+    "linearclip@FB*2.fi"
+  ],
+  "0x1b2bed6": [
+    "ForceFormat_Crouton_f2c@CB.FB"
+  ],
+  "0x2312732": [
+    "SlicePad_shape_inplace@CB*2.s4*3.CB"
+  ],
+  "0x18af77b": [
+    "Add.tcm@CB*3"
+  ],
+  "0xe609b0": [
+    "@BlockZap"
+  ],
+  "0x182657a": [
+    "Decimate.tcm@CB*2.s4"
+  ],
+  "0x2458e2c": [
+    "ResizeNear_slice.tcm_special@CB*2.fi*2"
+  ],
+  "0x1824474": [
+    "ConvLayer.opt.activations_to_vtcm_dma@CH.cH."
+  ],
+  "0x1ad3a50": [
+    "linearclip@CH.CB.fi"
+  ],
+  "0x22f8b84": [
+    "*OutputSlice@CB.s4*3."
+  ],
+  "0x178c1d5": [
+    "ConvLayer_s1.opt@CH*2.Xwb.Fi.t"
+  ],
+  "0x1b2a54c": [
+    "ForceFormat_Flat_c2f@FH.CH"
+  ],
+  "0x17bb0ec": [
+    "ConvLayer.opt.inconv_im2col.tcm@CH.FH.s4.t"
+  ],
+  "0x178c238": [
+    "ConvLayer_s1.opt@CH*2.Xpb.Fi.t"
+  ],
+  "0x2396032": [
+    "mul_op@CH*2.cH.fi"
+  ],
+  "0x262134a": [
+    "Transpose.2D@CH*2.t"
+  ],
+  "0x261bbce": [
+    "Transpose_impl@FH*2.fi.t"
+  ],
+  "0x2585182": [
+    "Slice_contig.tcm@FH*2.s4*2"
+  ],
+  "0x1ad1a32": [
+    "linearclip_simple_rq@CH*2.fi"
+  ],
+  "0x18c786e": [
+    "ElementWiseSign@CH*2"
+  ],
+  "0x2392f74": [
+    "mul_op@CH*2.fH.fi"
+  ],
+  "0x2388c48": [
+    "addsub_op@CH*2.fH.fi"
+  ],
+  "0x23899b2": [
+    "addsub_op@CH*3.fi"
+  ],
+  "0x161d6ba": [
+    "Abs@CH*2"
+  ],
+  "0x1ad07ce": [
+    "linearclip@CH*2.fi"
+  ],
+  "0x2395570": [
+    "mul_op_crt@CH*3.fi"
+  ],
+  "0x18af7b7": [
+    "Add.tcm@CH*3"
+  ],
+  "0x1675736": [
+    "d2s.shortD.flatout@FH.CH.fi"
+  ],
+  "0x1841956": [
+    "Dequantize@Ff.CH"
+  ],
+  "0x22f1e9e": [
+    "*OutputSlice@Ff.s4*3."
+  ]
+}

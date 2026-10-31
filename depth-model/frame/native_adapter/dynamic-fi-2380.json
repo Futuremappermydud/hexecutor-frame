@@ -1,0 +1,22 @@
+{
+  "sequence": 2380,
+  "command_index": 2128,
+  "executed_cpu_prefix_through_index": 2128,
+  "variant": "ConvLayer_s1.opt@CB*2.Xpb.Fi.t",
+  "input_bytes_sha256": "0b29694d25c7f3d90afc52404d5b08bc76912b185a3b8df688fad0b1d15cd115",
+  "weights_tensor": 1622,
+  "weights_ref": {
+    "pool": 1,
+    "offset": 5519360
+  },
+  "weights_bytes": 8192,
+  "weights_sha256": "659950a21d609c74a684ac509e66d9572723a191d8e2af5a9119e07ef683ac3f",
+  "fi_tensor": 1985,
+  "fi_ref": {
+    "pool": 1,
+    "offset": 5527552
+  },
+  "fi_bytes": 512,
+  "fi_sha256": "fde170ae53ec41022590bd1273dfb49e9745dd12beda81ac659a05ef05513d26",
+  "execution": "NativeGraph CPU QDRX prefix, no device or DSP"
+}

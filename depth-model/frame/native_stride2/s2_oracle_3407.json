@@ -1,0 +1,54 @@
+{
+  "fixture_sha256": "0eb60d0914ecd25fa4344f0b153bab6bf125bea7cffd7c575b4e520058c9edfd",
+  "sequence": 3407,
+  "input_dims": [
+    1,
+    9,
+    34,
+    512
+  ],
+  "input_max": [
+    1,
+    16,
+    40,
+    512
+  ],
+  "input_padding": [
+    0,
+    0,
+    0,
+    0
+  ],
+  "output_dims": [
+    1,
+    8,
+    32,
+    128
+  ],
+  "output_max": [
+    1,
+    8,
+    32,
+    128
+  ],
+  "weight_shape": [
+    3,
+    3,
+    128,
+    128
+  ],
+  "lowered_shape": [
+    2,
+    2,
+    512,
+    128
+  ],
+  "cpu_oracle_delta_histogram": {
+    "0": 32768
+  },
+  "lowered_packed_sha256": "06d82017b5067c9ebd7682bfe855408d219f3cac09ec75e4de1a9169b592687e",
+  "lowered_packed_fnv64": "d3e0737557933e10",
+  "oracle_exact": true,
+  "oracle_abs_le_1": true,
+  "cpu_active_sha256": "20468e9e2cba00b953f6613c058bbd78d8f00f503a0611d8b5472074ba0825b1"
+}

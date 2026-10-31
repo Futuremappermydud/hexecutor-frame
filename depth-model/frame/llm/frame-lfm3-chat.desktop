@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Frame LFM3 Chat
+Comment=LFM3-1.7B chat on the Frame CPU
+Exec=/home/steamos/frame-dsp/depth-model/dev/frame/llm/launch_cpu.sh
+Icon=dialog-information
+Terminal=false
+Categories=Utility;
+OnlyShowIn=gamescope;

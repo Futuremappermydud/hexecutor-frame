@@ -1,0 +1,26 @@
+{
+  "passed": true,
+  "offline_only": true,
+  "sequence": 247,
+  "mode": "direct",
+  "actual_graph_direct_run": true,
+  "fixed_l2_tables": "0x30000000",
+  "l2_sim_physical_base": "0xd8000000",
+  "sim_vtcm_base": "0xd9000000",
+  "abi_word_mismatches_vs_leaf_reference": 0,
+  "active_table_word_mismatches_vs_leaf_reference": 0,
+  "leaf_output_sha256": "cfec6dbed3eb2e88544d5c0371c8c50915ce90e6b14f44be7c4411c19bf5e15f",
+  "expected_staged_sha256": "cfec6dbed3eb2e88544d5c0371c8c50915ce90e6b14f44be7c4411c19bf5e15f",
+  "source_sha256": {
+    "direct_3x3_scatter_sim.c": "0746c6bbf8d3f2510695b0c10b699f54e9fd7d88b700bb109c6a2404a471ff0e",
+    "qd_native_direct.c": "38cba2830af8dbd630356fe27dac7e191d4b82f794f575761b92728186e144da",
+    "qd_native_direct.h": "933c72b9f6f1072b40b78258460139c51dddcec3abc2110ffe6c41613c96469b"
+  },
+  "checks_in_target_harness": [
+    "graph range preflight and dispatch through qd_graph_native_direct.h",
+    "seq247 input/output tables with duplicate refs and independent physical-page permutation",
+    "pool1 boundary copy-in/copyback and restored host pool pointer",
+    "all active VTCM bytes outside output pages unchanged",
+    "zero ABI/table differences from the standalone prepared leaf"
+  ]
+}

@@ -1,0 +1,70 @@
+{
+  "passed": true,
+  "offline_only": true,
+  "oracle_rechecked_simulator_output": true,
+  "simulator_native_minus_integer_bound": [
+    0,
+    1
+  ],
+  "simulator_different_values": 552,
+  "fixture_sha256": "5b8df2879945eed2ec46218cf397a73bcdf029e55da090def422adc779b079d9",
+  "fixture_bytes": 82980,
+  "packet_bytes": 40,
+  "packet_words": [
+    827408721,
+    1,
+    7,
+    8,
+    64,
+    128,
+    128,
+    1,
+    0,
+    7340032
+  ],
+  "regions": [
+    [
+      "fixture",
+      65536,
+      82980
+    ],
+    [
+      "packed_weights_copy",
+      155648,
+      16384
+    ],
+    [
+      "fi_copy",
+      172032,
+      1024
+    ],
+    [
+      "pool1",
+      262144,
+      131072
+    ],
+    [
+      "output_copy",
+      589824,
+      65536
+    ],
+    [
+      "input_echo",
+      655360,
+      65536
+    ],
+    [
+      "block_tables",
+      1048576,
+      2048
+    ],
+    [
+      "vtcm_backup",
+      3145728,
+      524288
+    ]
+  ],
+  "all_arena_ranges_disjoint": true,
+  "aligned_staged_weight_offset": 155648,
+  "aligned_staged_fi_offset": 172032
+}

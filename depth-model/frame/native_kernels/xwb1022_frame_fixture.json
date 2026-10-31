@@ -1,0 +1,13 @@
+{
+  "fixture": "xwb1022_frame_fixture.bin",
+  "bytes": 349644,
+  "sha256": "9ec0c8d50adfb87e4050e0a132f1246d8070956ebeb2a9ad1fe1261de92d9345",
+  "sources": {
+    "xwb1022_input_pages.bin": "247be4851d5804d80e254055530dac59f333574057c07ca30459dae00d0016b8",
+    "xwb1022_weights.bin": "5119e1c781aad96bfdaad620cc10813d10a9c15873ab37e8a2159ceaa46cf102",
+    "xwb1022_fi.bin": "8ff7ffedc5ab78ce2faee5d91bcd17cc79928fc34700a979165a6620ca00739d",
+    "xwb1022_hmx_output.bin": "865cee388e871029fca5f6310d92f977b966e72db3a320195f000790e86b11fa",
+    "xwb1022_cpu_output.bin": "7c4b4e4a705f3d771564612f0be77ae3cb3f21ca8906014f7e80166a531fd1b5"
+  },
+  "note": "Simulator-proven CI32/CO32 QDRX 1022 generic 3x3 fixture; not a device result."
+}

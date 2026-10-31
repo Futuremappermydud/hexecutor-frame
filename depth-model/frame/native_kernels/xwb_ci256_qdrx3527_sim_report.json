@@ -1,0 +1,59 @@
+{
+  "passed": true,
+  "sequence": 3527,
+  "variant": "ConvLayer_s1.opt@CB*2.Xwb.Fi.t",
+  "geometry": {
+    "input_dims": [
+      10,
+      66,
+      256
+    ],
+    "input_max": [
+      24,
+      80,
+      256
+    ],
+    "input_padding": [
+      7,
+      7
+    ],
+    "input_pages": 240,
+    "output_dims": [
+      8,
+      64,
+      128
+    ],
+    "output_max": [
+      8,
+      64,
+      128
+    ],
+    "output_slice_offset": 84,
+    "output_active_pages": 32,
+    "weight_dims": [
+      3,
+      3,
+      256,
+      128
+    ],
+    "weight_format": "Xwb"
+  },
+  "fixture_sha256": "ec2697f0ed857476888c0edb96ac714a0703437e35ac5ea0aa23e1407d3e2d3d",
+  "simulator_elf_sha256": "a2ccff093d87bc480deec3c7aa7437b784ca674c3d68d74dc6ca0e0c32fd1531",
+  "simulator_log_sha256": "81e769c2a18d49d914bbab2b75d2051641b20acf8939878cb834e6affd2770a6",
+  "cpu_active_output_sha256": "4756391a13c806e553a2fa2476a1c4d9aa712b850c5506753245e834ff9e4cf7",
+  "hmx_output_sha256": "bd76c56f57558ecafc37fa4064eb76083e43826c42670b13ee98a782431f477a",
+  "hmx_output_is_byte_exact_or_plus_one_to_cpu": true,
+  "delta_histogram": {
+    "0": 64026,
+    "1": 1510
+  },
+  "staged_fnv64": {
+    "X": "d99312d02a516d41",
+    "W": "6cfbd07d40ef22a7",
+    "FI": "5dd37a3d1d994dc3",
+    "Y_reference": "7b7de7574c365b1b"
+  },
+  "guard_and_block_table_tail_checks": "passed inside simulator C",
+  "device_accessed": false
+}

@@ -1,0 +1,9149 @@
+{
+  "variant": "ConvLayer_s2.opt@CB*2.Xwb.Fi",
+  "models": {
+    "primary": {
+      "count": 80,
+      "weight_ci_co_input_ci_counts": {
+        "(32, 64, 128)": 40,
+        "(64, 128, 256)": 20,
+        "(128, 128, 512)": 20
+      },
+      "sequences": [
+        224,
+        230,
+        240,
+        243,
+        244,
+        251,
+        256,
+        264,
+        266,
+        286,
+        304,
+        312,
+        363,
+        365,
+        367,
+        385,
+        413,
+        414,
+        430,
+        442,
+        455,
+        471,
+        507,
+        516,
+        517,
+        518,
+        576,
+        578,
+        579,
+        588,
+        656,
+        657,
+        658,
+        660,
+        711,
+        712,
+        730,
+        770,
+        771,
+        796,
+        797,
+        847,
+        862,
+        872,
+        944,
+        955,
+        976,
+        1001,
+        1003,
+        1009,
+        1064,
+        1076,
+        1093,
+        1098,
+        1142,
+        1259,
+        1285,
+        1290,
+        1296,
+        1303,
+        3407,
+        3412,
+        3492,
+        3649,
+        3652,
+        3657,
+        3660,
+        3665,
+        3666,
+        3683,
+        3821,
+        3823,
+        3824,
+        3854,
+        3859,
+        3888,
+        3967,
+        3969,
+        3971,
+        3973
+      ],
+      "cases": [
+        {
+          "sequence": 224,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 36,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 230,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 2,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 240,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 74,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 243,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 38,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 244,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 36,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 251,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 128,
+          "output_pages": 256,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 256,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 74,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 264,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 136,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 266,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 36,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 286,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 36,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 304,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 32,
+          "output_pages": 136,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 312,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 74,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 363,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 365,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 367,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 385,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 413,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 68,
+          "output_pages": 136,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 414,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 36,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 430,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 74,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 442,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 455,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 2,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 471,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 507,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 38,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 516,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 32,
+          "output_pages": 136,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 517,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 136,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 518,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 74,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 576,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 578,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 579,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 588,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 656,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 69,
+          "output_pages": 102,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 657,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 36,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 658,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 36,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 660,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 2,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 711,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 36,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 712,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 136,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 730,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 770,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 36,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 771,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 36,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 796,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 69,
+          "output_pages": 102,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 797,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 2,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 847,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 74,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 862,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 2,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 872,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 944,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 955,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 976,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 2,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1001,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 136,
+          "output_pages": 198,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1003,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 36,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1009,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 35,
+          "output_pages": 102,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1064,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 2,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1076,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 74,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1093,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 2,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1098,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 2,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1142,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1259,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1285,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1290,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1296,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1303,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3407,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 52,
+          "output_pages": 72,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3412,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 135,
+          "output_pages": 198,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3492,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 68,
+          "output_pages": 136,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3649,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 84,
+          "output_pages": 136,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3652,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 151,
+          "output_pages": 198,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3657,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3660,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 16,
+          "output_pages": 64,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3665,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 94,
+          "output_pages": 120,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3666,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3683,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 8,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3821,
+          "input_dims": [
+            1,
+            5,
+            18,
+            512
+          ],
+          "input_max": [
+            1,
+            8,
+            24,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 48,
+          "input_pages": 96,
+          "output_dims": [
+            1,
+            4,
+            16,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 185,
+          "output_pages": 240,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3823,
+          "input_dims": [
+            1,
+            9,
+            18,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            24,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 96,
+          "output_dims": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 7,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3824,
+          "input_dims": [
+            1,
+            9,
+            18,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            24,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 96,
+          "output_dims": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 60,
+          "output_pages": 72,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3854,
+          "input_dims": [
+            1,
+            5,
+            18,
+            512
+          ],
+          "input_max": [
+            1,
+            8,
+            24,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 48,
+          "input_pages": 96,
+          "output_dims": [
+            1,
+            4,
+            16,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 28,
+          "output_pages": 72,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3859,
+          "input_dims": [
+            1,
+            9,
+            18,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            24,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 96,
+          "output_dims": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 52,
+          "output_pages": 72,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3888,
+          "input_dims": [
+            1,
+            9,
+            18,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            24,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 96,
+          "output_dims": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 36,
+          "output_pages": 72,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3967,
+          "input_dims": [
+            1,
+            3,
+            10,
+            512
+          ],
+          "input_max": [
+            1,
+            8,
+            16,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 32,
+          "input_pages": 64,
+          "output_dims": [
+            1,
+            2,
+            8,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            8,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 4,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3969,
+          "input_dims": [
+            1,
+            3,
+            10,
+            512
+          ],
+          "input_max": [
+            1,
+            8,
+            16,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 32,
+          "input_pages": 64,
+          "output_dims": [
+            1,
+            2,
+            8,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            8,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 4,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3971,
+          "input_dims": [
+            1,
+            9,
+            10,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            16,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 64,
+          "output_dims": [
+            1,
+            8,
+            8,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            8,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 11,
+          "output_pages": 16,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3973,
+          "input_dims": [
+            1,
+            9,
+            10,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            16,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 64,
+          "output_dims": [
+            1,
+            8,
+            8,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            8,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 4,
+          "output_pages": 16,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        }
+      ]
+    },
+    "alternate": {
+      "count": 80,
+      "weight_ci_co_input_ci_counts": {
+        "(32, 64, 128)": 40,
+        "(64, 128, 256)": 20,
+        "(128, 128, 512)": 20
+      },
+      "sequences": [
+        170,
+        171,
+        175,
+        182,
+        187,
+        196,
+        263,
+        279,
+        280,
+        296,
+        304,
+        327,
+        342,
+        355,
+        357,
+        386,
+        413,
+        420,
+        437,
+        447,
+        460,
+        475,
+        489,
+        497,
+        532,
+        533,
+        576,
+        578,
+        580,
+        586,
+        654,
+        655,
+        656,
+        659,
+        699,
+        710,
+        756,
+        759,
+        764,
+        783,
+        807,
+        837,
+        852,
+        903,
+        904,
+        916,
+        944,
+        988,
+        989,
+        1007,
+        1024,
+        1041,
+        1056,
+        1058,
+        1147,
+        1209,
+        1221,
+        1222,
+        1234,
+        1236,
+        3392,
+        3397,
+        3398,
+        3415,
+        3425,
+        3447,
+        3451,
+        3452,
+        3462,
+        3465,
+        3621,
+        3623,
+        3624,
+        3659,
+        3661,
+        3662,
+        3760,
+        3762,
+        3765,
+        3766
+      ],
+      "cases": [
+        {
+          "sequence": 170,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 2,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 171,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 68,
+          "output_pages": 136,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 175,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 36,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 182,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 74,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 187,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 36,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 196,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 69,
+          "output_pages": 102,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 263,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 279,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 133,
+          "output_pages": 198,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 280,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 1,
+          "output_pages": 40,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 296,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 128,
+          "output_pages": 256,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 304,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 327,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 69,
+          "output_pages": 102,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 342,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 355,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 1,
+          "output_pages": 102,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 357,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 36,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 386,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 413,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 32,
+          "output_pages": 136,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 420,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 36,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 437,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 36,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 447,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 460,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 35,
+          "output_pages": 102,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 475,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 489,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 2,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 497,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 96,
+          "output_pages": 256,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 532,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 38,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 533,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 36,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 576,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 578,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 580,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 586,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 654,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 2,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 655,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 35,
+          "output_pages": 102,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 656,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 32,
+          "output_pages": 136,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 659,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 36,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 699,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 133,
+          "output_pages": 198,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 710,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 160,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 756,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 759,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 2,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 764,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 36,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 783,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 2,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 807,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 1,
+          "output_pages": 102,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 837,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 64,
+          "output_pages": 256,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 852,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 35,
+          "output_pages": 102,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 903,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 904,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 916,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 80,
+          "output_pages": 160,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 944,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 1,
+          "output_pages": 68,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 988,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 2,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 989,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 2,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1007,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 2,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1024,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 1,
+          "output_pages": 198,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1041,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 2,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1056,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 32,
+          "output_pages": 136,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1058,
+          "input_dims": [
+            1,
+            9,
+            130,
+            128
+          ],
+          "input_max": [
+            1,
+            16,
+            136,
+            128
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 136,
+          "output_dims": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_max": [
+            1,
+            8,
+            128,
+            64
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 2,
+          "output_pages": 108,
+          "weights_dims": [
+            3,
+            3,
+            32,
+            64
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            2,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1147,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 144,
+          "output_pages": 256,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1209,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 1,
+          "output_pages": 198,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1221,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 96,
+          "output_pages": 256,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1222,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 32,
+          "output_pages": 136,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1234,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 35,
+          "output_pages": 102,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 1236,
+          "input_dims": [
+            1,
+            9,
+            66,
+            256
+          ],
+          "input_max": [
+            1,
+            16,
+            72,
+            256
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 144,
+          "output_dims": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            64,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 69,
+          "output_pages": 102,
+          "weights_dims": [
+            3,
+            3,
+            64,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3392,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 28,
+          "output_pages": 72,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3397,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 52,
+          "output_pages": 72,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3398,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 160,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3415,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 28,
+          "output_pages": 72,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3425,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 52,
+          "output_pages": 72,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3447,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 28,
+          "output_pages": 72,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3451,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 52,
+          "output_pages": 72,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3452,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3462,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 20,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3465,
+          "input_dims": [
+            1,
+            9,
+            34,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            40,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 160,
+          "output_dims": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            32,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 20,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3621,
+          "input_dims": [
+            1,
+            5,
+            18,
+            512
+          ],
+          "input_max": [
+            1,
+            8,
+            24,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 48,
+          "input_pages": 96,
+          "output_dims": [
+            1,
+            4,
+            16,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 17,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3623,
+          "input_dims": [
+            1,
+            9,
+            18,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            24,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 96,
+          "output_dims": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 9,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3624,
+          "input_dims": [
+            1,
+            9,
+            18,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            24,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 96,
+          "output_dims": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 9,
+          "output_pages": 32,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3659,
+          "input_dims": [
+            1,
+            5,
+            18,
+            512
+          ],
+          "input_max": [
+            1,
+            8,
+            24,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 48,
+          "input_pages": 96,
+          "output_dims": [
+            1,
+            4,
+            16,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 52,
+          "output_pages": 72,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3661,
+          "input_dims": [
+            1,
+            9,
+            18,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            24,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 96,
+          "output_dims": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 60,
+          "output_pages": 72,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3662,
+          "input_dims": [
+            1,
+            9,
+            18,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            24,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 96,
+          "output_dims": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            16,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 56,
+          "output_pages": 64,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3760,
+          "input_dims": [
+            1,
+            3,
+            10,
+            512
+          ],
+          "input_max": [
+            1,
+            8,
+            16,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 32,
+          "input_pages": 64,
+          "output_dims": [
+            1,
+            2,
+            8,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            8,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 8,
+          "output_pages": 20,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3762,
+          "input_dims": [
+            1,
+            3,
+            10,
+            512
+          ],
+          "input_max": [
+            1,
+            8,
+            16,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 32,
+          "input_pages": 64,
+          "output_dims": [
+            1,
+            2,
+            8,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            8,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 12,
+          "output_pages": 20,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3765,
+          "input_dims": [
+            1,
+            9,
+            10,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            16,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 64,
+          "output_dims": [
+            1,
+            8,
+            8,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            8,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 0,
+          "output_pages": 20,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        },
+        {
+          "sequence": 3766,
+          "input_dims": [
+            1,
+            9,
+            10,
+            512
+          ],
+          "input_max": [
+            1,
+            16,
+            16,
+            512
+          ],
+          "input_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_slice": 0,
+          "input_pages": 64,
+          "output_dims": [
+            1,
+            8,
+            8,
+            128
+          ],
+          "output_max": [
+            1,
+            8,
+            8,
+            128
+          ],
+          "output_padding": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "output_slice": 28,
+          "output_pages": 72,
+          "weights_dims": [
+            3,
+            3,
+            128,
+            128
+          ],
+          "weight_class": "Xwb",
+          "fi_dims": [
+            1,
+            4,
+            1,
+            64
+          ]
+        }
+      ]
+    }
+  }
+}

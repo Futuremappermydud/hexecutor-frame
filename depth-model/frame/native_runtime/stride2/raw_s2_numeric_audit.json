@@ -1,0 +1,117 @@
+{
+  "sequence": 224,
+  "fixture_sha256": "b9a15ebd2bb22b070731ea30de83be66be3aee93a4dd5070ee4cbce6463aa865",
+  "native_output_sha256": "0c6638118fc073889927fc461d28716821f27d06cba78fe63c64993ff07d372f",
+  "captured_leaf_roles": {
+    "r0": "output request/table",
+    "r1": "input descriptor/table",
+    "r2": "raw Xwb",
+    "r3": "raw FI",
+    "r5": 128
+  },
+  "captured_descriptor_input": [
+    "table",
+    4,
+    68,
+    136,
+    16,
+    128
+  ],
+  "captured_descriptor_output": [
+    "table",
+    2,
+    32,
+    128,
+    8,
+    64
+  ],
+  "native_pages": 36,
+  "descriptor_active_pages": 32,
+  "canonical_s2_oracle_matches_cpu": true,
+  "canonical_s2_oracle_vs_leaf_hist_active": {
+    "elements": 65536,
+    "mismatches": 0,
+    "exact": 65536,
+    "min_delta": 0,
+    "max_delta": 0,
+    "most_common_deltas": [
+      [
+        0,
+        65536
+      ]
+    ]
+  },
+  "basis_lane_map_oracle_vs_cpu_hist_active": {
+    "elements": 65536,
+    "mismatches": 0,
+    "exact": 65536,
+    "min_delta": 0,
+    "max_delta": 0,
+    "most_common_deltas": [
+      [
+        0,
+        65536
+      ]
+    ]
+  },
+  "basis_lane_map_oracle_vs_leaf_hist_active": {
+    "elements": 65536,
+    "mismatches": 0,
+    "exact": 65536,
+    "min_delta": 0,
+    "max_delta": 0,
+    "most_common_deltas": [
+      [
+        0,
+        65536
+      ]
+    ]
+  },
+  "basis_tap_map": {
+    "0,2": [
+      0,
+      1,
+      0
+    ],
+    "0,0": [
+      0,
+      0,
+      0
+    ],
+    "2,2": [
+      1,
+      1,
+      0
+    ],
+    "2,0": [
+      1,
+      0,
+      0
+    ],
+    "0,1": [
+      0,
+      1,
+      1
+    ],
+    "2,1": [
+      1,
+      1,
+      1
+    ],
+    "1,2": [
+      0,
+      1,
+      2
+    ],
+    "1,0": [
+      0,
+      0,
+      2
+    ],
+    "1,1": [
+      0,
+      1,
+      3
+    ]
+  }
+}

@@ -1,0 +1,361 @@
+{
+  "provider_leaf": "hmx_v73_convbbb1x1_stride1",
+  "graph": "recovered/primary/graph.json",
+  "eligible_nodes": 140,
+  "one_by_one_nodes": 280,
+  "eligible_signatures": [
+    {
+      "count": 20,
+      "input_shape_raw": [
+        1,
+        8,
+        64,
+        128
+      ],
+      "input_dtype": "uint8",
+      "filter_shape": [
+        1,
+        1,
+        128,
+        128
+      ],
+      "output_shape_raw": [
+        1,
+        8,
+        64,
+        128
+      ],
+      "output_dtype": "uint8",
+      "output_hw_after_k_hmx_conv_clamp": [
+        8,
+        64
+      ],
+      "input_hw_reached_by_convolution": [
+        8,
+        64
+      ],
+      "physical_crouton_allocation_hw": [
+        8,
+        64
+      ]
+    },
+    {
+      "count": 80,
+      "input_shape_raw": [
+        1,
+        8,
+        8,
+        128
+      ],
+      "input_dtype": "uint8",
+      "filter_shape": [
+        1,
+        1,
+        128,
+        64
+      ],
+      "output_shape_raw": [
+        1,
+        8,
+        8,
+        64
+      ],
+      "output_dtype": "uint8",
+      "output_hw_after_k_hmx_conv_clamp": [
+        8,
+        8
+      ],
+      "input_hw_reached_by_convolution": [
+        8,
+        8
+      ],
+      "physical_crouton_allocation_hw": [
+        8,
+        8
+      ]
+    },
+    {
+      "count": 4,
+      "input_shape_raw": [
+        1,
+        8,
+        8,
+        128
+      ],
+      "input_dtype": "uint8",
+      "filter_shape": [
+        1,
+        1,
+        128,
+        128
+      ],
+      "output_shape_raw": [
+        1,
+        8,
+        8,
+        128
+      ],
+      "output_dtype": "uint8",
+      "output_hw_after_k_hmx_conv_clamp": [
+        8,
+        8
+      ],
+      "input_hw_reached_by_convolution": [
+        8,
+        8
+      ],
+      "physical_crouton_allocation_hw": [
+        8,
+        8
+      ]
+    },
+    {
+      "count": 4,
+      "input_shape_raw": [
+        1,
+        2,
+        8,
+        128
+      ],
+      "input_dtype": "uint8",
+      "filter_shape": [
+        1,
+        1,
+        128,
+        128
+      ],
+      "output_shape_raw": [
+        1,
+        2,
+        8,
+        128
+      ],
+      "output_dtype": "uint8",
+      "output_hw_after_k_hmx_conv_clamp": [
+        2,
+        8
+      ],
+      "input_hw_reached_by_convolution": [
+        2,
+        8
+      ],
+      "physical_crouton_allocation_hw": [
+        8,
+        8
+      ]
+    },
+    {
+      "count": 8,
+      "input_shape_raw": [
+        1,
+        8,
+        16,
+        128
+      ],
+      "input_dtype": "uint8",
+      "filter_shape": [
+        1,
+        1,
+        128,
+        128
+      ],
+      "output_shape_raw": [
+        1,
+        8,
+        16,
+        128
+      ],
+      "output_dtype": "uint8",
+      "output_hw_after_k_hmx_conv_clamp": [
+        8,
+        16
+      ],
+      "input_hw_reached_by_convolution": [
+        8,
+        16
+      ],
+      "physical_crouton_allocation_hw": [
+        8,
+        16
+      ]
+    },
+    {
+      "count": 4,
+      "input_shape_raw": [
+        1,
+        4,
+        16,
+        128
+      ],
+      "input_dtype": "uint8",
+      "filter_shape": [
+        1,
+        1,
+        128,
+        128
+      ],
+      "output_shape_raw": [
+        1,
+        4,
+        16,
+        128
+      ],
+      "output_dtype": "uint8",
+      "output_hw_after_k_hmx_conv_clamp": [
+        4,
+        16
+      ],
+      "input_hw_reached_by_convolution": [
+        4,
+        16
+      ],
+      "physical_crouton_allocation_hw": [
+        8,
+        16
+      ]
+    },
+    {
+      "count": 20,
+      "input_shape_raw": [
+        1,
+        8,
+        32,
+        128
+      ],
+      "input_dtype": "uint8",
+      "filter_shape": [
+        1,
+        1,
+        128,
+        128
+      ],
+      "output_shape_raw": [
+        1,
+        8,
+        32,
+        128
+      ],
+      "output_dtype": "uint8",
+      "output_hw_after_k_hmx_conv_clamp": [
+        8,
+        32
+      ],
+      "input_hw_reached_by_convolution": [
+        8,
+        32
+      ],
+      "physical_crouton_allocation_hw": [
+        8,
+        32
+      ]
+    }
+  ],
+  "excluded_signatures": [
+    {
+      "count": 80,
+      "input_shape_raw": [
+        1,
+        8,
+        256,
+        9
+      ],
+      "input_dtype": "uint8",
+      "filter_shape": [
+        1,
+        1,
+        12,
+        32
+      ],
+      "output_shape_raw": [
+        1,
+        8,
+        256,
+        32
+      ],
+      "output_dtype": "uint8",
+      "output_hw_after_k_hmx_conv_clamp": [
+        8,
+        256
+      ],
+      "input_hw_reached_by_convolution": [
+        8,
+        256
+      ],
+      "physical_crouton_allocation_hw": [
+        8,
+        256
+      ]
+    },
+    {
+      "count": 20,
+      "input_shape_raw": [
+        1,
+        8,
+        64,
+        18
+      ],
+      "input_dtype": "uint8",
+      "filter_shape": [
+        1,
+        1,
+        20,
+        128
+      ],
+      "output_shape_raw": [
+        1,
+        8,
+        64,
+        128
+      ],
+      "output_dtype": "uint8",
+      "output_hw_after_k_hmx_conv_clamp": [
+        8,
+        64
+      ],
+      "input_hw_reached_by_convolution": [
+        8,
+        64
+      ],
+      "physical_crouton_allocation_hw": [
+        8,
+        64
+      ]
+    },
+    {
+      "count": 40,
+      "input_shape_raw": [
+        1,
+        8,
+        64,
+        32
+      ],
+      "input_dtype": "uint16",
+      "filter_shape": [
+        1,
+        1,
+        32,
+        32
+      ],
+      "output_shape_raw": [
+        1,
+        8,
+        64,
+        32
+      ],
+      "output_dtype": "uint16",
+      "output_hw_after_k_hmx_conv_clamp": [
+        8,
+        64
+      ],
+      "input_hw_reached_by_convolution": [
+        8,
+        64
+      ],
+      "physical_crouton_allocation_hw": [
+        8,
+        64
+      ]
+    }
+  ],
+  "interpretation": "Eligibility is shape/dtype only. k_hmx_conv rounds oh up to 8 then clamps to the recorded output height and input bound; ow is rounded up to 8 then clamped. The simulator checks the entire physical 8x8-crouton allocation, including crop-external rows/columns, with poison table tails and canaries; this does not validate graph weight quantization or all runtime config branches."
+}

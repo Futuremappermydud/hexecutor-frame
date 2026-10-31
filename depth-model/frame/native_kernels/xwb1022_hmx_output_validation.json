@@ -1,0 +1,25 @@
+{
+  "qdrx_sequence": 1022,
+  "input_tensor": 998,
+  "weights_tensor": 960,
+  "fi_tensor": 933,
+  "physical_output_bytes": 65536,
+  "physical_output_sha256": "865cee388e871029fca5f6310d92f977b966e72db3a320195f000790e86b11fa",
+  "cpu_logical_output_sha256": "7c4b4e4a705f3d771564612f0be77ae3cb3f21ca8906014f7e80166a531fd1b5",
+  "logical_compare": {
+    "exact": 63095,
+    "plus1": 2441,
+    "minus1": 0,
+    "other": 0,
+    "first_mismatch": {
+      "y": 0,
+      "x": 1,
+      "co": 17,
+      "got": 15,
+      "cpu": 14,
+      "delta": 1
+    },
+    "criterion": "all deltas are 0 or +1"
+  },
+  "result": "PASS"
+}

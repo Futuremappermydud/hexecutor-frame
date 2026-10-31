@@ -1,0 +1,81 @@
+{
+  "backend": "offline-numpy-cpu",
+  "models": {
+    "primary": [
+      {
+        "case": "smoke",
+        "equal": true,
+        "hashes": [
+          "dfacee192b7a534ef79634993d03a1c870e1550e5ba1c485af5ab17466616ad3",
+          "a978ee8291ea05c0b482b72cdc54f09c1ad8294a366f3ba215bb32653cb3f32b"
+        ],
+        "seconds": 10.460954083013348
+      },
+      {
+        "case": "w+8",
+        "equal": true,
+        "hashes": [
+          "d4a24018663ffebe8b504666fa407aa5c94a6515dab696e392d1d094b2954e38",
+          "7339695b4b61c3f4be9222f9721573c9082b77c51eb84e3b2807b5c115a62798"
+        ],
+        "seconds": 6.589290375006385
+      },
+      {
+        "case": "random",
+        "equal": true,
+        "hashes": [
+          "7038ddd966f6552664184d28c7d7e4ce228b7229533778e227878ed540253317",
+          "31f6a27cc33892ece131692bdb70abea74fae20519cf0048c95fe072e2b5fb8e"
+        ],
+        "seconds": 6.69926091702655
+      },
+      {
+        "case": "smoke",
+        "equal": true,
+        "hashes": [
+          "dfacee192b7a534ef79634993d03a1c870e1550e5ba1c485af5ab17466616ad3",
+          "a978ee8291ea05c0b482b72cdc54f09c1ad8294a366f3ba215bb32653cb3f32b"
+        ],
+        "seconds": 6.87923487497028
+      }
+    ],
+    "alternate": [
+      {
+        "case": "smoke",
+        "equal": true,
+        "hashes": [
+          "dfacee192b7a534ef79634993d03a1c870e1550e5ba1c485af5ab17466616ad3",
+          "98d28b66c3489d1424569aad3e1c2b9bfa12fac3aba5b11e67b0fde10d8bc36a"
+        ],
+        "seconds": 10.919410082977265
+      },
+      {
+        "case": "w+8",
+        "equal": true,
+        "hashes": [
+          "d4a24018663ffebe8b504666fa407aa5c94a6515dab696e392d1d094b2954e38",
+          "65a8b8e09b3c9546069ca4011ff617cbd04006b08289404570fd9c1cfe467b4d"
+        ],
+        "seconds": 6.6779989580390975
+      },
+      {
+        "case": "random",
+        "equal": true,
+        "hashes": [
+          "7038ddd966f6552664184d28c7d7e4ce228b7229533778e227878ed540253317",
+          "6ac85f5f33fdf8dfba88f53f7f8afa7ed9adc5931239d61c778569fc854bcc47"
+        ],
+        "seconds": 6.731015708995983
+      },
+      {
+        "case": "smoke",
+        "equal": true,
+        "hashes": [
+          "dfacee192b7a534ef79634993d03a1c870e1550e5ba1c485af5ab17466616ad3",
+          "98d28b66c3489d1424569aad3e1c2b9bfa12fac3aba5b11e67b0fde10d8bc36a"
+        ],
+        "seconds": 7.034344832994975
+      }
+    ]
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "passed": true,
+  "purpose": "Input staging while preserving all duplicate-page aliases; not zero-copy",
+  "sequence": 247,
+  "input_pages": 108,
+  "repeated_aliases": 11,
+  "original_weights_fi_outputs": true,
+  "all_outside_output_bytes_exact": true,
+  "compact_tail_guard_passed": true,
+  "output_sha256": "cfec6dbed3eb2e88544d5c0371c8c50915ce90e6b14f44be7c4411c19bf5e15f",
+  "marker_mode": 3,
+  "source_and_elf_sha256": {
+    "frame/qd_graph_native_direct.h": "25d9b5dd55d37056a76694e357d4b8b8c63b52919d4c17506f28172643c08a42",
+    "frame/native_runtime/qd_native_direct.c": "38cba2830af8dbd630356fe27dac7e191d4b82f794f575761b92728186e144da",
+    "frame/native_runtime/qd_native_direct.h": "933c72b9f6f1072b40b78258460139c51dddcec3abc2110ffe6c41613c96469b",
+    "frame/native_runtime/direct_3x3_scatter_sim.c": "fcc6ac7f319a1191dd3f2390ff821d6f47862270e5790f7be823913a87798256",
+    "frame/native_runtime/build_direct_3x3_graph_compact_alias_sim.sh": "2dcf0e5ecc7f65f59c10fc01ccada0b7d82a64fccc602d20e398ba7d7632fe33",
+    "frame/native_runtime/direct_3x3_graph_compact_alias_sim.elf": "a6c6c1ebdbe9ff1ca7425d8f6d7f8b46b5e95d3b62679b814bb399dc61d71143"
+  }
+}

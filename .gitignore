@@ -1,0 +1,5 @@
+/depth-model/.work
+/depth-model/frame/__pycache__
+/depth-model/frame/bench/__pycache__
+/depth-model/frame/build
+*.log

@@ -1,0 +1,52 @@
+{
+  "source": "frame/build/resident-primary.qdrx",
+  "source_bytes": 1738088,
+  "prepared_bytes": 801704,
+  "saved_bytes": 936384,
+  "l2_planning_ceiling_bytes": 786432,
+  "within_planning_budget": false,
+  "l2_placement_proven": false,
+  "source_sha256": "dc8fcddcf4876d11f7a717ec4f111e1d3d3a40d4f3163758b590234e0b50b92b",
+  "metadata_traffic": {
+    "current_declared_ref_copy_bytes": {
+      "command_record": 243264,
+      "input_refs": 40376,
+      "output_refs": 14668,
+      "tensor_records": 1743616,
+      "block_lists": 2841984,
+      "calls": 68024,
+      "framework_vectors": 4916
+    },
+    "current_declared_ref_copy_total": 4956848,
+    "prepared_section_bytes": {
+      "tensors": 298816,
+      "blocks": 360990,
+      "commands": 101360,
+      "refs": 25946,
+      "vectors": 4916,
+      "calls": 9416,
+      "io": 8
+    },
+    "prepared_one_time_bytes": 801704,
+    "prepared_per_command_record_bytes": 101360,
+    "exact_subspan_dedup_opportunity": {
+      "block_lists": {
+        "unique_ordered_sequences": 1523,
+        "unique_entries": 120330,
+        "strict_subspan_sequences": 0,
+        "strict_subspan_entries": 0
+      },
+      "ref_lists": {
+        "unique_ordered_sequences": 6698,
+        "unique_entries": 12973,
+        "strict_subspan_sequences": 0,
+        "strict_subspan_entries": 0
+      }
+    },
+    "assumption": "upper structural estimate: every unique declared input/output tensor is fetched once per command; dispatcher local C is 48 B and DSP T is 128 B"
+  },
+  "tensors": 5336,
+  "commands": 5068,
+  "blocks": 120330,
+  "bytes": 801704
+}

@@ -1,0 +1,49 @@
+{
+  "passed": true,
+  "offline_only": true,
+  "sequence": 1195,
+  "format": "Xpb",
+  "geometry": [
+    8,
+    8,
+    128,
+    64
+  ],
+  "slices": [
+    12,
+    6
+  ],
+  "input_padding_origin": [
+    0,
+    0
+  ],
+  "output_padding_origin": [
+    0,
+    0
+  ],
+  "input_zero_point": 0,
+  "filter_sha256": "659950a21d609c74a684ac509e66d9572723a191d8e2af5a9119e07ef683ac3f",
+  "fi_sha256": "fde170ae53ec41022590bd1273dfb49e9745dd12beda81ac659a05ef05513d26",
+  "output_values": 4096,
+  "native_minus_int64_bound": [
+    0,
+    1
+  ],
+  "different_from_integer": 250,
+  "first_difference": {
+    "y": 0,
+    "x": 0,
+    "out": 25,
+    "raw_acc": 91584,
+    "multiplier_word": 4208527,
+    "multiplier_low16": 14223,
+    "bias": 0,
+    "input_zero_point": 0,
+    "expected": 84,
+    "actual": 85,
+    "delta": 1
+  },
+  "untouched_output_table_entries": 14,
+  "outside_active_entries_changed": [],
+  "shape_ok": true
+}

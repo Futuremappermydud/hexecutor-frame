@@ -1,0 +1,10 @@
+{
+  "handoff_files": {
+    "frame/HANDOFF_20261030_2145.md": "7aa16fb2730143328475546a56cec9a827ade28d011cba2b62892600a01c0979",
+    "frame/native_program/HANDOFF_20261030_2145.md": "5649fcd6c443e04d4369b5957d77bf064050601149f4f8bae29f219e79ff447e",
+    "frame/native_u16/HANDOFF_20261030_2145.md": "e588d6990f33bbff143eaa63d3bfc27ecdc5a94f1b9559363359830dedbdadf2",
+    "frame/native_runtime/stride2/HANDOFF_20261030_2145.md": "45e4c6422da153794e2afdeae15582403c003e63b1e872421ebf09b6980e2b3f"
+  },
+  "hardware_state": "clean idle, cdsp_mem unloaded, eye30467 S; checked2026-10-30 evening",
+  "pending_engine_build_only_sha256": "ee5eb80bd1a6673d7e8e54f8240e4bd3bf8ef6c278e503ef29507d92b86f2835"
+}

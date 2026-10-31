@@ -1,0 +1,35 @@
+{
+  "passed": true,
+  "hardware_accessed": false,
+  "path": "shared run_kernel staging -> generic HMX -> drain -> arena download",
+  "simulator_elf_sha256": "c531a309f071e47fe18844e3876350b03fbb7483bfe0abc40d9337c2c8b9466f",
+  "log_sha256": "00b6e8909913cf29c35b005c3a46d764c4d4569e834084502110e3550bc53ae4",
+  "output_sha256": "865cee388e871029fca5f6310d92f977b966e72db3a320195f000790e86b11fa",
+  "simulator_physical_exact": true,
+  "logical_compare": {
+    "simulator_physical_exact": true,
+    "logical_delta_counts": {
+      "0": 63095,
+      "1": 2441
+    },
+    "logical_delta_min": 0,
+    "logical_delta_max": 1,
+    "cpu_0_or_plus1": true,
+    "first_mismatch": [
+      0,
+      1,
+      17
+    ]
+  },
+  "staged_fnv32": [
+    3907766382,
+    4188297289,
+    2081150169
+  ],
+  "expected_fnv32": [
+    3907766382,
+    4188297289,
+    2081150169
+  ],
+  "guards_and_table_tails": "checked inside shared run_kernel"
+}
