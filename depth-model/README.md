@@ -1,5 +1,11 @@
 # Extracted Legacy headset stereo depth model
 
+> **Documentation map:** use [STATUS.md](STATUS.md) for the current project
+> navigation, runtime/test lanes, and handoff index. This README is the detailed
+> model recovery and reference record; its dated sections preserve evidence and
+> historical checkpoints, while the Frame [master handoff](frame/HANDOFF_20261030_2145.md)
+> is the consolidated entry point for the native runtime work.
+
 The two Model stereo models have been extracted into **valid Qualcomm QNN HTP
 context binaries**. Qualcomm's `qnn-context-binary-utility` from QAIRT 2.50 accepts
 both files and exports their graph I/O metadata.

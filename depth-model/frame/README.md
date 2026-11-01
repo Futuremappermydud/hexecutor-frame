@@ -1,5 +1,13 @@
 # Model stereo model on the Frame callback
 
+> **Navigation:** [project status and documentation index](../STATUS.md) maps
+> the model/reference, exact hybrid, experimental resident, and prepared native
+> lanes. For the consolidated native runtime checkpoint and lane handoffs, start
+> with the [Frame master handoff](HANDOFF_20261030_2145.md). The
+> [Oct 31 SlicePad simulation report](native_program/SLICE_PAD_CPU_PREFIX_SIM_REPORT_20261031.md)
+> is a later bounded CPU-prefix result; it does not replace the master handoff's
+> full-runtime status.
+
 Native runtime work now runs 823 convolutions through original HMX leaves.
 Experimental resident warm inference is **647–652 ms**, with inexact arithmetic;
 the frozen exact resident baseline is ~861–867 ms and the existing exact hybrid

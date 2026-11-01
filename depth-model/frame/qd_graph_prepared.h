@@ -10,6 +10,27 @@
 #if QDS_PREPARED_ELEMENTWISE
 #include "native_program/prepared_elementwise.h"
 #endif
+#if QDS_PREPARED_REFERENCE
+#include "native_program/prepared_reference.h"
+#if QDS_PREPARED_ELEMENTWISE
+#error QDS_PREPARED_REFERENCE gives handlers L1-cached heap scratch; HVX elementwise handlers need uncached scratch
+#endif
+#if QDS_PREPARED_COMPACT_3X3
+#error QDS_PREPARED_REFERENCE registers no native conv and owns the VTCM tail after its control area
+#endif
+/* Exact full-model mode: no native HMX conv. Convolution runs the fast exact
+ * kernel with its workspace in the VTCM tail after the 8 KiB control area and
+ * its scalar-accessed state in the L2-TCM slot the elementwise handlers would
+ * otherwise use; every other key without a specialized handler runs the
+ * reference kernel. Reference scratch peak is 983,168 bytes over both models.
+ * Profiles: per-variant cycles in g->stats, conv phases (staging, MAC,
+ * requant, output write) in g->dsp_conv_phase[0..3]. */
+#define QDS_REFERENCE_SCRATCH_BYTES 0x100000u
+#define QDS_REFERENCE_NEAR 0x30078000u
+#define QDS_REFERENCE_NEAR_BYTES 0x8000u
+#define QDS_REFERENCE_CHAINS 64u
+static const volatile char prepared_reference_feature[]="QD_PREPARED_REF_1";
+#endif
 
 #if QDS_NATIVE_PADDED_1X1
 static const volatile char prepared_padded_feature[]="QD_PREPARED_W1_1";
@@ -24,7 +45,30 @@ typedef struct {
     Nprg2NativeConfig native;
     Nprg2ExecBuffer inputs[4],outputs[2];
     Nprg2ExecStats stats;
+#if QDS_PREPARED_REFERENCE
+    Nprg2ReferenceConv conv;
+    Nprg2ReferenceChain chains[QDS_REFERENCE_CHAINS];
+    uint8_t *scratch;
+#endif
 } QdPreparedState;
+
+#if QDS_PREPARED_REFERENCE
+/* Chains the reference kernel under every specialized schema key, then
+ * registers it for every key still free. */
+static int prepared_register_reference(QdPreparedState *s) {
+    Nprg2Executor *e=&s->executor;
+    uint32_t chained=0;
+    for(uint32_t i=0;i<NPRG2_EXEC_REGISTRY_CAPACITY;i++) {
+        Nprg2ExecHandler *h=&e->handlers[i];
+        if(!h->used || h->opcode==QDR_NOP || h->validate==nprg2_exec_reference_validate)continue;
+        if(h->variant>QDR_VARIANTS || qdr_variant_ops[h->variant]!=h->opcode)continue;
+        if(chained==QDS_REFERENCE_CHAINS ||
+           nprg2_executor_chain_reference(e,h->opcode,h->variant,&s->chains[chained]))return 1;
+        chained++;
+    }
+    return nprg2_executor_register_reference_missing(e,NULL)!=NPRG2_EXEC_OK;
+}
+#endif
 
 /* Default prepared mode enables only direct 1x1. The separate compact-3x3
  * opt-in stages A within the bounded reserved tail; W/Fi/Y remain direct. */
@@ -118,11 +162,24 @@ static QdPreparedState *prepared_open(QdgGraph *g,const QdsConfig *cfg,
     s->native.family_mask=NPRG2_NATIVE_ALLOW_1X1|NPRG2_NATIVE_ALLOW_3X3;
     s->native.max_3x3_input_pages=(QD_DIRECT_TAIL_BYTES-0x2000u-128u)/2048u;
 #endif
+#if QDS_PREPARED_REFERENCE
+    s->conv=(Nprg2ReferenceConv){(uint8_t *)(QD_DIRECT_VTCM_BASE+QD_DIRECT_TAIL_OFFSET+0x2000u),
+                                 QD_DIRECT_TAIL_BYTES-0x2000u,
+                                 (uint8_t *)QDS_REFERENCE_NEAR,QDS_REFERENCE_NEAR_BYTES,
+                                 now_ns,g->dsp_conv_phase};
+    s->scratch=malloc(QDS_REFERENCE_SCRATCH_BYTES);
+    if(!s->scratch || nprg2_executor_register_reference_conv(&s->executor,&s->conv,NULL) ||
+       nprg2_executor_register_weights(&s->executor) ||
+       nprg2_executor_register_core_safe_ops(&s->executor)) {
+        free(s->scratch);nprg2_runner_close(&s->runner);free(s);return NULL;
+    }
+#else
     if(nprg2_executor_register_weights(&s->executor) ||
        nprg2_executor_register_core_safe_ops(&s->executor) ||
        nprg2_executor_register_native_conv(&s->executor,&s->native)) {
         nprg2_runner_close(&s->runner);free(s);return NULL;
     }
+#endif
 #if QDS_PREPARED_ELEMENTWISE
     if(NPRG2_ELEMENTWISE_SCRATCH_BYTES>0x8000u ||
        nprg2_executor_register_elementwise(&s->executor)) {
@@ -132,6 +189,11 @@ static QdPreparedState *prepared_open(QdgGraph *g,const QdsConfig *cfg,
 #if QDS_PREPARED_PREPROCESS
     if(nprg2_executor_register_preprocess(&s->executor)) {
         nprg2_runner_close(&s->runner);free(s);return NULL;
+    }
+#endif
+#if QDS_PREPARED_REFERENCE
+    if(prepared_register_reference(s)) {
+        free(s->scratch);nprg2_runner_close(&s->runner);free(s);return NULL;
     }
 #endif
     for(uint32_t k=0;k<4;k++)s->inputs[k]=(Nprg2ExecBuffer){(uint8_t *)inputs[k],(uint32_t)input_bytes[k]};
@@ -152,6 +214,11 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
 #if QDS_PREPARED_ELEMENTWISE
     scratch=(void *)0x30078000u;scratch_bytes=0x8000u;
 #endif
+#if QDS_PREPARED_REFERENCE
+    scratch=s->scratch;scratch_bytes=QDS_REFERENCE_SCRATCH_BYTES;
+    trace[15]=(uint32_t)prepared_reference_feature[0];
+#endif
+    s->stats.clock=now_ns;s->stats.variant_cycles=g->stats.variant_ns;s->stats.variant_count=g->stats.variant_count;
     int e=nprg2_runner_preflight(&s->runner,&s->executor,first,last-first,QD_DIRECT_ACTIVE_BYTES,
         s->inputs,4,s->outputs,2,g,scratch,scratch_bytes,&s->stats);
     if(e)goto failed;

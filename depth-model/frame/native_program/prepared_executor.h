@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define NPRG2_EXEC_REGISTRY_CAPACITY 80u
+#define NPRG2_EXEC_REGISTRY_CAPACITY 128u
 
 enum {
     NPRG2_EXEC_OK=0, NPRG2_EXEC_ARGUMENT=1, NPRG2_EXEC_REGISTRY_FULL=2,
@@ -36,9 +36,14 @@ typedef struct {
 typedef int (*Nprg2ExecValidate)(const Nprg2ExecCall *call, void *handler_ctx);
 typedef int (*Nprg2ExecRun)(const Nprg2ExecCall *call, void *handler_ctx);
 typedef int (*Nprg2ExecCancel)(void *ctx, uint32_t next_command);
+/* With clock and both arrays set, run adds each executed command's clock
+ * delta and count at its variant (variants below NPRG2_EXEC_PROFILE_VARIANTS). */
+#define NPRG2_EXEC_PROFILE_VARIANTS 80u
 typedef struct {
     uint32_t validated_commands, executed_commands, failed_command;
     uint8_t failed_opcode, failed_variant;
+    uint64_t (*clock)(void);
+    uint64_t *variant_cycles, *variant_count;
 } Nprg2ExecStats;
 
 typedef struct {

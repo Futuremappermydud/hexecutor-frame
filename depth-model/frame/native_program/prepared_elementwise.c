@@ -143,7 +143,9 @@ static int alias_proof(const Nprg2ExecCall *c,const QdBlockedU8 *a,const QdBlock
         if (b || o || !u16out) return 0;
         if (!collect(c,u16out->blocks,u16out->block_count,u16out->slice,u16out->meta,u16out->dims,u16out->origin,4,so,MAX_BLOCKS,&no)) return 0;
     } else {
-        if (!collect(c,b->blocks,b->block_count,b->slice,b->meta,b->dims,b->origin,8,sb,MAX_BLOCKS,&nb)) return 0;
+        if (b) {
+            if (!collect(c,b->blocks,b->block_count,b->slice,b->meta,b->dims,b->origin,8,sb,MAX_BLOCKS,&nb)) return 0;
+        }
         if (!collect(c,o->blocks,o->block_count,o->slice,o->meta,o->dims,o->origin,8,so,MAX_BLOCKS,&no)) return 0;
     }
     for (size_t i=1;i<no;i++) if (so[i]<so[i-1]+BLOCK_BYTES) return 0;
@@ -237,9 +239,63 @@ static int linearclip_run(const Nprg2ExecCall *c,void *ctx) {
     return qd_blocked_linearclip_u8_u16_apply(&prepared,&p);
 }
 
+static int requant_params(const Nprg2ExecCall *c,QdAddU8Params *p) {
+    if (c->command.call_count!=1 || c->command.call_first>c->bound->calls.bytes/88u ||
+        c->command.call_count>c->bound->calls.bytes/88u-c->command.call_first) return 0;
+    const uint8_t *r=c->bound->calls.data+(size_t)c->command.call_first*88u;
+    if (rd32e(r)!=QDR_CALL_REQUANTIZE_CROUTON_U8) return 0;
+    uint32_t mask=rd32e(r+4); uint64_t x[10];
+    for (unsigned i=0;i<10;i++) x[i]=rd64e(r+8u+i*8u);
+    if ((mask&0x38u) || x[4]!=0 || x[5]!=0 || x[3]>=(1ull<<40)) return 0;
+    int64_t m=(int64_t)(x[3]&0xffffu);
+    int64_t s=15-(int64_t)(x[3]>>24);
+    if (s<1 || s>31) return 0;
+    p->ma=(uint32_t)m;p->mb=0;p->shift=(uint32_t)s;
+    return (uint64_t)255*p->ma+(1ull<<(p->shift-1u))<=UINT32_MAX;
+}
+
+static int requant_validate(const Nprg2ExecCall *c,void *ctx) {
+    (void)ctx;
+    if (!c || c->command.opcode!=QDR_REQUANT_U8 || c->command.variant!=70 ||
+        c->command.input_count!=2 || c->command.output_count!=1) return 0;
+    QdBlockedU8 in,out;QdAddU8Params p;
+    if (!make_u8(c,0,0,&in) || !make_u8(c,0,1,&out) || !requant_params(c,&p)) return 0;
+    if (!qd_valid(in.meta,in.dims,in.origin,8) || !qd_valid(out.meta,out.dims,out.origin,8)) return 0;
+    for (int i=0;i<4;i++) if (in.dims[i]!=out.dims[i]) return 0;
+    if ((in.origin[3]&31)!=(out.origin[3]&31) || (in.origin[2]&3)!=(out.origin[2]&3)) return 0;
+    uint32_t oti;Nprg2TensorView ov;if (nprg2_exec_output(c,0,&oti,&ov)!=NPRG2_EXEC_OK) return 0;
+    if (ov.geometry_record[1]&GEOMETRY_CROUTON) {
+        int32_t depth=((out.dims[3]+out.origin[3]+31)/32)*32;
+        if (depth>out.meta[3]) depth=out.meta[3];
+        if (depth-out.origin[3]!=in.dims[3]) return 0;
+    }
+    uint32_t fi_id;Nprg2TensorView fi_view;
+    if (nprg2_exec_input(c,1,&fi_id,&fi_view)!=NPRG2_EXEC_OK) return 0;
+    (void)fi_id;
+    if (fi_view.storage_kind!=1 || fi_view.pool>=7 || !c->pools[fi_view.pool].base ||
+        fi_view.geometry_record[0]!=5 || memcmp(fi_view.geometry_record+2,"fi",2)) return 0;
+    int32_t d[4],m[4],o[4];if (!view_shape(&fi_view,d,m,o)) return 0;
+    static const int32_t want[4]={1,1,1,12};
+    for (int i=0;i<4;i++) if (d[i]!=want[i] || m[i]!=want[i] || o[i]) return 0;
+    uint32_t off=fi_view.offset,limit=c->pools[fi_view.pool].bytes;
+    if (fi_view.pool==1 && limit>c->pool1_writable_bytes) limit=c->pool1_writable_bytes;
+    if (off>limit || 48u>limit-off) return 0;
+    return alias_proof(c,&in,NULL,&out,NULL,0,c->pools[fi_view.pool].base+fi_view.offset,48);
+}
+
+static int requant_run(const Nprg2ExecCall *c,void *ctx) {
+    (void)ctx;QdBlockedU8 in,out;QdAddU8Params p;
+    if (!make_u8(c,0,0,&in) || !make_u8(c,0,1,&out) || !requant_params(c,&p)) return 0;
+    QdBlockedAddU8 prepared;prepared.a=in;prepared.b=in;prepared.out=out;prepared.cookie=0x51444138u;
+    return qd_blocked_add_u8_apply(&prepared,&p);
+}
+
 int nprg2_executor_register_elementwise(Nprg2Executor *e) {
     if (!e) return NPRG2_EXEC_ARGUMENT;
     int rc=nprg2_executor_register_scratch(e,QDR_ADD_U8,13,add_validate,add_run,NULL,
+            NPRG2_ELEMENTWISE_SCRATCH_BYTES,0);
+    if (rc) return rc;
+    rc=nprg2_executor_register_scratch(e,QDR_REQUANT_U8,70,requant_validate,requant_run,NULL,
             NPRG2_ELEMENTWISE_SCRATCH_BYTES,0);
     if (rc) return rc;
     /* Variant 68 is the proven linearclip@CH.CB.fi (CB u8 -> CH u16) form.

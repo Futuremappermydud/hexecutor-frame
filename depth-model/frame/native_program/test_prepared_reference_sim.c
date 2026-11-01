@@ -1,0 +1,580 @@
+/* Reference-kernel schedule test for the host and the V75 simulator.
+ *
+ *   test_prepared_reference_sim [primary|alternate|both] [prefix|full]
+ *   test_prepared_reference_sim <primary|alternate> split <segments> <dir>
+ *   test_prepared_reference_sim segment <file.rseg> [log every N commands]
+ *   test_prepared_reference_sim [primary|alternate|both] profile   (host)
+ *
+ * Any mode also accepts "fast" (fast exact convolution in a VTCM-tail-sized
+ * workspace) and "cycles" (per-command cost table; pcycles in the simulator).
+ *
+ * prefix starts from a captured NativeGraph CPU prefix (.mpfx from
+ * capture_multi_prefix_cpu.py) and requires all seven pools to equal the
+ * capture afterwards. full starts from zeroed pools plus the constant pool,
+ * runs the complete schedule on the native-smoke inputs, and requires both
+ * graph outputs to match the emulator smoke sha256.
+ *
+ * split (host) runs the full schedule, cuts it into segments of roughly equal
+ * host run time, checks the final outputs against the emulator sha256, and
+ * writes each segment's start and end state (all pools plus both graph
+ * outputs) as <dir>/<model>-seg<k>.rseg. segment runs one such file and
+ * requires the end state bit for bit, so the segments can run in parallel
+ * simulator processes and together cover the whole schedule.
+ *
+ * Every key is registered to prepared_reference. The census sizes scratch from
+ * nprg2_exec_reference_scratch, one preflight covers the range without writing
+ * any pool, and one run executes it. Run from the depth-model directory. */
+#include "prepared_reference.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#ifdef __hexagon__
+#include <hexagon_sim_timer.h>
+#endif
+
+#define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
+
+enum { MPFX_HEADER = 64, RSEG_HEADER = 72, POOL1_CEILING = 0x780000, MAX_SEGMENTS = 64, CONV_WORKSPACE = 0x7e000,
+       CONV_NEAR = 0x8000 };
+
+/* "fast" anywhere on the command line registers the fast exact convolution
+ * with a VTCM-tail-sized workspace and the Frame's 32 KiB near slot; "cycles"
+ * times every command and prints the cost per (opcode, variant) and the fast
+ * convolution's phases after each run. */
+static int use_fast, use_cycles;
+static Nprg2ReferenceConv conv;
+static uint64_t conv_phase[4];
+
+/* Simulator pcycles on Hexagon (link -lhexagon), clock() ticks on the host. */
+static uint64_t ticks(void) {
+#ifdef __hexagon__
+    return hexagon_sim_read_pcycles();
+#else
+    return (uint64_t)clock();
+#endif
+}
+static const char *tick_unit(void) {
+#ifdef __hexagon__
+    return "pcycles";
+#else
+    return "clock ticks";
+#endif
+}
+
+static const uint32_t kOutputBytes[2] = {163840, 655360};
+static const char *const kExpect[2][2] = {
+    {"dfacee192b7a534ef79634993d03a1c870e1550e5ba1c485af5ab17466616ad3",
+     "a978ee8291ea05c0b482b72cdc54f09c1ad8294a366f3ba215bb32653cb3f32b"},
+    {"dfacee192b7a534ef79634993d03a1c870e1550e5ba1c485af5ab17466616ad3",
+     "98d28b66c3489d1424569aad3e1c2b9bfa12fac3aba5b11e67b0fde10d8bc36a"}};
+
+static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+static void wr32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }
+
+static uint8_t *read_file(const char *path, uint32_t *n) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
+    CHECK(!fseek(f, 0, SEEK_END));
+    long z = ftell(f);
+    CHECK(z > 0 && (uint64_t)z <= 64u * 1024u * 1024u);
+    CHECK(!fseek(f, 0, SEEK_SET));
+    uint8_t *p = malloc((size_t)z);
+    CHECK(p && fread(p, 1, (size_t)z, f) == (size_t)z);
+    fclose(f);
+    *n = (uint32_t)z;
+    return p;
+}
+
+static int resolve_all(void *ctx, const Nprg2Program *p, uint32_t i, const Nprg2Command *c, Nprg2Capability *cap) {
+    (void)ctx; (void)p; (void)i; (void)c;
+    cap->supported = 1; cap->may_fallback = 0; cap->scratch_bytes = 0; cap->concurrent_worker_scratch_bytes = 0;
+    return 1;
+}
+
+static int model_code(const char *model) { return strcmp(model, "primary") ? 1 : 0; }
+
+static int outputs_match_emulator(const char *model, uint8_t *const *out) {
+    for (int j = 0; j < 2; j++) {
+        uint8_t sha[32];
+        char hex[65];
+        nprg2_sha256(out[j], kOutputBytes[j], sha);
+        for (int b = 0; b < 32; b++) snprintf(hex + 2 * b, 3, "%02x", sha[b]);
+        if (strcmp(hex, kExpect[model_code(model)][j])) {
+            fprintf(stderr, "%s output %d sha256 %s, emulator %s\n", model, j, hex, kExpect[model_code(model)][j]);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* An opened, bound program with the reference kernel on every key. */
+typedef struct {
+    const char *model;
+    uint8_t *q, *raw, *hot, *scratch;
+    uint32_t scratch_bytes;
+    uint32_t progress; /* nonzero: run in chunks of this many commands and log each */
+    Nprg2Pool pools[7];
+    Nprg2Program p;
+    Nprg2Bound b;
+    Nprg2Executor e;
+    uint8_t *out[2];
+    Nprg2ExecBuffer in[4], ob[2];
+} Env;
+
+static void env_open(Env *v, const char *model, uint8_t *const *inputs, const uint32_t *input_bytes) {
+    char path[256];
+    uint32_t qn, nn;
+    memset(v, 0, sizeof *v);
+    v->model = model;
+    snprintf(path, sizeof path, "frame/build/resident-%s.qdrx", model);
+    v->q = read_file(path, &qn);
+    snprintf(path, sizeof path, "frame/native_program/examples/%s-v2.nprg", model);
+    v->raw = read_file(path, &nn);
+    uint8_t qsha[32], nsha[32];
+    nprg2_sha256(v->q, qn, qsha);
+    nprg2_sha256(v->raw, nn, nsha);
+    Nprg2ExpectedHashes exp = {v->q + 32, v->q + 64, qsha, nsha};
+    for (uint32_t i = 0; i < 7; i++) {
+        v->pools[i].bytes = rd32(v->raw + 144 + i * 4);
+        if (!v->pools[i].bytes) continue;
+        v->pools[i].base = aligned_alloc(2048, (v->pools[i].bytes + 2047u) & ~2047u);
+        CHECK(v->pools[i].base);
+        memset(v->pools[i].base, 0, v->pools[i].bytes);
+    }
+    CHECK(nprg2_open(&v->p, v->raw, nn, &exp, v->pools, (Nprg2Allocator){0}) == NPRG2_OK);
+    v->hot = calloc(1, 300000);
+    CHECK(v->hot);
+    Nprg2BindConfig bc = {.hot_memory = v->hot, .hot_capacity = 300000, .l2_available_bytes = 786432,
+                          .pool1_is_verified_vtcm = 1, .resolve = resolve_all};
+    CHECK(nprg2_bind_mock(&v->p, v->pools, &bc, &v->b) == NPRG2_OK);
+    nprg2_executor_init(&v->e);
+    uint32_t added = 0;
+    if (use_fast) {
+        if (!conv.workspace) {
+            conv.workspace = aligned_alloc(2048, CONV_WORKSPACE);
+            conv.workspace_bytes = CONV_WORKSPACE;
+            conv.near = aligned_alloc(128, CONV_NEAR);
+            conv.near_bytes = CONV_NEAR;
+            CHECK(conv.workspace && conv.near);
+            if (use_cycles) { conv.clock = ticks; conv.phase = conv_phase; }
+        }
+        CHECK(nprg2_executor_register_reference_conv(&v->e, &conv, &added) == NPRG2_EXEC_OK);
+    }
+    CHECK(nprg2_executor_register_reference_missing(&v->e, &added) == NPRG2_EXEC_OK);
+    for (int j = 0; j < 2; j++) {
+        v->out[j] = calloc(1, kOutputBytes[j]);
+        CHECK(v->out[j]);
+        v->ob[j] = (Nprg2ExecBuffer){v->out[j], kOutputBytes[j]};
+    }
+    for (int j = 0; j < 4; j++) v->in[j] = (Nprg2ExecBuffer){inputs[j], input_bytes[j]};
+}
+
+static void env_close(Env *v) {
+    free(v->scratch);
+    free(v->hot);
+    nprg2_close(&v->p);
+    for (int i = 0; i < 7; i++) free(v->pools[i].base);
+    for (int j = 0; j < 2; j++) free(v->out[j]);
+    free(v->raw);
+    free(v->q);
+}
+
+/* Sizes scratch for [first, first+count) and prints the range's census. */
+static void env_census(Env *v, uint32_t first, uint32_t count) {
+    uint32_t peak = 0, peak_cmd = first, histogram[QDR_OPCODES + 1] = {0}, ws_peak = 0, near = 0;
+    for (uint32_t i = first; i < first + count; i++) {
+        Nprg2ExecCall call = {.command_index = i, .program = &v->p, .bound = &v->b, .pools = v->pools,
+                              .pool1_writable_bytes = POOL1_CEILING,
+                              .inputs = v->in, .input_count = 4, .outputs = v->ob, .output_count = 2};
+        CHECK(nprg2_command_at(&v->b, i, &call.command) == NPRG2_OK);
+        uint32_t need = 0, ws = 0;
+        if (!nprg2_exec_reference_conv_measure(&call, use_fast ? &conv : NULL, &need, &ws)) {
+            fprintf(stderr, "%s census reject cmd=%lu op=%u var=%u line=%lu\n", v->model, (unsigned long)i,
+                    call.command.opcode, call.command.variant, (unsigned long)nprg2_exec_reference_error_line());
+            exit(1);
+        }
+        if (call.command.opcode <= QDR_OPCODES) histogram[call.command.opcode]++;
+        if (need > peak) { peak = need; peak_cmd = i; }
+        if (ws > ws_peak) ws_peak = ws;
+        if (call.command.opcode == QDR_HMX_CONV && nprg2_exec_reference_conv_path() == 2) near++;
+    }
+    if (use_fast)
+        printf("%s: fast convolution workspace peak %lu bytes, %lu convolutions with near memory\n", v->model,
+               (unsigned long)ws_peak, (unsigned long)near);
+    free(v->scratch);
+    v->scratch_bytes = (peak + 4095u) & ~4095u;
+    v->scratch = v->scratch_bytes ? aligned_alloc(128, v->scratch_bytes) : NULL;
+    CHECK(!v->scratch_bytes || v->scratch);
+    printf("%s: commands %lu..%lu, scratch peak %lu bytes at cmd %lu; opcodes:", v->model, (unsigned long)first,
+           (unsigned long)(first + count - 1u), (unsigned long)peak, (unsigned long)peak_cmd);
+    for (uint32_t op = 0; op <= QDR_OPCODES; op++)
+        if (histogram[op]) printf(" %lu:%lu", (unsigned long)op, (unsigned long)histogram[op]);
+    printf("\n");
+    fflush(stdout);
+}
+
+/* One preflight, then one run. With start (seven pools, then two outputs; a
+ * NULL entry means all zero), the preflight must leave every pool and output
+ * equal to it. The simulator heap has no room for a separate copy. */
+static void env_run(Env *v, uint32_t first, uint32_t count, const uint8_t *const *start) {
+    Nprg2ExecStats st;
+    Nprg2ExecRequest r = {.program = &v->p, .bound = &v->b, .pool1_writable_bytes = POOL1_CEILING,
+                          .inputs = v->in, .input_count = 4, .outputs = v->ob, .output_count = 2,
+                          .scratch = v->scratch, .scratch_bytes = v->scratch_bytes,
+                          .command_first = first, .command_count = count, .stats = &st};
+    memcpy(r.pools, v->pools, sizeof v->pools);
+    uint64_t preflight_started = ticks();
+    int rc = nprg2_executor_preflight(&v->e, &r);
+    if (use_cycles)
+        printf("%s: preflight of commands %lu..%lu cost %llu %s\n", v->model, (unsigned long)first,
+               (unsigned long)(first + count - 1u), (unsigned long long)(ticks() - preflight_started), tick_unit());
+    if (rc != NPRG2_EXEC_OK) {
+        fprintf(stderr, "%s preflight rc=%d cmd=%lu op=%u var=%u line=%lu\n", v->model, rc,
+                (unsigned long)st.failed_command, st.failed_opcode, st.failed_variant,
+                (unsigned long)nprg2_exec_reference_error_line());
+        exit(1);
+    }
+    for (int i = 0; start && i < 9; i++) {
+        const uint8_t *now = i < 7 ? v->pools[i].base : v->out[i - 7];
+        uint32_t n = i < 7 ? v->pools[i].bytes : kOutputBytes[i - 7];
+        if (start[i]) CHECK(!n || !memcmp(now, start[i], n));
+        else for (uint32_t j = 0; j < n; j++) CHECK(!now[j]);
+    }
+    static uint64_t cost[QDR_OPCODES + 1][QDR_VARIANTS + 1];
+    static uint32_t calls[QDR_OPCODES + 1][QDR_VARIANTS + 1];
+    memset(cost, 0, sizeof cost);
+    memset(calls, 0, sizeof calls);
+    memset(conv_phase, 0, sizeof conv_phase);
+    uint64_t started = ticks(), total = 0;
+    uint32_t step = v->progress ? v->progress : count, logged = 0;
+    for (uint32_t done = 0; done < count; done += r.command_count) {
+        r.command_first = first + done;
+        r.command_count = use_cycles ? 1u : count - done < step ? count - done : step;
+        uint64_t t0 = ticks();
+        rc = nprg2_executor_run(&v->e, &r);
+        uint64_t spent = ticks() - t0;
+        if (rc != NPRG2_EXEC_OK) {
+            fprintf(stderr, "%s run rc=%d cmd=%lu op=%u var=%u line=%lu\n", v->model, rc, (unsigned long)st.failed_command,
+                    st.failed_opcode, st.failed_variant, (unsigned long)nprg2_exec_reference_error_line());
+            exit(1);
+        }
+        CHECK(st.executed_commands == r.command_count && st.validated_commands == r.command_count);
+        if (use_cycles) {
+            Nprg2Command c;
+            CHECK(nprg2_command_at(&v->b, r.command_first, &c) == NPRG2_OK && c.opcode <= QDR_OPCODES && c.variant <= QDR_VARIANTS);
+            cost[c.opcode][c.variant] += spent;
+            calls[c.opcode][c.variant]++;
+            total += spent;
+        }
+        uint32_t ran = done + r.command_count;
+        if (v->progress && (ran - logged >= step || ran == count)) {
+            logged = ran;
+            printf("%s: ran %lu/%lu commands (through cmd %lu), %llu %s\n", v->model, (unsigned long)ran,
+                   (unsigned long)count, (unsigned long)(first + ran - 1u), (unsigned long long)(ticks() - started),
+                   tick_unit());
+            fflush(stdout);
+        }
+    }
+    if (!use_cycles) return;
+    printf("%s: commands %lu..%lu cost %llu %s in handlers (validate + run)\n  share        %-7s  commands  op var\n",
+           v->model, (unsigned long)first, (unsigned long)(first + count - 1u), (unsigned long long)total, tick_unit(),
+           tick_unit());
+    for (;;) {
+        uint32_t bo = 0, bv = 0;
+        for (uint32_t o = 0; o <= QDR_OPCODES; o++)
+            for (uint32_t w = 0; w <= QDR_VARIANTS; w++)
+                if (calls[o][w] && (!calls[bo][bv] || cost[o][w] > cost[bo][bv])) { bo = o; bv = w; }
+        if (!calls[bo][bv]) break;
+        printf("  %5.1f%%  %12llu  %8lu  %2lu %3lu\n", total ? 100.0 * (double)cost[bo][bv] / (double)total : 0.0,
+               (unsigned long long)cost[bo][bv], (unsigned long)calls[bo][bv], (unsigned long)bo, (unsigned long)bv);
+        calls[bo][bv] = 0;
+    }
+    if (conv.phase)
+        printf("  near conv phases (%s): staging %llu, mac %llu, requant %llu, output %llu\n", tick_unit(),
+               (unsigned long long)conv_phase[0], (unsigned long long)conv_phase[1],
+               (unsigned long long)conv_phase[2], (unsigned long long)conv_phase[3]);
+    fflush(stdout);
+}
+
+static int env_pools_match(Env *v, const uint8_t *const *want) {
+    for (int i = 0; i < 7; i++) {
+        if (!v->pools[i].bytes || !memcmp(v->pools[i].base, want[i], v->pools[i].bytes)) continue;
+        uint32_t diff = 0;
+        while (v->pools[i].base[diff] == want[i][diff]) diff++;
+        fprintf(stderr, "%s pool mismatch: pool=%d off=0x%lx prepared=%u want=%u\n", v->model, i, (unsigned long)diff,
+                v->pools[i].base[diff], want[i][diff]);
+        return 0;
+    }
+    return 1;
+}
+
+static void read_smoke(const char *model, uint8_t **inputs, uint32_t *input_bytes, uint8_t **constants, uint32_t *cn) {
+    static const char *const names[4] = {"x", "y", "hidden", "t"};
+    char path[256];
+    for (int j = 0; j < 4; j++) {
+        snprintf(path, sizeof path, "frame/build/native-smoke/%s.raw", names[j]);
+        inputs[j] = read_file(path, &input_bytes[j]);
+    }
+    snprintf(path, sizeof path, "recovered/%s/constants/constant_pool_5.bin", model);
+    *constants = read_file(path, cn);
+}
+
+static void run_prefix(const char *model) {
+    char path[256];
+    uint32_t fn;
+    snprintf(path, sizeof path, "frame/native_program/fixtures/%s-smoke-prefix-%d.mpfx", model,
+             model_code(model) ? 100 : 132);
+    uint8_t *fx = read_file(path, &fn);
+    CHECK(fn >= MPFX_HEADER && !memcmp(fx, "MPFX", 4) && rd32(fx + 4) == 1u && rd32(fx + 16) == 4u);
+    CHECK(rd32(fx + 8) == (uint32_t)model_code(model));
+    uint32_t count = rd32(fx + 12), input_bytes[4], pool_bytes[7];
+    uint8_t *inputs[4];
+    const uint8_t *initial[7], *want[7];
+    uint64_t at = MPFX_HEADER;
+    for (int j = 0; j < 4; j++) { input_bytes[j] = rd32(fx + 20 + 4 * j); inputs[j] = fx + at; at += input_bytes[j]; }
+    for (int i = 0; i < 7; i++) { pool_bytes[i] = rd32(fx + 36 + 4 * i); initial[i] = fx + at; at += pool_bytes[i]; }
+    for (int i = 0; i < 7; i++) { want[i] = fx + at; at += pool_bytes[i]; }
+    CHECK(at == fn);
+    static Env v;
+    env_open(&v, model, inputs, input_bytes);
+    CHECK(count > 0 && count <= v.p.command_count);
+    for (int i = 0; i < 7; i++) {
+        CHECK(v.pools[i].bytes == pool_bytes[i]);
+        if (pool_bytes[i]) memcpy(v.pools[i].base, initial[i], pool_bytes[i]);
+    }
+    env_census(&v, 0, count);
+    const uint8_t *start[9] = {initial[0], initial[1], initial[2], initial[3], initial[4], initial[5], initial[6], NULL, NULL};
+    env_run(&v, 0, count, start);
+    if (!env_pools_match(&v, want)) exit(1);
+    printf("PASS %s reference prefix: commands 0..%lu, one preflight without pool writes, one run, "
+           "all seven pools identical to the NativeGraph CPU capture\n", model, (unsigned long)count - 1u);
+    fflush(stdout);
+    env_close(&v);
+    free(fx);
+}
+
+static void run_full(const char *model) {
+    uint8_t *inputs[4], *constants;
+    uint32_t input_bytes[4], cn;
+    read_smoke(model, inputs, input_bytes, &constants, &cn);
+    static Env v;
+    env_open(&v, model, inputs, input_bytes);
+    CHECK(v.pools[5].bytes == cn);
+    memcpy(v.pools[5].base, constants, cn);
+    env_census(&v, 0, v.p.command_count);
+    const uint8_t *start[9] = {0};
+    start[5] = constants;
+    env_run(&v, 0, v.p.command_count, start);
+    if (!outputs_match_emulator(model, v.out)) exit(1);
+    printf("PASS %s reference full schedule: %lu commands, one preflight without pool writes, one run, "
+           "both graph outputs match the emulator smoke sha256\n", model, (unsigned long)v.p.command_count);
+    fflush(stdout);
+    env_close(&v);
+    free(constants);
+    for (int j = 0; j < 4; j++) free(inputs[j]);
+}
+
+/* RSEG v1: "RSEG", version, model code, first, count, input bytes[4],
+ * pool bytes[7], output bytes[2]; then the inputs, the start pools and
+ * outputs, and the end pools and outputs. */
+static uint8_t *snapshot(Env *v, uint32_t *bytes) {
+    uint32_t n = kOutputBytes[0] + kOutputBytes[1];
+    for (int i = 0; i < 7; i++) n += v->pools[i].bytes;
+    uint8_t *s = malloc(n), *at = s;
+    CHECK(s);
+    for (int i = 0; i < 7; i++) { if (v->pools[i].bytes) memcpy(at, v->pools[i].base, v->pools[i].bytes); at += v->pools[i].bytes; }
+    for (int j = 0; j < 2; j++) { memcpy(at, v->out[j], kOutputBytes[j]); at += kOutputBytes[j]; }
+    *bytes = n;
+    return s;
+}
+
+static void write_segment(Env *v, const char *dir, uint32_t k, uint32_t first, uint32_t count, const uint32_t *input_bytes,
+                          const uint8_t *start, const uint8_t *end, uint32_t state_bytes) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s-seg%lu.rseg", dir, v->model, (unsigned long)k);
+    uint8_t h[RSEG_HEADER];
+    memcpy(h, "RSEG", 4);
+    wr32(h + 4, 1);
+    wr32(h + 8, (uint32_t)model_code(v->model));
+    wr32(h + 12, first);
+    wr32(h + 16, count);
+    for (int j = 0; j < 4; j++) wr32(h + 20 + 4 * j, input_bytes[j]);
+    for (int i = 0; i < 7; i++) wr32(h + 36 + 4 * i, v->pools[i].bytes);
+    for (int j = 0; j < 2; j++) wr32(h + 64 + 4 * j, kOutputBytes[j]);
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "cannot create %s\n", path); exit(1); }
+    CHECK(fwrite(h, 1, sizeof h, f) == sizeof h);
+    for (int j = 0; j < 4; j++) CHECK(fwrite(v->in[j].data, 1, input_bytes[j], f) == input_bytes[j]);
+    CHECK(fwrite(start, 1, state_bytes, f) == state_bytes);
+    CHECK(fwrite(end, 1, state_bytes, f) == state_bytes);
+    CHECK(!fclose(f));
+    printf("%s: commands %lu..%lu\n", path, (unsigned long)first, (unsigned long)(first + count - 1u));
+}
+
+static void split(const char *model, uint32_t segments, const char *dir) {
+    CHECK(segments >= 1 && segments <= MAX_SEGMENTS);
+    uint8_t *inputs[4], *constants;
+    uint32_t input_bytes[4], cn;
+    read_smoke(model, inputs, input_bytes, &constants, &cn);
+    static Env v;
+    env_open(&v, model, inputs, input_bytes);
+    uint32_t n = v.p.command_count;
+    CHECK(v.pools[5].bytes == cn && segments <= n);
+    memcpy(v.pools[5].base, constants, cn);
+    env_census(&v, 0, n);
+
+    double *cost = calloc(n, sizeof *cost), total = 0;
+    CHECK(cost);
+    for (uint32_t i = 0; i < n; i++) {
+        clock_t t0 = clock();
+        env_run(&v, i, 1, NULL);
+        cost[i] = (double)(clock() - t0) + 1.0;
+        total += cost[i];
+    }
+    uint32_t bound[MAX_SEGMENTS + 1] = {0}, k = 1;
+    double cum = 0;
+    for (uint32_t i = 0; i < n && k < segments; i++) {
+        cum += cost[i];
+        if (cum >= total * k / segments && i + 1 > bound[k - 1]) bound[k++] = i + 1;
+    }
+    segments = k;
+    bound[segments] = n;
+    free(cost);
+
+    for (int i = 0; i < 7; i++) if (v.pools[i].bytes) memset(v.pools[i].base, 0, v.pools[i].bytes);
+    memcpy(v.pools[5].base, constants, cn);
+    for (int j = 0; j < 2; j++) memset(v.out[j], 0, kOutputBytes[j]);
+    uint32_t state_bytes;
+    uint8_t *start = snapshot(&v, &state_bytes);
+    for (uint32_t s = 0; s < segments; s++) {
+        env_run(&v, bound[s], bound[s + 1] - bound[s], NULL);
+        uint8_t *end = snapshot(&v, &state_bytes);
+        write_segment(&v, dir, s, bound[s], bound[s + 1] - bound[s], input_bytes, start, end, state_bytes);
+        free(start);
+        start = end;
+    }
+    free(start);
+    if (!outputs_match_emulator(model, v.out)) exit(1);
+    printf("PASS %s split: %lu segments cover commands 0..%lu; final outputs match the emulator smoke sha256\n", model,
+           (unsigned long)segments, (unsigned long)n - 1u);
+    env_close(&v);
+    free(constants);
+    for (int j = 0; j < 4; j++) free(inputs[j]);
+}
+
+/* Host time per (opcode, variant) over the full schedule, slowest first. */
+static void profile(const char *model) {
+    uint8_t *inputs[4], *constants;
+    uint32_t input_bytes[4], cn;
+    read_smoke(model, inputs, input_bytes, &constants, &cn);
+    static Env v;
+    env_open(&v, model, inputs, input_bytes);
+    CHECK(v.pools[5].bytes == cn);
+    memcpy(v.pools[5].base, constants, cn);
+    env_census(&v, 0, v.p.command_count);
+    static double cost[QDR_OPCODES + 1][QDR_VARIANTS + 1];
+    static uint32_t calls[QDR_OPCODES + 1][QDR_VARIANTS + 1];
+    memset(cost, 0, sizeof cost);
+    memset(calls, 0, sizeof calls);
+    double total = 0;
+    for (uint32_t i = 0; i < v.p.command_count; i++) {
+        Nprg2Command c;
+        CHECK(nprg2_command_at(&v.b, i, &c) == NPRG2_OK && c.opcode <= QDR_OPCODES && c.variant <= QDR_VARIANTS);
+        clock_t t0 = clock();
+        env_run(&v, i, 1, NULL);
+        double t = (double)(clock() - t0) / CLOCKS_PER_SEC;
+        cost[c.opcode][c.variant] += t;
+        calls[c.opcode][c.variant]++;
+        total += t;
+    }
+    if (!outputs_match_emulator(model, v.out)) exit(1);
+    printf("%s profile: %.3f s total host time, reference kernel on every key\n", model, total);
+    printf("  share   seconds  commands  op var\n");
+    for (;;) {
+        uint32_t bo = 0, bv = 0;
+        for (uint32_t o = 0; o <= QDR_OPCODES; o++)
+            for (uint32_t w = 0; w <= QDR_VARIANTS; w++)
+                if (calls[o][w] && cost[o][w] > cost[bo][bv]) { bo = o; bv = w; }
+        if (!calls[bo][bv] || cost[bo][bv] < total * 0.001) break;
+        printf("  %5.1f%%  %7.3f  %8lu  %2lu %3lu\n", 100.0 * cost[bo][bv] / total, cost[bo][bv],
+               (unsigned long)calls[bo][bv], (unsigned long)bo, (unsigned long)bv);
+        calls[bo][bv] = 0;
+    }
+    env_close(&v);
+    free(constants);
+    for (int j = 0; j < 4; j++) free(inputs[j]);
+}
+
+static void run_segment(const char *path, uint32_t progress) {
+    uint32_t fn;
+    uint8_t *fx = read_file(path, &fn);
+    CHECK(fn >= RSEG_HEADER && !memcmp(fx, "RSEG", 4) && rd32(fx + 4) == 1u && rd32(fx + 8) <= 1u);
+    const char *model = rd32(fx + 8) ? "alternate" : "primary";
+    uint32_t first = rd32(fx + 12), count = rd32(fx + 16), input_bytes[4], pool_bytes[7];
+    uint8_t *inputs[4];
+    uint64_t at = RSEG_HEADER;
+    for (int j = 0; j < 4; j++) { input_bytes[j] = rd32(fx + 20 + 4 * j); inputs[j] = fx + at; at += input_bytes[j]; }
+    for (int j = 0; j < 2; j++) CHECK(rd32(fx + 64 + 4 * j) == kOutputBytes[j]);
+    const uint8_t *state[2][9];
+    for (int s = 0; s < 2; s++) {
+        for (int i = 0; i < 7; i++) { pool_bytes[i] = rd32(fx + 36 + 4 * i); state[s][i] = fx + at; at += pool_bytes[i]; }
+        for (int j = 0; j < 2; j++) { state[s][7 + j] = fx + at; at += kOutputBytes[j]; }
+    }
+    CHECK(at == fn);
+    static Env v;
+    env_open(&v, model, inputs, input_bytes);
+    v.progress = progress;
+    CHECK(count > 0 && first <= v.p.command_count && count <= v.p.command_count - first);
+    for (int i = 0; i < 7; i++) {
+        CHECK(v.pools[i].bytes == pool_bytes[i]);
+        if (pool_bytes[i]) memcpy(v.pools[i].base, state[0][i], pool_bytes[i]);
+    }
+    for (int j = 0; j < 2; j++) memcpy(v.out[j], state[0][7 + j], kOutputBytes[j]);
+    env_census(&v, first, count);
+    env_run(&v, first, count, state[0]);
+    if (!env_pools_match(&v, state[1])) exit(1);
+    for (int j = 0; j < 2; j++) {
+        if (memcmp(v.out[j], state[1][7 + j], kOutputBytes[j])) { fprintf(stderr, "%s output %d mismatch\n", model, j); exit(1); }
+    }
+    printf("PASS %s reference segment: commands %lu..%lu, one preflight without pool or output writes, %s, "
+           "all seven pools and both graph outputs identical to the host end state\n", model, (unsigned long)first,
+           (unsigned long)(first + count - 1u), progress ? "runs in logged chunks" : "one run");
+    fflush(stdout);
+    env_close(&v);
+    free(fx);
+}
+
+int main(int argc, char **argv) {
+    int kept = 1;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "fast")) use_fast = 1;
+        else if (!strcmp(argv[i], "cycles")) use_cycles = 1;
+        else argv[kept++] = argv[i];
+    }
+    argc = kept;
+    if (argc > 2 && !strcmp(argv[1], "segment")) {
+        run_segment(argv[2], argc > 3 ? (uint32_t)strtoul(argv[3], NULL, 10) : 0);
+        return 0;
+    }
+    const char *which = argc > 1 ? argv[1] : "both";
+    const char *mode = argc > 2 ? argv[2] : "prefix";
+    CHECK(!strcmp(which, "both") || !strcmp(which, "primary") || !strcmp(which, "alternate"));
+    if (!strcmp(mode, "profile") || !strcmp(mode, "split")) use_cycles = 0;
+    if (!strcmp(mode, "profile")) {
+        if (strcmp(which, "alternate")) profile("primary");
+        if (strcmp(which, "primary")) profile("alternate");
+        return 0;
+    }
+    if (!strcmp(mode, "split")) {
+        CHECK(argc > 4 && strcmp(which, "both"));
+        split(which, (uint32_t)strtoul(argv[3], NULL, 10), argv[4]);
+        return 0;
+    }
+    CHECK(!strcmp(mode, "prefix") || !strcmp(mode, "full"));
+    void (*run)(const char *) = strcmp(mode, "full") ? run_prefix : run_full;
+    if (strcmp(which, "alternate")) run("primary");
+    if (strcmp(which, "primary")) run("alternate");
+    return 0;
+}

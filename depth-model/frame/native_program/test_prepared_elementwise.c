@@ -16,7 +16,7 @@ static int resolve_all(void *ctx,const Nprg2Program *p,uint32_t i,const Nprg2Com
 static void shape(const Nprg2TensorView *v,int32_t d[4],int32_t m[4],int32_t o[4]){for(int i=0;i<4;i++){d[i]=rdi16(v->geometry_record+6+2*i);m[i]=rdi16(v->geometry_record+14+2*i);o[i]=rdi16(v->geometry_record+22+2*i);}}
 static uint32_t first_touched_index(const Nprg2TensorView *v,int width){int32_t d[4],m[4],o[4];shape(v,d,m,o);uint32_t nbh=(uint32_t)(m[1]+7)/8u,nbw=(uint32_t)(m[2]+width-1)/width,nbd=(uint32_t)(m[3]+31)/32;return (uint32_t)((((uint64_t)o[0]*nbh+(uint32_t)o[1]/8u)*nbw+(uint32_t)o[2]/width)*nbd+v->slice_origin+(uint32_t)o[3]/32u);}
 static int first_command(const Nprg2Program *p,const Nprg2Bound *b,uint8_t op,uint8_t variant){for(uint32_t i=0;i<p->command_count;i++){Nprg2Command c;CHECK(nprg2_command_at(b,i,&c)==NPRG2_OK);if(c.opcode==op&&c.variant==variant)return (int)i;}return -1;}
-static void run_model(const char *qpath,const char *npath,const char *add_fixture,const char *clip_fixture){
+static void run_model(const char *qpath,const char *npath,const char *add_fixture,const char *clip_fixture,const char *requant_fixture){
     uint32_t qn,nn;uint8_t *q=read_file(qpath,&qn),*raw=read_file(npath,&nn),qsha[32],nsha[32];nprg2_sha256(q,qn,qsha);nprg2_sha256(raw,nn,nsha);Nprg2ExpectedHashes x={q+32,q+64,qsha,nsha};
     Nprg2Pool pools[7]={0};pool_alloc(raw,pools);Nprg2Program p;CHECK(nprg2_open(&p,raw,nn,&x,pools,(Nprg2Allocator){0})==NPRG2_OK);
     uint8_t *hot=calloc(1,300000);CHECK(hot);Nprg2BindConfig bc={.hot_memory=hot,.hot_capacity=300000,.l2_available_bytes=786432,.pool1_is_verified_vtcm=1,.resolve=resolve_all};Nprg2Bound b;CHECK(nprg2_bind_mock(&p,pools,&bc,&b)==NPRG2_OK);
@@ -24,10 +24,13 @@ static void run_model(const char *qpath,const char *npath,const char *add_fixtur
     uint8_t *scratch=malloc(NPRG2_ELEMENTWISE_SCRATCH_BYTES+sizeof(uintptr_t));CHECK(scratch);uintptr_t *aligned=(uintptr_t *)(((uintptr_t)scratch+sizeof(uintptr_t)-1u)&~(uintptr_t)(sizeof(uintptr_t)-1u));
     Nprg2ExecRequest r={.program=&p,.bound=&b,.pool1_writable_bytes=0x780000u,.scratch=aligned,.scratch_bytes=NPRG2_ELEMENTWISE_SCRATCH_BYTES};memcpy(r.pools,pools,sizeof pools);
     Nprg2ExecStats stats;r.stats=&stats;
-    int cmds[2]={first_command(&p,&b,QDR_ADD_U8,13),first_command(&p,&b,QDR_LINEARCLIP,68)};CHECK(cmds[0]>=0&&cmds[1]>=0);
-    for(int which=0;which<2;which++){
+    int cmds[3]={first_command(&p,&b,QDR_ADD_U8,13),first_command(&p,&b,QDR_LINEARCLIP,68),first_command(&p,&b,QDR_REQUANT_U8,70)};
+    CHECK(cmds[0]>=0&&cmds[1]>=0&&cmds[2]>=0);
+    for(int which=0;which<3;which++){
         uint32_t first=(uint32_t)cmds[which];Nprg2Command c;CHECK(nprg2_command_at(&b,first,&c)==NPRG2_OK);r.command_first=first;r.command_count=1;
-        uint32_t fixture_bytes;uint8_t *fixture=read_file(which?clip_fixture:add_fixture,&fixture_bytes);
+        uint32_t fixture_bytes;
+        const char *fx_path=which==0?add_fixture:(which==1?clip_fixture:requant_fixture);
+        uint8_t *fixture=read_file(fx_path,&fixture_bytes);
         CHECK(fixture_bytes>=68u&&!memcmp(fixture,"EPCP",4)&&rd32(fixture+4)==1u);
         CHECK(rd32(fixture+8)==c.opcode&&rd32(fixture+12)==c.variant&&rd32(fixture+16)==c.sequence&&rd32(fixture+20)==first);
         uint32_t fi_pool=rd32(fixture+24),fi_offset=rd32(fixture+28),fi_bytes=rd32(fixture+32),page_count=rd32(fixture+36);
@@ -44,7 +47,7 @@ static void run_model(const char *qpath,const char *npath,const char *add_fixtur
         /* Corrupt the output's first encoded page to overlap an input page.
          * Full preflight must reject and leave the entire VTCM pool intact. */
         uint32_t oi,ii;Nprg2TensorView ov,iv;CHECK(!nprg2_exec_output(&call,0,&oi,&ov));CHECK(!nprg2_exec_input(&call,0,&ii,&iv));
-        CHECK(ov.block_count&&iv.block_count);uint32_t oi0=first_touched_index(&ov,which?4:8),ii0=first_touched_index(&iv,8);CHECK(oi0<ov.block_count&&ii0<iv.block_count);uint32_t *out_blocks=(uint32_t *)ov.blocks;uint32_t old=out_blocks[oi0];out_blocks[oi0]=iv.blocks[ii0];
+        CHECK(ov.block_count&&iv.block_count);uint32_t oi0=first_touched_index(&ov,which==1?4:8),ii0=first_touched_index(&iv,8);CHECK(oi0<ov.block_count&&ii0<iv.block_count);uint32_t *out_blocks=(uint32_t *)ov.blocks;uint32_t old=out_blocks[oi0];out_blocks[oi0]=iv.blocks[ii0];
         CHECK(nprg2_executor_preflight(&e,&r)==NPRG2_EXEC_REJECTED);for(uint32_t pi=0;pi<7;pi++)if(pools[pi].bytes)CHECK(!memcmp(pools[pi].base,want_pool[pi],pools[pi].bytes));out_blocks[oi0]=old;
         out_blocks[oi0]=0x780001u;CHECK(nprg2_executor_preflight(&e,&r)==NPRG2_EXEC_REJECTED);for(uint32_t pi=0;pi<7;pi++)if(pools[pi].bytes)CHECK(!memcmp(pools[pi].base,want_pool[pi],pools[pi].bytes));out_blocks[oi0]=old;
         free(want_pool[1]);free(fixture);
@@ -56,6 +59,19 @@ static void run_model(const char *qpath,const char *npath,const char *add_fixtur
 }
 int main(int argc,char **argv){
     SIM_ACQUIRE_HVX;SIM_SET_HVX_DOUBLE_MODE;
-    if(argc==1){run_model("frame/build/resident-primary.qdrx","frame/native_program/examples/primary-v2.nprg","frame/native_program/fixtures/primary-smoke-add.epcpu","frame/native_program/fixtures/primary-smoke-linearclip.epcpu");run_model("frame/build/resident-alternate.qdrx","frame/native_program/examples/alternate-v2.nprg","frame/native_program/fixtures/alternate-smoke-add.epcpu","frame/native_program/fixtures/alternate-smoke-linearclip.epcpu");SIM_RELEASE_HVX;return 0;}
-    CHECK(argc==9);run_model(argv[1],argv[2],argv[3],argv[4]);run_model(argv[5],argv[6],argv[7],argv[8]);SIM_RELEASE_HVX;return 0;
+    if(argc==1){
+        run_model("frame/build/resident-primary.qdrx","frame/native_program/examples/primary-v2.nprg",
+                  "frame/native_program/fixtures/primary-smoke-add.epcpu",
+                  "frame/native_program/fixtures/primary-smoke-linearclip.epcpu",
+                  "frame/native_program/fixtures/primary-smoke-requant.epcpu");
+        run_model("frame/build/resident-alternate.qdrx","frame/native_program/examples/alternate-v2.nprg",
+                  "frame/native_program/fixtures/alternate-smoke-add.epcpu",
+                  "frame/native_program/fixtures/alternate-smoke-linearclip.epcpu",
+                  "frame/native_program/fixtures/alternate-smoke-requant.epcpu");
+        SIM_RELEASE_HVX;return 0;
+    }
+    CHECK(argc==11);
+    run_model(argv[1],argv[2],argv[3],argv[4],argv[5]);
+    run_model(argv[6],argv[7],argv[8],argv[9],argv[10]);
+    SIM_RELEASE_HVX;return 0;
 }

@@ -1,0 +1,1881 @@
+/* Exact dense ports of qd_graph.c's CPU-backend kernels; see prepared_reference.h.
+ * Each kernel keeps the reference's statement order, rounding and checks. In a
+ * dry pass, xfer only proves bounds, salloc only measures, and the arithmetic
+ * blocks guarded by !g->dry are skipped. */
+#include "prepared_reference.h"
+
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+#if defined(__HVX__) && __HVX_LENGTH__==128
+#include <hexagon_types.h>
+#include <hexagon_protos.h>
+#endif
+
+enum { DT_U8=1, DT_I8=2, DT_U16=3, DT_I16=4, DT_I32=5, DT_F32=6, DT_Q32=7 };
+enum { F_SHAPE=1, F_BLOCKED=2, F_DIRECT=4, F_SV=8, F_SCALAR=16, F_QUANT=32, F_CROUTON=64 };
+enum { E_TENSOR=2, E_SHAPE=3, E_ARGS=4, E_RANGE=5, E_UNSUPPORTED=6, E_MEMORY=7 };
+enum { CALL_BYTES=88, BLOCK_BYTES=2048, CACHED_INPUTS=8, SPILL_POOL=6 };
+
+static uint32_t reference_error_line;
+#define FAIL(code) do { reference_error_line=__LINE__; return (code); } while(0)
+#define CHECK(cond,code) do { if(!(cond)) FAIL(code); } while(0)
+#define TRY(expr) do { int e_=(expr); if(e_) return e_; } while(0)
+
+typedef struct {
+    uint32_t dtype, flags, esize, crouton, cls, scalar;
+    int32_t d[4], m[4], p[4], sv[4];
+    uint32_t pool, offset, nblocks, slice;
+    const uint32_t *blocks;
+    int32_t zp;
+    double scale;
+} T;
+
+typedef struct { int32_t n[4]; uint32_t dt, scalar, unknown; void *p; } A;
+
+typedef struct {
+    const Nprg2ExecCall *call;
+    int dry;
+    uint8_t *scratch;
+    size_t used, cap;
+    uint8_t *pool[7];
+    uint64_t pool_bytes[7], write_limit[7];
+    uint32_t op, variant, io, nin, nout, nfv, ncalls;
+    const uint8_t *calls, *fv;
+    T in[CACHED_INPUTS], out;
+    uint8_t measure_only;
+    const Nprg2ReferenceConv *conv;
+    size_t wused;
+} G;
+
+static uint32_t rd32(const uint8_t *p){return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
+static uint64_t rd64(const uint8_t *p){return (uint64_t)rd32(p)|((uint64_t)rd32(p+4)<<32);}
+static int32_t rdi16(const uint8_t *p){return (int16_t)(uint16_t)(p[0]|p[1]<<8);}
+
+/* ------------------------------------------------------------------ scratch */
+static void *salloc(G *g, size_t bytes) {
+    size_t at=(g->used+63)&~(size_t)63;
+    if(at<g->used || bytes>SIZE_MAX-at || at+bytes>g->cap) return NULL;
+    g->used=at+bytes;
+    if(g->measure_only) return (void *)g; /* never dereferenced in a dry pass */
+    return g->scratch+at;
+}
+static size_t count4(const int32_t *n) {return (size_t)n[0]*n[1]*n[2]*n[3];}
+static uint32_t dsize(uint32_t dt) {return dt==DT_U8||dt==DT_I8?1:dt==DT_U16||dt==DT_I16?2:4;}
+static int anew(G *g, A *a, const int32_t *n, uint32_t dt) {
+    for(int i=0;i<4;i++){if(n[i]<0)FAIL(E_SHAPE);a->n[i]=n[i];}
+    CHECK(count4(n)<=(SIZE_MAX>>3),E_SHAPE);
+    a->dt=dt;a->scalar=0;a->unknown=0;
+    a->p=salloc(g,count4(n)*dsize(dt)+64);
+    return a->p?0:E_MEMORY;
+}
+static int64_t aget(const A *a, size_t i) {
+    switch(a->dt) {
+    case DT_U8: return ((const uint8_t *)a->p)[i];
+    case DT_I8: return ((const int8_t *)a->p)[i];
+    case DT_U16: return ((const uint16_t *)a->p)[i];
+    case DT_I16: return ((const int16_t *)a->p)[i];
+    default: return ((const int32_t *)a->p)[i];
+    }
+}
+static int to_i32(G *g, const A *a, int32_t **out) {
+    size_t n=count4(a->n);
+    int32_t *r=salloc(g,n*4+64);
+    if(!r) FAIL(E_MEMORY);
+    if(a->dt==DT_F32) FAIL(E_UNSUPPORTED);
+    if(!g->dry) {
+        if(a->dt==DT_U8){const uint8_t *s=a->p;for(size_t i=0;i<n;i++)r[i]=s[i];}
+        else if(a->dt==DT_U16){const uint16_t *s=a->p;for(size_t i=0;i<n;i++)r[i]=s[i];}
+        else for(size_t i=0;i<n;i++)r[i]=(int32_t)aget(a,i);
+    }
+    *out=r;return 0;
+}
+static void from_i64(A *a, size_t i, int64_t v) {
+    switch(a->dt) {
+    case DT_U8: ((uint8_t *)a->p)[i]=(uint8_t)v;break;
+    case DT_I8: ((int8_t *)a->p)[i]=(int8_t)v;break;
+    case DT_U16: ((uint16_t *)a->p)[i]=(uint16_t)v;break;
+    case DT_I16: ((int16_t *)a->p)[i]=(int16_t)v;break;
+    default: ((int32_t *)a->p)[i]=(int32_t)v;break;
+    }
+}
+static int64_t clip64(int64_t v, int64_t lo, int64_t hi) {return v<lo?lo:v>hi?hi:v;}
+static int64_t dtmax(uint32_t dt) {return dt==DT_U8?255:dt==DT_U16?65535:dt==DT_I8?127:dt==DT_I16?32767:2147483647;}
+static int64_t s32(uint64_t v) {return (int64_t)(int32_t)(uint32_t)v;}
+
+/* ------------------------------------------------------------ tensor access */
+static int decode(const Nprg2TensorView *v, T *t) {
+    const uint8_t *r=v->geometry_record;
+    if(!r) return 0;
+    memset(t,0,sizeof *t);
+    t->dtype=r[0];t->flags=r[1]&~(uint32_t)(F_BLOCKED|F_DIRECT);
+    t->cls=rd32(r+2);t->esize=dsize(t->dtype);t->crouton=!!(t->flags&F_CROUTON);
+    /* The record payload is a union. A shape tensor whose QDRX source also
+     * had a value/scalar payload loses those flags, so their users reject. */
+    if(t->flags&F_SHAPE) {
+        t->flags&=~(uint32_t)(F_SV|F_SCALAR);
+        for(int i=0;i<4;i++){t->d[i]=rdi16(r+6+2*i);t->m[i]=rdi16(r+14+2*i);t->p[i]=rdi16(r+22+2*i);}
+    } else if(t->flags&F_SV) {
+        t->flags&=~(uint32_t)F_SCALAR;
+        for(int i=0;i<4;i++)t->sv[i]=(int32_t)rd32(r+6+4*i);
+    } else if(t->flags&F_SCALAR) t->scalar=rd32(r+6);
+    t->zp=(int32_t)rd32(r+30);memcpy(&t->scale,r+34,8);
+    if(v->storage_kind==1){t->flags|=F_DIRECT;t->pool=v->pool;t->offset=v->offset;}
+    else if(v->storage_kind==2) {
+        if(!v->blocks || !v->block_count) return 0;
+        t->flags|=F_BLOCKED;t->blocks=v->blocks;t->nblocks=v->block_count;t->slice=v->slice_origin;
+    }
+    return 1;
+}
+static int input_at(G *g, uint32_t i, T *t) {
+    uint32_t index;Nprg2TensorView v;
+    if(i>=g->nin || nprg2_exec_input(g->call,i,&index,&v)!=NPRG2_EXEC_OK || !decode(&v,t)) FAIL(E_TENSOR);
+    return 0;
+}
+static const T *in(G *g, uint32_t i) {return i<g->nin && i<CACHED_INPUTS?&g->in[i]:NULL;}
+static const T *out0(G *g) {return &g->out;}
+#define NEED(nin_min) CHECK(g->nin>=(nin_min) && (nin_min)<=CACHED_INPUTS && g->nout>=1,E_ARGS)
+
+/* Every block a blocked transfer touches: absent entries read as zero and
+ * are skipped on store, exactly as qd_graph's blocked_impl. */
+static int blocked_check(G *g, const T *t, const int32_t *dims, const int32_t *origin, int store) {
+    for(int i=0;i<4;i++)CHECK(origin[i]>=0 && dims[i]>=0,E_RANGE);
+    if(!dims[0] || !dims[1] || !dims[2] || !dims[3]) return 0;
+    CHECK(t->esize==1 || t->esize==2 || t->esize==4,E_TENSOR);
+    int64_t cw=t->esize==1?8:t->esize==2?4:2;
+    int64_t nbh=((int64_t)t->m[1]+7)/8,nbw=((int64_t)t->m[2]+cw-1)/cw,nbd=((int64_t)t->m[3]+31)/32;
+    for(int64_t b=origin[0];b<(int64_t)origin[0]+dims[0];b++)
+     for(int64_t h=origin[1]/8;h<=((int64_t)origin[1]+dims[1]-1)/8;h++)
+      for(int64_t w=origin[2]/cw;w<=((int64_t)origin[2]+dims[2]-1)/cw;w++)
+       for(int64_t z=origin[3]/32;z<=((int64_t)origin[3]+dims[3]-1)/32;z++) {
+        int64_t index=((b*nbh+h)*nbw+w)*nbd+t->slice+z;
+        if(index<0 || index>=(int64_t)t->nblocks) continue;
+        uint32_t e=t->blocks[index],pool=e&127u;
+        if(!pool) continue;
+        CHECK(pool<7 && g->pool[pool],E_RANGE);
+        uint64_t limit=store?g->write_limit[pool]:g->pool_bytes[pool];
+        CHECK((uint64_t)(e&~127u)+BLOCK_BYTES<=limit,E_RANGE);
+       }
+    return 0;
+}
+static inline __attribute__((always_inline)) void blocked_impl(uint8_t *const *pools, const T *t, uint8_t *values,
+        const int32_t *dims, const int32_t *origin, const uint32_t size, const int store) {
+    const int64_t cw=size==1?8:size==2?4:2;
+    int64_t maxh=t->m[1],maxw=t->m[2],maxd=t->m[3],slice=t->slice,count=t->nblocks;
+    int64_t nbh=(maxh+7)/8,nbw=(maxw+cw-1)/cw,nbd=(maxd+31)/32;
+    const uint32_t *blocks=t->blocks;
+    size_t pos=0;
+    for(int64_t b=0;b<dims[0];b++)for(int64_t h=0;h<dims[1];h++) {
+        int64_t B=b+origin[0],H=h+origin[1];
+        int64_t hrow=(B*nbh+H/8)*nbw;
+        size_t hin=size==1?(H%8)*256:size==2?(H%8)*128:(H%8)*64;
+        for(int64_t w=0;w<dims[2];w++) {
+            int64_t W=w+origin[2];
+            int64_t wrow=(hrow+W/cw)*nbd+slice;
+            size_t win=hin+(size==1?(W%8)*32:size==2?((W%4)/2)*64+W%2:(W%2)*32);
+            for(int64_t d=0;d<dims[3];) {
+                int64_t D=d+origin[3],n=32-D%32;
+                if(n>dims[3]-d)n=dims[3]-d;
+                int64_t index=wrow+D/32;
+                uint32_t e=(index>=0 && index<count)?blocks[index]:0,pool=e&127;
+                uint8_t *base=pool?pools[pool]:NULL;
+                if(base) {
+                    size_t within=win+(size==2?(D%32)*2:D%32);
+                    uint8_t *ptr=base+(e&~127u)+within*size;
+                    if(size!=2) {
+                        if(store)memcpy(ptr,values+pos,n*size);else memcpy(values+pos,ptr,n*size);
+                    } else {
+                        uint16_t v16;
+                        for(int64_t c=0;c<n;c++) {
+                            if(store){memcpy(&v16,values+pos+2*c,2);memcpy(ptr+4*c,&v16,2);}
+                            else {memcpy(&v16,ptr+4*c,2);memcpy(values+pos+2*c,&v16,2);}
+                        }
+                    }
+                } else if(!store)memset(values+pos,0,n*size);
+                pos+=n*size;d+=n;
+            }
+        }
+    }
+}
+static int direct_check(G *g, const T *t, const int32_t *dims, const int32_t *origin, int store) {
+    for(int i=0;i<4;i++)CHECK(origin[i]>=0 && dims[i]>=0 && (int64_t)origin[i]+dims[i]<=t->m[i],E_RANGE);
+    CHECK(t->pool<7 && g->pool[t->pool],E_TENSOR);
+    if(!dims[0] || !dims[1] || !dims[2] || !dims[3]) return 0;
+    uint64_t es=t->esize;
+    uint64_t first=((((uint64_t)origin[0]*t->m[1]+origin[1])*t->m[2]+origin[2])*t->m[3]+origin[3]);
+    uint64_t last=((((uint64_t)(origin[0]+dims[0]-1)*t->m[1]+origin[1]+dims[1]-1)*t->m[2]+origin[2]+dims[2]-1)*t->m[3]+origin[3]+dims[3]-1);
+    uint64_t limit=store?g->write_limit[t->pool]:g->pool_bytes[t->pool];
+    (void)first;
+    CHECK((uint64_t)t->offset+(last+1)*es<=limit,E_RANGE);
+    return 0;
+}
+static int xfer_check(G *g, const T *t, const int32_t *dims, const int32_t *origin, int store) {
+    if(t->flags&F_DIRECT) return direct_check(g,t,dims,origin,store);
+    if(t->flags&F_BLOCKED) return blocked_check(g,t,dims,origin,store);
+    FAIL(E_TENSOR);
+}
+/* The data movement of xfer for a region xfer_check accepted. */
+static void xfer_copy(G *g, const T *t, void *values, const int32_t *dims, const int32_t *origin, int store) {
+    if(t->flags&F_DIRECT) {
+        uint8_t *base=g->pool[t->pool];
+        size_t es=t->esize,row=(size_t)dims[3]*es,pos=0;
+        for(int32_t b=0;b<dims[0];b++)for(int32_t h=0;h<dims[1];h++)for(int32_t w=0;w<dims[2];w++) {
+            size_t lin=(((size_t)(b+origin[0])*t->m[1]+h+origin[1])*t->m[2]+w+origin[2])*t->m[3]+origin[3];
+            uint8_t *ptr=base+t->offset+lin*es;
+            if(store)memmove(ptr,(uint8_t *)values+pos,row);else memmove((uint8_t *)values+pos,ptr,row);
+            pos+=row;
+        }
+        return;
+    }
+    switch(t->esize*2+!!store) {
+    case 2: blocked_impl(g->pool,t,values,dims,origin,1,0);break;
+    case 3: blocked_impl(g->pool,t,values,dims,origin,1,1);break;
+    case 4: blocked_impl(g->pool,t,values,dims,origin,2,0);break;
+    case 5: blocked_impl(g->pool,t,values,dims,origin,2,1);break;
+    case 8: blocked_impl(g->pool,t,values,dims,origin,4,0);break;
+    default: blocked_impl(g->pool,t,values,dims,origin,4,1);break;
+    }
+}
+static int xfer(G *g, const T *t, void *values, const int32_t *dims, const int32_t *origin, int store) {
+    TRY(xfer_check(g,t,dims,origin,store));
+    if(!g->dry) xfer_copy(g,t,values,dims,origin,store);
+    return 0;
+}
+static int t_read(G *g, const T *t, A *a, int full) {
+    static const int32_t zero[4]={0,0,0,0};
+    CHECK(t->flags&F_SHAPE,E_TENSOR);
+    TRY(anew(g,a,full?t->m:t->d,t->dtype));
+    return xfer(g,t,a->p,a->n,full?zero:t->p,0);
+}
+static int t_read_region(G *g, const T *t, A *a, const int32_t *dims, const int32_t *origin) {
+    TRY(anew(g,a,dims,t->dtype));
+    return xfer(g,t,a->p,a->n,origin,0);
+}
+/* Memory.write: crouton depth extends to its 32-lane boundary, a narrower 4-D
+ * value is zero padded in depth, then broadcast. A dry value whose shape
+ * depends on non-constant live data (unknown) takes the broadcast path's
+ * scratch bound. */
+static int t_write(G *g, const T *t, const A *v) {
+    int32_t dims[4];
+    CHECK(t->flags&F_SHAPE,E_TENSOR);
+    CHECK(v->dt==t->dtype || (dsize(v->dt)==t->esize && v->dt!=DT_F32 && t->dtype!=DT_F32),E_TENSOR);
+    memcpy(dims,t->d,sizeof dims);
+    if(t->crouton) {
+        int32_t e=(t->d[3]+t->p[3]+31)/32*32;
+        if(e>t->m[3])e=t->m[3];
+        dims[3]=e-t->p[3];
+    }
+    int32_t vn[4];memcpy(vn,v->n,sizeof vn);
+    int pad=!v->scalar && vn[3]<dims[3];
+    int same=!pad;
+    if(v->unknown) same=0;
+    else for(int i=0;i<4;i++) {
+        int32_t have=(pad && i==3)?dims[3]:vn[i];
+        if(have!=dims[i] && have!=1) FAIL(E_SHAPE);
+        if(have!=dims[i]) same=0;
+    }
+    if(same) return xfer(g,t,v->p,dims,t->p,1);
+    A full;TRY(anew(g,&full,dims,t->dtype));
+    if(!g->dry) {
+        size_t es=t->esize,row=(size_t)dims[3]*es;
+        uint8_t *dst=full.p;
+        for(int32_t b=0;b<dims[0];b++)for(int32_t h=0;h<dims[1];h++)for(int32_t w=0;w<dims[2];w++,dst+=row) {
+            int32_t ib=vn[0]==1?0:b,ih=vn[1]==1?0:h,iw=vn[2]==1?0:w;
+            const uint8_t *src=(const uint8_t *)v->p+((((size_t)ib*vn[1]+ih)*vn[2]+iw)*vn[3])*es;
+            if(pad){memcpy(dst,src,(size_t)vn[3]*es);memset(dst+(size_t)vn[3]*es,0,row-(size_t)vn[3]*es);}
+            else if(vn[3]==dims[3])memcpy(dst,src,row);
+            else for(int32_t d=0;d<dims[3];d++)memcpy(dst+d*es,src,es);
+        }
+    }
+    return xfer(g,t,full.p,dims,t->p,1);
+}
+static int t_write_region(G *g, const T *t, const A *v, const int32_t *origin) {
+    CHECK(dsize(v->dt)==t->esize,E_TENSOR);
+    return xfer(g,t,v->p,v->n,origin,1);
+}
+static int read_scalar(G *g, const T *t, int64_t *value) {
+    A a;TRY(t_read(g,t,&a,0));
+    CHECK(count4(a.n)>0 && a.dt!=DT_F32,E_TENSOR);
+    *value=g->dry?0:aget(&a,0);return 0;
+}
+static int read_i32(G *g, const T *t, int32_t **values, size_t *n) {
+    A a;TRY(t_read(g,t,&a,0));
+    CHECK(a.dt==DT_I32 || a.dt==DT_Q32,E_TENSOR);
+    *values=a.p;*n=count4(a.n);return 0;
+}
+/* Element i of a direct constant (pool 5) tensor's dense region, read as
+ * aget would. The constant pool is immutable, so a dry pass may use it to
+ * size data-dependent results exactly. */
+static int const_value(const G *g, const T *t, size_t i, int64_t *v) {
+    if(!(t->flags&F_DIRECT) || !(t->flags&F_SHAPE) || t->pool!=5 || !g->pool[5] || t->dtype==DT_F32) return 0;
+    for(int k=0;k<4;k++)if(t->d[k]<0 || t->p[k]<0 || (int64_t)t->p[k]+t->d[k]>t->m[k]) return 0;
+    if(i>=count4(t->d)) return 0;
+    size_t c[4];
+    for(int k=3;k>=0;k--){c[k]=i%(size_t)t->d[k]+(size_t)t->p[k];i/=(size_t)t->d[k];}
+    uint64_t lin=(((uint64_t)c[0]*t->m[1]+c[1])*t->m[2]+c[2])*t->m[3]+c[3];
+    if((uint64_t)t->offset+(lin+1)*t->esize>g->pool_bytes[5]) return 0;
+    uint32_t raw=0;
+    memcpy(&raw,g->pool[5]+t->offset+lin*t->esize,t->esize);
+    A a={.dt=t->dtype,.p=&raw};
+    *v=aget(&a,0);
+    return 1;
+}
+static int sv_or_scalar(const T *t, int64_t *v) {
+    if(t->flags&F_SCALAR){*v=t->dtype==DT_F32?0:(int32_t)t->scalar;return t->dtype==DT_F32;}
+    return 1;
+}
+static int shape_values_nonnegative(const T *t) {
+    return (t->flags&F_SV) && t->sv[0]>=0 && t->sv[1]>=0 && t->sv[2]>=0 && t->sv[3]>=0;
+}
+
+/* ---------------------------------------------------------------- arguments */
+static int call_args(G *g, uint32_t func, int64_t *args, uint32_t used) {
+    const uint8_t *found=NULL;
+    for(uint32_t i=0;i<g->ncalls;i++) {
+        const uint8_t *r=g->calls+(size_t)i*CALL_BYTES;
+        if(rd32(r)==func){CHECK(!found,E_ARGS);found=r;}
+    }
+    CHECK(found,E_ARGS);
+    uint32_t mask=rd32(found+4);
+    for(uint32_t j=0;j<10;j++) {
+        uint64_t v=rd64(found+8+8*j);
+        if(used&(1u<<j)) CHECK(!(mask&(1u<<j)),E_ARGS);
+        args[j]=(int64_t)v;
+    }
+    return 0;
+}
+static uint32_t fv(const G *g, uint32_t i) {return rd32(g->fv+(size_t)i*4u);}
+static int shift_ok(int64_t s) {return s>=0 && s<=48;}
+static int small(const int64_t *r, uint32_t mask) {
+    for(int j=0;j<10;j++)if((mask&(1u<<j)) && (uint64_t)r[j]>=(1ull<<40))return 0;
+    return 1;
+}
+
+/* ------------------------------------------------------------------ kernels */
+static int k_input_slice_pad(G *g) {
+    CHECK(g->nin==7 && g->nout==1 && g->io<2 && g->io<g->call->input_count,E_ARGS);
+    const T *pb=in(g,0),*st=in(g,1),*os=in(g,2),*fl=in(g,3),*is=in(g,6),*o=out0(g);
+    CHECK((pb->flags&st->flags&os->flags&is->flags&F_SV),E_ARGS);
+    CHECK(shape_values_nonnegative(os) && shape_values_nonnegative(is),E_ARGS);
+    int64_t fill=0;
+    if(fl->flags&F_SCALAR)CHECK(!sv_or_scalar(fl,&fill),E_ARGS);
+    else CHECK(fl->flags&F_SV && !fl->sv[0] && !fl->sv[1] && !fl->sv[2] && !fl->sv[3],E_ARGS);
+    const Nprg2ExecBuffer *input=&g->call->inputs[g->io];
+    const uint8_t *img=input->data;
+    CHECK(img && o->dtype==DT_U8 && input->bytes==count4(is->sv),E_ARGS);
+    A a;TRY(anew(g,&a,os->sv,DT_U8));
+    if(!g->dry) {
+        memset(a.p,(uint8_t)fill,count4(a.n));
+        int32_t lo[4],s0[4],s1[4];
+        for(int i=0;i<4;i++) {
+            lo[i]=st->sv[i]-pb->sv[i];
+            s0[i]=lo[i]>0?lo[i]:0;
+            s1[i]=lo[i]+os->sv[i]<is->sv[i]?lo[i]+os->sv[i]:is->sv[i];
+            if(s1[i]<s0[i])s1[i]=s0[i];
+        }
+        uint8_t *dst=a.p;
+        for(int32_t b=s0[0];b<s1[0];b++)for(int32_t h=s0[1];h<s1[1];h++)for(int32_t w=s0[2];w<s1[2];w++) {
+            size_t si=(((size_t)b*is->sv[1]+h)*is->sv[2]+w)*is->sv[3];
+            size_t di=(((size_t)(b-lo[0])*a.n[1]+(h-lo[1]))*a.n[2]+(w-lo[2]))*a.n[3];
+            memcpy(dst+di+(s0[3]-lo[3]),img+si+s0[3],s1[3]-s0[3]);
+        }
+    }
+    return t_write(g,o,&a);
+}
+static int k_input_slice(G *g) {
+    CHECK(g->nout==1 && (g->io==2 || g->io==3) && g->io<g->call->input_count,E_ARGS);
+    const T *o=out0(g);
+    const Nprg2ExecBuffer *input=&g->call->inputs[g->io];
+    CHECK(o->flags&F_SHAPE,E_TENSOR);
+    for(int i=0;i<4;i++)CHECK(o->d[i]>=0,E_SHAPE);
+    CHECK(input->data && o->dtype==DT_F32 && input->bytes==count4(o->d)*4,E_ARGS);
+    A a={{o->d[0],o->d[1],o->d[2],o->d[3]},DT_F32,0,0,(void *)input->data};
+    return t_write(g,o,&a);
+}
+static int k_weights_to_vtcm(G *g) {
+    CHECK(g->nin==1 && g->nout==1,E_ARGS);
+    const T *s=in(g,0),*d=out0(g);
+    CHECK((s->flags&d->flags&F_DIRECT) && s->pool<7 && d->pool<7 && g->pool[s->pool] && g->pool[d->pool],E_TENSOR);
+    for(int i=0;i<4;i++)CHECK(s->m[i]>=0 && d->m[i]>=0,E_SHAPE);
+    size_t ns=count4(s->m)*s->esize,nd=count4(d->m)*d->esize,n=ns<nd?ns:nd;
+    CHECK(s->offset+(uint64_t)n<=g->pool_bytes[s->pool] && d->offset+(uint64_t)n<=g->write_limit[d->pool],E_RANGE);
+    if(!g->dry)memmove(g->pool[d->pool]+d->offset,g->pool[s->pool]+s->offset,n);
+    return 0;
+}
+static int k_im2col(G *g) {
+    CHECK(g->nin==3 && g->nout==1,E_ARGS);
+    const T *i=in(g,0),*k=in(g,1),*s=in(g,2),*o=out0(g);
+    CHECK(k->flags&s->flags&F_SV,E_ARGS);
+    A x;TRY(t_read(g,i,&x,0));
+    CHECK(x.n[0]==1,E_SHAPE);
+    int32_t kh=k->sv[0],kw=k->sv[1],cin=k->sv[2],sh=s->sv[1],sw=s->sv[2],oh=o->d[1],ow=o->d[2];
+    CHECK(sh>0 && sw>0 && cin<=x.n[3] && kh>0 && kw>0 && cin>=0,E_ARGS);
+    CHECK(oh>=0 && ow>=0,E_SHAPE);
+    CHECK((kh-1)+sh*(oh-1)<x.n[1] && (kw-1)+sw*(ow-1)<x.n[2],E_SHAPE);
+    int32_t depth=kh*kw*cin,keep=o->d[3]<depth?o->d[3]:depth;
+    int32_t n[4]={1,oh,ow,keep};
+    A r;TRY(anew(g,&r,n,x.dt));
+    if(!g->dry) {
+        size_t es=dsize(x.dt);
+        for(int32_t h=0;h<oh;h++)for(int32_t w=0;w<ow;w++) {
+            uint8_t *dst=(uint8_t *)r.p+((size_t)h*ow+w)*keep*es;
+            int32_t col=0;
+            for(int32_t y=0;y<kh && col<keep;y++)for(int32_t xx=0;xx<kw && col<keep;xx++) {
+                int32_t nn=cin<keep-col?cin:keep-col;
+                size_t si=((size_t)(y+sh*h)*x.n[2]+(xx+sw*w))*x.n[3];
+                if(es==1){const uint8_t *src=(const uint8_t *)x.p+si;for(int32_t ch=0;ch<nn;ch++)dst[col+ch]=src[ch];}
+                else memcpy(dst+col*es,(const uint8_t *)x.p+si*es,(size_t)nn*es);
+                col+=nn;
+            }
+        }
+    }
+    return t_write(g,o,&r);
+}
+static int k_space_to_depth(G *g) {
+    CHECK(g->nin>=1 && g->nout==1,E_ARGS);
+    const T *i=in(g,0),*o=out0(g);
+    int32_t ph=i->p[1],pw=i->p[2],oh=o->d[1],oc=o->d[3],ci=i->m[3];
+    int32_t ow=(i->m[2]-pw)/2;
+    if(o->m[2]<ow)ow=o->m[2];
+    CHECK(i->dtype==DT_U8 && i->m[0]>=1 && oh>0 && ow>0 && ph+2*(oh-1)+1<i->m[1] && pw+2*(ow-1)<i->m[2] && pw>=1,E_SHAPE);
+    int32_t rd[4]={1,2*oh,2*ow,ci},ro[4]={0,ph,pw-1,0};
+    A xf;TRY(t_read_region(g,i,&xf,rd,ro));
+    ph=0;pw=1;
+    int32_t n[4]={1,oh,ow,oc};
+    A r;TRY(anew(g,&r,n,DT_U8));
+    for(int dy=0;dy<2;dy++)for(int dx=0;dx<2;dx++)for(int32_t cb=0;cb<(ci+31)/32;cb++) {
+        int32_t j=cb*4+2*dy+dx;
+        if(32*j>=oc)continue;
+        int32_t width=32;
+        if(32*j+width>oc)width=oc-32*j;
+        int32_t src_width=ci-32*cb<32?ci-32*cb:32;
+        CHECK(width==src_width,E_SHAPE);
+    }
+    if(!g->dry) {
+        memset(r.p,0,count4(n));
+        const uint8_t *s=xf.p;uint8_t *d=r.p;
+        for(int dy=0;dy<2;dy++)for(int dx=0;dx<2;dx++)for(int32_t cb=0;cb<(ci+31)/32;cb++) {
+            int32_t j=cb*4+2*dy+dx;
+            if(32*j>=oc)continue;
+            int32_t width=32;
+            if(32*j+width>oc)width=oc-32*j;
+            for(int32_t h=0;h<oh;h++)for(int32_t w=0;w<ow;w++)
+                memcpy(d+((size_t)h*ow+w)*oc+32*j,s+((size_t)(ph+2*h+dy)*xf.n[2]+(pw+2*w-dx))*ci+32*cb,width);
+        }
+    }
+    static const int32_t zero[4]={0,0,0,0};
+    return t_write_region(g,o,&r,zero);
+}
+
+/* Elementwise helpers: binary broadcasting as NumPy for two 4-D arrays. */
+static int bshape(const A *a, const A *b, int32_t *n) {
+    for(int i=0;i<4;i++) {
+        if(a->n[i]==b->n[i] || b->n[i]==1)n[i]=a->n[i];
+        else if(a->n[i]==1)n[i]=b->n[i];
+        else return E_SHAPE;
+    }
+    return 0;
+}
+static size_t bindex(const int32_t *have, int32_t b, int32_t h, int32_t w, int32_t d) {
+    return (((size_t)(have[0]==1?0:b)*have[1]+(have[1]==1?0:h))*have[2]+(have[2]==1?0:w))*have[3]+(have[3]==1?0:d);
+}
+static int64_t f_add_u8(int64_t a,int64_t b,const int64_t *k){return (a*k[0]+b*k[1]+((int64_t)1<<(k[2]-1)))>>k[2];}
+static int64_t f_add_u16(int64_t a,int64_t b,const int64_t *k){return (a*k[0]+b*k[1]+((int64_t)1<<k[2]))>>(k[2]+1);}
+static int64_t f_addsub_u16(int64_t a,int64_t b,const int64_t *k){return (a*k[0]-b*k[1]+k[3])>>k[2];}
+static int64_t f_add1111(int64_t x,int64_t s,const int64_t *k){return (x*k[0]+s*k[1]+k[3])>>k[2];}
+static inline int64_t mul_u16(int64_t a, int64_t b, int64_t P1, int64_t zb, int64_t za, int64_t K, int64_t P2) {
+    int64_t D=s32((uint64_t)(a*b)+(uint64_t)K-(uint64_t)(b*(zb&0xffff)+a*(za&0xffff)));
+    int64_t lo=P1&0xffff,hi=s32((uint64_t)P1)>>16;
+    int64_t e=(D*lo)>>16;
+    int64_t q=clip64((2*e+2*D*hi)>>16,-2147483648LL,2147483647LL);
+    int64_t s=clip64(q+s32((uint64_t)P2),-2147483648LL,2147483647LL);
+    return clip64((s+4)>>3,0,65535);
+}
+static int64_t f_mul_u16(int64_t a,int64_t b,const int64_t *k){return mul_u16(a,b,k[0],k[1],k[2],k[3],k[4]);}
+static int64_t f_addsub_flat(int64_t a,int64_t b,const int64_t *k){return (a*k[0]+k[4]*b*k[1]+2*k[3]+((int64_t)1<<k[2]))>>(k[2]+1);}
+#define BINARY_BODY(F) do { \
+    int32_t n[4];TRY(bshape(a,b,n)); \
+    int32_t *ia,*ib;TRY(to_i32(g,a,&ia));TRY(to_i32(g,b,&ib)); \
+    A r;TRY(anew(g,&r,n,odt)); \
+    if(!g->dry) { \
+        int64_t hi=dtmax(odt); \
+        size_t total=count4(n); \
+        int same=!memcmp(a->n,n,16) && !memcmp(b->n,n,16),scalar=!memcmp(a->n,n,16) && count4(b->n)==1; \
+        if(same||scalar) { \
+            if(odt==DT_U16){uint16_t *o=r.p;for(size_t k2=0;k2<total;k2++)o[k2]=(uint16_t)clip64(F(ia[k2],ib[scalar?0:k2],k),0,hi);} \
+            else if(odt==DT_U8){uint8_t *o=r.p;for(size_t k2=0;k2<total;k2++)o[k2]=(uint8_t)clip64(F(ia[k2],ib[scalar?0:k2],k),0,hi);} \
+            else for(size_t k2=0;k2<total;k2++)from_i64(&r,k2,clip64(F(ia[k2],ib[scalar?0:k2],k),0,hi)); \
+        } else { \
+            size_t k2=0; \
+            for(int32_t i0=0;i0<n[0];i0++)for(int32_t i1=0;i1<n[1];i1++)for(int32_t i2=0;i2<n[2];i2++)for(int32_t i3=0;i3<n[3];i3++,k2++) \
+                from_i64(&r,k2,clip64(F(ia[bindex(a->n,i0,i1,i2,i3)],ib[bindex(b->n,i0,i1,i2,i3)],k),0,hi)); \
+        } \
+    } \
+    return t_write(g,o,&r); } while(0)
+#define DEFINE_BINARY(NAME,F) static int NAME(G *g, const A *a, const A *b, const int64_t *k, uint32_t odt, const T *o) { BINARY_BODY(F); }
+DEFINE_BINARY(b_add_u8,f_add_u8)
+DEFINE_BINARY(b_add_u16,f_add_u16)
+DEFINE_BINARY(b_addsub_u16,f_addsub_u16)
+DEFINE_BINARY(b_add1111,f_add1111)
+DEFINE_BINARY(b_mul_u16,f_mul_u16)
+DEFINE_BINARY(b_addsub_flat,f_addsub_flat)
+
+static int read2(G *g, A *a, A *b) {
+    NEED(2);
+    TRY(t_read(g,in(g,0),a,0));
+    return t_read(g,in(g,1),b,0);
+}
+static int k_add_u8(G *g) {
+    int64_t r[10],k[4];
+    TRY(call_args(g,QDR_CALL_ELEMENTWISE_ADD_CROUTON_U8,r,0x1f0));
+    CHECK(r[7]==0 && small(r,0x70),E_UNSUPPORTED);
+    k[0]=r[4];k[1]=r[5];k[2]=r[6]+8;
+    CHECK(shift_ok(k[2]) && k[2]>=1,E_ARGS);
+    A a,b;TRY(read2(g,&a,&b));
+    if(!memcmp(a.n,b.n,16) && a.dt==DT_U8 && b.dt==DT_U8 && k[0]>=0 && k[1]>=0 && k[2]<=31 &&
+       ((uint64_t)k[0]+(uint64_t)k[1])*255+(1ull<<(k[2]-1))<=0xffffffffull) {
+        A o;TRY(anew(g,&o,a.n,DT_U8));
+        if(!g->dry) {
+            uint32_t ma=(uint32_t)k[0],mb=(uint32_t)k[1],rd=1u<<(k[2]-1),s=(uint32_t)k[2];
+            const uint8_t *pa=a.p,*pb=b.p;uint8_t *po=o.p;
+            for(size_t i=0,n=count4(a.n);i<n;i++){uint32_t v=(pa[i]*ma+pb[i]*mb+rd)>>s;po[i]=(uint8_t)(v>255?255:v);}
+        }
+        return t_write(g,out0(g),&o);
+    }
+    return b_add_u8(g,&a,&b,k,DT_U8,out0(g));
+}
+static int k_add_u16(G *g) {
+    int64_t r[10],k[3];
+    TRY(call_args(g,QDR_CALL_ELEMENTWISE_ADD_CROUTON_U16,r,0x1f0));
+    CHECK(r[7]==0 && small(r,0x70) && shift_ok(r[6]),E_ARGS);
+    k[0]=r[4];k[1]=r[5];k[2]=r[6];
+    A a,b;TRY(read2(g,&a,&b));
+    return b_add_u16(g,&a,&b,k,DT_U16,out0(g));
+}
+static int k_addsub_u16(G *g) {
+    int64_t r[10],k[4];
+    TRY(call_args(g,QDR_CALL_ELEMENTWISE_ADDSUB_CROUTON_U16,r,0x70));
+    const T *o=out0(g);
+    CHECK(small(r,0x70) && shift_ok(r[6]+1),E_ARGS);
+    k[0]=r[4];k[1]=r[5];k[2]=r[6]+1;k[3]=((int64_t)o->zp<<k[2])+((int64_t)1<<r[6])+1;
+    A a,b;TRY(read2(g,&a,&b));
+    return b_addsub_u16(g,&a,&b,k,DT_U16,o);
+}
+static int k_add1111_u16(G *g) {
+    int64_t r[10],k[4],s;
+    NEED(2);
+    TRY(call_args(g,QDR_CALL_ELEMENTWISE_ADD1111_CROUTON_U16,r,0xf0));
+    CHECK(small(r,0x70) && shift_ok(r[6]+1),E_ARGS);
+    k[0]=r[4];k[1]=r[5];k[2]=r[6]+1;k[3]=2*s32((uint64_t)r[7])+((int64_t)1<<r[6]);
+    A x;TRY(t_read(g,in(g,0),&x,0));
+    TRY(read_scalar(g,in(g,1),&s));
+    int32_t sv=(int32_t)s;
+    A b={{1,1,1,1},DT_I32,1,0,&sv};
+    return b_add1111(g,&x,&b,k,DT_U16,out0(g));
+}
+static int k_mul_u16(G *g) {
+    int64_t r[10],k[5];
+    TRY(call_args(g,QDR_CALL_ELEMENTWISE_MUL_CROUTON_U16,r,0x1f0));
+    k[0]=r[4];k[1]=r[5];k[2]=r[6];k[3]=r[7];k[4]=r[8];
+    A a,b;TRY(read2(g,&a,&b));
+    return b_mul_u16(g,&a,&b,k,DT_U16,out0(g));
+}
+static int k_mul1111_u16(G *g) {
+    int64_t r[10],k[5],s;
+    NEED(2);
+    TRY(call_args(g,QDR_CALL_ELEMENTWISE_MUL1111_CROUTON_U16,r,0x1f0));
+    k[0]=r[4];k[1]=r[5];k[2]=r[6];k[3]=r[7];k[4]=r[8];
+    A x;TRY(t_read(g,in(g,0),&x,0));
+    TRY(read_scalar(g,in(g,1),&s));
+    if(!g->dry)CHECK(s>=INT32_MIN && s<=INT32_MAX,E_ARGS);
+    int32_t sv=(int32_t)s;
+    A b={{1,1,1,1},DT_I32,1,0,&sv};
+    return b_mul_u16(g,&x,&b,k,DT_U16,out0(g));
+}
+static int k_mul_inline(G *g) {
+    CHECK(g->nin==3,E_ARGS);
+    NEED(3);
+    int32_t *p;size_t np;int64_t s,k[5]={0,0,0,0,0};
+    TRY(read_i32(g,in(g,2),&p,&np));
+    CHECK(np>=6,E_ARGS);
+    if(!g->dry) {
+        uint64_t z=(uint32_t)p[3];
+        k[0]=p[2];k[1]=(int64_t)(z&65535);k[2]=(int64_t)(z>>16);k[3]=p[4];k[4]=p[5];
+    }
+    A x;TRY(t_read(g,in(g,0),&x,0));
+    TRY(read_scalar(g,in(g,1),&s));
+    if(!g->dry)CHECK(s>=INT32_MIN && s<=INT32_MAX,E_ARGS);
+    int32_t sv=(int32_t)s;
+    A b={{1,1,1,1},DT_I32,1,0,&sv};
+    return b_mul_u16(g,&x,&b,k,DT_U16,out0(g));
+}
+static int k_addsub_flat(G *g) {
+    CHECK(g->ncalls>=1,E_ARGS);
+    uint32_t fn=rd32(g->calls);
+    CHECK(fn==QDR_CALL_ELEMENTWISE_SUB_FLAT_U16 || fn==QDR_CALL_ELEMENTWISE_ADD_FLAT_U16,E_ARGS);
+    int64_t r[10],k[5];
+    uint32_t mask=rd32(g->calls+4);
+    for(int j=0;j<10;j++)r[j]=(int64_t)rd64(g->calls+8+8*j);
+    CHECK(!(mask&0xf0) && small(r,0x70) && shift_ok(r[6]+1),E_ARGS);
+    k[0]=r[4];k[1]=r[5];k[2]=r[6];k[3]=s32((uint64_t)r[7]);k[4]=fn==QDR_CALL_ELEMENTWISE_SUB_FLAT_U16?-1:1;
+    A a,b;TRY(read2(g,&a,&b));
+    return b_addsub_flat(g,&a,&b,k,DT_U16,out0(g));
+}
+static int k_addsub_inline(G *g) {
+    CHECK(g->nin==3,E_ARGS);
+    NEED(3);
+    int32_t *p;size_t np;int64_t k[4]={0,0,1,0};
+    TRY(read_i32(g,in(g,2),&p,&np));
+    CHECK(np>=5,E_ARGS);
+    const T *o=out0(g);
+    if(!g->dry) {
+        int64_t sh=(int64_t)p[4]>>16;
+        CHECK(shift_ok(sh+1),E_ARGS);
+        k[0]=(int64_t)p[1]>>16;k[1]=p[2];k[2]=sh+1;k[3]=((int64_t)o->zp<<(sh+1))+((int64_t)1<<sh)+1;
+    }
+    A a,b;TRY(read2(g,&a,&b));
+    return b_addsub_u16(g,&a,&b,k,DT_U16,o);
+}
+static int k_requant_u8(G *g) {
+    int64_t r[10];
+    NEED(1);
+    TRY(call_args(g,QDR_CALL_REQUANTIZE_CROUTON_U8,r,0x38));
+    CHECK(r[4]==0 && r[5]==0 && small(r,0x8),E_UNSUPPORTED);
+    int64_t m=r[3]&0xffff,s=15-(r[3]>>24);
+    CHECK(s>=1 && s<=31,E_ARGS);
+    A x;TRY(t_read(g,in(g,0),&x,0));
+    CHECK(x.dt==DT_U8,E_TENSOR);
+    A o;TRY(anew(g,&o,x.n,DT_U8));
+    if(!g->dry) {
+        uint32_t mm=(uint32_t)m,rd=1u<<(s-1),ss=(uint32_t)s;
+        const uint8_t *px=x.p;uint8_t *po=o.p;
+        for(size_t i=0,n=count4(x.n);i<n;i++){uint32_t v=(px[i]*mm+rd)>>ss;po[i]=(uint8_t)(v>255?255:v);}
+    }
+    return t_write(g,out0(g),&o);
+}
+static int k_requant_u16(G *g) {
+    int64_t r[10];
+    NEED(1);
+    TRY(call_args(g,QDR_CALL_REQUANTIZE_CROUTON_U16,r,0x18));
+    CHECK(small(r,0x18),E_ARGS);
+    int64_t m=r[3]&0xffff,s=15-(r[3]>>24),zin=r[4]&0xffff,zout=r[4]>>16;
+    CHECK(s>=1 && s<=48,E_ARGS);
+    A x;TRY(t_read(g,in(g,0),&x,0));
+    int32_t *v;TRY(to_i32(g,&x,&v));
+    A o;TRY(anew(g,&o,x.n,DT_U16));
+    if(!g->dry) {
+        uint16_t *po=o.p;
+        for(size_t i=0,n=count4(x.n);i<n;i++)po[i]=(uint16_t)clip64((((v[i]-zin)*m+((int64_t)1<<(s-1)))>>s)+zout,0,65535);
+    }
+    return t_write(g,out0(g),&o);
+}
+static int k_linearclip(G *g) {
+    CHECK(g->nin==2,E_ARGS);
+    NEED(2);
+    const T *i=in(g,0),*o=out0(g);
+    int32_t *p;size_t np;
+    TRY(read_i32(g,in(g,1),&p,&np));
+    A x;TRY(t_read(g,i,&x,0));
+    int32_t *v;TRY(to_i32(g,&x,&v));
+    A r;TRY(anew(g,&r,x.n,o->dtype));
+    if(i->dtype==DT_U8 && o->dtype==DT_U16) CHECK(np>=2,E_ARGS);
+    else CHECK(np>=12,E_ARGS);
+    if(!g->dry) {
+        int64_t hi=dtmax(o->dtype);
+        size_t n=count4(x.n);
+        if(i->dtype==DT_U8 && o->dtype==DT_U16) {
+            int64_t m=p[1]&0xffff,sh=7-((int64_t)p[1]>>16);
+            CHECK(sh>=1 && sh<=48,E_ARGS);
+            for(size_t j=0;j<n;j++)from_i64(&r,j,clip64((v[j]*m+((int64_t)1<<(sh-1)))>>sh,0,hi));
+        } else {
+            int64_t P=(uint32_t)p[10],zp=(uint32_t)p[11],m=P&0xffff,sh=15-(P>>24);
+            if(p[6]<0)m=-m;
+            if(i->dtype==DT_U8) {
+                CHECK(sh==14 && zp==0 && m>=0,E_UNSUPPORTED);
+                for(size_t j=0;j<n;j++)from_i64(&r,j,clip64((((v[j]*m+128)>>8)+32)>>6,0,hi));
+            } else {
+                CHECK(sh>=1 && sh<=48,E_ARGS);
+                int64_t zin=zp&0xffff,zout=zp>>16;
+                for(size_t j=0;j<n;j++)from_i64(&r,j,clip64((((v[j]-zin)*m+((int64_t)1<<(sh-1)))>>sh)+zout,0,hi));
+            }
+        }
+    }
+    return t_write(g,o,&r);
+}
+static int k_copy_values(G *g) {
+    CHECK(g->nin>=1 && g->nout==1,E_ARGS);
+    const T *o=out0(g);
+    A x;TRY(t_read(g,in(g,0),&x,0));
+    CHECK(o->flags&F_SHAPE,E_TENSOR);
+    CHECK(count4(x.n)==count4(o->d),E_SHAPE);
+    memcpy(x.n,o->d,16);
+    CHECK(x.dt==o->dtype,E_TENSOR);
+    return t_write(g,o,&x);
+}
+static int k_copy_activation(G *g) {
+    static const int32_t zero[4]={0,0,0,0};
+    NEED(1);
+    const T *i=in(g,0),*o=out0(g);
+    CHECK(i->dtype==o->dtype,E_TENSOR);
+    A x;TRY(t_read(g,i,&x,1));
+    return t_write_region(g,o,&x,zero);
+}
+static int k_transpose(G *g) {
+    CHECK(g->nin>=2,E_ARGS);
+    NEED(1);
+    T pt;TRY(input_at(g,g->nin-1,&pt));
+    int32_t *perm;size_t np;
+    TRY(read_i32(g,&pt,&perm,&np));
+    CHECK(np==4,E_ARGS);
+    A x;TRY(t_read(g,in(g,0),&x,0));
+    int32_t known[4];
+    if(g->dry) {
+        int64_t v;
+        for(int i=0;i<4;i++) {
+            if(!const_value(g,&pt,(size_t)i,&v)) {
+                A r;TRY(anew(g,&r,x.n,x.dt));
+                r.unknown=1;
+                return t_write(g,out0(g),&r);
+            }
+            known[i]=(int32_t)v;
+        }
+        perm=known;
+    }
+    int used=0;
+    for(int i=0;i<4;i++){CHECK(perm[i]>=0 && perm[i]<4 && !(used&(1<<perm[i])),E_ARGS);used|=1<<perm[i];}
+    int32_t n[4];for(int i=0;i<4;i++)n[i]=x.n[perm[i]];
+    A r;TRY(anew(g,&r,n,x.dt));
+    if(g->dry) return t_write(g,out0(g),&r);
+    size_t es=dsize(x.dt),st[4]={(size_t)x.n[1]*x.n[2]*x.n[3],(size_t)x.n[2]*x.n[3],(size_t)x.n[3],1},k=0;
+    size_t ps[4]={st[perm[0]],st[perm[1]],st[perm[2]],st[perm[3]]};
+    for(int32_t a=0;a<n[0];a++)for(int32_t b=0;b<n[1];b++)for(int32_t d2=0;d2<n[2];d2++) {
+        size_t base=a*ps[0]+b*ps[1]+d2*ps[2];
+        if(es==1){const uint8_t *s=x.p;uint8_t *d=(uint8_t *)r.p+k;for(int32_t e=0;e<n[3];e++)d[e]=s[base+e*ps[3]];}
+        else if(es==2){const uint16_t *s=x.p;uint16_t *d=(uint16_t *)r.p+k;for(int32_t e=0;e<n[3];e++)d[e]=s[base+e*ps[3]];}
+        else {const uint32_t *s=x.p;uint32_t *d=(uint32_t *)r.p+k;for(int32_t e=0;e<n[3];e++)d[e]=s[base+e*ps[3]];}
+        k+=n[3];
+    }
+    return t_write(g,out0(g),&r);
+}
+static int k_concat(G *g) {
+    CHECK(g->nin>=2 && g->nout>=1,E_ARGS);
+    int64_t axis;
+    CHECK(!sv_or_scalar(in(g,0),&axis),E_ARGS);
+    if(axis<0)axis+=4;
+    CHECK(axis>=0 && axis<4,E_ARGS);
+    int32_t n[4];uint32_t dt=0;
+    for(uint32_t i=1;i<g->nin;i++) {
+        T t;TRY(input_at(g,i,&t));
+        CHECK(t.flags&F_SHAPE,E_TENSOR);
+        if(i==1){memcpy(n,t.d,16);dt=t.dtype;continue;}
+        for(int d=0;d<4;d++)CHECK(d==axis || t.d[d]==n[d],E_SHAPE);
+        CHECK(t.dtype==dt,E_TENSOR);
+        n[axis]+=t.d[axis];
+    }
+    A r;TRY(anew(g,&r,n,dt));
+    size_t es=dsize(r.dt),outer=1,inner=es;
+    for(int d=0;d<axis;d++)outer*=n[d];
+    for(int d=axis+1;d<4;d++)inner*=n[d];
+    size_t at=0;
+    for(uint32_t i=1;i<g->nin;i++) {
+        T t;TRY(input_at(g,i,&t));
+        A part;TRY(t_read(g,&t,&part,0));
+        size_t chunk=inner*part.n[axis];
+        if(!g->dry)for(size_t o=0;o<outer;o++)memcpy((uint8_t *)r.p+o*inner*n[axis]+at,(uint8_t *)part.p+o*chunk,chunk);
+        at+=chunk;
+    }
+    return t_write(g,out0(g),&r);
+}
+static int k_gather(G *g) {
+    CHECK(g->nin==4,E_ARGS);
+    NEED(3);
+    int64_t axis;TRY(read_scalar(g,in(g,1),&axis));
+    int32_t *idx;size_t ni;TRY(read_i32(g,in(g,2),&idx,&ni));
+    A x;TRY(t_read(g,in(g,0),&x,0));
+    if(g->dry && !const_value(g,in(g,1),0,&axis)) {
+        size_t worst=0;
+        for(int a=0;a<4;a++)if(x.n[a]){size_t c=count4(x.n)/(size_t)x.n[a]*ni;if(c>worst)worst=c;}
+        CHECK(worst<=INT32_MAX,E_SHAPE);
+        int32_t n[4]={1,1,1,(int32_t)worst};
+        A r;TRY(anew(g,&r,n,x.dt));
+        r.unknown=1;
+        return t_write(g,out0(g),&r);
+    }
+    if(axis<0)axis+=4;
+    CHECK(axis>=0 && axis<4,E_ARGS);
+    CHECK(ni<=INT32_MAX,E_SHAPE);
+    int32_t n[4];memcpy(n,x.n,16);n[axis]=(int32_t)ni;
+    A r;TRY(anew(g,&r,n,x.dt));
+    size_t es=dsize(x.dt),outer=1,inner=es;
+    for(int d=0;d<axis;d++)outer*=n[d];
+    for(int d=axis+1;d<4;d++)inner*=n[d];
+    if(!g->dry)for(size_t o=0;o<outer;o++)for(size_t j=0;j<ni;j++) {
+        int64_t k=idx[j];
+        if(k<0)k+=x.n[axis];
+        CHECK(k>=0 && k<x.n[axis],E_RANGE);
+        memcpy((uint8_t *)r.p+(o*ni+j)*inner,(uint8_t *)x.p+(o*x.n[axis]+k)*inner,inner);
+    }
+    return t_write(g,out0(g),&r);
+}
+static int k_slice(G *g) {
+    CHECK(g->nin==3,E_ARGS);
+    NEED(3);
+    const T *s=in(g,1),*n=in(g,2);
+    CHECK(s->flags&n->flags&F_SV,E_ARGS);
+    const T *i=in(g,0);
+    int32_t origin[4];
+    for(int k=0;k<4;k++){CHECK(s->sv[k]>=0 && n->sv[k]>=0 && (int64_t)s->sv[k]+n->sv[k]<=i->d[k],E_RANGE);origin[k]=i->p[k]+s->sv[k];}
+    A r;TRY(t_read_region(g,i,&r,n->sv,origin));
+    return t_write(g,out0(g),&r);
+}
+static int k_slice_pad(G *g) {
+    CHECK(g->nin==5,E_ARGS);
+    NEED(5);
+    const T *pad=in(g,1),*st=in(g,2),*sz=in(g,3);
+    CHECK(pad->flags&st->flags&sz->flags&F_SV,E_ARGS);
+    int64_t fill;TRY(read_scalar(g,in(g,4),&fill));
+    A x;TRY(t_read(g,in(g,0),&x,0));
+    CHECK(x.dt!=DT_F32,E_ARGS);
+    A r;TRY(anew(g,&r,sz->sv,x.dt));
+    if(!g->dry) {
+        CHECK(fill>=0 && fill<=dtmax(x.dt),E_ARGS);
+        size_t es=dsize(x.dt),n=count4(r.n);
+        if(es==1)memset(r.p,(uint8_t)fill,n);
+        else for(size_t i=0;i<n;i++)from_i64(&r,i,fill);
+        int32_t lo[4],s0[4],s1[4];
+        for(int i=0;i<4;i++) {
+            lo[i]=st->sv[i]-pad->sv[i];
+            s0[i]=lo[i]>0?lo[i]:0;
+            s1[i]=lo[i]+r.n[i]<x.n[i]?lo[i]+r.n[i]:x.n[i];
+            if(s1[i]<s0[i])s1[i]=s0[i];
+        }
+        for(int32_t b=s0[0];b<s1[0];b++)for(int32_t h=s0[1];h<s1[1];h++)for(int32_t w=s0[2];w<s1[2];w++) {
+            size_t si=(((size_t)b*x.n[1]+h)*x.n[2]+w)*x.n[3]+s0[3];
+            size_t di=(((size_t)(b-lo[0])*r.n[1]+(h-lo[1]))*r.n[2]+(w-lo[2]))*r.n[3]+(s0[3]-lo[3]);
+            memcpy((uint8_t *)r.p+di*es,(uint8_t *)x.p+si*es,(s1[3]-s0[3])*es);
+        }
+    }
+    return t_write(g,out0(g),&r);
+}
+static int k_decimate(G *g) {
+    NEED(2);
+    const T *s=in(g,1);
+    CHECK(g->nin==2 && (s->flags&F_SV),E_ARGS);
+    A x;TRY(t_read(g,in(g,0),&x,0));
+    int32_t n[4];
+    for(int i=0;i<4;i++){CHECK(s->sv[i]>0,E_ARGS);n[i]=(x.n[i]+s->sv[i]-1)/s->sv[i];}
+    A r;TRY(anew(g,&r,n,x.dt));
+    if(!g->dry) {
+        size_t es=dsize(x.dt),k=0;
+        for(int32_t b=0;b<n[0];b++)for(int32_t h=0;h<n[1];h++)for(int32_t w=0;w<n[2];w++)for(int32_t d=0;d<n[3];d++,k++) {
+            size_t si=((((size_t)b*s->sv[0])*x.n[1]+(size_t)h*s->sv[1])*x.n[2]+(size_t)w*s->sv[2])*x.n[3]+(size_t)d*s->sv[3];
+            if(es==1)((uint8_t *)r.p)[k]=((const uint8_t *)x.p)[si];
+            else if(es==2)((uint16_t *)r.p)[k]=((const uint16_t *)x.p)[si];
+            else memcpy((uint8_t *)r.p+k*4,(uint8_t *)x.p+si*4,4);
+        }
+    }
+    return t_write(g,out0(g),&r);
+}
+static int k_resize(G *g) {
+    CHECK(g->nin==3,E_ARGS);
+    NEED(3);
+    int32_t *hp,*wp;size_t nh,nw;
+    TRY(read_i32(g,in(g,1),&hp,&nh));
+    TRY(read_i32(g,in(g,2),&wp,&nw));
+    CHECK(nh>=6 && nw>=6,E_ARGS);
+    A x;TRY(t_read(g,in(g,0),&x,0));
+    const T *o=out0(g);
+    CHECK((o->flags&F_SHAPE) && o->d[1]>=0 && o->d[2]>=0,E_SHAPE);
+    int32_t n[4]={x.n[0],o->d[1],o->d[2],x.n[3]};
+    int32_t *hi=salloc(g,4*(size_t)n[1]+4),*wi=salloc(g,4*(size_t)n[2]+4);
+    CHECK(hi && wi,E_MEMORY);
+    if(!g->dry) {
+        for(int32_t i=0;i<n[1];i++) {
+            int64_t v=(int64_t)((((uint64_t)i*(uint32_t)hp[2])+(uint32_t)hp[4])>>32)+hp[5];
+            if(v<0)v+=x.n[1];
+            CHECK(v>=0 && v<x.n[1],E_RANGE);hi[i]=(int32_t)v;
+        }
+        for(int32_t i=0;i<n[2];i++) {
+            int64_t v=(int64_t)((((uint64_t)i*(uint32_t)wp[2])+(uint32_t)wp[4])>>32)+wp[5];
+            if(v<0)v+=x.n[2];
+            CHECK(v>=0 && v<x.n[2],E_RANGE);wi[i]=(int32_t)v;
+        }
+    }
+    A r;TRY(anew(g,&r,n,x.dt));
+    if(!g->dry) {
+        size_t es=dsize(x.dt),row=(size_t)n[3]*es;
+        for(int32_t b=0;b<n[0];b++)for(int32_t h=0;h<n[1];h++)for(int32_t w=0;w<n[2];w++)
+            memcpy((uint8_t *)r.p+(((size_t)b*n[1]+h)*n[2]+w)*row,(uint8_t *)x.p+(((size_t)b*x.n[1]+hi[h])*x.n[2]+wi[w])*row,row);
+    }
+    return t_write(g,o,&r);
+}
+static int k_depth_to_space(G *g) {
+    CHECK(g->nin==2,E_ARGS);
+    NEED(2);
+    int32_t *f;size_t nf;
+    TRY(read_i32(g,in(g,1),&f,&nf));
+    CHECK(nf==2,E_ARGS);
+    A x;TRY(t_read(g,in(g,0),&x,0));
+    int32_t known[2];
+    if(g->dry) {
+        int64_t v0,v1;
+        if(!const_value(g,in(g,1),0,&v0) || !const_value(g,in(g,1),1,&v1)) {
+            A r;TRY(anew(g,&r,x.n,x.dt));
+            r.unknown=1;
+            return t_write(g,out0(g),&r);
+        }
+        known[0]=(int32_t)v0;known[1]=(int32_t)v1;
+        f=known;
+    }
+    CHECK(f[0]>0 && f[1]>0,E_ARGS);
+    int32_t rh=f[0],rw=f[1];
+    CHECK(x.n[3]%(rh*rw)==0,E_SHAPE);
+    int32_t cc=x.n[3]/(rh*rw),n[4]={x.n[0],x.n[1]*rh,x.n[2]*rw,cc};
+    A r;TRY(anew(g,&r,n,x.dt));
+    if(g->dry) return t_write(g,out0(g),&r);
+    size_t es=dsize(x.dt);
+    for(int32_t b=0;b<x.n[0];b++)for(int32_t h=0;h<x.n[1];h++)for(int32_t i=0;i<rh;i++)
+        for(int32_t w=0;w<x.n[2];w++)for(int32_t j=0;j<rw;j++) {
+            size_t si=((((size_t)b*x.n[1]+h)*x.n[2]+w)*x.n[3]+(size_t)(i*rw+j)*cc);
+            size_t di=((((size_t)b*n[1]+h*rh+i)*n[2]+w*rw+j)*cc);
+            memcpy((uint8_t *)r.p+di*es,(uint8_t *)x.p+si*es,cc*es);
+        }
+    return t_write(g,out0(g),&r);
+}
+static int k_spill_fill(G *g, int spill) {
+    CHECK(g->nfv>=4,E_ARGS);
+    uint64_t offset=fv(g,3);
+    for(uint32_t i=4;i+1<g->nfv;i+=2) {
+        uint32_t p=fv(g,i),n=fv(g,i+1),pool=p&0x7ff,addr=p&~0x7ffu;
+        CHECK(pool<7 && pool!=SPILL_POOL && g->pool[pool] && g->pool[SPILL_POOL],E_RANGE);
+        CHECK((uint64_t)addr+n<=g->pool_bytes[pool] && offset+n<=g->pool_bytes[SPILL_POOL],E_RANGE);
+        if(spill)CHECK(offset+n<=g->write_limit[SPILL_POOL],E_RANGE);
+        else CHECK((uint64_t)addr+n<=g->write_limit[pool],E_RANGE);
+        if(!g->dry) {
+            uint8_t *dst=spill?g->pool[SPILL_POOL]+offset:g->pool[pool]+addr;
+            const uint8_t *src=spill?g->pool[pool]+addr:g->pool[SPILL_POOL]+offset;
+            memmove(dst,src,n);
+        }
+        offset+=n;
+    }
+    return 0;
+}
+static int k_output_slice(G *g) {
+    CHECK(g->nin==4 && g->io<2 && g->io<g->call->output_count,E_ARGS);
+    const T *sh=in(g,1),*st=in(g,2);
+    CHECK(sh->flags&st->flags&F_SV,E_ARGS);
+    CHECK(shape_values_nonnegative(sh),E_ARGS);
+    A x;TRY(t_read(g,in(g,0),&x,0));
+    size_t es=dsize(x.dt);
+    const Nprg2ExecBuffer *output=&g->call->outputs[g->io];
+    CHECK(output->data && output->bytes==count4(sh->sv)*es,E_ARGS);
+    for(int i=0;i<4;i++)CHECK(st->sv[i]>=0 && (int64_t)st->sv[i]+x.n[i]<=sh->sv[i],E_RANGE);
+    if(g->dry) return 0;
+    uint8_t *o=output->data;
+    for(int32_t b=0;b<x.n[0];b++)for(int32_t h=0;h<x.n[1];h++)for(int32_t w=0;w<x.n[2];w++) {
+        size_t di=((((size_t)b+st->sv[0])*sh->sv[1]+h+st->sv[1])*sh->sv[2]+w+st->sv[2])*sh->sv[3]+st->sv[3];
+        memcpy(o+di*es,(uint8_t *)x.p+(((size_t)b*x.n[1]+h)*x.n[2]+w)*x.n[3]*es,x.n[3]*es);
+    }
+    return 0;
+}
+static int k_quantize(G *g) {
+    NEED(1);
+    const T *o=out0(g);
+    A x;TRY(t_read(g,in(g,0),&x,0));
+    CHECK(x.dt==DT_F32 && o->dtype==DT_U16 && (o->flags&F_QUANT),E_TENSOR);
+    A r;TRY(anew(g,&r,x.n,DT_U16));
+    if(!g->dry) {
+        double inv=(double)(float)(1.0/o->scale);
+        const float *s=x.p;uint16_t *d=r.p;
+        for(size_t i=0,n=count4(x.n);i<n;i++) {
+            double v=floor((double)s[i]*inv+0.5)+o->zp;
+            d[i]=(uint16_t)(v<0?0:v>65535?65535:v);
+        }
+    }
+    return t_write(g,o,&r);
+}
+static int k_dequantize(G *g) {
+    NEED(1);
+    const T *i=in(g,0);
+    A x;TRY(t_read(g,i,&x,0));
+    int32_t *v;TRY(to_i32(g,&x,&v));
+    A r;TRY(anew(g,&r,x.n,DT_F32));
+    if(!g->dry) {
+        double sc=(double)(float)i->scale;
+        float *d=r.p;
+        for(size_t j=0,n=count4(x.n);j<n;j++) {
+            double exact=((double)v[j]-i->zp)*sc;
+            float rounded=(float)exact;
+            float away=nextafterf(rounded,exact<0?-INFINITY:INFINITY);
+            d[j]=exact==((double)rounded+(double)away)*0.5?away:rounded;
+        }
+    }
+    return t_write(g,out0(g),&r);
+}
+static int k_sign(G *g) {
+    NEED(1);
+    const T *i=in(g,0),*o=out0(g);
+    A x;TRY(t_read(g,i,&x,0));
+    int32_t *v;TRY(to_i32(g,&x,&v));
+    A r;TRY(anew(g,&r,x.n,o->dtype));
+    if(!g->dry)for(size_t j=0,n=count4(x.n);j<n;j++) {
+        int64_t d=(int64_t)v[j]-i->zp,s=d>0?1:d<0?-1:0;
+        double y=floor((double)s/o->scale+o->zp+0.5);
+        from_i64(&r,j,y<0?0:y>65535?65535:(int64_t)y);
+    }
+    return t_write(g,o,&r);
+}
+static int k_mean(G *g) {
+    NEED(1);
+    const T *i=in(g,0),*o=out0(g);
+    A x;TRY(t_read(g,i,&x,0));
+    CHECK(count4(x.n)==32 && i->zp==o->zp && i->scale==o->scale,E_UNSUPPORTED);
+    int32_t one[4]={1,1,1,1};
+    A r;TRY(anew(g,&r,one,o->dtype));r.scalar=1;
+    if(!g->dry){int64_t s=0;for(size_t j=0;j<32;j++)s+=aget(&x,j);from_i64(&r,0,clip64((s+33)>>5,0,65535));}
+    return t_write(g,o,&r);
+}
+static float f32_from_bits(uint32_t b){float f;memcpy(&f,&b,4);return f;}
+static uint32_t f32_bits(float f){uint32_t b;memcpy(&b,&f,4);return b;}
+static int k_weight_scales(G *g) {
+    NEED(1);
+    const T *i=in(g,0),*o=out0(g);
+    A x;TRY(t_read(g,i,&x,0));
+    CHECK(x.dt==DT_U8 && o->dtype==DT_F32,E_TENSOR);
+    int32_t co=x.n[3];
+    CHECK(co>0 && (size_t)co==count4(o->d),E_SHAPE);
+    A r;TRY(anew(g,&r,o->d,DT_F32));
+    if(!g->dry) {
+        size_t rows=count4(x.n)/co;
+        for(int32_t k=0;k<co;k++) {
+            int32_t mn=INT32_MAX,mx=INT32_MIN;
+            for(size_t j=0;j<rows;j++){int32_t v=((uint8_t *)x.p)[j*co+k]-i->zp;if(v<mn)mn=v;if(v>mx)mx=v;}
+            int32_t a=-127*mn>128*mx?-127*mn:128*mx;
+            float s=(float)a/(float)16256;
+            if(!(s>=1.0f))s=s!=s?s:1.0f;
+            ((float *)r.p)[k]=f32_from_bits((f32_bits(s)+0x800u)&0xfffff000u);
+        }
+    }
+    return t_write(g,o,&r);
+}
+static int k_invscale(G *g) {
+    NEED(1);
+    const T *o=out0(g);
+    A x;TRY(t_read(g,in(g,0),&x,0));
+    CHECK(x.dt==DT_F32 && (o->dtype==DT_Q32 || o->dtype==DT_I32),E_TENSOR);
+    A r;TRY(anew(g,&r,x.n,o->dtype));
+    if(!g->dry)for(size_t j=0,n=count4(x.n);j<n;j++) {
+        volatile float q=(float)65536/((float *)x.p)[j];
+        volatile float s=q+0.5f;
+        float t=truncf(s);
+        CHECK(t>-2147483648.0f && t<2147483648.0f,E_RANGE);
+        ((int32_t *)r.p)[j]=(int32_t)t;
+    }
+    return t_write(g,o,&r);
+}
+static int k_combine_scales(G *g) {
+    CHECK(g->nin==3,E_ARGS);
+    NEED(3);
+    const T *s=in(g,2);
+    CHECK((s->flags&F_SCALAR) && s->dtype==DT_F32,E_ARGS);
+    A a,b;TRY(read2(g,&a,&b));
+    CHECK(a.dt==DT_F32 && b.dt==DT_F32 && !memcmp(a.n,b.n,16),E_SHAPE);
+    A r;TRY(anew(g,&r,a.n,DT_F32));
+    if(!g->dry) {
+        float k=f32_from_bits(s->scalar);
+        for(size_t j=0,n=count4(a.n);j<n;j++){volatile float p=((float *)a.p)[j]*((float *)b.p)[j];((float *)r.p)[j]=p*k;}
+    }
+    return t_write(g,out0(g),&r);
+}
+static int k_convert_weights(G *g) {
+    CHECK(g->nin==4,E_ARGS);
+    NEED(3);
+    const T *i=in(g,0),*o=out0(g);
+    A x,s;TRY(t_read(g,i,&x,0));TRY(t_read(g,in(g,2),&s,0));
+    CHECK(x.dt==DT_U8 && (s.dt==DT_Q32 || s.dt==DT_I32) && (o->flags&F_DIRECT),E_TENSOR);
+    int32_t H=x.n[0],W=x.n[1],I=x.n[2],O=x.n[3];
+    CHECK(I%4==0 && O%32==0,E_SHAPE);
+    int32_t bn[4];CHECK(!bshape(&x,&s,bn) && !memcmp(bn,x.n,16),E_SHAPE);
+    size_t total=count4(x.n);
+    CHECK(o->pool<7 && g->pool[o->pool] && o->offset+(uint64_t)total<=g->write_limit[o->pool],E_RANGE);
+    if(g->dry) return 0;
+    int8_t *raw=(int8_t *)g->pool[o->pool]+o->offset;
+    for(int32_t h=0;h<H;h++)for(int32_t w=0;w<W;w++)for(int32_t ii=0;ii<I;ii++)for(int32_t oo=0;oo<O;oo++) {
+        int64_t v=((uint8_t *)x.p)[(((size_t)h*W+w)*I+ii)*O+oo]-(int64_t)i->zp;
+        int64_t sc=((int32_t *)s.p)[bindex(s.n,h,w,ii,oo)];
+        int64_t q=clip64((v*sc+32768)>>16,-128,127);
+        size_t at=(((((size_t)(oo/32)*H+h)*W+w)*(I/4)+ii/4)*32+oo%32)*4+ii%4;
+        raw[at]=(int8_t)q;
+    }
+    return 0;
+}
+static int k_scale_convert(G *g) {
+    NEED(1);
+    const T *o=out0(g);
+    A x;TRY(t_read(g,in(g,0),&x,0));
+    CHECK(x.dt==DT_F32 && o->esize==4 && o->dtype!=DT_F32,E_TENSOR);
+    A r;TRY(anew(g,&r,x.n,o->dtype));
+    if(!g->dry)for(size_t j=0,n=count4(x.n);j<n;j++) {
+        int64_t h=((int64_t)((uint32_t *)x.p)[j]+0x1000)>>13;
+        ((int32_t *)r.p)[j]=(int32_t)((h&0x3ff)+(((h&0x7c00)+0x6400)&0x7c00)+0x400000);
+    }
+    return t_write(g,o,&r);
+}
+static int k_dynamic_bias(G *g) {
+    CHECK(g->nout>=1,E_ARGS);
+    for(uint32_t i=3;i<g->nin;i++) {
+        T t;TRY(input_at(g,i,&t));int64_t v;
+        CHECK(!sv_or_scalar(&t,&v) && v==0,E_UNSUPPORTED);
+    }
+    const T *o=out0(g);
+    int32_t zero=0;
+    A r={{1,1,1,1},o->dtype,1,0,&zero};
+    CHECK(o->esize==4 && o->dtype!=DT_F32,E_TENSOR);
+    return t_write(g,o,&r);
+}
+static int k_bias_shuffle(G *g) {
+    CHECK(g->nin==3,E_ARGS);
+    NEED(3);
+    int64_t mode;
+    CHECK(!sv_or_scalar(in(g,2),&mode) && mode==0,E_UNSUPPORTED);
+    int32_t *a,*b;size_t na,nb;
+    TRY(read_i32(g,in(g,0),&a,&na));TRY(read_i32(g,in(g,1),&b,&nb));
+    const T *o=out0(g);
+    CHECK(o->flags&F_SHAPE,E_TENSOR);
+    CHECK(na==nb && na%32==0 && 2*na==count4(o->d) && o->esize==4 && o->dtype!=DT_F32,E_SHAPE);
+    A r;TRY(anew(g,&r,o->d,o->dtype));
+    if(!g->dry){int32_t *d=r.p;for(size_t row=0;row<na/32;row++){memcpy(d+row*64,a+row*32,128);memcpy(d+row*64+32,b+row*32,128);}}
+    return t_write(g,o,&r);
+}
+static int k_abs(G *g) {
+    NEED(1);
+    const T *i=in(g,0),*o=out0(g);
+    A x;TRY(t_read(g,i,&x,0));
+    int32_t *v;TRY(to_i32(g,&x,&v));
+    CHECK(i->esize==2,E_TENSOR);
+    A r;TRY(anew(g,&r,x.n,o->dtype));
+    if(!g->dry) {
+        float ratio=(float)i->scale*(float)(1.0/o->scale);
+        int64_t mult=(int64_t)rintf(ratio*262144.0f);
+        volatile float a=ratio*32768.0f;
+        volatile float b=a+(float)o->zp;
+        volatile float e=b*8.0f;
+        int64_t offset=(int64_t)rintf(e);
+        size_t k=0;
+        for(int32_t bb=0;bb<x.n[0];bb++)for(int32_t h=0;h<x.n[1];h++)for(int32_t w=0;w<x.n[2];w++)for(int32_t d=0;d<x.n[3];d++,k++) {
+            int64_t lane;
+            int64_t H=h+i->p[1],W=w+i->p[2],B=bb+i->p[0],D=d+i->p[3];
+            if(i->flags&F_DIRECT) {
+                int64_t lin=((B*i->m[1]+H)*i->m[2]+W)*i->m[3]+D;
+                lane=((i->offset+lin*2)/2)%2==0;
+            } else lane=W%2==0;
+            int64_t centered=llabs((int64_t)v[k]-i->zp)-32768;
+            int64_t y=((centered*mult+lane*16384)>>15)+offset;
+            from_i64(&r,k,clip64((y+4)>>3,0,65535));
+        }
+    }
+    return t_write(g,o,&r);
+}
+static int k_block_zap(G *g) {
+    CHECK(g->nfv>=2 && g->pool[1],E_ARGS);
+    uint32_t fill=fv(g,0),header=fv(g,1),count=header&0x7fff;
+    CHECK((header&0x8000) && (header&0xc00000)==0xc00000,E_UNSUPPORTED);
+    uint32_t nzero=((header>>16)&7)*256;
+    CHECK(nzero<=BLOCK_BYTES,E_UNSUPPORTED);
+    uint8_t *tile=salloc(g,BLOCK_BYTES);
+    CHECK(tile,E_MEMORY);
+    for(uint32_t j=0;j<count;j++) {
+        CHECK(2+2*j+1<g->nfv,E_ARGS);
+        uint32_t src=fv(g,2+2*j),dst=fv(g,3+2*j);
+        CHECK((uint64_t)src+BLOCK_BYTES<=g->pool_bytes[1] && (uint64_t)dst+BLOCK_BYTES<=g->write_limit[1],E_RANGE);
+        if(g->dry) continue;
+        memcpy(tile,g->pool[1]+src,BLOCK_BYTES);
+        memset(tile+BLOCK_BYTES-nzero,fill&255,nzero);
+        memcpy(g->pool[1]+dst,tile,BLOCK_BYTES);
+    }
+    return 0;
+}
+
+/* -------------------------------------------------------------- convolution */
+typedef struct {
+    int32_t kh, kw, ci, co;
+    int8_t *w;
+    int64_t *wsum;
+} Weights;
+static const int S2_TAPS[9][2]={{0,2},{0,0},{2,2},{2,0},{0,1},{2,1},{1,2},{1,0},{1,1}};
+static void unpack_weights(int8_t *o, const int8_t *raw, int32_t H, int32_t W, int32_t I, int32_t O, int packed) {
+    size_t k=0;
+    for(int32_t h=0;h<H;h++)for(int32_t w=0;w<W;w++)for(int32_t i=0;i<I;i++)for(int32_t oo=0;oo<O;oo++) {
+        size_t off=packed?(((size_t)(oo/32)*H+h)*W+w)*(I/4)*128+(size_t)(i/4)*128+(oo%32)*4+i%4:
+            ((((size_t)(oo/32)*(I/32)+i/32)*H+h)*W+w)*1024+(size_t)((i/4)%8)*128+(oo%32)*4+i%4;
+        o[k++]=raw[off];
+    }
+}
+static int is_class(const T *t, const char *a, const char *b) {
+    uint32_t x=0,y=0;memcpy(&x,a,strlen(a));memcpy(&y,b,strlen(b));
+    return t->cls==x || t->cls==y;
+}
+/* qd_graph conv_weights without its static-source cache: dense HWIO int8
+ * (stride-2 regrouped to 2x2 taps, Xwb width-reversed) and channel sums. */
+static int conv_weights(G *g, const T *t, int s2, int32_t co, Weights *e) {
+    int reverse=!s2 && t->cls==('X'|'w'<<8|'b'<<16);
+    CHECK((t->flags&F_DIRECT) && t->pool<7 && g->pool[t->pool],E_TENSOR);
+    int32_t H=t->m[0],W=t->m[1],I=t->m[2],O=t->m[3];
+    CHECK(H>0 && W>0 && I>0 && O>0,E_SHAPE);
+    int packed=is_class(t,"Xpb","xpb");
+    size_t n=(size_t)H*W*I*O;
+    CHECK(I%4==0 && O%32==0 && (packed || I%32==0),E_SHAPE);
+    CHECK(t->offset+(uint64_t)n<=g->pool_bytes[t->pool],E_RANGE);
+    int8_t *w=salloc(g,n),*final=NULL;
+    CHECK(w,E_MEMORY);
+    if(!g->dry)unpack_weights(w,(const int8_t *)g->pool[t->pool]+t->offset,H,W,I,O,packed);
+    int32_t kh=H,kw=W,ci=I;
+    if(s2) {
+        CHECK(H==3 && W==3 && !(I%32),E_SHAPE);
+        int8_t *tr=salloc(g,n);
+        CHECK(tr,E_MEMORY);
+        kh=kw=2;ci=4*I;
+        final=salloc(g,(size_t)4*ci*O);
+        CHECK(final,E_MEMORY);
+        if(!g->dry) {
+            memset(tr,0,n);memset(final,0,(size_t)4*ci*O);
+            for(int k=0;k<9;k++)memcpy(tr+((size_t)S2_TAPS[k][0]*3+S2_TAPS[k][1])*I*O,w+(size_t)k*I*O,(size_t)I*O);
+            for(int a=0;a<2;a++)for(int b=0;b<2;b++)for(int dy=0;dy<2;dy++)for(int dx=0;dx<2;dx++) {
+                int ky=2*a+dy,kx=2*b-dx;
+                if(ky<3 && kx>=0 && kx<3)for(int32_t cb=0;cb<I/32;cb++) {
+                    int32_t j=cb*4+2*dy+dx;
+                    for(int32_t ch=0;ch<32;ch++)
+                        memcpy(final+(((size_t)a*2+b)*ci+32*j+ch)*O,tr+(((size_t)ky*3+kx)*I+32*cb+ch)*O,O);
+                }
+            }
+        }
+    } else if(reverse) {
+        final=salloc(g,n);
+        CHECK(final,E_MEMORY);
+        if(!g->dry)for(int32_t h=0;h<H;h++)for(int32_t x=0;x<W;x++)
+            memcpy(final+((size_t)h*W+x)*I*O,w+((size_t)h*W+(W-1-x))*I*O,(size_t)I*O);
+    } else final=w;
+    CHECK(co>0 && co<=O,E_SHAPE);
+    size_t terms=(size_t)kh*kw*ci;
+    e->kh=kh;e->kw=kw;e->ci=ci;e->co=co;
+    e->w=salloc(g,terms*co);e->wsum=salloc(g,(size_t)co*sizeof(int64_t));
+    CHECK(e->w && e->wsum,E_MEMORY);
+    if(!g->dry) {
+        memset(e->wsum,0,(size_t)co*sizeof(int64_t));
+        for(size_t k=0;k<terms;k++)for(int32_t o=0;o<co;o++){int8_t v=final[k*O+o];e->w[k*co+o]=v;e->wsum[o]+=v;}
+    }
+    return 0;
+}
+static void cpu_accumulate(const A *x, const Weights *w, int64_t *acc, int32_t *row, int32_t oh, int32_t ow) {
+    int32_t co=w->co,ci=w->ci;
+    for(int32_t y=0;y<oh;y++)for(int32_t xx=0;xx<ow;xx++) {
+        int64_t *a=acc+((size_t)y*ow+xx)*co;
+        memset(a,0,(size_t)co*8);
+        for(int32_t ky=0;ky<w->kh;ky++)for(int32_t kx=0;kx<w->kw;kx++) {
+            memset(row,0,(size_t)co*4);
+            const int8_t *wk=w->w+((size_t)(ky*w->kw+kx)*ci)*co;
+            size_t base=((size_t)(y+ky)*x->n[2]+xx+kx)*x->n[3];
+            if(x->dt==DT_U8) {
+                const uint8_t *xs=(const uint8_t *)x->p+base;
+                for(int32_t i=0;i<ci;i++){int32_t v=xs[i];const int8_t *wr=wk+(size_t)i*co;for(int32_t o=0;o<co;o++)row[o]+=v*wr[o];}
+                for(int32_t o=0;o<co;o++)a[o]+=row[o];
+            } else {
+                const uint16_t *xs=(const uint16_t *)x->p+base;
+                for(int32_t i=0;i<ci;i++){int64_t v=xs[i];const int8_t *wr=wk+(size_t)i*co;for(int32_t o=0;o<co;o++)a[o]+=v*wr[o];}
+            }
+        }
+    }
+}
+static void requant_params(const int32_t *mult, int32_t co, int sixteen, int32_t *M, int32_t *pre, int32_t *post) {
+    for(int32_t c=0;c<co;c++) {
+        uint32_t h=(uint32_t)mult[c]&65535,shift=34-((h>>10)&31);
+        M[c]=1024+(h&1023);pre[c]=sixteen?8:(int32_t)shift-14;post[c]=(int32_t)shift-pre[c];
+    }
+}
+static inline int64_t requant_value(int64_t acc, int32_t bias, int sixteen, int32_t M, int32_t pre, int32_t post) {
+    int64_t a=acc+(int64_t)bias*(sixteen?256:1);
+    int64_t q=(((a>>pre)*M)+((int64_t)1<<(post-1)))>>post;
+    return clip64(q,0,sixteen?65535:255);
+}
+static void requant(uint8_t *o, const int64_t *acc, const int32_t *mult, const int32_t *bias, size_t pixels,
+                    int32_t co, int sixteen, int32_t *M, int32_t *pre, int32_t *post) {
+    requant_params(mult,co,sixteen,M,pre,post);
+    for(size_t p=0;p<pixels;p++)for(int32_t c=0;c<co;c++) {
+        size_t j=p*co+c;
+        int64_t q=requant_value(acc[j],bias[c],sixteen,M[c],pre[c],post[c]);
+        if(sixteen)((uint16_t *)o)[j]=(uint16_t)q;else o[j]=(uint8_t)q;
+    }
+}
+
+/* Fast exact path. The workspace is a second bump arena; a dry pass only
+ * measures it. */
+static void *walloc(G *g, size_t bytes) {
+    size_t at=(g->wused+127)&~(size_t)127;
+    if(at<g->wused || bytes>SIZE_MAX-at) return NULL;
+    g->wused=at+bytes;
+    if(g->dry) return (void *)g;
+    if(g->wused>g->conv->workspace_bytes) return NULL;
+    return g->conv->workspace+at;
+}
+#define NO_TILE 0xffffffffu
+enum { PIXEL_BLOCK=8 };
+/* Byte offset in the raw weight tensor of the [O%32][I%4] tile that feeds
+ * final tap (ky,kx), final input channels 4*group..+3 and output block j, or
+ * NO_TILE where the stride-2 regrouping leaves zeros. Mirrors unpack_weights,
+ * the S2 regrouping and the Xwb width reversal in conv_weights. */
+static uint32_t weight_tile(const T *t, int s2, int reverse, int packed, int32_t ky, int32_t kx, int32_t group, int32_t j) {
+    int32_t H=t->m[0],W=t->m[1],I=t->m[2],h=ky,x=kx,i=4*group;
+    if(s2) {
+        int32_t jj=i/32,cb=jj/4,dy=(jj%4)/2,dx=jj%2,y3=2*ky+dy,x3=2*kx-dx,k=0;
+        if(y3>=3 || x3<0 || x3>=3) return NO_TILE;
+        while(S2_TAPS[k][0]!=y3 || S2_TAPS[k][1]!=x3) k++;
+        h=k/3;x=k%3;i=32*cb+i%32;
+    } else if(reverse) x=W-1-kx;
+    size_t off=packed?(((size_t)j*H+h)*W+x)*(size_t)(I/4)*128+(size_t)(i/4)*128:
+        ((((size_t)j*(I/32)+i/32)*H+h)*W+x)*1024+(size_t)((i/4)%8)*128;
+    return (uint32_t)off;
+}
+/* For output block b (tiles tb: t0, and t1 when non-NULL) and pixel p < np:
+ * acc[b][p][o] = sum over tiles k of the four u8 channels at xs+xoff[k]+p*stride
+ * times tb[k]'s [o][0..3] weights. NO_TILE entries are the same in t0 and t1. */
+#if defined(__HVX__) && __HVX_LENGTH__==128
+/* Activation words are 4-byte aligned: ci%4==0 and the dense input is
+ * 128-byte aligned in the workspace. */
+#define SPLAT(p) HVX_Vector s##p=Q6_V_vsplat_R(*(const uint32_t *)(x+(size_t)(p)*stride))
+#define MAC(a,p,w) a##p=Q6_Vw_vrmpyacc_VwVubVb(a##p,s##p,w)
+#define MAC8(a,w) MAC(a,0,w);MAC(a,1,w);MAC(a,2,w);MAC(a,3,w);MAC(a,4,w);MAC(a,5,w);MAC(a,6,w);MAC(a,7,w)
+static void tile_block(int32_t *acc, int32_t np, const uint8_t *xs, uint32_t stride, uint32_t ntiles,
+                       const uint32_t *t0, const uint32_t *t1, const uint32_t *xoff, const int8_t *wbase) {
+    HVX_UVector *o=(HVX_UVector *)acc;
+    if(np==PIXEL_BLOCK && t1) {
+        HVX_Vector a0=Q6_V_vzero(),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0;
+        HVX_Vector b0=a0,b1=a0,b2=a0,b3=a0,b4=a0,b5=a0,b6=a0,b7=a0;
+        for(uint32_t k=0;k<ntiles;k++) {
+            if(t0[k]==NO_TILE) continue;
+            HVX_Vector w0=*(const HVX_UVector *)(wbase+t0[k]),w1=*(const HVX_UVector *)(wbase+t1[k]);
+            const uint8_t *x=xs+xoff[k];
+            SPLAT(0);SPLAT(1);SPLAT(2);SPLAT(3);SPLAT(4);SPLAT(5);SPLAT(6);SPLAT(7);
+            MAC8(a,w0);MAC8(b,w1);
+        }
+        o[0]=a0;o[1]=a1;o[2]=a2;o[3]=a3;o[4]=a4;o[5]=a5;o[6]=a6;o[7]=a7;
+        o[8]=b0;o[9]=b1;o[10]=b2;o[11]=b3;o[12]=b4;o[13]=b5;o[14]=b6;o[15]=b7;
+        return;
+    }
+    if(np==PIXEL_BLOCK) {
+        HVX_Vector a0=Q6_V_vzero(),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0;
+        for(uint32_t k=0;k<ntiles;k++) {
+            if(t0[k]==NO_TILE) continue;
+            HVX_Vector w0=*(const HVX_UVector *)(wbase+t0[k]);
+            const uint8_t *x=xs+xoff[k];
+            SPLAT(0);SPLAT(1);SPLAT(2);SPLAT(3);SPLAT(4);SPLAT(5);SPLAT(6);SPLAT(7);
+            MAC8(a,w0);
+        }
+        o[0]=a0;o[1]=a1;o[2]=a2;o[3]=a3;o[4]=a4;o[5]=a5;o[6]=a6;o[7]=a7;
+        return;
+    }
+    for(int32_t b=0;b<(t1?2:1);b++)for(int32_t p=0;p<np;p++) {
+        const uint32_t *t=b?t1:t0;
+        HVX_Vector a=Q6_V_vzero();
+        for(uint32_t k=0;k<ntiles;k++) {
+            if(t[k]==NO_TILE) continue;
+            const uint8_t *x=xs+xoff[k]+(size_t)p*stride;
+            a=Q6_Vw_vrmpyacc_VwVubVb(a,Q6_V_vsplat_R(*(const uint32_t *)x),*(const HVX_UVector *)(wbase+t[k]));
+        }
+        o[b*PIXEL_BLOCK+p]=a;
+    }
+}
+#undef MAC8
+#undef MAC
+#undef SPLAT
+#else
+static void tile_block(int32_t *acc, int32_t np, const uint8_t *xs, uint32_t stride, uint32_t ntiles,
+                       const uint32_t *t0, const uint32_t *t1, const uint32_t *xoff, const int8_t *wbase) {
+    for(int32_t b=0;b<(t1?2:1);b++) {
+        const uint32_t *t=b?t1:t0;
+        int32_t *ab=acc+(size_t)b*PIXEL_BLOCK*32;
+        memset(ab,0,(size_t)np*32*4);
+        for(uint32_t k=0;k<ntiles;k++) {
+            if(t[k]==NO_TILE) continue;
+            const int8_t *w=wbase+t[k];
+            const uint8_t *x=xs+xoff[k];
+            for(int32_t p=0;p<np;p++) {
+                const uint8_t *v=x+(size_t)p*stride;
+                int32_t v0=v[0],v1=v[1],v2=v[2],v3=v[3],*r=ab+32*p;
+                for(int32_t o=0;o<32;o++)r[o]+=v0*w[4*o]+v1*w[4*o+1]+v2*w[4*o+2]+v3*w[4*o+3];
+            }
+        }
+    }
+}
+#endif
+static void fast_conv_compute(G *g, const T *xt, const T *wt, const T *ft, int s2, int reverse, int packed, int sixteen,
+                              int32_t kh, int32_t kw, int32_t ci, int32_t co, int32_t oh, int32_t ow, uint8_t *x,
+                              uint8_t *xlo, uint8_t *xhi, uint8_t *r, uint32_t *tiles, uint32_t *xoff, int32_t *acc,
+                              int32_t *mult, int32_t *bias, int32_t *M, int32_t *pre, int32_t *post, int64_t *wsum);
+
+/* Near-memory layout for one command: output columns per chunk, the staged
+ * chunk's row stride in pixels, and 128-aligned offsets into near. */
+typedef struct { int32_t cols, sw; size_t acc, tiles, xoff, mult, bias, M, pre, post, wsum, out, lo, hi; } NearPlan;
+static size_t nbump(size_t *at, size_t bytes) {size_t a=(*at+127)&~(size_t)127;*at=a+bytes;return a;}
+static size_t near_layout(NearPlan *p, int32_t cols, int32_t kh, int32_t kw, int32_t ci, int32_t co, uint32_t ntiles,
+                          int sixteen) {
+    /* Each staged plane has 128 bytes of slack for whole-vector copies. */
+    size_t at=0,plane=(size_t)kh*(cols+kw-1)*ci+128;
+    p->cols=cols;p->sw=cols+kw-1;
+    p->acc=nbump(&at,(size_t)2*PIXEL_BLOCK*32*4*(sixteen?2:1));
+    p->tiles=nbump(&at,(size_t)ntiles*(co/32)*4);p->xoff=nbump(&at,(size_t)ntiles*4);
+    p->mult=nbump(&at,(size_t)co*4);p->bias=nbump(&at,(size_t)co*4);p->M=nbump(&at,(size_t)co*4);
+    p->pre=nbump(&at,(size_t)co*4);p->post=nbump(&at,(size_t)co*4);p->wsum=nbump(&at,(size_t)co*8);
+    p->out=nbump(&at,(size_t)cols*co*(sixteen?2:1));
+    p->lo=nbump(&at,plane);p->hi=sixteen?nbump(&at,plane):0;
+    return at;
+}
+/* The widest whole-block chunk that fits, or 0. Depends on shapes only. */
+static int near_plan(const G *g, NearPlan *p, int32_t ow, int32_t kh, int32_t kw, int32_t ci, int32_t co,
+                     uint32_t ntiles, int sixteen) {
+    const Nprg2ReferenceConv *c=g->conv;
+    if(!c->near || ((uintptr_t)c->near&127u)) return 0;
+    for(int32_t cols=(ow+PIXEL_BLOCK-1)/PIXEL_BLOCK*PIXEL_BLOCK;cols>0;cols-=PIXEL_BLOCK)
+        if(near_layout(p,cols,kh,kw,ci,co,ntiles,sixteen)<=c->near_bytes) return 1;
+    return 0;
+}
+/* Whole-vector copies: they read up to 127 bytes past src+n (255 past 2n for
+ * the u16 split) and write up to 127 past each destination's n. */
+#if defined(__HVX__) && __HVX_LENGTH__==128
+static void near_copy(uint8_t *d, const uint8_t *s, size_t n) {
+    for(size_t i=0;i<n;i+=128) *(HVX_UVector *)(d+i)=*(const HVX_UVector *)(s+i);
+}
+static void near_split16(uint8_t *lo, uint8_t *hi, const uint8_t *s, size_t n) {
+    for(size_t i=0;i<n;i+=128) {
+        HVX_Vector a=*(const HVX_UVector *)(s+2*i),b=*(const HVX_UVector *)(s+2*i+128);
+        *(HVX_UVector *)(lo+i)=Q6_Vb_vpacke_VhVh(b,a);
+        *(HVX_UVector *)(hi+i)=Q6_Vb_vpacko_VhVh(b,a);
+    }
+}
+#else
+static void near_copy(uint8_t *d, const uint8_t *s, size_t n) {memcpy(d,s,n);}
+static void near_split16(uint8_t *lo, uint8_t *hi, const uint8_t *s, size_t n) {
+    for(size_t i=0;i<n;i++){uint16_t v;memcpy(&v,s+2*i,2);lo[i]=(uint8_t)v;hi[i]=(uint8_t)(v>>8);}
+}
+#endif
+static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o, int s2, int reverse, int packed,
+                         int sixteen, int32_t kh, int32_t kw, int32_t ci, int32_t co, int32_t oh, int32_t ow,
+                         const uint8_t *x, const NearPlan *p);
+static uint32_t conv_path;
+/* Returns 1 when the command took the fast path (or would, in a dry pass),
+ * 0 to use the reference convolution, or a negative error. */
+static int fast_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int s2, int sixteen, int32_t co,
+                     int32_t oh, int32_t ow, int32_t *err) {
+    *err=0;conv_path=0;
+    if(!g->conv) return 0;
+    int32_t H=wt->m[0],W=wt->m[1],I=wt->m[2],O=wt->m[3];
+    int packed=is_class(wt,"Xpb","xpb"),reverse=!s2 && wt->cls==('X'|'w'<<8|'b'<<16);
+    if(!(wt->flags&F_DIRECT) || wt->pool>=7 || !g->pool[wt->pool]) return 0;
+    if(H<=0 || W<=0 || I<=0 || O<=0 || I%4 || O%32 || (!packed && I%32) || co%32 || co>O) return 0;
+    if(s2 && (H!=3 || W!=3 || I%32)) return 0;
+    int32_t kh=s2?2:H,kw=s2?2:W,ci=s2?4*I:I;
+    if(ci>xt->m[3]) return 0;
+    if((int64_t)kh*kw*ci*255*128>INT32_MAX) return 0;
+    int32_t xH=xt->m[1]-xt->p[1],xW=xt->m[2]-xt->p[2],cw=sixteen?4:8;
+    oh=(oh+7)/8*8;if(oh>o->m[1])oh=o->m[1];if(oh>xH-kh+1)oh=xH-kh+1;
+    ow=(ow+cw-1)/cw*cw;if(ow>o->m[2])ow=o->m[2];if(ow>xW-kw+1)ow=xW-kw+1;
+    if(oh<=0 || ow<=0) return 0;
+    if(wt->offset+(uint64_t)H*W*I*O>g->pool_bytes[wt->pool]){*err=E_RANGE;return -1;}
+
+    int32_t xh=oh+kh-1,xw=ow+kw-1,groups=ci/4,blocks=co/32;
+    uint32_t ntiles=(uint32_t)(kh*kw*groups);
+    size_t es=sixteen?2:1,pixels=(size_t)oh*ow;
+    NearPlan plan;
+    if(near_plan(g,&plan,ow,kh,kw,ci,co,ntiles,sixteen)) {
+        g->wused=0;
+        uint8_t *x=walloc(g,(size_t)xh*xw*ci*es+256);
+        if(g->wused>g->conv->workspace_bytes) return 0;
+        if(!x){*err=E_MEMORY;return -1;}
+        int32_t dims[4]={1,xh,xw,ci},origin[4]={0,xt->p[1],xt->p[2],0};
+        int32_t on[4]={1,oh,ow,co},oorigin[4]={0,o->p[1],o->p[2],0};
+        if(o->esize!=es){*err=E_TENSOR;return -1;}
+        if((*err=xfer_check(g,xt,dims,origin,0)) || (*err=xfer_check(g,o,on,oorigin,1))) return -1;
+        conv_path=2;
+        if(g->dry) return 1;
+        const Nprg2ReferenceConv *c=g->conv;
+        uint64_t t=c->clock && c->phase?c->clock():0;
+        xfer_copy(g,xt,x,dims,origin,0);
+        if(c->clock && c->phase) c->phase[0]+=c->clock()-t;
+        near_compute(g,xt,wt,ft,o,s2,reverse,packed,sixteen,kh,kw,ci,co,oh,ow,x,&plan);
+        return 1;
+    }
+    g->wused=0;
+    uint8_t *x=walloc(g,(size_t)xh*xw*ci*es+128),*xlo=sixteen?walloc(g,(size_t)xh*xw*ci+128):NULL,
+            *xhi=sixteen?walloc(g,(size_t)xh*xw*ci+128):NULL,*r=walloc(g,pixels*co*es);
+    uint32_t *tiles=walloc(g,(size_t)ntiles*blocks*4),*xoff=walloc(g,(size_t)ntiles*4);
+    int32_t *acc=walloc(g,(size_t)2*PIXEL_BLOCK*32*4*(sixteen?2:1)),*mult=walloc(g,(size_t)co*4),
+            *bias=walloc(g,(size_t)co*4),*M=walloc(g,(size_t)co*4),*pre=walloc(g,(size_t)co*4),*post=walloc(g,(size_t)co*4);
+    int64_t *wsum=walloc(g,(size_t)co*8);
+    if(g->wused>g->conv->workspace_bytes) return 0;
+    if(!x || (sixteen && (!xlo || !xhi)) || !r || !tiles || !xoff || !acc || !mult || !bias || !M || !pre || !post || !wsum){
+        *err=E_MEMORY;return -1;
+    }
+    int32_t dims[4]={1,xh,xw,ci},origin[4]={0,xt->p[1],xt->p[2],0};
+    if((*err=xfer(g,xt,x,dims,origin,0))) return -1;
+    if(!g->dry) fast_conv_compute(g,xt,wt,ft,s2,reverse,packed,sixteen,kh,kw,ci,co,oh,ow,x,xlo,xhi,r,tiles,xoff,acc,
+                                  mult,bias,M,pre,post,wsum);
+    A out={.n={1,oh,ow,co},.dt=sixteen?DT_U16:DT_U8,.p=r};
+    int32_t oorigin[4]={0,o->p[1],o->p[2],0};
+    if((*err=t_write_region(g,o,&out,oorigin))) return -1;
+    conv_path=1;
+    return 1;
+}
+static void fast_conv_compute(G *g, const T *xt, const T *wt, const T *ft, int s2, int reverse, int packed, int sixteen,
+                              int32_t kh, int32_t kw, int32_t ci, int32_t co, int32_t oh, int32_t ow, uint8_t *x,
+                              uint8_t *xlo, uint8_t *xhi, uint8_t *r, uint32_t *tiles, uint32_t *xoff, int32_t *acc,
+                              int32_t *mult, int32_t *bias, int32_t *M, int32_t *pre, int32_t *post, int64_t *wsum) {
+    int32_t xh=oh+kh-1,xw=ow+kw-1,groups=ci/4,blocks=co/32;
+    uint32_t ntiles=(uint32_t)(kh*kw*groups);
+    const int8_t *wbase=(const int8_t *)g->pool[wt->pool]+wt->offset;
+    const uint8_t *rows=g->pool[ft->pool]+ft->offset;
+    for(int32_t c=0;c<co;c++){memcpy(mult+c,rows+(size_t)(c/32)*256+(c%32)*4,4);memcpy(bias+c,rows+(size_t)(c/32)*256+128+(c%32)*4,4);}
+    requant_params(mult,co,sixteen,M,pre,post);
+    for(int32_t j=0;j<blocks;j++)for(int32_t ky=0;ky<kh;ky++)for(int32_t kx=0;kx<kw;kx++)for(int32_t q=0;q<groups;q++)
+        tiles[(size_t)j*ntiles+((size_t)ky*kw+kx)*groups+q]=weight_tile(wt,s2,reverse,packed,ky,kx,q,j);
+    for(int32_t ky=0;ky<kh;ky++)for(int32_t kx=0;kx<kw;kx++)for(int32_t q=0;q<groups;q++)
+        xoff[((size_t)ky*kw+kx)*groups+q]=(uint32_t)((((size_t)ky*xw+kx)*ci+4*q));
+    memset(wsum,0,(size_t)co*8);
+    if(xt->zp) for(int32_t j=0;j<blocks;j++)for(uint32_t k=0;k<ntiles;k++) {
+        uint32_t tile=tiles[(size_t)j*ntiles+k];
+        if(tile!=NO_TILE)for(int32_t c=0;c<128;c++)wsum[j*32+c/4]+=wbase[tile+c];
+    }
+    if(sixteen) {
+        const uint16_t *s=(const uint16_t *)x;
+        for(size_t i=0;i<(size_t)xh*xw*ci;i++){xlo[i]=(uint8_t)s[i];xhi[i]=(uint8_t)(s[i]>>8);}
+    }
+    uint32_t stride=(uint32_t)ci;
+    for(int32_t y=0;y<oh;y++)for(int32_t x0=0;x0<ow;x0+=PIXEL_BLOCK) {
+        int32_t np=ow-x0<PIXEL_BLOCK?ow-x0:PIXEL_BLOCK;
+        size_t at=((size_t)y*xw+x0)*ci;
+        for(int32_t j=0;j<blocks;j+=2) {
+            int32_t nb=blocks-j<2?blocks-j:2;
+            const uint32_t *t0=tiles+(size_t)j*ntiles,*t1=nb==2?t0+ntiles:NULL;
+            int32_t *hi=acc+2*PIXEL_BLOCK*32;
+            if(sixteen) {
+                tile_block(acc,np,xlo+at,stride,ntiles,t0,t1,xoff,wbase);
+                tile_block(hi,np,xhi+at,stride,ntiles,t0,t1,xoff,wbase);
+            } else tile_block(acc,np,x+at,stride,ntiles,t0,t1,xoff,wbase);
+            for(int32_t b=0;b<nb;b++)for(int32_t p=0;p<np;p++)for(int32_t c=0;c<32;c++) {
+                int32_t k=(j+b)*32+c;
+                size_t a_at=((size_t)b*PIXEL_BLOCK+p)*32+c;
+                int64_t a=sixteen?(int64_t)hi[a_at]*256+acc[a_at]:(int64_t)acc[a_at];
+                a-=(int64_t)xt->zp*wsum[k];
+                int64_t v=requant_value(a,bias[k],sixteen,M[k],pre[k],post[k]);
+                size_t idx=((size_t)y*ow+x0+p)*co+k;
+                if(sixteen)((uint16_t *)r)[idx]=(uint16_t)v;else r[idx]=(uint8_t)v;
+            }
+        }
+    }
+}
+/* fast_conv_compute over near memory, one output row chunk at a time: stage
+ * the chunk's kh input rows from x, accumulate, requantize into a near output
+ * chunk and write it to o. x holds the whole input, so in-place outputs are
+ * safe. */
+static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o, int s2, int reverse, int packed,
+                         int sixteen, int32_t kh, int32_t kw, int32_t ci, int32_t co, int32_t oh, int32_t ow,
+                         const uint8_t *x, const NearPlan *p) {
+    const Nprg2ReferenceConv *c=g->conv;
+    uint8_t *n=c->near,*out=n+p->out,*lo=n+p->lo,*hi=sixteen?n+p->hi:NULL;
+    int32_t *acc=(int32_t *)(n+p->acc),*mult=(int32_t *)(n+p->mult),*bias=(int32_t *)(n+p->bias);
+    int32_t *M=(int32_t *)(n+p->M),*pre=(int32_t *)(n+p->pre),*post=(int32_t *)(n+p->post);
+    uint32_t *tiles=(uint32_t *)(n+p->tiles),*xoff=(uint32_t *)(n+p->xoff);
+    int64_t *wsum=(int64_t *)(n+p->wsum);
+    int32_t xw=ow+kw-1,groups=ci/4,blocks=co/32,sw=p->sw;
+    uint32_t ntiles=(uint32_t)(kh*kw*groups);
+    const int8_t *wbase=(const int8_t *)g->pool[wt->pool]+wt->offset;
+    const uint8_t *rows=g->pool[ft->pool]+ft->offset;
+    for(int32_t k=0;k<co;k++){memcpy(mult+k,rows+(size_t)(k/32)*256+(k%32)*4,4);memcpy(bias+k,rows+(size_t)(k/32)*256+128+(k%32)*4,4);}
+    requant_params(mult,co,sixteen,M,pre,post);
+    for(int32_t j=0;j<blocks;j++)for(int32_t ky=0;ky<kh;ky++)for(int32_t kx=0;kx<kw;kx++)for(int32_t q=0;q<groups;q++)
+        tiles[(size_t)j*ntiles+((size_t)ky*kw+kx)*groups+q]=weight_tile(wt,s2,reverse,packed,ky,kx,q,j);
+    for(int32_t ky=0;ky<kh;ky++)for(int32_t kx=0;kx<kw;kx++)for(int32_t q=0;q<groups;q++)
+        xoff[((size_t)ky*kw+kx)*groups+q]=(uint32_t)((((size_t)ky*sw+kx)*ci+4*q));
+    memset(wsum,0,(size_t)co*8);
+    if(xt->zp) for(int32_t j=0;j<blocks;j++)for(uint32_t k=0;k<ntiles;k++) {
+        uint32_t tile=tiles[(size_t)j*ntiles+k];
+        if(tile!=NO_TILE)for(int32_t q=0;q<128;q++)wsum[j*32+q/4]+=wbase[tile+q];
+    }
+    uint64_t (*clock)(void)=c->phase?c->clock:NULL,*ph=c->phase,t=clock?clock():0;
+#define LAP(i) do { if(clock){uint64_t u_=clock();ph[i]+=u_-t;t=u_;} } while(0)
+    size_t es=sixteen?2:1,plane=(size_t)sw*ci;
+    int32_t *ahi=acc+2*PIXEL_BLOCK*32;
+    for(int32_t y=0;y<oh;y++)for(int32_t x0=0;x0<ow;x0+=p->cols) {
+        int32_t nc=ow-x0<p->cols?ow-x0:p->cols;
+        size_t span=(size_t)(nc+kw-1)*ci;
+        for(int32_t ky=0;ky<kh;ky++) {
+            const uint8_t *src=x+(((size_t)(y+ky)*xw+x0)*ci)*es;
+            if(sixteen) near_split16(lo+(size_t)ky*plane,hi+(size_t)ky*plane,src,span);
+            else near_copy(lo+(size_t)ky*plane,src,span);
+        }
+        LAP(0);
+        for(int32_t px=0;px<nc;px+=PIXEL_BLOCK) {
+            int32_t np=nc-px<PIXEL_BLOCK?nc-px:PIXEL_BLOCK;
+            size_t at=(size_t)px*ci;
+            for(int32_t j=0;j<blocks;j+=2) {
+                int32_t nb=blocks-j<2?blocks-j:2;
+                const uint32_t *t0=tiles+(size_t)j*ntiles,*t1=nb==2?t0+ntiles:NULL;
+                tile_block(acc,np,lo+at,(uint32_t)ci,ntiles,t0,t1,xoff,wbase);
+                if(sixteen) tile_block(ahi,np,hi+at,(uint32_t)ci,ntiles,t0,t1,xoff,wbase);
+                LAP(1);
+                for(int32_t b=0;b<nb;b++)for(int32_t q=0;q<np;q++)for(int32_t l=0;l<32;l++) {
+                    int32_t k=(j+b)*32+l;
+                    size_t a_at=((size_t)b*PIXEL_BLOCK+q)*32+l;
+                    int64_t a=sixteen?(int64_t)ahi[a_at]*256+acc[a_at]:(int64_t)acc[a_at];
+                    a-=(int64_t)xt->zp*wsum[k];
+                    int64_t v=requant_value(a,bias[k],sixteen,M[k],pre[k],post[k]);
+                    size_t idx=(size_t)(px+q)*co+k;
+                    if(sixteen)((uint16_t *)out)[idx]=(uint16_t)v;else out[idx]=(uint8_t)v;
+                }
+                LAP(2);
+            }
+        }
+        int32_t dims[4]={1,1,nc,co},origin[4]={0,o->p[1]+y,o->p[2]+x0,0};
+        xfer_copy(g,o,out,dims,origin,1);
+        LAP(3);
+    }
+#undef LAP
+}
+static int k_hmx_conv(G *g) {
+    CHECK(g->nin>=3 && g->nout==1,E_ARGS);
+    const T *xt=in(g,0),*wt=in(g,1),*ft=in(g,2),*o=out0(g);
+    int s2=g->variant==36;
+    CHECK((ft->flags&F_DIRECT) && ft->dtype==DT_I32 && ft->pool<7 && g->pool[ft->pool],E_TENSOR);
+    for(int i=0;i<4;i++)CHECK(ft->m[i]>=0,E_SHAPE);
+    size_t nfi=count4(ft->m);
+    CHECK(nfi%64==0 && ft->offset+(uint64_t)nfi*4<=g->pool_bytes[ft->pool],E_RANGE);
+    size_t nm=nfi/2;
+    int sixteen=xt->cls==('C'|'H'<<8) || xt->cls==('c'|'H'<<8);
+    CHECK((o->flags&F_SHAPE) && (xt->flags&F_SHAPE),E_TENSOR);
+    int32_t oh=o->d[1],ow=o->d[2],co=(o->d[3]+31)/32*32;
+    int32_t wco=wt->m[3];
+    if(co>wco)co=wco;
+    if((size_t)co>nm)co=(int32_t)nm;
+    int32_t ferr;
+    int fast=fast_conv(g,xt,wt,ft,o,s2,sixteen,co,oh,ow,&ferr);
+    if(fast<0) FAIL(ferr);
+    if(fast) return 0;
+    int32_t *mult=salloc(g,nm*4+4),*bias=salloc(g,nm*4+4);
+    CHECK(mult && bias,E_MEMORY);
+    if(!g->dry) {
+        const uint8_t *rows=g->pool[ft->pool]+ft->offset;
+        for(size_t r=0;r<nfi/64;r++){memcpy(mult+r*32,rows+r*256,128);memcpy(bias+r*32,rows+r*256+128,128);}
+    }
+    Weights w;
+    TRY(conv_weights(g,wt,s2,co,&w));
+    int32_t xH=xt->m[1]-xt->p[1],xW=xt->m[2]-xt->p[2];
+    CHECK(w.ci<=xt->m[3],E_SHAPE);
+    int32_t cw=sixteen?4:8;
+    oh=(oh+7)/8*8;if(oh>o->m[1])oh=o->m[1];if(oh>xH-w.kh+1)oh=xH-w.kh+1;
+    ow=(ow+cw-1)/cw*cw;if(ow>o->m[2])ow=o->m[2];if(ow>xW-w.kw+1)ow=xW-w.kw+1;
+    CHECK(oh>0 && ow>0,E_SHAPE);
+    int32_t dims[4]={1,oh+w.kh-1,ow+w.kw-1,w.ci},origin[4]={0,xt->p[1],xt->p[2],0};
+    int32_t on[4]={1,oh,ow,co},oorigin[4]={0,o->p[1],o->p[2],0};
+    size_t pixels=(size_t)oh*ow,values=pixels*co;
+    A x;TRY(t_read_region(g,xt,&x,dims,origin));
+    A r;
+    int64_t *acc=salloc(g,values*8);
+    CHECK(acc,E_MEMORY);
+    TRY(anew(g,&r,on,sixteen?DT_U16:DT_U8));
+    int32_t *row=salloc(g,(size_t)co*4+64),*M=salloc(g,(size_t)co*4),*pre=salloc(g,(size_t)co*4),*post=salloc(g,(size_t)co*4);
+    CHECK(row && M && pre && post,E_MEMORY);
+    if(!g->dry) {
+        cpu_accumulate(&x,&w,acc,row,oh,ow);
+        for(size_t p=0;p<pixels;p++)for(int32_t k=0;k<co;k++)acc[p*co+k]-=(int64_t)xt->zp*w.wsum[k];
+        requant(r.p,acc,mult,bias,pixels,co,sixteen,M,pre,post);
+    }
+    return t_write_region(g,o,&r,oorigin);
+}
+
+/* ------------------------------------------------------------------ dispatch */
+static int run_kernel(G *g) {
+    switch(g->op) {
+    case QDR_NOP: return 0;
+    case QDR_INPUT_SLICE_PAD: return k_input_slice_pad(g);
+    case QDR_INPUT_SLICE: return k_input_slice(g);
+    case QDR_WEIGHTS_TO_VTCM: return k_weights_to_vtcm(g);
+    case QDR_IM2COL: return k_im2col(g);
+    case QDR_HMX_CONV: return k_hmx_conv(g);
+    case QDR_SPACE_TO_DEPTH: return k_space_to_depth(g);
+    case QDR_REQUANT_U8: return k_requant_u8(g);
+    case QDR_REQUANT_U16: return k_requant_u16(g);
+    case QDR_ADD_U8: return k_add_u8(g);
+    case QDR_ADD_U16: return k_add_u16(g);
+    case QDR_ADDSUB_U16: return k_addsub_u16(g);
+    case QDR_ADD1111_U16: return k_add1111_u16(g);
+    case QDR_MUL_U16: return k_mul_u16(g);
+    case QDR_MUL1111_U16: return k_mul1111_u16(g);
+    case QDR_COPY_VALUES: return k_copy_values(g);
+    case QDR_COPY_ACTIVATION: return k_copy_activation(g);
+    case QDR_TRANSPOSE: return k_transpose(g);
+    case QDR_CONCAT: return k_concat(g);
+    case QDR_GATHER: return k_gather(g);
+    case QDR_SLICE: return k_slice(g);
+    case QDR_SLICE_PAD: return k_slice_pad(g);
+    case QDR_DECIMATE: return k_decimate(g);
+    case QDR_RESIZE: return k_resize(g);
+    case QDR_DEPTH_TO_SPACE: return k_depth_to_space(g);
+    case QDR_SPILL_FILL: return k_spill_fill(g,g->variant==9);
+    case QDR_OUTPUT_SLICE: return k_output_slice(g);
+    case QDR_QUANTIZE: return k_quantize(g);
+    case QDR_DEQUANTIZE: return k_dequantize(g);
+    case QDR_SIGN: return k_sign(g);
+    case QDR_MEAN: return k_mean(g);
+    case QDR_WEIGHT_SCALES: return k_weight_scales(g);
+    case QDR_INVSCALE: return k_invscale(g);
+    case QDR_COMBINE_SCALES: return k_combine_scales(g);
+    case QDR_CONVERT_WEIGHTS: return k_convert_weights(g);
+    case QDR_SCALE_CONVERT: return k_scale_convert(g);
+    case QDR_DYNAMIC_BIAS: return k_dynamic_bias(g);
+    case QDR_BIAS_SHUFFLE: return k_bias_shuffle(g);
+    case QDR_LINEARCLIP: return k_linearclip(g);
+    case QDR_ABS: return k_abs(g);
+    case QDR_MUL_INLINE: return k_mul_inline(g);
+    case QDR_ADDSUB_FLAT: return k_addsub_flat(g);
+    case QDR_ADDSUB_INLINE: return k_addsub_inline(g);
+    case QDR_BLOCK_ZAP: return k_block_zap(g);
+    default: FAIL(E_UNSUPPORTED);
+    }
+}
+
+/* Duplicate-pad NOP records keep their source InputSlicePad variant. */
+static int variant_matches(uint32_t op, uint32_t variant) {
+    if(!op || op>QDR_OPCODES || !variant || variant>QDR_VARIANTS) return 0;
+    return qdr_variant_ops[variant]==op || (op==QDR_NOP && qdr_variant_ops[variant]==QDR_INPUT_SLICE_PAD);
+}
+static int setup(G *g, const Nprg2ExecCall *c, int dry, int measure, const Nprg2ReferenceConv *conv) {
+    memset(g,0,sizeof *g);
+    if(!c || !c->program || !c->bound || !c->pools) FAIL(E_ARGS);
+    const Nprg2Command *k=&c->command;
+    if(!variant_matches(k->opcode,k->variant)) FAIL(E_ARGS);
+    g->call=c;g->dry=dry;g->measure_only=(uint8_t)measure;
+    g->scratch=measure?NULL:(uint8_t *)c->scratch;
+    g->cap=measure?SIZE_MAX:(c->scratch?c->scratch_bytes:0);
+    if(conv && k->opcode==QDR_HMX_CONV && conv->workspace && conv->workspace_bytes) g->conv=conv;
+    if(g->conv && g->conv->near) {
+        uintptr_t n=(uintptr_t)conv->near,ne=n+conv->near_bytes,w=(uintptr_t)conv->workspace;
+        if(n<w+conv->workspace_bytes && w<ne) FAIL(E_MEMORY);
+        if(c->scratch && c->scratch_bytes && n<(uintptr_t)c->scratch+c->scratch_bytes && (uintptr_t)c->scratch<ne)
+            FAIL(E_MEMORY);
+        for(unsigned i=0;i<7;i++)
+            if(c->pools[i].bytes && n<(uintptr_t)c->pools[i].base+c->pools[i].bytes && (uintptr_t)c->pools[i].base<ne)
+                FAIL(E_MEMORY);
+    }
+    for(unsigned i=0;i<7;i++) {
+        g->pool[i]=c->pools[i].bytes?c->pools[i].base:NULL;
+        g->pool_bytes[i]=g->pool[i]?c->pools[i].bytes:0;
+        if(g->conv && g->pool[i]) {
+            uintptr_t b=(uintptr_t)g->pool[i],w=(uintptr_t)conv->workspace;
+            if(w<b+g->pool_bytes[i] && b<w+conv->workspace_bytes) g->pool_bytes[i]=w>b?w-b:0;
+            if(c->scratch && c->scratch_bytes) {
+                uintptr_t s=(uintptr_t)c->scratch;
+                if(w<s+c->scratch_bytes && s<w+conv->workspace_bytes) FAIL(E_MEMORY);
+            }
+        }
+        g->write_limit[i]=g->pool_bytes[i];
+    }
+    if(c->pool1_writable_bytes<g->write_limit[1]) g->write_limit[1]=c->pool1_writable_bytes;
+    /* The constant pool is immutable model state. */
+    g->write_limit[5]=0;
+    g->op=k->opcode;g->variant=k->variant;g->io=k->io_index;
+    g->nin=k->input_count;g->nout=k->output_count;g->nfv=k->vector_count;g->ncalls=k->call_count;
+    if(g->ncalls) {
+        if(!c->bound->calls.data || k->call_first>c->bound->calls.bytes/CALL_BYTES ||
+           g->ncalls>c->bound->calls.bytes/CALL_BYTES-k->call_first) FAIL(E_ARGS);
+        g->calls=c->bound->calls.data+(size_t)k->call_first*CALL_BYTES;
+    }
+    if(g->nfv) {
+        if(!c->bound->vectors.data || k->vector_first>c->bound->vectors.bytes/4u ||
+           g->nfv>c->bound->vectors.bytes/4u-k->vector_first) FAIL(E_ARGS);
+        g->fv=c->bound->vectors.data+(size_t)k->vector_first*4u;
+    }
+    if(g->nout>1) FAIL(E_ARGS);
+    for(uint32_t i=0;i<g->nin && i<CACHED_INPUTS;i++)TRY(input_at(g,i,&g->in[i]));
+    if(g->nout) {
+        uint32_t index;Nprg2TensorView v;
+        if(nprg2_exec_output(c,0,&index,&v)!=NPRG2_EXEC_OK || !decode(&v,&g->out)) FAIL(E_TENSOR);
+    }
+    return 0;
+}
+
+/* ctx is NULL or the Nprg2ReferenceConv given at conv registration. */
+int nprg2_exec_reference_validate(const Nprg2ExecCall *c, void *ctx) {
+    G g;
+    if(setup(&g,c,1,0,ctx)) return 0;
+    return run_kernel(&g)==0;
+}
+int nprg2_exec_reference_run(const Nprg2ExecCall *c, void *ctx) {
+    G g;
+    if(setup(&g,c,1,0,ctx) || run_kernel(&g)) return 0;
+    if(setup(&g,c,0,0,ctx)) return 0;
+    return run_kernel(&g)==0;
+}
+int nprg2_exec_reference_conv_measure(const Nprg2ExecCall *c, const Nprg2ReferenceConv *conv,
+                                      uint32_t *scratch_bytes, uint32_t *workspace_bytes) {
+    G g;
+    if(!scratch_bytes || setup(&g,c,1,1,conv) || run_kernel(&g) || g.used>UINT32_MAX || g.wused>UINT32_MAX) return 0;
+    *scratch_bytes=(uint32_t)g.used;
+    if(workspace_bytes)*workspace_bytes=(uint32_t)g.wused;
+    return 1;
+}
+int nprg2_exec_reference_scratch(const Nprg2ExecCall *c, uint32_t *bytes) {
+    return nprg2_exec_reference_conv_measure(c,NULL,bytes,NULL);
+}
+uint32_t nprg2_exec_reference_error_line(void) {return reference_error_line;}
+uint32_t nprg2_exec_reference_conv_path(void) {return conv_path;}
+
+int nprg2_executor_register_reference(Nprg2Executor *e, uint8_t opcode, uint8_t variant) {
+    if(!e || !variant_matches(opcode,variant)) return NPRG2_EXEC_ARGUMENT;
+    return nprg2_executor_register(e,opcode,variant,nprg2_exec_reference_validate,nprg2_exec_reference_run,NULL);
+}
+int nprg2_executor_register_reference_missing(Nprg2Executor *e, uint32_t *added) {
+    if(!e) return NPRG2_EXEC_ARGUMENT;
+    uint32_t n=0;
+    for(uint32_t v=1;v<=QDR_VARIANTS+1u;v++) {
+        uint8_t op=v<=QDR_VARIANTS?qdr_variant_ops[v]:QDR_NOP,variant=v<=QDR_VARIANTS?(uint8_t)v:QDR_INPUT_SLICE_PAD;
+        int r=nprg2_executor_register_reference(e,op,variant);
+        if(r==NPRG2_EXEC_DUPLICATE) continue;
+        if(r!=NPRG2_EXEC_OK){if(added)*added=n;return r;}
+        n++;
+    }
+    if(added)*added=n;
+    return NPRG2_EXEC_OK;
+}
+int nprg2_executor_register_reference_conv(Nprg2Executor *e, Nprg2ReferenceConv *conv, uint32_t *added) {
+    if(!e || !conv || !conv->workspace || !conv->workspace_bytes) return NPRG2_EXEC_ARGUMENT;
+    uint32_t n=0;
+    for(uint32_t v=1;v<=QDR_VARIANTS;v++) {
+        if(qdr_variant_ops[v]!=QDR_HMX_CONV) continue;
+        int r=nprg2_executor_register(e,QDR_HMX_CONV,(uint8_t)v,nprg2_exec_reference_validate,nprg2_exec_reference_run,conv);
+        if(r==NPRG2_EXEC_DUPLICATE) continue;
+        if(r!=NPRG2_EXEC_OK){if(added)*added=n;return r;}
+        n++;
+    }
+    if(added)*added=n;
+    return NPRG2_EXEC_OK;
+}
+
+static int chain_validate(const Nprg2ExecCall *c, void *ctx) {
+    const Nprg2ReferenceChain *k=ctx;
+    return k->validate(c,k->ctx) || nprg2_exec_reference_validate(c,NULL);
+}
+static int chain_run(const Nprg2ExecCall *c, void *ctx) {
+    const Nprg2ReferenceChain *k=ctx;
+    if(k->validate(c,k->ctx)) return k->run(c,k->ctx);
+    return nprg2_exec_reference_run(c,NULL);
+}
+int nprg2_executor_chain_reference(Nprg2Executor *e, uint8_t opcode, uint8_t variant, Nprg2ReferenceChain *storage) {
+    if(!e || !storage) return NPRG2_EXEC_ARGUMENT;
+    for(uint32_t i=0;i<NPRG2_EXEC_REGISTRY_CAPACITY;i++) {
+        Nprg2ExecHandler *h=&e->handlers[i];
+        if(!h->used || h->opcode!=opcode || h->variant!=variant) continue;
+        if(h->validate==chain_validate) return NPRG2_EXEC_DUPLICATE;
+        storage->validate=h->validate;storage->run=h->run;storage->ctx=h->ctx;
+        h->validate=chain_validate;h->run=chain_run;h->ctx=storage;
+        return NPRG2_EXEC_OK;
+    }
+    return NPRG2_EXEC_UNSUPPORTED;
+}

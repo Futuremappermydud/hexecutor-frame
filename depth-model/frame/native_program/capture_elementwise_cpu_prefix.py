@@ -17,7 +17,7 @@ import resident_image
 from check_kernels import load_inputs
 from bench.verify_native_graph import cases
 
-TARGETS=((10,'Add.tcm@CB*3','add'),(39,'linearclip@CH.CB.fi','linearclip'))
+TARGETS=((10,'Add.tcm@CB*3','add'),(39,'linearclip@CH.CB.fi','linearclip'),(8,'linearclip_simple_rq@CB*2.fi','requant'))
 
 def output_pages(tensor,width:int,pool_expected:int):
     sh=tensor['shape'];dims=sh['dimensions'];maximum=sh['max_dimensions'];origin=sh['padding']
@@ -65,15 +65,15 @@ def capture(model:str,case:str,outdir:Path):
             graph.run(inputs,0,index)
             before={p:(graph.pools[p].copy() if p in graph.pools else np.zeros(0,dtype=np.uint8)) for p in range(7)}
             fi_bytes=b'';fi_pool=0xffffffff;fi_offset=0
-            if label=='linearclip':
+            if label in ('linearclip', 'requant'):
                 fi=tensors[c['inputs'][1]];st=fi['storage']['direct']
                 fi_pool=st['pool'];fi_offset=st['offset']
                 fi_bytes=before[fi_pool][fi_offset:fi_offset+48].tobytes()
-                if len(fi_bytes)!=48:raise ValueError('LinearClip Fi does not fit direct pool range')
+                if len(fi_bytes)!=48:raise ValueError(f'{label} Fi does not fit direct pool range')
             graph.run(inputs,index,index+1)
             after=graph.pools[1]
             output=tensors[c['outputs'][0]]
-            pages=output_pages(output,8 if label=='add' else 4,1)
+            pages=output_pages(output,4 if label=='linearclip' else 8,1)
             fixture=outdir/f'{model}-{case}-{label}.epcpu'
             with fixture.open('wb') as f:
                 variant=resident_image.VARIANTS[variant_name]

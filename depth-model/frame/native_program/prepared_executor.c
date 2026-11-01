@@ -125,7 +125,11 @@ int nprg2_executor_run(const Nprg2Executor *e,const Nprg2ExecRequest *r){
         uint32_t ix=r->command_first+n;Nprg2ExecCall call;if(!make_call(r,ix,&call))return NPRG2_EXEC_REJECTED;
         if(r->cancelled&&r->cancelled(r->cancel_ctx,ix)){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_CANCELLED;}
         int hi=handler_index(e,call.command.opcode,call.command.variant);if(hi<0)return NPRG2_EXEC_UNSUPPORTED;
+        uint32_t v=call.command.variant;
+        int timed=s->clock&&s->variant_cycles&&s->variant_count&&v<NPRG2_EXEC_PROFILE_VARIANTS;
+        uint64_t t0=timed?s->clock():0;
         if(!e->handlers[hi].run(&call,e->handlers[hi].ctx)){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_HANDLER_ERROR;}
+        if(timed){s->variant_cycles[v]+=s->clock()-t0;s->variant_count[v]++;}
         s->executed_commands++;
     }
     return NPRG2_EXEC_OK;

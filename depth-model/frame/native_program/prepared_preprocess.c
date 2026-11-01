@@ -68,6 +68,8 @@ static int make_slice_plan(const Nprg2ExecCall *c,SlicePlan *p){
     for(unsigned i=0;i<4;i++)if((int16_t)rd16p(g+6+2*i)!=dims[i]||(int16_t)rd16p(g+14+2*i)!=dims[i]||(int16_t)rd16p(g+22+2*i))return 0;
     if(o.offset>c->pool1_writable_bytes||128u>c->pool1_writable_bytes-o.offset||o.offset>c->pools[1].bytes||128u>c->pools[1].bytes-o.offset||c->inputs[3].bytes!=128u)return 0;
     uintptr_t s=(uintptr_t)c->inputs[3].data,d=(uintptr_t)c->pools[1].base+o.offset;if(128u>UINTPTR_MAX-s||128u>UINTPTR_MAX-d||(s<d+128u&&d<s+128u))return 0;
+    const uint8_t *src_bytes=(const uint8_t *)c->inputs[3].data;
+    for(uint32_t i=0;i<32u;i++){uint32_t w=rd32p(src_bytes+i*4u);if((w&0x7f800000u)==0x7f800000u)return 0;}
     p->src=c->inputs[3].data;p->dst=(uint8_t *)d;p->bytes=128;return 1;
 }
 static int slice_validate(const Nprg2ExecCall *c,void *ctx){(void)ctx;SlicePlan p;return make_slice_plan(c,&p);}

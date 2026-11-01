@@ -22,6 +22,7 @@ docker run --rm --platform linux/amd64 -v "$task_sdk_root:/sdk:ro" -v "$PWD/fram
    -e QDS_PREPARED_PREPROCESS="${QDS_PREPARED_PREPROCESS:-0}" \
    -e QDS_PREPARED_QUANTIZE="${QDS_PREPARED_QUANTIZE:-0}" \
    -e QDS_PREPARED_ELEMENTWISE="${QDS_PREPARED_ELEMENTWISE:-0}" \
+   -e QDS_PREPARED_REFERENCE="${QDS_PREPARED_REFERENCE:-0}" \
    depth-model-hmx-tools:latest sh -eu -c '
 cc=/sdk/tools/HEXAGON_Tools/19.0.07/Tools/bin/hexagon-clang
 flags="-mv75 -mhvx -mhvx-length=128b -O2 -G0 -ffreestanding -fno-builtin -fno-vectorize -fno-slp-vectorize -ffp-contract=off -fno-strict-aliasing -Wall -Wextra -DQDO_SCALAR_CACHE=$QDS_SCALAR_CACHE"
@@ -59,6 +60,13 @@ fi
 case "$QDS_PREPARED_ELEMENTWISE" in 0|1) ;; *) echo "QDS_PREPARED_ELEMENTWISE must be 0 or 1" >&2; exit 1;; esac
 if [ "$QDS_PREPARED_ELEMENTWISE" = 1 ] && { [ "$QDS_NATIVE_PREPARED" != 1 ] || [ "$QDS_BLOCKED_GLUE" != 1 ]; }; then
   echo "QDS_PREPARED_ELEMENTWISE requires prepared and blocked glue" >&2; exit 1
+fi
+case "$QDS_PREPARED_REFERENCE" in 0|1) ;; *) echo "QDS_PREPARED_REFERENCE must be 0 or 1" >&2; exit 1;; esac
+# Reference scratch is L1-cached heap: no HVX may touch it, so no elementwise
+# handlers and no autovectorized engine.
+if [ "$QDS_PREPARED_REFERENCE" = 1 ] && { [ "$QDS_NATIVE_PREPARED" != 1 ] || [ "$QDS_PREPARED_ELEMENTWISE" != 0 ] ||
+   [ "$QDS_PREPARED_COMPACT_3X3" != 0 ] || [ "$QDS_VECTORIZE" != 0 ]; }; then
+  echo "QDS_PREPARED_REFERENCE requires prepared dispatch, QDS_VECTORIZE=0, and excludes elementwise and compact-3x3" >&2; exit 1
 fi
 if [ "$QDS_DIRECT_BIND_ONLY" = 1 ] && { [ "$QDS_NATIVE_DIRECT_RANGE" != 1 ] || [ "$QDS_NATIVE_PREPARED" != 0 ]; }; then
   echo "QDS_DIRECT_BIND_ONLY requires direct-range and disables prepared dispatch" >&2; exit 1
@@ -110,6 +118,7 @@ engine_flags="$engine_flags -DQDS_PREPARED_PREPROCESS=$QDS_PREPARED_PREPROCESS"
 engine_flags="$engine_flags -DQDS_PREPARED_QUANTIZE=$QDS_PREPARED_QUANTIZE"
 engine_flags="$engine_flags -DQDS_PREPARED_ELEMENTWISE=$QDS_PREPARED_ELEMENTWISE"
 engine_flags="$engine_flags -DQDS_PRESERVE_VTCM=$QDS_PRESERVE_VTCM"
+engine_flags="$engine_flags -DQDS_PREPARED_REFERENCE=$QDS_PREPARED_REFERENCE"
 glue_src=
 native_src=
 if [ "$QDS_DYNAMIC_TCM" = 1 ]; then engine="${engine%.elf}-dynamic-tcm.elf"; fi
@@ -156,6 +165,10 @@ if [ "$QDS_PREPARED_QUANTIZE" = 1 ]; then
   native_src="$native_src native_program/prepared_quantize.c native_program/prepared_quantize_core.c"
 fi
 if [ "$QDS_PREPARED_COMPACT_3X3" = 1 ]; then engine="${engine%.elf}-compact-3x3.elf"; fi
+if [ "$QDS_PREPARED_REFERENCE" = 1 ]; then
+  engine="${engine%.elf}-reference.elf"
+  native_src="$native_src native_program/prepared_reference.c"
+fi
 if [ "$QDS_PRESERVE_VTCM" = 1 ]; then
   engine="${engine%.elf}-vtcm-lease.elf"
   bootstrap="${bootstrap%.elf}-preserve-vtcm-guarded-entry.elf"

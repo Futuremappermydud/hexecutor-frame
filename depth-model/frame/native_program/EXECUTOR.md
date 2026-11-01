@@ -100,8 +100,9 @@ and framework NOP records also preserve the full pool byte-for-byte.
 to the core-safe I/O handlers. It covers InputSlice variant 1 only for the
 observed `*InputSlice@Ff.s4*6.` tuple: six exact shape-value inputs, caller
 input 3 containing 128 bytes, and direct float32 pool-1 output `[1,2,4,4]`.
-It copies those bytes directly after preflight checks the active pool-1 limit
-and rejects input/output overlap.
+Preflight checks the active pool-1 limit, rejects input/output overlap, and
+rejects any of the 32 input words with an all-ones exponent (NaN or infinity).
+It copies the accepted words directly.
 
 Im2col coverage is variant 24 (`ConvLayer.opt.inconv_im2col.tcm@CB.FB.s4.t`)
 for u8 source `[1,10,258,1]`, kernel `[3,3,1,32]`, stride `[1,1,1,1]`, and CB
@@ -175,10 +176,13 @@ runner moves pool 1 or starts an earlier command.
 
 ## Blocked u8 elementwise handlers
 
-`prepared_elementwise.c/.h` registers QDR ADD_U8 variant 13 and LinearClip
-variant 68 (`linearclip@CH.CB.fi`, blocked CB u8 to CH u16). Other variants
-remain uncovered. Both handlers read current bound tensor locations and
-current Fi values; neither allocates or creates a dense intermediate. They
+`prepared_elementwise.c/.h` registers QDR ADD_U8 variant 13, QDR REQUANT_U8
+variant 70 (`linearclip_simple_rq@CB*2.fi`), and LinearClip variant 68
+(`linearclip@CH.CB.fi`, blocked CB u8 to CH u16). Other variants remain
+uncovered. The requant handler uses the existing blocked u8 add arithmetic
+with a zero second multiplier, matching the CPU reference's rounding and
+saturation. The handlers read current bound tensor locations; LinearClip
+also reads current Fi values. None allocates or creates a dense intermediate. They
 validate the exact blocked geometry, command coefficients or Fi shape/range,
 pool-1 active write ceiling, touched-page bounds, and output/input page alias
 rules before execution.
@@ -189,12 +193,12 @@ maximum 2,560 block entries per tensor. The requirement is
 64-bit hosts and 30,748 bytes on Hexagon. The trailing seven pointers hold the
 pool map needed by the audited HVX helpers. Preflight does no graph-pool
 writes. The runner must reserve this scratch for command ranges containing
-either handler. The current executor repeats whole-range preflight at run
-entry; a later prepared-plan cache can retain the validated alias proof to
-avoid repeating it across frame executions.
+these handlers. The current executor repeats whole-range preflight at run
+entry. A separate plan-cache prototype exists, but is not integrated with the
+runner and must not replace whole-range preflight: see the limitations below.
 
 The fixture generator runs NativeGraph's CPU backend to the first command of
-each registered family, snapshots every graph pool and the live LinearClip Fi,
+each registered family, snapshots every graph pool and the live Fi spans,
 executes that exact CPU command, and captures the physical output pages. The
 V75 simulator harness reloads those pools, dispatches the same prepared
 command, and compares every pool byte with the captured CPU step. It also
@@ -205,6 +209,202 @@ execution calls the existing audited `blocked_glue/add_u8.c` and
 device latency result.
 
 `run_prepared_elementwise_host_sanitized.sh` runs ASan/UBSan read-only
-preflight against actual LinearClip metadata from both NPRG images. Its host
-link stubs cover only the unused numeric apply calls; V75 simulation above
-executes the real HVX glue.
+preflight against actual LinearClip and requant metadata from both NPRG images.
+It also rejects a malformed requant coefficient without changing any pool.
+Its host link stubs cover only the unused numeric apply calls; V75 simulation
+above executes the real HVX glue.
+
+## Additional bounded command handlers
+
+The independent `prepared_block_zap`, `prepared_spill_fill`, and
+`prepared_flat_vtcm` modules expose explicit registration functions. They are
+not automatically added to every runner session. A caller must register each
+module before requesting a range that contains its command family.
+
+`@BlockZap` (opcode 44, variant 5) accepts the three observed page-copy
+headers and checks every 2 KiB source and destination against the active
+pool-1 ceiling before writing. A host ASan/UBSan harness runs all 33 commands
+in each model and compares the complete pool-1 image with the CPU page-copy
+rule after every command. A strict V75 object build passes.
+
+`@Fill` and `@Spill` (opcode 26, variants 8 and 9) copy ordered spans between
+pool 6 and the encoded pool. The handler proves every span before the first
+copy; Fill destinations in pool 1 must stay within the active ceiling. The
+host harness covers all 62 Fill / 26 Spill commands in primary and 53 Fill /
+20 Spill in alternate, checking all pool bytes after each command against an
+ordered `memmove` oracle. It rejects a malformed later span without writes.
+A strict V75 object build passes; no V75 numerical fixture is claimed.
+
+`flat_to_vtcm@Ff.ff.` (opcode 16, variant 65) supports the observed direct
+float32 pool-3 to pool-1 copy. Its test executes all 160 commands in each
+model, compares full pool-1 and pool-3 images, and checks a reduced write
+ceiling rejects before writes. The V75 simulator build and run pass.
+
+`ConvLayer_SpaceToDepth_stride2.tcm@CB*2.s4` (opcode 7, variant 31) wraps the
+audited direct blocked u8 layout helper with an 8 KiB caller scratch tile.
+Its read-only preflight accepts all 174 commands in each model and restricts
+the helper's planned output pages to the active pool-1 ceiling. Host and V75
+simulator runs compare the full pool-1 image against captured CPU output for
+10 distinct shape/view profiles per model. These are bounded command proofs,
+not a full prepared schedule or device timing result.
+
+## Additional bounded CPU-prefix handlers
+
+These modules use explicit registration calls; adding a source file to a
+build does not make its opcode/variant available in a runner. Each proof below
+covers the named fixture commands or tuple only. It does not imply full model
+schedule coverage, Frame integration, or device execution.
+
+`prepared_abs.c/.h` registers QDR ABS variants 12 (`Abs@FH*2`, direct u16)
+and 11 (`Abs@CH*2`, blocked Crouton u16). The V75 simulator test compares
+physical pools with captured CPU prefixes for primary FH and CH commands and
+alternate FH. It checks malformed dtype/shape, unsupported variant, bounds,
+flat-buffer aliasing, and blocked-view corruption fail closed. This is a
+small set of command fixtures, not coverage of every ABS record.
+
+`prepared_mean.c/.h` registers QDR Mean variant 47 for exactly three direct
+u16 inputs and one direct u16 output with 32 input elements, one output
+element, and matching quantization metadata. Primary and alternate CPU-prefix
+fixtures pass bit-for-bit under the V75 simulator. The test also rejects an
+unregistered variant and a destination beyond the writable pool-1 limit.
+This does not establish generic Mean coverage.
+
+`prepared_conv_s2.c/.h` registers HMX-convolution variant 36, the tested
+Crouton u8 stride-2 profile. Its V75 simulator test compares full physical
+pools with captured NativeGraph CPU prefixes for three primary commands
+(command indices 224, 363, and 3407) and tests rejection of an unsupported
+variant. This is command-level software/HVX equivalence for those fixtures;
+no alternate-model or device result is claimed.
+
+`prepared_conv_u16.c/.h` registers HMX-convolution variants 34 and 35 for the
+tested CH/u16 1x1 and 3x3 forms. The simulator harness captures two primary
+model CPU-prefix fixtures and compares the resulting physical pool images.
+It is not a claim of full u16 convolution family coverage or device HMX
+execution.
+
+`prepared_slice_pad.c/.h` is an independent InputSlicePad registration module
+for opcode 2 variants 2 and 8. The Oct 31 report and simulator fixture test
+cover only variant 2 at alternate commands 68 and 69 (sequences 118 and 120),
+with exact CPU-prefix output and fail-closed checks. Variant 8 is registered
+in code but has no numerical fixture evidence in that report. This module is
+separate from the existing `prepared_io` InputSlicePad variant-2 handler;
+callers should register only one owner for a given key in a registry.
+
+## New direct scalar handlers
+
+All four modules below register explicitly and are not wired into the Frame
+runtime. They do not establish a multi-command or device result. Each host
+test first runs preflight on every matching command in both models. It then
+loads captured CPU-prefix pools, runs one command, and compares all seven
+physical pools byte-for-byte. Malformed metadata must reject before any pool
+write. The V75 simulator runners rebuild the same tests for `-mv75`.
+
+`prepared_sign.c/.h` registers opcode 30, variants 40 (`ElementWiseSign@FH*2`,
+direct pool-1 FH/u16 scalar) and 39 (blocked CH). Census: 13/13 per model.
+Fixtures exist for all 13 commands per model. The default build compares
+primary 157/4776 and alternate 109/4666. Building with `-DSIGN_ALL_FIXTURES`
+compares all 26 (host: all pass). V75: the four default cases pass. The CH
+path validates page bounds, output uniqueness, and read/write disjointness
+using two 2,560-entry `uintptr_t` stack arrays (20 KiB on Hexagon) and an
+O(n^2) overlap scan, and `run` repeats that validation. Check this against the
+per-worker stack budget before runtime integration.
+
+`prepared_addsub_flat.c/.h` registers opcode 42, variant 62 for the three
+direct flat Add/Sub commands in each model: primary 152/180/182, alternate
+100/128/130. The arithmetic profiles are one subtraction and two additions,
+mirrored across models. It validates offsets, shapes, quantization, the call
+signature, coefficients, pool roles and bounds, output aliasing, and the write
+ceiling. Host: 6/6 full-pool exact. V75: 6/6 full-pool exact.
+
+`prepared_mul_flat.c/.h` registers opcode 41, variant 75
+(`mul_op_flat@FH*2.fH.fi`) for the two direct scalar sites per model: primary
+158/181, alternate 110/129. It reads the live six-word parameter tensor and
+checks geometry, dtype, bounds, aliasing, and the pool-1 ceiling. Host and
+V75: 4/4 full-pool exact. CH Mul (10 per model) is not covered.
+
+`prepared_reshape_cb.c/.h` registers opcode 16, variant 49 (`Reshape.hw@CB*2`):
+source `[1,1,64,128]` (max H 8) to output `[1,8,8,128]`. The single live
+source row is the source H padding (0–7). Each value occurs in 10 commands per
+model. The handler copies 32-byte runs from 32 source pages to 4 output pages.
+It requires pool-1 pages that are in bounds, unique, and disjoint from the
+source. Census: 80/80 per model. `capture_reshape_cb_cpu_prefix.py --all-pads`
+captures the first command for each padding value. Host compares all 16
+(`*-reshape-cb-pad{0..7}.epcpu`). V75 (`-DRESHAPE_SIM_SUBSET`) compares pads
+0, 3, and 7; all pass. Caveat: in the smoke input, source rows 0–5 hold
+identical data. A mutant that ignores the padding and reads row 0 still
+passes pads 1–5 and first fails at pad 6. So only pads 6–7 actually test row
+selection.
+
+Reproduce with `sh frame/native_program/run_prepared_{sign,addsub_flat,mul_flat,reshape_cb}_sim.sh`
+from the project root. For host runs, compile `test_prepared_<family>.c` with
+its handler, `prepared_executor.c`, and `nprg2_runtime.c`.
+
+## Full-model reference kernel
+
+`prepared_reference.c/.h` is an exact port of every `qd_graph.c` CPU kernel.
+It covers all 76 (opcode, variant) keys, including the NOP duplicate-pad key
+(op 1, variant 2), so both prepared models run every command through the
+executor. Each command first runs a dry pass (metadata, call arguments, every
+touched block/byte range against pool bounds and the pool-1 ceiling, and the
+exact scratch need), then a wet pass. Gather axes, Transpose permutations and
+DepthToSpace factors stored as direct pool-5 constants are read in the dry
+pass, so their results are sized exactly. Other data-dependent checks
+(indices, runtime shifts) run in the wet pass before that command's first
+graph write. Convolution is a slow scalar CPU port: a correctness path, not a
+performance path.
+
+Registration is explicit. `nprg2_executor_register_reference_missing` fills
+every free key. `nprg2_executor_chain_reference` puts the reference kernel
+under an existing specialized handler, for commands that handler's validator
+rejects. The chain storage must outlive the executor. Scratch must come from
+`nprg2_exec_reference_scratch` over the scheduled range. The peak is 1,647,936
+bytes in both models (op 6 variant 33), well above the 0x8000-byte L2 scratch
+`prepared_run` passes today.
+
+Fast exact convolution: `nprg2_executor_register_reference_conv` registers
+every op-6 variant with an `Nprg2ReferenceConv` workspace (at least 467,456
+bytes; tests use 0x7e000). Each convolution then reads raw weight tiles in
+place and accumulates in int32 (HVX `vrmpy` when built with `-mhvx`, portable
+C otherwise), with the unchanged `requant`. The decision depends only on the
+shapes, and anything the fast path does not support falls back to the scalar
+reference. Size scratch and the workspace with
+`nprg2_exec_reference_conv_measure`; the scratch peak drops to 983,168 bytes.
+Pools that overlap the workspace are clipped below it in the dry pass.
+
+Evidence:
+
+- Host, `test_prepared_full_model.c`, both models: reference-only and mixed
+  (18 specialized keys chained over the reference) both pass. Lockstep shows
+  all seven pools identical to `qd_graph` CPU after every command. A whole
+  schedule runs as one preflight with no pool writes, then one run. Both
+  produce the emulator smoke output sha256. In reference-only lockstep, each
+  command's scratch is capped at exactly its own measured need. No command
+  writes above the 0x780000 pool-1 ceiling.
+- V75 simulator, `run_prepared_reference_sim.sh` (`test_prepared_reference_sim.c`):
+  `prefix` mode runs primary commands 0–131 and alternate commands 0–99 from
+  the `.mpfx` CPU captures. All seven pools match bit for bit in both models
+  (about 4 minutes including the build). `full` mode runs the whole schedule
+  from zeroed pools plus constants and checks the output sha256. With `fast`
+  and `segments 6`, all 12 segments of both models pass, and the final outputs
+  match the emulator sha256. That run took about 6.5e9 handler pcycles per
+  model, 73% of it conv.
+- Host: `fast` and `mixedfast` modes of `test_prepared_full_model` pass
+  lockstep and whole-schedule for both models.
+
+Not established: anything on hardware. The Frame wiring (`QDS_PREPARED_REFERENCE=1`
+in `qd_graph_prepared.h`) is compiled offline only. The pure scalar reference conv
+has not completed a full-schedule simulator run.
+
+## Plan-cache prototype
+
+`nprg2_plan_cache.c/.h` is a standalone prototype, not part of
+`prepared_runner` and not a supported optimization or replacement for normal
+preflight. Its test builds a cache for both actual schedules using mock
+handlers that accept every encountered opcode/variant, then checks cached and
+ordinary dispatch counts and a couple of mutated-request failures. That
+proves the prototype's basic tag-table plumbing only; it does not validate the
+real handlers' shape, alias, or live I/O predicates at cached run time.
+`dynamic_command_count` is currently left zero by the builder, so cached
+preflight skips handler validation. The header's approximate timing comment
+is not measured evidence. Use the ordinary executor preflight/run path for
+prepared execution.
