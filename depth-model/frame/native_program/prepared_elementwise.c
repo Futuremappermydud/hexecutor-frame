@@ -290,16 +290,19 @@ static int requant_run(const Nprg2ExecCall *c,void *ctx) {
     return qd_blocked_add_u8_apply(&prepared,&p);
 }
 
-int nprg2_executor_register_elementwise(Nprg2Executor *e) {
+int nprg2_executor_register_elementwise_region(Nprg2Executor *e, uint8_t region) {
     if (!e) return NPRG2_EXEC_ARGUMENT;
-    int rc=nprg2_executor_register_scratch(e,QDR_ADD_U8,13,add_validate,add_run,NULL,
-            NPRG2_ELEMENTWISE_SCRATCH_BYTES,0);
+    int rc=nprg2_executor_register_scratch_region(e,QDR_ADD_U8,13,add_validate,add_run,NULL,
+            NPRG2_ELEMENTWISE_SCRATCH_BYTES,0,region);
     if (rc) return rc;
-    rc=nprg2_executor_register_scratch(e,QDR_REQUANT_U8,70,requant_validate,requant_run,NULL,
-            NPRG2_ELEMENTWISE_SCRATCH_BYTES,0);
+    rc=nprg2_executor_register_scratch_region(e,QDR_REQUANT_U8,70,requant_validate,requant_run,NULL,
+            NPRG2_ELEMENTWISE_SCRATCH_BYTES,0,region);
     if (rc) return rc;
     /* Variant 68 is the proven linearclip@CH.CB.fi (CB u8 -> CH u16) form.
      * U16->U16 and dense/FB variants remain unregistered and fail closed. */
-    return nprg2_executor_register_scratch(e,QDR_LINEARCLIP,68,linearclip_validate,linearclip_run,NULL,
-            NPRG2_ELEMENTWISE_SCRATCH_BYTES,0);
+    return nprg2_executor_register_scratch_region(e,QDR_LINEARCLIP,68,linearclip_validate,linearclip_run,NULL,
+            NPRG2_ELEMENTWISE_SCRATCH_BYTES,0,region);
+}
+int nprg2_executor_register_elementwise(Nprg2Executor *e) {
+    return nprg2_executor_register_elementwise_region(e,NPRG2_EXEC_SCRATCH_DEFAULT);
 }

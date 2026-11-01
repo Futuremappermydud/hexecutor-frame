@@ -18,6 +18,9 @@ typedef struct {
     uint32_t *l2_expanded_blocks;
     uint32_t l2_expanded_bytes, l2_hot_bytes;
     uint8_t *l2_hot;
+    /* Executor scratch regions 1.. passed with every request (zero = absent).
+     * Set with nprg2_runner_set_scratch_region after open. */
+    Nprg2ExecBuffer extra_scratch[NPRG2_EXEC_SCRATCH_REGIONS-1u];
     uint8_t ready;
 } Nprg2PreparedRunner;
 
@@ -58,6 +61,12 @@ int nprg2_runner_preflight(Nprg2PreparedRunner *runner,
                            const Nprg2ExecBuffer *outputs,uint32_t output_count,
                            void *user,void *scratch,uint32_t scratch_bytes,
                            Nprg2ExecStats *stats);
+
+/* Sets executor scratch region `region` (1..NPRG2_EXEC_SCRATCH_REGIONS-1) for
+ * later preflight/execute calls; bytes=0 removes it. The executor checks it
+ * against graph memory and the other regions on every request. */
+int nprg2_runner_set_scratch_region(Nprg2PreparedRunner *runner,uint8_t region,
+                                    void *scratch,uint32_t scratch_bytes);
 
 void nprg2_runner_close(Nprg2PreparedRunner *runner);
 

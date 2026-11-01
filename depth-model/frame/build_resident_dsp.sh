@@ -62,11 +62,13 @@ if [ "$QDS_PREPARED_ELEMENTWISE" = 1 ] && { [ "$QDS_NATIVE_PREPARED" != 1 ] || [
   echo "QDS_PREPARED_ELEMENTWISE requires prepared and blocked glue" >&2; exit 1
 fi
 case "$QDS_PREPARED_REFERENCE" in 0|1) ;; *) echo "QDS_PREPARED_REFERENCE must be 0 or 1" >&2; exit 1;; esac
-# Reference scratch is L1-cached heap: no HVX may touch it, so no elementwise
-# handlers and no autovectorized engine.
-if [ "$QDS_PREPARED_REFERENCE" = 1 ] && { [ "$QDS_NATIVE_PREPARED" != 1 ] || [ "$QDS_PREPARED_ELEMENTWISE" != 0 ] ||
+# Reference scratch is L1-cached heap: no HVX may touch it, so no
+# autovectorized engine. Elementwise handlers are allowed: with the reference
+# build they get their own L2-TCM scratch region (qd_graph_prepared.h,
+# QDS_ELEMENTWISE_L2), not the heap scratch.
+if [ "$QDS_PREPARED_REFERENCE" = 1 ] && { [ "$QDS_NATIVE_PREPARED" != 1 ] ||
    [ "$QDS_PREPARED_COMPACT_3X3" != 0 ] || [ "$QDS_VECTORIZE" != 0 ]; }; then
-  echo "QDS_PREPARED_REFERENCE requires prepared dispatch, QDS_VECTORIZE=0, and excludes elementwise and compact-3x3" >&2; exit 1
+  echo "QDS_PREPARED_REFERENCE requires prepared dispatch, QDS_VECTORIZE=0, and excludes compact-3x3" >&2; exit 1
 fi
 if [ "$QDS_DIRECT_BIND_ONLY" = 1 ] && { [ "$QDS_NATIVE_DIRECT_RANGE" != 1 ] || [ "$QDS_NATIVE_PREPARED" != 0 ]; }; then
   echo "QDS_DIRECT_BIND_ONLY requires direct-range and disables prepared dispatch" >&2; exit 1

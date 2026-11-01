@@ -12,9 +12,6 @@
 #endif
 #if QDS_PREPARED_REFERENCE
 #include "native_program/prepared_reference.h"
-#if QDS_PREPARED_ELEMENTWISE
-#error QDS_PREPARED_REFERENCE gives handlers L1-cached heap scratch; HVX elementwise handlers need uncached scratch
-#endif
 #if QDS_PREPARED_COMPACT_3X3
 #error QDS_PREPARED_REFERENCE registers no native conv and owns the VTCM tail after its control area
 #endif
@@ -29,6 +26,16 @@
 #define QDS_REFERENCE_NEAR 0x30078000u
 #define QDS_REFERENCE_NEAR_BYTES 0x8000u
 #define QDS_REFERENCE_CHAINS 64u
+/* With QDS_PREPARED_ELEMENTWISE the HVX add/requant/linearclip handlers (13,
+ * 70, 68) get executor scratch region NPRG2_EXEC_SCRATCH_NEAR, an L2-TCM slot
+ * of their own, never the L1-cached heap scratch above (region 0) and never
+ * the conv near slot at 0x30078000. 0x300f8000..0x30100000 is the top half
+ * of the work slot: QdsWork uses 116 bytes at 0x300f0000, the hot program
+ * ends at 0x300ef000 and the worker stacks at 0x300b0000. Demand is 30,748
+ * bytes on Hexagon. They stay chained to the reference kernel, so a command
+ * their validator rejects still runs the reference kernel in region 0. */
+#define QDS_ELEMENTWISE_L2 0x300f8000u
+#define QDS_ELEMENTWISE_L2_BYTES 0x8000u
 static const volatile char prepared_reference_feature[]="QD_PREPARED_REF_1";
 #endif
 
@@ -180,7 +187,14 @@ static QdPreparedState *prepared_open(QdgGraph *g,const QdsConfig *cfg,
         nprg2_runner_close(&s->runner);free(s);return NULL;
     }
 #endif
-#if QDS_PREPARED_ELEMENTWISE
+#if QDS_PREPARED_ELEMENTWISE && QDS_PREPARED_REFERENCE
+    if(NPRG2_ELEMENTWISE_SCRATCH_BYTES>QDS_ELEMENTWISE_L2_BYTES ||
+       nprg2_runner_set_scratch_region(&s->runner,NPRG2_EXEC_SCRATCH_NEAR,
+                                       (void *)QDS_ELEMENTWISE_L2,QDS_ELEMENTWISE_L2_BYTES) ||
+       nprg2_executor_register_elementwise_region(&s->executor,NPRG2_EXEC_SCRATCH_NEAR)) {
+        free(s->scratch);nprg2_runner_close(&s->runner);free(s);return NULL;
+    }
+#elif QDS_PREPARED_ELEMENTWISE
     if(NPRG2_ELEMENTWISE_SCRATCH_BYTES>0x8000u ||
        nprg2_executor_register_elementwise(&s->executor)) {
         nprg2_runner_close(&s->runner);free(s);return NULL;
@@ -211,10 +225,11 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
     trace[10]=(uint32_t)(uintptr_t)s->runner.l2_hot;
     trace[11]=(uint32_t)(uintptr_t)s->runner.l2_expanded_blocks;
     void *scratch=NULL;uint32_t scratch_bytes=0;
-#if QDS_PREPARED_ELEMENTWISE
+#if QDS_PREPARED_ELEMENTWISE && !QDS_PREPARED_REFERENCE
     scratch=(void *)0x30078000u;scratch_bytes=0x8000u;
 #endif
 #if QDS_PREPARED_REFERENCE
+    /* Region 0 only; the elementwise L2 region is set on the runner. */
     scratch=s->scratch;scratch_bytes=QDS_REFERENCE_SCRATCH_BYTES;
     trace[15]=(uint32_t)prepared_reference_feature[0];
 #endif

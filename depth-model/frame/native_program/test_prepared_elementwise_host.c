@@ -41,6 +41,24 @@ static void run_model(const char *qpath,const char *npath,const char *fixture_pa
         CHECK(nprg2_executor_preflight(&e,&req)==NPRG2_EXEC_REJECTED);
         *coefficient=saved;
     }
+    {
+        /* Handlers registered for scratch region 1: region 0 too small to
+         * matter, region 1 absent -> rejected, too small -> rejected,
+         * aliasing region 0 -> argument error, sized -> accepted. */
+        Nprg2Executor e1;nprg2_executor_init(&e1);
+        CHECK(nprg2_executor_register_elementwise_region(&e1,NPRG2_EXEC_SCRATCH_NEAR)==NPRG2_EXEC_OK);
+        CHECK(nprg2_executor_register_elementwise_region(&e1,NPRG2_EXEC_SCRATCH_REGIONS)!=NPRG2_EXEC_OK);
+        void *r0_raw=malloc(64);CHECK(r0_raw);
+        Nprg2ExecRequest q1=req;q1.scratch=r0_raw;q1.scratch_bytes=64;
+        CHECK(nprg2_executor_preflight(&e1,&q1)==NPRG2_EXEC_REJECTED);
+        q1.extra_scratch[0]=(Nprg2ExecBuffer){(uint8_t *)scratch,NPRG2_ELEMENTWISE_SCRATCH_BYTES-1u};
+        CHECK(nprg2_executor_preflight(&e1,&q1)==NPRG2_EXEC_REJECTED);
+        q1.extra_scratch[0]=(Nprg2ExecBuffer){(uint8_t *)r0_raw,64};
+        CHECK(nprg2_executor_preflight(&e1,&q1)==NPRG2_EXEC_ARGUMENT);
+        q1.extra_scratch[0]=(Nprg2ExecBuffer){(uint8_t *)scratch,NPRG2_ELEMENTWISE_SCRATCH_BYTES};
+        CHECK(nprg2_executor_preflight(&e1,&q1)==NPRG2_EXEC_OK);
+        free(r0_raw);
+    }
     for(unsigned i=0;i<7;i++)if(pools[i].bytes)CHECK(!memcmp(before[i],pools[i].base,pools[i].bytes));
     printf("PASS ASan/UBSan %s actual-metadata preflight: %s command=%u\n",name,qpath,cmd);
     free(scratch_raw);for(unsigned i=0;i<7;i++){free(before[i]);free(pools[i].base);}free(hot);nprg2_close(&p);free(fx);free(q);free(raw);

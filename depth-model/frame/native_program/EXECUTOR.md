@@ -391,6 +391,87 @@ Evidence:
 - Host: `fast` and `mixedfast` modes of `test_prepared_full_model` pass
   lockstep and whole-schedule for both models.
 
+Vector block copies and direct blocked conv output (2026-11-01, **not yet
+run in the simulator**; HVX, `-DNPRG2_SCALAR_REQUANT` and host builds compile
+with `-Werror`):
+
+- In the u8 blocked layout, pixels W..W+7 (W%8==0) of one row and one
+  32-channel group are 256 contiguous bytes, 32 per pixel. `blocked_impl`
+  (behind `xfer_copy`, so conv input staging and every reference op) now
+  moves such 8-pixel runs with `blocked_run8`. With 32 dense channels it does
+  two 128-byte vector copies. With more channels it does one 32-byte masked
+  store per pixel (`store_part`/`load_part`). Partial channel groups and
+  absent blocks keep the scalar path, which zero-fills on load and skips on
+  store. `load_part` loads only the aligned vectors holding the first and
+  last byte, so it never reads into an unmapped next page. u16/i32 blocked
+  copies are unchanged.
+- `near_compute`, u8 with fused HVX requant, blocked output, and a chunk
+  starting at an 8-aligned output column: `rq_emit` stores each block's
+  pixels straight into the output block (`RqOut.blocked`/`blk[2]`,
+  located by `blocked_row8`). Full 8-pixel blocks are two aligned vector
+  stores. The near output chunk and its `xfer_copy` are skipped, so
+  phase 3 (output write) drops to about zero and the store cost shows up in
+  phase 1. u16, scalar requant and unaligned chunks still use the near chunk
+  and `xfer_copy`.
+- To validate: `run_prepared_reference_sim.sh` in prefix mode, then fast full
+  with `segments 6`, comparing pools and sha256 against the earlier results.
+
+HVX elementwise handlers back on in the reference build, via per-handler
+scratch regions (2026-11-01, **change made, NOT run in the simulator or on
+hardware**):
+
+- Why: about 27% of simulated time is the generic scalar reference over
+  ~138M elements per model; the largest are ADD_U8/13 (15.6M elements),
+  S2D/31, REQUANT_U8/70 and LINEARCLIP/68. `prepared_elementwise.c` already
+  has HVX handlers for 13, 70 and 68 from the accepted 74d engine. The
+  reference build turned them off (`#error` in `qd_graph_prepared.h`, check in
+  `build_resident_dsp.sh`) because they and the conv near state both used the
+  L2 slot at 0x30078000, and the reference build hands every handler its
+  L1-cached heap scratch.
+- Executor (`prepared_executor.{c,h}`): `NPRG2_EXEC_SCRATCH_REGIONS` (2).
+  Region 0 is the request's `scratch`/`scratch_bytes`; region 1
+  (`NPRG2_EXEC_SCRATCH_NEAR`) is `request->extra_scratch[0]`. Handlers pick a
+  region with `nprg2_executor_register_scratch_region` (stored in the former
+  `Nprg2ExecHandler.reserved` byte, now `scratch_region`; the old register
+  calls mean region 0). Preflight checks the handler's byte demand against
+  its region and run passes that region as `call->scratch`. Every region is
+  checked against graph memory, the control arrays, I/O buffers and the
+  other regions. `Nprg2ExecCall.scratch_region[]` carries all regions.
+- Reference chain (`prepared_reference.{c,h}`): `Nprg2ReferenceChain` now
+  stores the wrapped handler's region and byte demand. The chained entry is
+  moved to region 0 with zero demand (the reference validator checks its own
+  peak). `chain_call` gives the wrapped handler its own region. If that region
+  is absent or too small, or the handler's validator rejects, the command runs
+  the reference kernel with region 0, as before.
+- Runner: `Nprg2PreparedRunner.extra_scratch` and
+  `nprg2_runner_set_scratch_region`, copied into every request.
+- Plan cache: builds region 0 into its calls and rejects
+  (`NPRG2_PLAN_UNSUPPORTED`) a handler registered for any other region.
+- Elementwise: `nprg2_executor_register_elementwise_region(e, region)`;
+  `nprg2_executor_register_elementwise` is region 0, as before.
+- Frame (`qd_graph_prepared.h`): with `QDS_PREPARED_REFERENCE=1` and
+  `QDS_PREPARED_ELEMENTWISE=1`, the handlers are registered for region 1 =
+  `QDS_ELEMENTWISE_L2` 0x300f8000..0x30100000 (32 KiB L2-TCM, demand 30,748
+  bytes). That is the top half of the work slot: `QdsWork` uses 116 bytes at
+  0x300f0000, the hot program ends at 0x300ef000 and the worker stacks at
+  0x300b0000. They stay chained, so region 0 is still the 1 MiB heap scratch
+  and conv near stays at 0x30078000. The `#error` is gone, and
+  `build_resident_dsp.sh` no longer rejects REFERENCE=1 with ELEMENTWISE=1
+  (VECTORIZE=0 and COMPACT_3X3=0 are still required). The non-reference
+  elementwise build is unchanged (region 0 = 0x30078000).
+- Checked: host ASan/UBSan `test_prepared_elementwise_host` (now also tests
+  region 1: absent or too small -> REJECTED, aliasing region 0 -> ARGUMENT,
+  sized -> OK), `test_prepared_executor` and `test_nprg2_plan_cache` on both
+  models all pass. The Hexagon engine with the 74d flags minus COMPACT_3X3
+  plus VECTORIZE=0, REFERENCE=1 and ELEMENTWISE=1 compiles and links. It was
+  built from a scratch copy of `frame/`, so `frame/build` and the bootstrap
+  were not touched.
+- Not done: the reference-simulator full run with 13/70/68 on HVX, and any
+  hardware run. Before relying on it, recheck 13/70/68 against the CPU
+  reference on hardware (pools and sha256 as for the frozen reference
+  engine), and confirm that nothing on the Frame writes 0x300f8000..0x30100000
+  during a prepared call.
+
 Not established: anything on hardware. The Frame wiring (`QDS_PREPARED_REFERENCE=1`
 in `qd_graph_prepared.h`) is compiled offline only. The pure scalar reference conv
 has not completed a full-schedule simulator run.

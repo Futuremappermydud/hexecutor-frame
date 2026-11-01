@@ -66,8 +66,12 @@ int nprg2_plan_build(const Nprg2Bound *bound,
             .outputs = config->outputs,
             .output_count = config->output_count,
             .scratch = config->scratch,
-            .scratch_bytes = config->scratch_bytes
+            .scratch_bytes = config->scratch_bytes,
+            .scratch_region = {{(uint8_t *)config->scratch, config->scratch_bytes}}
         };
+        /* The plan carries one scratch region; a handler registered for
+         * another region fails closed here instead of getting the wrong one. */
+        if (h->scratch_region != NPRG2_EXEC_SCRATCH_DEFAULT) return NPRG2_PLAN_UNSUPPORTED;
 
         /* Run full static validation (including alias_proof with caller scratch) */
         if (!h->validate(&call, h->ctx)) return NPRG2_PLAN_REJECTED;
@@ -221,7 +225,8 @@ int nprg2_executor_run_cached(const Nprg2Executor *e,
             .output_count = r->output_count,
             .user = r->user,
             .scratch = r->scratch,
-            .scratch_bytes = r->scratch_bytes
+            .scratch_bytes = r->scratch_bytes,
+            .scratch_region = {{(uint8_t *)r->scratch, r->scratch_bytes}}
         };
         if (nprg2_command_at(r->bound, ix, &call.command) != NPRG2_OK) return NPRG2_EXEC_REJECTED;
 

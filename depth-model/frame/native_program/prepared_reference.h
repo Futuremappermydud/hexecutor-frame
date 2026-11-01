@@ -65,8 +65,15 @@ int nprg2_exec_reference_conv_measure(const Nprg2ExecCall *call, const Nprg2Refe
 uint32_t nprg2_exec_reference_conv_path(void);
 
 /* Rewrites an existing registration so commands its validator rejects use the
- * reference kernel instead. Storage must outlive the executor. */
-typedef struct { Nprg2ExecValidate validate; Nprg2ExecRun run; void *ctx; } Nprg2ReferenceChain;
+ * reference kernel instead. Storage must outlive the executor. The chained
+ * entry takes the default scratch region (the reference kernel's); the
+ * wrapped handler is still called with its own registered region and byte
+ * demand, and falls through to the reference kernel when that region is
+ * absent or too small. */
+typedef struct {
+    Nprg2ExecValidate validate; Nprg2ExecRun run; void *ctx;
+    uint32_t scratch_bytes; uint8_t scratch_region;
+} Nprg2ReferenceChain;
 int nprg2_executor_chain_reference(Nprg2Executor *executor, uint8_t opcode, uint8_t variant,
                                    Nprg2ReferenceChain *storage);
 

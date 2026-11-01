@@ -22,6 +22,31 @@ static uint32_t reference_error_line;
 #define CHECK(cond,code) do { if(!(cond)) FAIL(code); } while(0)
 #define TRY(expr) do { int e_=(expr); if(e_) return e_; } while(0)
 
+#if defined(__HVX__) && __HVX_LENGTH__==128
+#define BLK_HVX 1
+/* Bytes v[src..src+n) to d, with masked aligned stores; src+n<=128. */
+static inline void store_part(uint8_t *d, HVX_Vector v, uint32_t src, uint32_t n) {
+    uint32_t off=(uint32_t)((uintptr_t)d&127u),end=off+n;
+    if(!off && !src && n==128){*(HVX_Vector *)d=v;return;}
+    HVX_Vector *base=(HVX_Vector *)(d-off),r=Q6_V_vror_VR(v,(int32_t)((src-off)&127u));
+    HVX_VectorPred q=Q6_Q_not_Q(Q6_Q_vsetq_R((int32_t)off));
+    if(end<128) q=Q6_Q_and_QQ(q,Q6_Q_vsetq_R((int32_t)end));
+    Q6_vmem_QRIV(q,base,r);
+    if(end>128) Q6_vmem_QRIV(Q6_Q_vsetq_R((int32_t)(end-128)),base+1,r);
+}
+/* A vector whose bytes [0,n) are s[0..n), 0<n<=128. Only the aligned vectors
+ * holding s[0] and s[n-1] are loaded, so no page past the buffer is touched. */
+static inline HVX_Vector load_part(const uint8_t *s, uint32_t n) {
+    uintptr_t a=(uintptr_t)s;
+    const HVX_Vector *lo=(const HVX_Vector *)(a&~(uintptr_t)127);
+    if(!(a&127u)) return *lo;
+    const HVX_Vector *hi=(const HVX_Vector *)((a+n-1)&~(uintptr_t)127);
+    return Q6_V_valign_VVR(*hi,*lo,(int32_t)(a&127u));
+}
+#else
+#define BLK_HVX 0
+#endif
+
 typedef struct {
     uint32_t dtype, flags, esize, crouton, cls, scalar;
     int32_t d[4], m[4], p[4], sv[4];
@@ -158,6 +183,42 @@ static int blocked_check(G *g, const T *t, const int32_t *dims, const int32_t *o
        }
     return 0;
 }
+#if BLK_HVX
+/* u8 blocked_impl for the 8 pixels W..W+7 (W%8==0) of one row. In a block
+ * they are 256 contiguous bytes per 32-channel group, 32 per pixel; values
+ * holds them pixel-major with nd channels each. Whole groups move as vectors. */
+static void blocked_run8(uint8_t *const *pools, const uint32_t *blocks, int64_t count, uint8_t *values,
+                         int64_t wrow, size_t hin, int64_t nd, int64_t d0, int store) {
+    for(int64_t d=0;d<nd;) {
+        int64_t D=d+d0,n=32-D%32;
+        if(n>nd-d)n=nd-d;
+        int64_t index=wrow+D/32;
+        uint32_t e=(index>=0 && index<count)?blocks[index]:0,pool=e&127;
+        uint8_t *base=pool?pools[pool]:NULL,*v=values+d;
+        if(!base) {
+            if(!store)for(int k=0;k<8;k++)memset(v+k*nd,0,(size_t)n);
+        } else {
+            uint8_t *blk=base+(e&~127u)+hin;
+            if(n==32 && nd==32) {
+                if(store){store_part(blk,load_part(v,128),0,128);store_part(blk+128,load_part(v+128,128),0,128);}
+                else {store_part(v,load_part(blk,128),0,128);store_part(v+128,load_part(blk+128,128),0,128);}
+            } else if(n==32) {
+                if(store)for(int k=0;k<8;k++)store_part(blk+32*k,load_part(v+k*nd,32),0,32);
+                else {
+                    HVX_Vector b0=load_part(blk,128),b1=load_part(blk+128,128);
+                    for(int k=0;k<8;k++)store_part(v+k*nd,k<4?b0:b1,(uint32_t)(k%4)*32,32);
+                }
+            } else {
+                size_t at=(size_t)(D%32);
+                for(int k=0;k<8;k++) {
+                    if(store)memcpy(blk+32*k+at,v+k*nd,(size_t)n);else memcpy(v+k*nd,blk+32*k+at,(size_t)n);
+                }
+            }
+        }
+        d+=n;
+    }
+}
+#endif
 static inline __attribute__((always_inline)) void blocked_impl(uint8_t *const *pools, const T *t, uint8_t *values,
         const int32_t *dims, const int32_t *origin, const uint32_t size, const int store) {
     const int64_t cw=size==1?8:size==2?4:2;
@@ -172,6 +233,13 @@ static inline __attribute__((always_inline)) void blocked_impl(uint8_t *const *p
         for(int64_t w=0;w<dims[2];w++) {
             int64_t W=w+origin[2];
             int64_t wrow=(hrow+W/cw)*nbd+slice;
+#if BLK_HVX
+            if(size==1 && W%8==0 && dims[2]-w>=8) {
+                blocked_run8(pools,blocks,count,values+pos,wrow,hin,dims[3],origin[3],store);
+                pos+=(size_t)8*dims[3];w+=7;
+                continue;
+            }
+#endif
             size_t win=hin+(size==1?(W%8)*32:size==2?((W%4)/2)*64+W%2:(W%2)*32);
             for(int64_t d=0;d<dims[3];) {
                 int64_t D=d+origin[3],n=32-D%32;
@@ -1373,16 +1441,10 @@ static int rq_prepare(int32_t *par, int32_t co, int sixteen, int64_t bound, int3
 #if defined(__HVX__) && __HVX_LENGTH__==128
 /* Where tile_block requantizes: block j's parameters, the output byte for
  * pixel 0 channel 32*j, and the byte stride between pixels. */
-typedef struct { const HVX_Vector *par; uint8_t *out; uint32_t pstride; int sixteen; } RqOut;
-/* Bytes v[src..src+n) to d, with masked aligned stores; src+n<=128. */
-static inline void store_part(uint8_t *d, HVX_Vector v, uint32_t src, uint32_t n) {
-    uint32_t off=(uint32_t)((uintptr_t)d&127u),end=off+n;
-    HVX_Vector *base=(HVX_Vector *)(d-off),r=Q6_V_vror_VR(v,(int32_t)((src-off)&127u));
-    HVX_VectorPred q=Q6_Q_not_Q(Q6_Q_vsetq_R((int32_t)off));
-    if(end<128) q=Q6_Q_and_QQ(q,Q6_Q_vsetq_R((int32_t)end));
-    Q6_vmem_QRIV(q,base,r);
-    if(end>128) Q6_vmem_QRIV(Q6_Q_vsetq_R((int32_t)(end-128)),base+1,r);
-}
+/* With blocked set (u8 only), block b's pixels go to blk[b] instead, 32
+ * bytes each and contiguous: the final blocked layout. A NULL blk[b] is an
+ * absent block, which stores skip. */
+typedef struct { const HVX_Vector *par; uint8_t *out; uint32_t pstride; int sixteen, blocked; uint8_t *blk[2]; } RqOut;
 static inline HVX_Vector rq_lane(HVX_Vector a, HVX_Vector lo, const HVX_Vector *k, HVX_Vector c, HVX_Vector r,
                                  HVX_Vector sl, HVX_Vector sr, int sixteen) {
     HVX_Vector x,m16=Q6_V_vsplat_R(0xffff);
@@ -1406,6 +1468,18 @@ static inline void rq_emit(const RqOut *o, const HVX_Vector *acc, const HVX_Vect
                                              Q6_V_vsplat_R(1<<22)):r;
         for(int32_t p=0;p<np;p++)
             q[b*PIXEL_BLOCK+p]=rq_lane(acc[b*PIXEL_BLOCK+p],lo?lo[b*PIXEL_BLOCK+p]:z,k,c,r,sl,sr,sixteen);
+    }
+    if(o->blocked) {
+        for(int32_t b=0;b<nb;b++) {
+            const HVX_Vector *qb=q+b*PIXEL_BLOCK;
+            if(o->blk[b])for(int32_t p=0;p<np;p+=4) {
+#define QP(i) (p+(i)<np?qb[p+(i)]:z)
+                HVX_Vector v=Q6_Vub_vpack_VhVh_sat(Q6_Vh_vpack_VwVw_sat(QP(3),QP(2)),Q6_Vh_vpack_VwVw_sat(QP(1),QP(0)));
+#undef QP
+                store_part(o->blk[b]+32*p,v,0,(uint32_t)(np-p<4?np-p:4)*32);
+            }
+        }
+        return;
     }
     /* Output order is pixel-major, 32 channels (one block) per segment; a
      * packed vector holds g segments. */
@@ -1674,7 +1748,7 @@ static void fast_conv_compute(G *g, const T *xt, const T *wt, const T *ft, int s
             if(vec) {
                 size_t es=sixteen?2:1;
                 RqOut ro={(const HVX_Vector *)rqp+(size_t)j*RQ_VECS,r+(((size_t)y*ow+x0)*co+(size_t)j*32)*es,
-                          (uint32_t)(co*es),sixteen};
+                          (uint32_t)(co*es),sixteen,0,{NULL,NULL}};
                 if(sixteen) {
                     tile_block(acc,np,xlo+at,stride,ntiles,t0,t1,xoff,wbase,NULL,NULL);
                     tile_block(hi,np,xhi+at,stride,ntiles,t0,t1,xoff,wbase,&ro,(const HVX_Vector *)acc);
@@ -1698,6 +1772,16 @@ static void fast_conv_compute(G *g, const T *xt, const T *wt, const T *ft, int s
         }
     }
 }
+#if RQ_HVX
+/* Where pixels (h, w..w+7), w%8==0, of channel group z start in a u8 blocked
+ * tensor (batch 0), or NULL for an absent block, as blocked_impl finds them. */
+static uint8_t *blocked_row8(uint8_t *const *pools, const T *t, int64_t h, int64_t w, int64_t z) {
+    int64_t nbw=((int64_t)t->m[2]+7)/8,nbd=((int64_t)t->m[3]+31)/32;
+    int64_t index=((h/8)*nbw+w/8)*nbd+t->slice+z;
+    uint32_t e=(index>=0 && index<(int64_t)t->nblocks)?t->blocks[index]:0,pool=e&127;
+    return pool && pools[pool]?pools[pool]+(e&~127u)+(size_t)(h%8)*256:NULL;
+}
+#endif
 /* fast_conv_compute over near memory, one output row chunk at a time: stage
  * the chunk's kh input rows from x, accumulate, requantize into a near output
  * chunk and write it to o. x holds the whole input, so in-place outputs are
@@ -1733,8 +1817,12 @@ static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o
 #define LAP(i) do { if(clock){uint64_t u_=clock();ph[i]+=u_-t;t=u_;} } while(0)
     size_t es=sixteen?2:1,plane=(size_t)sw*ci;
     int32_t *ahi=acc+2*PIXEL_BLOCK*32;
+    /* u8 blocked outputs aligned to whole blocks are requantized straight into
+     * o, skipping the near output chunk and its xfer_copy. */
+    int direct=vec && !sixteen && (o->flags&F_BLOCKED) && o->esize==1;
     for(int32_t y=0;y<oh;y++)for(int32_t x0=0;x0<ow;x0+=p->cols) {
         int32_t nc=ow-x0<p->cols?ow-x0:p->cols;
+        int dchunk=direct && (o->p[2]+x0)%8==0;
         size_t span=(size_t)(nc+kw-1)*ci;
         for(int32_t ky=0;ky<kh;ky++) {
             const uint8_t *src=x+(((size_t)(y+ky)*xw+x0)*ci)*es;
@@ -1752,7 +1840,12 @@ static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o
                 /* Fused: requant time lands in the mac phase. */
                 if(vec) {
                     RqOut ro={(const HVX_Vector *)rqp+(size_t)j*RQ_VECS,out+((size_t)px*co+(size_t)j*32)*es,
-                              (uint32_t)(co*es),sixteen};
+                              (uint32_t)(co*es),sixteen,0,{NULL,NULL}};
+                    if(dchunk) {
+                        ro.blocked=1;
+                        for(int32_t b=0;b<nb;b++)
+                            ro.blk[b]=blocked_row8(g->pool,o,(int64_t)o->p[1]+y,(int64_t)o->p[2]+x0+px,j+b);
+                    }
                     if(sixteen) {
                         tile_block(acc,np,lo+at,(uint32_t)ci,ntiles,t0,t1,xoff,wbase,NULL,NULL);
                         tile_block(ahi,np,hi+at,(uint32_t)ci,ntiles,t0,t1,xoff,wbase,&ro,(const HVX_Vector *)acc);
@@ -1776,8 +1869,10 @@ static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o
                 LAP(2);
             }
         }
-        int32_t dims[4]={1,1,nc,co},origin[4]={0,o->p[1]+y,o->p[2]+x0,0};
-        xfer_copy(g,o,out,dims,origin,1);
+        if(!dchunk) {
+            int32_t dims[4]={1,1,nc,co},origin[4]={0,o->p[1]+y,o->p[2]+x0,0};
+            xfer_copy(g,o,out,dims,origin,1);
+        }
         LAP(3);
     }
 #undef LAP
@@ -2001,13 +2096,22 @@ int nprg2_executor_register_reference_conv(Nprg2Executor *e, Nprg2ReferenceConv 
     return NPRG2_EXEC_OK;
 }
 
+/* The call as the wrapped handler would get it unchained: its own scratch
+ * region. 0 when that region is absent or below the registered demand. */
+static int chain_call(const Nprg2ExecCall *c, const Nprg2ReferenceChain *k, Nprg2ExecCall *w) {
+    if(k->scratch_region>=NPRG2_EXEC_SCRATCH_REGIONS) return 0;
+    *w=*c;
+    const Nprg2ExecBuffer *b=&c->scratch_region[k->scratch_region];
+    w->scratch=b->bytes?b->data:NULL;w->scratch_bytes=b->bytes;
+    return w->scratch_bytes>=k->scratch_bytes;
+}
 static int chain_validate(const Nprg2ExecCall *c, void *ctx) {
-    const Nprg2ReferenceChain *k=ctx;
-    return k->validate(c,k->ctx) || nprg2_exec_reference_validate(c,NULL);
+    const Nprg2ReferenceChain *k=ctx;Nprg2ExecCall w;
+    return (chain_call(c,k,&w) && k->validate(&w,k->ctx)) || nprg2_exec_reference_validate(c,NULL);
 }
 static int chain_run(const Nprg2ExecCall *c, void *ctx) {
-    const Nprg2ReferenceChain *k=ctx;
-    if(k->validate(c,k->ctx)) return k->run(c,k->ctx);
+    const Nprg2ReferenceChain *k=ctx;Nprg2ExecCall w;
+    if(chain_call(c,k,&w) && k->validate(&w,k->ctx)) return k->run(&w,k->ctx);
     return nprg2_exec_reference_run(c,NULL);
 }
 int nprg2_executor_chain_reference(Nprg2Executor *e, uint8_t opcode, uint8_t variant, Nprg2ReferenceChain *storage) {
@@ -2016,8 +2120,14 @@ int nprg2_executor_chain_reference(Nprg2Executor *e, uint8_t opcode, uint8_t var
         Nprg2ExecHandler *h=&e->handlers[i];
         if(!h->used || h->opcode!=opcode || h->variant!=variant) continue;
         if(h->validate==chain_validate) return NPRG2_EXEC_DUPLICATE;
+        if(h->scratch_bytes>UINT32_MAX-h->concurrent_worker_scratch_bytes) return NPRG2_EXEC_ARGUMENT;
         storage->validate=h->validate;storage->run=h->run;storage->ctx=h->ctx;
+        storage->scratch_bytes=h->scratch_bytes+h->concurrent_worker_scratch_bytes;
+        storage->scratch_region=h->scratch_region;
+        /* The entry now gets the reference kernel's default region; the
+         * reference validator checks its own scratch peak against it. */
         h->validate=chain_validate;h->run=chain_run;h->ctx=storage;
+        h->scratch_region=NPRG2_EXEC_SCRATCH_DEFAULT;h->scratch_bytes=0;h->concurrent_worker_scratch_bytes=0;
         return NPRG2_EXEC_OK;
     }
     return NPRG2_EXEC_UNSUPPORTED;

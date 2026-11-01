@@ -23,13 +23,21 @@ int nprg2_executor_register(Nprg2Executor *e,uint8_t op,uint8_t variant,
 int nprg2_executor_register_scratch(Nprg2Executor *e,uint8_t op,uint8_t variant,
                                     Nprg2ExecValidate validate,Nprg2ExecRun run,void *ctx,
                                     uint32_t scratch_bytes,uint32_t worker_scratch_bytes){
-    if(!e||!op||op>QDR_OPCODES||!variant||variant>QDR_VARIANTS||!validate||!run)return NPRG2_EXEC_ARGUMENT;
+    return nprg2_executor_register_scratch_region(e,op,variant,validate,run,ctx,scratch_bytes,worker_scratch_bytes,
+                                                  NPRG2_EXEC_SCRATCH_DEFAULT);
+}
+int nprg2_executor_register_scratch_region(Nprg2Executor *e,uint8_t op,uint8_t variant,
+                                           Nprg2ExecValidate validate,Nprg2ExecRun run,void *ctx,
+                                           uint32_t scratch_bytes,uint32_t worker_scratch_bytes,
+                                           uint8_t region){
+    if(!e||!op||op>QDR_OPCODES||!variant||variant>QDR_VARIANTS||!validate||!run||
+       region>=NPRG2_EXEC_SCRATCH_REGIONS)return NPRG2_EXEC_ARGUMENT;
     if(e->count>=NPRG2_EXEC_REGISTRY_CAPACITY)return NPRG2_EXEC_REGISTRY_FULL;
     uint32_t at=handler_hash(op,variant);
     for(uint32_t n=0;n<NPRG2_EXEC_REGISTRY_CAPACITY;n++,at=(at+1u)%NPRG2_EXEC_REGISTRY_CAPACITY){
         Nprg2ExecHandler *h=&e->handlers[at];if(h->used){if(h->opcode==op&&h->variant==variant)return NPRG2_EXEC_DUPLICATE;continue;}
         h->opcode=op;h->variant=variant;h->used=1;h->validate=validate;h->run=run;h->ctx=ctx;
-        h->scratch_bytes=scratch_bytes;h->concurrent_worker_scratch_bytes=worker_scratch_bytes;e->count++;return NPRG2_EXEC_OK;
+        h->scratch_bytes=scratch_bytes;h->concurrent_worker_scratch_bytes=worker_scratch_bytes;h->scratch_region=region;e->count++;return NPRG2_EXEC_OK;
     }
     return NPRG2_EXEC_REGISTRY_FULL;
 }
@@ -58,7 +66,14 @@ static int make_call(const Nprg2ExecRequest *r,uint32_t index,Nprg2ExecCall *cal
     call->pools=r->pools;call->pool1_writable_bytes=r->pool1_writable_bytes;
     call->inputs=r->inputs;call->input_count=r->input_count;call->outputs=r->outputs;call->output_count=r->output_count;
     call->user=r->user;call->scratch=r->scratch;call->scratch_bytes=r->scratch_bytes;
+    call->scratch_region[0]=(Nprg2ExecBuffer){(uint8_t *)r->scratch,r->scratch_bytes};
+    for(uint32_t k=1;k<NPRG2_EXEC_SCRATCH_REGIONS;k++)call->scratch_region[k]=r->extra_scratch[k-1u];
     return nprg2_command_at(r->bound,index,&call->command)==NPRG2_OK;
+}
+/* Hands the handler the region it registered for. */
+static void select_scratch(Nprg2ExecCall *call,const Nprg2ExecHandler *h){
+    const Nprg2ExecBuffer *b=&call->scratch_region[h->scratch_region<NPRG2_EXEC_SCRATCH_REGIONS?h->scratch_region:0u];
+    call->scratch=b->bytes?b->data:NULL;call->scratch_bytes=b->bytes;
 }
 static int no_graph_alias(const Nprg2Executor *e,const Nprg2ExecRequest *r,const void *ptr,size_t bytes){
     if(!bytes)return 1;
@@ -87,6 +102,16 @@ static int request_valid(const Nprg2Executor *e,const Nprg2ExecRequest *r){
        !no_graph_alias(e,r,r->stats,r->stats?sizeof *r->stats:0)||
        !no_graph_alias(e,r,r->inputs,(size_t)r->input_count*sizeof *r->inputs)||
        !no_graph_alias(e,r,r->outputs,(size_t)r->output_count*sizeof *r->outputs))return 0;
+    for(uint32_t k=0;k+1u<NPRG2_EXEC_SCRATCH_REGIONS;k++){
+        const Nprg2ExecBuffer *x=&r->extra_scratch[k];if(!x->bytes)continue;
+        if(!x->data||!no_graph_alias(e,r,x->data,x->bytes)||overlaps(x->data,x->bytes,r->scratch,r->scratch_bytes)||
+           overlaps(x->data,x->bytes,r->stats,r->stats?sizeof *r->stats:0)||
+           overlaps(x->data,x->bytes,r->inputs,(size_t)r->input_count*sizeof *r->inputs)||
+           overlaps(x->data,x->bytes,r->outputs,(size_t)r->output_count*sizeof *r->outputs))return 0;
+        for(uint32_t j=0;j<r->input_count;j++)if(overlaps(x->data,x->bytes,r->inputs[j].data,r->inputs[j].bytes))return 0;
+        for(uint32_t j=0;j<r->output_count;j++)if(overlaps(x->data,x->bytes,r->outputs[j].data,r->outputs[j].bytes))return 0;
+        for(uint32_t j=0;j<k;j++)if(overlaps(x->data,x->bytes,r->extra_scratch[j].data,r->extra_scratch[j].bytes))return 0;
+    }
     for(uint32_t j=0;j<r->input_count;j++)if(!no_graph_alias(e,r,r->inputs[j].data,r->inputs[j].bytes))return 0;
     for(uint32_t j=0;j<r->output_count;j++)if(!no_graph_alias(e,r,r->outputs[j].data,r->outputs[j].bytes))return 0;
     if(overlaps(r->scratch,r->scratch_bytes,r->stats,r->stats?sizeof *r->stats:0)||
@@ -106,7 +131,7 @@ int nprg2_executor_preflight(const Nprg2Executor *e,const Nprg2ExecRequest *r){
         uint32_t ix=r->command_first+n;Nprg2ExecCall call;if(!make_call(r,ix,&call))return NPRG2_EXEC_REJECTED;
         int hi=handler_index(e,call.command.opcode,call.command.variant);
         if(hi<0){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_UNSUPPORTED;}
-        const Nprg2ExecHandler *h=&e->handlers[hi];
+        const Nprg2ExecHandler *h=&e->handlers[hi];select_scratch(&call,h);
         if(h->scratch_bytes>UINT32_MAX-h->concurrent_worker_scratch_bytes||
            h->scratch_bytes+h->concurrent_worker_scratch_bytes>call.scratch_bytes){
             s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_REJECTED;
@@ -125,6 +150,7 @@ int nprg2_executor_run(const Nprg2Executor *e,const Nprg2ExecRequest *r){
         uint32_t ix=r->command_first+n;Nprg2ExecCall call;if(!make_call(r,ix,&call))return NPRG2_EXEC_REJECTED;
         if(r->cancelled&&r->cancelled(r->cancel_ctx,ix)){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_CANCELLED;}
         int hi=handler_index(e,call.command.opcode,call.command.variant);if(hi<0)return NPRG2_EXEC_UNSUPPORTED;
+        select_scratch(&call,&e->handlers[hi]);
         uint32_t v=call.command.variant;
         int timed=s->clock&&s->variant_cycles&&s->variant_count&&v<NPRG2_EXEC_PROFILE_VARIANTS;
         uint64_t t0=timed?s->clock():0;
