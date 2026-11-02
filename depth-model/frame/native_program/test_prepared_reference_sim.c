@@ -60,7 +60,7 @@ static Nprg2ReferenceChain ew_chains[32];
 static uint8_t ew_scratch[NPRG2_ELEMENTWISE_SCRATCH_BYTES + 8] __attribute__((aligned(128)));
 #endif
 static Nprg2ReferenceConv conv;
-static uint64_t conv_phase[4];
+static uint64_t conv_phase[8];
 /* "par" / "parrev" / "parshuf" / "thr": QDS_PREPARED_THREADS-style parallel hook
  * with 3 parts and the Frame's two 0x3e00-byte helper conv slots. par runs the
  * parts serially ascending, parrev descending, parshuf shuffled (any order
@@ -453,9 +453,10 @@ static void env_run(Env *v, uint32_t first, uint32_t count, const uint8_t *const
         calls[bo][bv] = 0;
     }
     if (conv.phase)
-        printf("  near conv phases (%s): staging %llu, mac %llu, requant %llu, output %llu\n", tick_unit(),
-               (unsigned long long)conv_phase[0], (unsigned long long)conv_phase[1],
-               (unsigned long long)conv_phase[2], (unsigned long long)conv_phase[3]);
+        for (int k = 0; k < 2; k++)
+            printf("  near conv phases %s (%s): staging %llu, mac %llu, requant %llu, output %llu\n", k ? "u16" : "u8",
+                   tick_unit(), (unsigned long long)conv_phase[4 * k], (unsigned long long)conv_phase[4 * k + 1],
+                   (unsigned long long)conv_phase[4 * k + 2], (unsigned long long)conv_phase[4 * k + 3]);
     fflush(stdout);
 }
 

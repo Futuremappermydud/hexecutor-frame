@@ -48,8 +48,9 @@ int nprg2_executor_register_reference_missing(Nprg2Executor *executor, uint32_t 
  * chunks into near, and tile offsets, accumulators, requant parameters and
  * output rows live there too; otherwise the command keeps the workspace-only
  * path. near must not overlap any pool, the workspace or the call scratch.
- * clock (optional) with phase[4] accumulates, per fast command: input staging,
- * multiply-accumulate, requantization, output write. */
+ * clock (optional) with phase[8] accumulates, per fast command: input staging,
+ * multiply-accumulate, requantization, output write; u8 convs in phase[0..3],
+ * u16 in phase[4..7], summed over every thread part (CPU time, not wall). */
 typedef struct {
     uint8_t *workspace; uint32_t workspace_bytes;
     uint8_t *near; uint32_t near_bytes;

@@ -52,10 +52,14 @@ def main():
                      'outputs_equal':hashes==expected,
                      'variant_profile':sorted(dsp.profile,key=lambda v:-v['ms']),
                      'handler_profile':dsp.handler_profile,'executor_profile':dsp.executor_profile,'parallel_profile':getattr(dsp,'parallel_profile',{})}
-                # The prepared reference engine reuses the first four conv phase slots.
-                phases=list(dsp.last.get('conv_phases_ms',{}).values())[:4]
-                if len(phases)==4:
-                    row['near_conv_phases_ms']=dict(zip(('staging','mac','requant','output'),phases))
+                # The prepared reference engine reuses the conv phase slots:
+                # u8 convs in 0..3, u16 in 4..7, summed over thread parts.
+                phases=list(dsp.last.get('conv_phases_ms',{}).values())
+                if len(phases)==8:
+                    keys=('staging','mac','requant','output')
+                    row['near_conv_phases_ms']=dict(zip(keys,(phases[k]+phases[4+k] for k in range(4))))
+                    row['near_conv_phases_u8_ms']=dict(zip(keys,phases[:4]))
+                    row['near_conv_phases_u16_ms']=dict(zip(keys,phases[4:]))
                 row['passed']=(dsp.last.get('status')==0 and row['outputs_equal'] and
                                dsp.last.get('native_prepared_program') is True and len(trace)==16 and
                                trace[8]==commands and trace[9]==commands and
