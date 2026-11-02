@@ -1174,10 +1174,102 @@ typedef struct {
     G *g; const T *xt, *o; int32_t KB, NB, bw, m0, mt; const uint32_t *ktab; uint8_t *A, *C;
     int64_t xnbw, xnbd, onbw, onbd;
     int32_t H, W, cbs; uint8_t kinv[256]; /* (cb*3+ky)*3+kx -> k */
+    /* N16_PT: input block pointer table ptab[(R*ncol+w)*cbs+cb] (R from
+     * p[1]>>3, w from p[2]>>2; absent blocks point at n16_zero), per-row
+     * block row / byte offset for the 10 rows of a 3x3 tile, and p[2]&3. */
+    const uint8_t *const *ptab; int32_t ncol, cph; uint32_t mi[10], ro[10];
+    /* N16_DIRECT_OUT: HMX writes 2048-aligned output blocks in place; outp
+     * (NB*mt) is filled during staging, nc[t] marks tiles with a C copy. */
+    uint8_t **outp; uint8_t *nc; int32_t direct; uint32_t anyc[4];
+    void (*stage)(void *, uint32_t, uint32_t);
 } N16Job;
 #ifndef N16_FUSED
 #define N16_FUSED 1
 #endif
+/* Unrolled 3x3 staging from the block pointer table (-DN16_PT=1, default 1). */
+#ifndef N16_PT
+#define N16_PT 1
+#endif
+/* HMX stores straight into aligned output blocks, no C copy pass (default 1). */
+#ifndef N16_DIRECT_OUT
+#define N16_DIRECT_OUT 1
+#endif
+/* Double-buffered A/C: stage chunk i+1 while HMX runs chunk i (default 0). */
+#ifndef N16_OVERLAP
+#define N16_OVERLAP 0
+#endif
+static const uint8_t n16_zero[2048] __attribute__((aligned(2048)));
+#define N16_SH(a,b) Q6_V_vor_VV(Q6_Vuw_vlsr_VuwR((a),16),Q6_Vw_vasl_VwR((b),16))
+/* One input row i (constant) of a 3x3 tile: build the three column shifts
+ * from the pixel pairs and store them into every tap tile using the row. */
+static inline __attribute__((always_inline)) void n16_row3(const N16Job *J, const uint8_t *const B[3][3],
+                                                           HVX_Vector *const D[3][3], const int i, const int c) {
+    const uint32_t m=J->mi[i],ro=J->ro[i];
+    const HVX_Vector *b0=(const HVX_Vector *)(B[m][0]+ro),*b1=(const HVX_Vector *)(B[m][1]+ro),
+                     *b2=(const HVX_Vector *)(B[m][2]+ro);
+    HVX_Vector P0,P1,P2,P3;
+    if(c&2){P0=b0[1];P1=b1[0];P2=b1[1];P3=b2[0];}
+    else {P0=b0[0];P1=b0[1];P2=b1[0];P3=b1[1];}
+    HVX_Vector v0[3],v1[3];
+    if(!(c&1)){v0[0]=P0;v1[0]=P1;v0[1]=N16_SH(P0,P1);v1[1]=N16_SH(P1,P2);v0[2]=P1;v1[2]=P2;}
+    else {v0[0]=N16_SH(P0,P1);v1[0]=N16_SH(P1,P2);v0[1]=P1;v1[1]=P2;v0[2]=N16_SH(P1,P2);v1[2]=N16_SH(P2,P3);}
+    const int lo=i>7?i-7:0,hi=i<2?i:2;
+#pragma unroll
+    for(int kx=0;kx<3;kx++) {
+#pragma unroll
+        for(int ky=lo;ky<=hi;ky++) {HVX_Vector *d=D[ky][kx]+2*(i-ky);d[0]=v0[kx];d[1]=v1[kx];}
+    }
+}
+static inline __attribute__((always_inline)) void n16_tile3(const N16Job *J, int32_t t, int32_t cb, const int c) {
+    const int32_t tt=J->m0+t,by=tt/J->bw,bx=tt-by*J->bw;
+    const size_t cbs=(size_t)J->cbs,rs=(size_t)J->ncol*cbs;
+    const uint8_t *const *pr=J->ptab+((size_t)by*J->ncol+(size_t)bx)*cbs+(size_t)cb;
+    const uint8_t *B[3][3];
+    for(int m=0;m<3;m++)for(int b=0;b<3;b++)B[m][b]=pr[(size_t)m*rs+(size_t)b*cbs];
+    HVX_Vector *D[3][3];
+    for(int ky=0;ky<3;ky++)for(int kx=0;kx<3;kx++)
+        D[ky][kx]=(HVX_Vector *)(J->A+((size_t)t*J->KB+J->kinv[(cb*3+ky)*3+kx])*2048);
+    n16_row3(J,B,D,0,c);n16_row3(J,B,D,1,c);n16_row3(J,B,D,2,c);n16_row3(J,B,D,3,c);n16_row3(J,B,D,4,c);
+    n16_row3(J,B,D,5,c);n16_row3(J,B,D,6,c);n16_row3(J,B,D,7,c);n16_row3(J,B,D,8,c);n16_row3(J,B,D,9,c);
+}
+static void n16_prep3_part(void *ctx, uint32_t part, uint32_t parts) {
+    const N16Job *J=(const N16Job *)ctx;
+    const uint32_t units=(uint32_t)J->mt*(uint32_t)J->cbs;
+    const uint32_t cbs=(uint32_t)J->cbs;
+    switch(J->cph) {
+#define N16_CASE(C) case C: for(uint32_t u=part;u<units;u+=parts) n16_tile3(J,(int32_t)(u/cbs),(int32_t)(u%cbs),C); break;
+    N16_CASE(0) N16_CASE(1) N16_CASE(2) N16_CASE(3)
+#undef N16_CASE
+    }
+}
+/* Output block pointers for this part's tiles (N16_DIRECT_OUT). */
+static void n16_outp_part(const N16Job *J, uint32_t part, uint32_t parts) {
+    const T *o=J->o;uint32_t any=0;
+    for(int32_t t=(int32_t)part;t<J->mt;t+=(int32_t)parts) {
+        int32_t tt=J->m0+t,by=tt/J->bw,bx=tt-by*J->bw;
+        uint32_t nc=0;
+        for(int32_t j=0;j<J->NB;j++) {
+            uint8_t *ob=NULL;
+            {   /* hmx_row(o, p[1]+by*8, (p[2]>>2)+bx, j) block start, in 32-bit arithmetic */
+                const int32_t ry=(o->p[1]>>3)+by,wb=(o->p[2]>>2)+bx;
+                if(ry>=0 && wb>=0 && wb<(int32_t)J->onbw) {
+                    const uint32_t idx=(uint32_t)(((int32_t)(ry*(int32_t)J->onbw)+wb)*(int32_t)J->onbd)+o->slice+(uint32_t)j;
+                    const uint32_t e=idx<o->nblocks?o->blocks[idx]:0,pool=e&127u;
+                    if(pool && J->g->pool[pool]) ob=J->g->pool[pool]+(e&~127u);
+                }
+            }
+            if(ob && !((uintptr_t)ob&2047u)) J->outp[(size_t)j*J->mt+t]=ob;
+            else {J->outp[(size_t)j*J->mt+t]=J->C+((size_t)t*J->NB+(size_t)j)*2048;nc|=ob!=NULL;}
+        }
+        J->nc[t]=(uint8_t)nc;any|=nc;
+    }
+    ((N16Job *)J)->anyc[part]=any;
+}
+static void n16_stage_part(void *ctx, uint32_t part, uint32_t parts) {
+    const N16Job *J=(const N16Job *)ctx;
+    if(J->direct) n16_outp_part(J,part,parts);
+    J->stage(ctx,part,parts);
+}
 /* All H*W taps of tile t, channel block cb, in one pass: each input row
  * (8+H-1 of them) is loaded once as up to 4 pixel pairs, the W column
  * shifts are built from them and stored into every tap tile using that row.
@@ -1264,13 +1356,69 @@ static void n16_prep_part(void *ctx, uint32_t part, uint32_t parts) {
 static void n16_out_part(void *ctx, uint32_t part, uint32_t parts) {
     const N16Job *J=(const N16Job *)ctx;const T *o=J->o;
     for(int32_t t=(int32_t)part;t<J->mt;t+=(int32_t)parts) {
+        if(J->direct && !J->nc[t]) continue;
         int32_t tt=J->m0+t,by=tt/J->bw,bx=tt-by*J->bw;
         for(int32_t j=0;j<J->NB;j++) {
+            if(J->direct && (uint8_t *)J->outp[(size_t)j*J->mt+t]!=J->C+((size_t)t*J->NB+(size_t)j)*2048) continue;
             uint8_t *ob=hmx_row(J->g->pool,o,(int64_t)o->p[1]+by*8,((int64_t)o->p[2]>>2)+bx,J->onbw,J->onbd,j);
             if(!ob) continue;
             const HVX_Vector *c=(const HVX_Vector *)(J->C+((size_t)t*J->NB+(size_t)j)*2048);
             for(int i=0;i<16;i++) ((HVX_Vector *)ob)[i]=c[i];
         }
+    }
+}
+/* ptab[(R*ncol+w)*cbs+cb] = hmx_row(xt, (p[1]>>3)+R) block start for block column (p[2]>>2)+w, or n16_zero.
+ * Whole runs of the (contiguous) block table are converted with HVX when every
+ * entry is absent or in the tensor's pool; otherwise (or with vec=0) per entry. */
+static void n16_build_ptab(const uint8_t **pt, G *g, const T *xt, int32_t nR, int32_t ncol, int32_t cbs,
+                           int64_t xnbw, int64_t xnbd, int vec) {
+    const int32_t lo=xt->p[1]>>3,wlo=xt->p[2]>>2;
+    const uint32_t Pk=xt->pool;
+    vec=vec && xnbd==cbs && Pk>0 && Pk<7 && g->pool[Pk];
+    HVX_Vector acc=Q6_V_vzero();uint32_t badrow=0;
+    const HVX_Vector zv=Q6_V_vsplat_R((int32_t)(uintptr_t)n16_zero),m127=Q6_V_vsplat_R(127),mhi=Q6_V_vsplat_R(~127),
+                     pk=Q6_V_vsplat_R((int32_t)Pk),pb=Q6_V_vsplat_R((int32_t)(uintptr_t)g->pool[Pk]),one=Q6_V_vsplat_R(1);
+    for(int32_t R=0;R<nR;R++) {
+        const uint8_t **row=pt+(size_t)R*(size_t)ncol*(size_t)cbs;
+        const int64_t h=(int64_t)(lo+R)*8;
+        int32_t w0=wlo<0?-wlo:0,w1=ncol;
+        if((int64_t)wlo+w1>xnbw) w1=(int32_t)(xnbw-wlo);
+        if(h<0 || w1<=w0) {w0=0;w1=0;}
+        for(int32_t i=0;i<w0*cbs;i++) row[i]=n16_zero;
+        for(int32_t i=w1*cbs;i<ncol*cbs;i++) row[i]=n16_zero;
+        if(w1<=w0) continue;
+        const int32_t n=(w1-w0)*cbs;
+        const int64_t start=((int64_t)(lo+R)*xnbw+wlo+w0)*xnbd+xt->slice;
+        int32_t i=0;
+        if(vec && start>=0 && start+n<=(int64_t)xt->nblocks) {
+            const uint32_t *src=xt->blocks+start;
+            for(;i+32<=n;i+=32) {
+                HVX_Vector e=*(const HVX_UVector *)(src+i);
+                HVX_Vector pf=Q6_V_vand_VV(e,m127);
+                HVX_VectorPred okq=Q6_Q_vcmp_eq_VwVw(pf,pk),abq=Q6_Q_vcmp_eq_VwVw(pf,Q6_V_vzero());
+                acc=Q6_V_vor_VV(acc,Q6_V_vmux_QVV(Q6_Q_or_QQ(okq,abq),Q6_V_vzero(),one));
+                HVX_Vector ptr=Q6_V_vmux_QVV(okq,Q6_Vw_vadd_VwVw(pb,Q6_V_vand_VV(e,mhi)),zv);
+                *(HVX_UVector *)(row+w0*cbs+i)=ptr;
+            }
+            /* 32-bit tail, no hmx_row (64-bit index math): absent or in the tensor's pool */
+            const uint8_t *pbase=g->pool[Pk];uint32_t sbad=0;
+            for(;i<n;i++) {
+                const uint32_t e=src[i],pf=e&127u;
+                row[w0*cbs+i]=pf==Pk?pbase+(e&~127u):n16_zero;
+                sbad|=pf!=Pk && pf!=0;
+            }
+            if(sbad) badrow=1;
+        }
+        for(;i<n;i++) {
+            const uint8_t *b=hmx_row(g->pool,xt,h,wlo+w0+i/cbs,xnbw,xnbd,i%cbs);
+            row[w0*cbs+i]=b?b:n16_zero;
+        }
+    }
+    if(vec) {
+        uint32_t tmp[32] __attribute__((aligned(128)));
+        *(HVX_Vector *)tmp=acc;
+        uint32_t bad=badrow;for(int k=0;k<32;k++) bad|=tmp[k];
+        if(bad) n16_build_ptab(pt,g,xt,nR,ncol,cbs,xnbw,xnbd,0);
     }
 }
 /* 1 ran (or would, dry), 0 not eligible, -1 error. */
@@ -1299,13 +1447,21 @@ static int hmx_native16(G *g, const T *xt, const T *wt, const T *ft, const T *o,
     }
     size_t at=0;
     size_t o_ktab=nbump(&at,(size_t)KB*4),o_rows=nbump(&at,(size_t)NB*256),o_fi=nbump(&at,(size_t)NB*256+256),
-           o_out=0;
+           o_out=0,o_nc=0,o_pt=0;
     const int32_t bw=ow/4,total=(oh/8)*bw;
+    const int32_t nbuf=N16_OVERLAP?2:1;
     const size_t fixed=((size_t)NB*256+256+2048*2+2047)&~(size_t)2047,per=(size_t)KB*2048+(size_t)NB*2048;
-    if(c->workspace_bytes<fixed+per+2048) return 0;
-    int32_t mt=(int32_t)((c->workspace_bytes-fixed-2048)/per);
+    if(c->workspace_bytes<fixed+per*(size_t)nbuf+2048) return 0;
+    int32_t mt=(int32_t)((c->workspace_bytes-fixed-2048)/(per*(size_t)nbuf));
     if(mt>total) mt=total;
-    o_out=nbump(&at,(size_t)NB*mt*sizeof(uint8_t *));
+    o_out=nbump(&at,(size_t)nbuf*NB*mt*sizeof(uint8_t *));
+    o_nc=nbump(&at,(size_t)nbuf*((mt+3)&~3));
+    const int32_t ncol=bw+3,nR=oh/8+2;
+    int use_pt=N16_PT && H==3 && W==3;
+#if N16_PT
+    o_pt=nbump(&at,(size_t)nR*ncol*cbs*sizeof(uint8_t *));
+    if(at>c->near_bytes) {use_pt=0;at=o_pt;}
+#endif
     if(at>c->near_bytes) return 0;
     uint8_t *n=c->near;
     /* Fi words straight from the filter rows: scale 0x400000|e<<10|(M-1024), bias. */
@@ -1330,58 +1486,81 @@ static int hmx_native16(G *g, const T *xt, const T *wt, const T *ft, const T *o,
             ktab[k]=(uint32_t)h|(uint32_t)(reverse?W-1-x:x)<<8|(uint32_t)cb<<16;
     }
     g->wused=0;
-    uint8_t *ws=walloc(g,fixed+(size_t)mt*per+2048);
+    uint8_t *ws=walloc(g,fixed+(size_t)nbuf*mt*per+2048);
     if(!ws){*err=E_MEMORY;return -1;}
     conv_path=5;
     if(g->dry) return 1;
     uint8_t *base=(uint8_t *)(((uintptr_t)ws+2047)&~(uintptr_t)2047);
     int32_t *fi=(int32_t *)base,*zero=(int32_t *)(base+(size_t)NB*256);
-    uint8_t *completion=base+fixed-2048,*A=base+fixed,*C=A+(size_t)mt*KB*2048;
+    uint8_t *completion=base+fixed-2048;
     near_copy(base,(const uint8_t *)nf,(size_t)NB*256+256);
-    uint8_t **outp=(uint8_t **)(n+o_out);
-    N16Job J={.g=g,.xt=xt,.o=o,.KB=KB,.NB=NB,.bw=bw,.ktab=ktab,.A=A,.C=C,
+    const Nprg2HmxOps *h=c->hmx;
+    N16Job J[2];
+    for(int b=0;b<nbuf;b++) {
+        J[b]=(N16Job){.g=g,.xt=xt,.o=o,.KB=KB,.NB=NB,.bw=bw,.ktab=ktab,
+              .A=base+fixed+(size_t)b*mt*per,.C=base+fixed+(size_t)b*mt*per+(size_t)mt*KB*2048,
               .xnbw=((int64_t)xt->m[2]+3)/4,.xnbd=((int64_t)xt->m[3]+31)/32,
               .onbw=((int64_t)o->m[2]+3)/4,.onbd=((int64_t)o->m[3]+31)/32};
-    const Nprg2HmxOps *h=c->hmx;
+        J[b].outp=(uint8_t **)(n+o_out)+(size_t)b*NB*mt;J[b].nc=n+o_nc+(size_t)b*((mt+3)&~3);
+        J[b].direct=N16_DIRECT_OUT;J[b].H=H;J[b].W=W;J[b].cbs=0;J[b].stage=NULL;
+    }
 #if N16_FUSED
     /* the fused staging needs every (cb, ky, kx) tap exactly once */
-    J.H=H;J.W=W;J.cbs=0;
     if(H*W*cbs==KB) {
-        memset(J.kinv,255,sizeof J.kinv);int ok=cbs*9<=256;
+        memset(J[0].kinv,255,sizeof J[0].kinv);int ok=cbs*9<=256;
         for(int32_t k=0;k<KB && ok;k++) {
             uint32_t e=ktab[k];uint32_t ky=e&255u,kx=(e>>8)&255u,cb=e>>16;
             uint32_t ix=(cb*3u+ky)*3u+kx;
-            if(ky>=(uint32_t)H || kx>=(uint32_t)W || cb>=(uint32_t)cbs || J.kinv[ix]!=255) ok=0;
-            else J.kinv[ix]=(uint8_t)k;
+            if(ky>=(uint32_t)H || kx>=(uint32_t)W || cb>=(uint32_t)cbs || J[0].kinv[ix]!=255) ok=0;
+            else J[0].kinv[ix]=(uint8_t)k;
         }
-        if(ok) J.cbs=cbs;
+        if(ok) for(int b=0;b<nbuf;b++) {J[b].cbs=cbs;if(b) memcpy(J[b].kinv,J[0].kinv,sizeof J[0].kinv);}
     }
 #endif
+    void (*stage)(void *, uint32_t, uint32_t)=J[0].cbs?n16_prep_all_part:n16_prep_part;
+#if N16_PT
+    if(use_pt && J[0].cbs) {
+        const uint8_t **pt=(const uint8_t **)(n+o_pt);
+        n16_build_ptab(pt,g,xt,nR,ncol,cbs,J[0].xnbw,J[0].xnbd,1);
+        stage=n16_prep3_part;
+        for(int b=0;b<nbuf;b++) {
+            J[b].ptab=pt;J[b].ncol=ncol;J[b].cph=xt->p[2]&3;
+            const int32_t s=xt->p[1]&7;
+            for(int i=0;i<10;i++){J[b].mi[i]=(uint32_t)((s+i)>>3);J[b].ro[i]=(uint32_t)((s+i)&7)*256u;}
+        }
+    }
+#endif
+    for(int b=0;b<nbuf;b++) J[b].stage=stage;
     uint64_t (*clock)(void)=c->phase?c->clock:NULL,t0=clock?clock():0,t1;
     uint32_t parts=nprg2_parallel_parts(g->call->parallel,3);
     uint32_t saved=h->enter?h->enter():0;
     int e=0;
-    for(int32_t m0=0;m0<total && !e;m0+=mt) {
-        J.m0=m0;J.mt=total-m0<mt?total-m0:mt;
-        for(int32_t j=0;j<NB;j++)for(int32_t t=0;t<J.mt;t++) outp[(size_t)j*J.mt+(size_t)t]=C+((size_t)t*NB+(size_t)j)*2048;
-        if(clock){t1=clock();c->phase[6]+=t1-t0;t0=t1;}
-#if N16_FUSED
-        if(J.cbs) {
-            if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,n16_prep_all_part,&J);
-            else n16_prep_all_part(&J,0,1);
-        } else
-#endif
-        {
-            if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,n16_prep_part,&J);
-            else n16_prep_part(&J,0,1);
-        }
-        if(clock){t1=clock();c->phase[4]+=t1-t0;t0=t1;}
+    const int32_t nch=(total+mt-1)/mt;
+    /* stage chunk ci into buffer ci%nbuf */
+#define N16_STAGE(ci) do { \
+        N16Job *Jc=&J[(ci)%nbuf];Jc->m0=(ci)*mt;Jc->mt=total-Jc->m0<mt?total-Jc->m0:mt; \
+        if(!Jc->direct) for(int32_t j=0;j<NB;j++)for(int32_t t=0;t<Jc->mt;t++) \
+            Jc->outp[(size_t)j*Jc->mt+t]=Jc->C+((size_t)t*NB+(size_t)j)*2048; \
+        for(int k=0;k<4;k++) Jc->anyc[k]=0; \
+        if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,n16_stage_part,Jc); \
+        else n16_stage_part(Jc,0,1); \
+    } while(0)
+    if(clock){t1=clock();c->phase[6]+=t1-t0;t0=t1;}
+    N16_STAGE(0);
+    if(clock){t1=clock();c->phase[4]+=t1-t0;t0=t1;}
+    for(int32_t ci=0;ci<nch && !e;ci++) {
+        N16Job *Jc=&J[ci%nbuf];
         HVX_Vector sentinel=Q6_V_vsplat_R(-1);
         for(uint32_t i=0;i<2048;i+=128)*(HVX_Vector *)(completion+i)=sentinel;
         __asm__ volatile("barrier":::"memory");
         for(int32_t j=0;j<NB;j++)
-            h->native16_n(A,(void *)(wbase+(size_t)j*KB*1024),fi+j*64,(void *const *)(outp+(size_t)j*J.mt),(uint32_t)KB,(uint32_t)J.mt);
+            h->native16_n(Jc->A,(void *)(wbase+(size_t)j*KB*1024),fi+j*64,(void *const *)(Jc->outp+(size_t)j*Jc->mt),(uint32_t)KB,(uint32_t)Jc->mt);
         h->finish(zero,completion);
+        if(N16_OVERLAP && ci+1<nch) {
+            if(clock){t1=clock();c->phase[5]+=t1-t0;t0=t1;}
+            N16_STAGE(ci+1);
+            if(clock){t1=clock();c->phase[4]+=t1-t0;t0=t1;}
+        }
         uint64_t end=h->clock?h->clock()+1000000000ull:0;
         for(uint64_t spin=0;;spin++) {
             typedef uint32_t HmxWords __attribute__((vector_size(128)));
@@ -1392,10 +1571,17 @@ static int hmx_native16(G *g, const T *xt, const T *wt, const T *ft, const T *o,
         __asm__ volatile("barrier":::"memory");
         if(clock){t1=clock();c->phase[5]+=t1-t0;t0=t1;}
         if(e) break;
-        if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,n16_out_part,&J);
-        else n16_out_part(&J,0,1);
+        if(!Jc->direct || (Jc->anyc[0]|Jc->anyc[1]|Jc->anyc[2]|Jc->anyc[3])) {
+            if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,n16_out_part,Jc);
+            else n16_out_part(Jc,0,1);
+        }
         if(clock){t1=clock();c->phase[7]+=t1-t0;t0=t1;}
+        if(!N16_OVERLAP && ci+1<nch) {
+            N16_STAGE(ci+1);
+            if(clock){t1=clock();c->phase[4]+=t1-t0;t0=t1;}
+        }
     }
+#undef N16_STAGE
     if(h->leave) h->leave(saved);
     if(e){*err=E_RANGE;return -1;}
     return 1;
