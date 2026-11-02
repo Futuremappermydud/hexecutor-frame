@@ -46,7 +46,9 @@ int main(void){
         if(!dq_scale(fb(invf),&mi,&ei)) continue;
         for(int i=0;i<200000;i++){
             float s;
-            switch(i%4){
+            switch(i%6){
+            case 4: s=bf((rnd()&0x807fffffu)>>(rnd()%24));break;   /* zeros and subnormals */
+            case 5: s=bf(rnd()&0x80000000u);break;                 /* +-0 */
             case 0: s=bf(rnd());break;
             case 1: s=(float)(((int32_t)(rnd()%140000)-70000)*scale);break;
             case 2: s=(float)((((int32_t)(rnd()%140000)-70000)+0.5)*scale);break;

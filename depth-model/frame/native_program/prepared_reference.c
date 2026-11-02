@@ -148,6 +148,43 @@ static int64_t clip64(int64_t v, int64_t lo, int64_t hi) {return v<lo?lo:v>hi?hi
 static int64_t dtmax(uint32_t dt) {return dt==DT_U8?255:dt==DT_U16?65535:dt==DT_I8?127:dt==DT_I16?32767:2147483647;}
 static int64_t s32(uint64_t v) {return (int64_t)(int32_t)(uint32_t)v;}
 
+/* Per-command memos, keyed by (program, command index); two programs (the
+ * two models) are kept. Not thread-safe: reference commands run on the
+ * executor's thread.
+ * need: scratch need from the first dry pass, so later runs skip it. The dry
+ *   pass reads only geometry and the constant pool, so the need is a property
+ *   of the bound program; were it ever larger, salloc fails loudly.
+ * conv_checked: bit k set once hmx_conv's bounds checks (xfer_check,
+ *   blocked_overlap: geometry and pool limits only) passed with epilogue kind
+ *   k, so later runs skip them. Pool bases/limits are part of the key. */
+enum { MEMO_COMMANDS=8192 };
+typedef struct {
+    const void *program;
+    uint64_t limits;
+    uint32_t need[MEMO_COMMANDS];
+    uint8_t conv_checked[MEMO_COMMANDS];
+} Memo;
+static Memo memos[2];
+static uint32_t memo_next;
+static uint64_t memo_limits(const Nprg2ExecCall *c) {
+    uint64_t h=0xcbf29ce484222325ull;
+    for(int i=0;i<7;i++){h=(h^(uintptr_t)c->pools[i].base)*0x100000001b3ull;h=(h^c->pools[i].bytes)*0x100000001b3ull;}
+    return (h^c->pool1_writable_bytes)*0x100000001b3ull;
+}
+static Memo *memo_for(const Nprg2ExecCall *c) {
+    if(!c->program || c->command_index>=MEMO_COMMANDS) return NULL;
+    uint64_t lim=memo_limits(c);
+    for(int i=0;i<2;i++) if(memos[i].program==c->program && memos[i].limits==lim) return &memos[i];
+    Memo *m=&memos[memo_next++&1u];
+    m->program=c->program;m->limits=lim;
+    memset(m->need,0xff,sizeof m->need);memset(m->conv_checked,0,sizeof m->conv_checked);
+    return m;
+}
+static uint32_t *memo_slot(const Nprg2ExecCall *c) {
+    Memo *m=memo_for(c);
+    return m?&m->need[c->command_index]:NULL;
+}
+
 /* ------------------------------------------------------------ tensor access */
 static int decode(const Nprg2TensorView *v, T *t) {
     const uint8_t *r=v->geometry_record;
@@ -2063,9 +2100,16 @@ static void build_taps(const T *wt, int s2, int reverse, int packed, int32_t kh,
         for(int32_t kx=0;kx<kw;kx++)for(int32_t q=0;q<groups;q++) {
             if(weight_tile(wt,s2,reverse,packed,ky,kx,q,0)==NO_TILE) continue;
             xoff[n]=(uint32_t)((merge?(size_t)ky*kystride:0)+(size_t)(lead+kx)*ci+4*(size_t)q);
+            /* weight_tile is linear in the output block j: each block's
+             * weights are H*W*I*32 bytes in every layout (packed: (I/4)*128
+             * per (h, x); unpacked: (I/32)*1024), NO_TILE never depends on j. */
+            uint32_t t0=weight_tile(wt,s2,reverse,packed,ky,kx,q,0),js=(uint32_t)wt->m[0]*(uint32_t)wt->m[1]*(uint32_t)wt->m[2]*32u;
             for(int32_t pj=0;pj*2<blocks;pj++)for(int32_t b=0;b<2;b++) {
                 int32_t j=2*pj+b<blocks?2*pj+b:2*pj;
-                wp[((size_t)pj*nt+n)*2+(size_t)b]=WREF(wbase,weight_tile(wt,s2,reverse,packed,ky,kx,q,j));
+#ifdef TAP_CHECK
+                if(t0+(uint32_t)j*js!=weight_tile(wt,s2,reverse,packed,ky,kx,q,j)) abort();
+#endif
+                wp[((size_t)pj*nt+n)*2+(size_t)b]=WREF(wbase,t0+(uint32_t)j*js);
             }
             n++;
         }
@@ -2396,8 +2440,8 @@ static int fast_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, in
     ow=(ow+cw-1)/cw*cw;if(ow>o->m[2])ow=o->m[2];if(ow>xW-kw+1)ow=xW-kw+1;
     if(oh<=0 || ow<=0) return 0;
     if(wt->offset+(uint64_t)H*W*I*O>g->pool_bytes[wt->pool]){*err=E_RANGE;return -1;}
-    if(!s2 && !sixteen) {
-        int r=hmx_conv(g,xt,wt,ft,o,packed,reverse,co,oh,ow,err);
+    if(!sixteen) {
+        int r=hmx_conv(g,xt,wt,ft,o,packed,reverse,s2,co,oh,ow,err);
         if(r) return r;
     }
 
@@ -2411,10 +2455,19 @@ static int fast_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, in
      * could overwrite input that later rows still need. */
     int direct=0,use_near=0,checked=0;
     if(g->conv->near) {
-        if((xt->flags&F_BLOCKED) && xt->esize==es && o->esize==es &&
-           !xfer_check(g,xt,dims,origin,0) && !xfer_check(g,o,on,oorigin,1)) {
-            checked=1;
-            direct=!blocked_overlap(xt,dims,origin,o,on,oorigin);
+        /* checked/direct depend on geometry and pool limits only: memoised
+         * per command after the first non-dry evaluation (bits 3..5 of
+         * conv_checked: known, checked, direct). */
+        Memo *mm=g->dry?NULL:memo_for(g->call);
+        uint8_t *mb=mm?&mm->conv_checked[g->call->command_index]:NULL;
+        if(mb && (*mb&8u)) {checked=!!(*mb&16u);direct=!!(*mb&32u);}
+        else {
+            if((xt->flags&F_BLOCKED) && xt->esize==es && o->esize==es &&
+               !xfer_check(g,xt,dims,origin,0) && !xfer_check(g,o,on,oorigin,1)) {
+                checked=1;
+                direct=!blocked_overlap(xt,dims,origin,o,on,oorigin);
+            }
+            if(mb) *mb|=(uint8_t)(8u|(checked?16u:0u)|(direct?32u:0u));
         }
         int32_t head0=(int32_t)(xt->p[2]&(sixteen?3:7));
         use_near=direct && near_plan(g,&plan,ow,kh,kw,ci,co,nt,sixteen,1,head0);
@@ -3096,23 +3149,6 @@ int nprg2_exec_reference_validate(const Nprg2ExecCall *c, void *ctx) {
     G g;
     if(setup(&g,c,1,0,ctx)) return 0;
     return run_kernel(&g)==0;
-}
-/* Per-command scratch need, memoised from the first dry pass so later runs
- * of the same program skip it. The dry pass reads only geometry and the
- * constant pool, so the need is a property of the bound program; if it ever
- * were larger, salloc fails and the command errors (never silently wrong).
- * Two programs (the two models) are kept. Not thread-safe: reference
- * commands run on the executor's thread. */
-enum { MEMO_COMMANDS=8192 };
-static struct { const void *program; uint32_t need[MEMO_COMMANDS]; } scratch_memo[2];
-static uint32_t scratch_memo_next;
-static uint32_t *memo_slot(const Nprg2ExecCall *c) {
-    if(!c->program || c->command_index>=MEMO_COMMANDS) return NULL;
-    for(int i=0;i<2;i++) if(scratch_memo[i].program==c->program) return &scratch_memo[i].need[c->command_index];
-    uint32_t i=scratch_memo_next++&1u;
-    scratch_memo[i].program=c->program;
-    memset(scratch_memo[i].need,0xff,sizeof scratch_memo[i].need);
-    return &scratch_memo[i].need[c->command_index];
 }
 int nprg2_exec_reference_run(const Nprg2ExecCall *c, void *ctx) {
     G g;

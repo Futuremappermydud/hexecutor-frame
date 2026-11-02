@@ -44,13 +44,14 @@ static inline int dq_scale(uint32_t b, uint32_t *m24, int32_t *e) {
  * float and inv = (double)(float)(1/scale) = mi * 2^ei (mi in [2^23,2^24)).
  * s*inv is an exact 48-bit product times a power of two, and adding 0.5 in
  * double is exact wherever it can change the floor, so the integer
- * floor((P + 2^(sh-1)) >> sh) is equal. Returns 0 for s zero-exponent
- * (zero/subnormal) or inf/NaN: the caller uses the reference formula. */
+ * floor((P + 2^(sh-1)) >> sh) is equal (zero and subnormal s included).
+ * Returns 0 for inf/NaN: the caller uses the reference formula. */
 static inline int q_exact(uint32_t sb, uint32_t mi, int32_t ei, int32_t zp, uint16_t *out) {
     uint32_t x=(sb>>23)&255u;
-    if(!x || x==255u) return 0;
-    uint64_t P=(uint64_t)((sb&0x7fffffu)|0x800000u)*mi;
-    int32_t k=(int32_t)x-150+ei;
+    if(x==255u) return 0;
+    /* zero and subnormal s: no implicit bit, exponent field taken as 1 */
+    uint64_t P=(uint64_t)((sb&0x7fffffu)|(x?0x800000u:0u))*mi;
+    int32_t k=(int32_t)(x?x:1u)-150+ei;
     int neg=(int)(sb>>31);
     int64_t r;
     if(k>=0) {*out=neg?0:65535;return 1;} /* |s*inv| >= 2^46 */

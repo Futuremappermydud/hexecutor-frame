@@ -28,6 +28,7 @@ docker run --rm --platform linux/amd64 -v "$task_sdk_root:/sdk:ro" -v "$PWD/fram
    -e QDS_L2_CACHE="${QDS_L2_CACHE:-0}" \
    -e QDS_PREPARED_THREADS="${QDS_PREPARED_THREADS:-1}" \
    -e QDS_PREPARED_HMX="${QDS_PREPARED_HMX:-0}" \
+   -e QDS_EXTRA_CFLAGS="${QDS_EXTRA_CFLAGS:-}" \
    depth-model-hmx-tools:latest sh -eu -c '
 cc=/sdk/tools/HEXAGON_Tools/19.0.07/Tools/bin/hexagon-clang
 flags="-mv75 -mhvx -mhvx-length=128b -O2 -G0 -ffreestanding -fno-builtin -fno-vectorize -fno-slp-vectorize -ffp-contract=off -fno-strict-aliasing -Wall -Wextra -DQDO_SCALAR_CACHE=$QDS_SCALAR_CACHE"
@@ -128,6 +129,7 @@ engine_flags="$engine_flags -DQDS_PREPARED_COMPACT_3X3=$QDS_PREPARED_COMPACT_3X3
 engine_flags="$engine_flags -DQDS_PREPARED_PREPROCESS=$QDS_PREPARED_PREPROCESS"
 engine_flags="$engine_flags -DQDS_PREPARED_QUANTIZE=$QDS_PREPARED_QUANTIZE"
 engine_flags="$engine_flags -DQDS_PREPARED_ELEMENTWISE=$QDS_PREPARED_ELEMENTWISE"
+engine_flags="$engine_flags $(echo "$QDS_EXTRA_CFLAGS" | tr + " ")"  # + separates defines: ab.sh splits variants on commas
 engine_flags="$engine_flags -DQDS_PRESERVE_VTCM=$QDS_PRESERVE_VTCM"
 engine_flags="$engine_flags -DQDS_PREPARED_REFERENCE=$QDS_PREPARED_REFERENCE"
 case "$QDS_PREPARED_PROFILE" in 0|1) ;; *) echo "QDS_PREPARED_PROFILE must be 0 or 1" >&2; exit 1;; esac

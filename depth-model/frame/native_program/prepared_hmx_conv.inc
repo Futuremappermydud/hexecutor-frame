@@ -29,6 +29,13 @@
 #ifndef HMX_SETUP_SLOT
 #define HMX_SETUP_SLOT 2 /* phase slot that HMX per-command setup is charged to */
 #endif
+/* Profiling builds: HMX_PROF=s charges setup sub-step s (1 bounds checks,
+ * 2 filter rows/requant/wsum, 3 fi/multv records, 4 row pointer tables) to
+ * the output slot (3) instead, so it is the difference against a normal build. */
+#ifndef HMX_PROF
+#define HMX_PROF 0
+#endif
+#define HMX_MARK(step) do { if(clock){t1=clock();c->phase[HMX_PROF==(step)?3:HMX_SETUP_SLOT]+=t1-t0;t0=t1;} } while(0)
 typedef struct {
     G *g; const T *xt, *o;
     int32_t oh, ow, KB, NB, total, m0, mt; /* tiles m0..m0+mt-1 of total */
@@ -62,9 +69,28 @@ static void hmx_tab(uint8_t **tab, uint8_t *const *pools, const T *t, int32_t ro
                     int32_t nwb, int32_t nz) {
     const int32_t nbw=(t->m[2]+7)/8,nbd=(t->m[3]+31)/32;
     const uint32_t nb=t->nblocks;
+    const int32_t width=nwb*nz;
     for(int32_t r=0;r<nrows;r++) {
         int32_t h=row0+r;
-        uint8_t **row=tab+(size_t)r*(size_t)nwb*(size_t)nz;
+        uint8_t **row=tab+(size_t)r*(size_t)width;
+        /* Within a block row the entries are the previous row's plus 256
+         * (absent stays absent): no block-table lookups. */
+        if(r && h>0 && (h&7)) {
+            uint8_t *const *prev=row-width;
+            int32_t i=0;
+#if BLK_HVX
+            if(sizeof(uint8_t *)==4) {
+                HVX_Vector z=Q6_V_vzero(),k=Q6_V_vsplat_R(256);
+                for(;i+32<=width;i+=32) {
+                    HVX_Vector v=*(const HVX_UVector *)(prev+i);
+                    HVX_VectorPred nz0=Q6_Q_vcmp_eq_VwVw(v,z);
+                    *(HVX_UVector *)(row+i)=Q6_V_vmux_QVV(nz0,z,Q6_Vw_vadd_VwVw(v,k));
+                }
+            }
+#endif
+            for(;i<width;i++) row[i]=prev[i]?prev[i]+256:NULL;
+            continue;
+        }
         for(int32_t w=0;w<nwb;w++) {
             int32_t wb=wb0+w;
             int ok=h>=0 && wb>=0 && wb<nbw;
@@ -303,7 +329,7 @@ static int hmx_mac(const HmxJob *J, int32_t *fi, int32_t *zero, uint8_t *complet
 }
 /* 1: the command ran (or would, dry) on HMX; 0: not eligible (use the HVX
  * path); -1: error in *err. */
-static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int packed, int reverse, int32_t co,
+static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int packed, int reverse, int s2, int32_t co,
                     int32_t oh, int32_t ow, int32_t *err) {
     const Nprg2ReferenceConv *c=g->conv;
     uint64_t (*clock)(void)=c->phase && !g->dry?c->clock:NULL,t0=clock?clock():0,t1;
@@ -311,17 +337,48 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     /* A fused epilogue must cover exactly the region the conv writes. */
     if(g->fx.kind && (oh!=o->d[1] || ow!=o->d[2] || co!=o->d[3])) return 0;
     int32_t H=wt->m[0],W=wt->m[1],I=wt->m[2];
+    /* Stride 2 (3x3 raw weights): a 2x2 conv over the space-to-depth input's
+     * 4I channels (fast_conv's regrouping). A 32-channel K block is either
+     * all NO_TILE or one contiguous 1024-byte raw weight block, so B is the
+     * present blocks, copied per command (s2off: raw offset of K block k for
+     * output block 0; block j adds js). */
+    uint32_t s2off[256],js=0;
+    if(s2) {
+        if(H!=3 || W!=3 || I%32 || packed || reverse) return 0;
+        js=(uint32_t)H*(uint32_t)W*(uint32_t)I*32u;
+        H=2;W=2;I*=4;
+    }
     if(I%32 || xt->m[3]<I || H>3 || W>3 || ow%4 || co%32) return 0;
     if(!(xt->flags&F_BLOCKED) || xt->esize!=1 || !(o->flags&F_BLOCKED) || o->esize!=1) return 0;
     if(xt->p[0] || o->p[0] || xt->m[0]!=1 || o->m[0]!=1 || wt->pool!=1) return 0;
-    const int32_t cbs=I/32,KB=H*W*cbs,NB=co/32;
-    if(KB*32>HMX_TERMS_MAX || KB>255) return 0;
+    const int32_t cbs=I/32,NB=co/32;
+    int32_t KB=H*W*cbs;
+    if(s2) {
+        KB=0;
+        for(int32_t ky=0;ky<2;ky++)for(int32_t kx=0;kx<2;kx++)for(int32_t cb=0;cb<cbs;cb++) {
+            uint32_t t=weight_tile(wt,1,0,0,ky,kx,cb*8,0);
+            if(t==NO_TILE) continue;
+            for(int32_t q=1;q<8;q++) if(weight_tile(wt,1,0,0,ky,kx,cb*8+q,0)!=t+(uint32_t)q*128u) return 0;
+            if(KB>=255) return 0;
+            s2off[KB++]=t|(uint32_t)0; /* offset; the (ky,kx,cb) goes to ktab below */
+        }
+    }
+    if(!KB || KB*32>HMX_TERMS_MAX || KB>255) return 0;
     const int8_t *wbase=(const int8_t *)g->pool[wt->pool]+wt->offset;
-    if((uintptr_t)wbase&1023u) return 0;
+    if(!s2 && ((uintptr_t)wbase&1023u)) return 0;
     int32_t dims[4]={1,oh+H-1,ow+W-1,I},origin[4]={0,xt->p[1],xt->p[2],0};
     int32_t on[4]={1,oh,ow,co},oorigin[4]={0,o->p[1],o->p[2],0};
-    if(xfer_check(g,xt,dims,origin,0) || xfer_check(g,o,on,oorigin,1) ||
-       blocked_overlap(xt,dims,origin,o,on,oorigin)) return 0;
+    {
+        /* bits 0..2: checks passed with epilogue kind 0..2 (bits 3..5 are fast_conv's) */
+        Memo *mm=g->dry || g->fx.kind<0 || g->fx.kind>2?NULL:memo_for(g->call);
+        uint8_t bit=(uint8_t)(1u<<(g->fx.kind&3));
+        if(!mm || !(mm->conv_checked[g->call->command_index]&bit)) {
+            if(xfer_check(g,xt,dims,origin,0) || xfer_check(g,o,on,oorigin,1) ||
+               blocked_overlap(xt,dims,origin,o,on,oorigin)) return 0;
+            if(mm) mm->conv_checked[g->call->command_index]|=bit;
+        }
+    }
+    HMX_MARK(1);
     /* Scalar tables in near: ktab, corr, pre, M, then the multiplier vectors. */
     size_t at=0;
     size_t o_ktab=nbump(&at,(size_t)KB*4),o_corr=nbump(&at,(size_t)co*4),o_pre=nbump(&at,(size_t)co*4),
@@ -357,7 +414,24 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     }
     requant_params(mult,co,0,Mq,pre,post);
     memset(wsum,0,(size_t)co*8);
-    if(xt->zp) for(int32_t j=0;j<NB;j++) {
+    if(xt->zp && s2) for(int32_t j=0;j<NB;j++) {
+        /* the present raw blocks of output block j (NO_TILE blocks are zero) */
+#if BLK_HVX
+        HVX_Vector ones=Q6_V_vsplat_R(0x01010101),a=Q6_V_vzero();
+        for(int32_t k=0;k<KB;k++) {
+            const int8_t *b=wbase+s2off[k]+(size_t)j*js;
+            for(int32_t r=0;r<8;r++) a=Q6_Vw_vrmpyacc_VwVbVb(a,*(const HVX_UVector *)(b+128*r),ones);
+        }
+        int32_t tmp[32] __attribute__((aligned(128)));
+        *(HVX_Vector *)tmp=a;
+        for(int q=0;q<32;q++) wsum[32*j+q]=tmp[q];
+#else
+        for(int32_t k=0;k<KB;k++) {
+            const int8_t *b=wbase+s2off[k]+(size_t)j*js;
+            for(int q=0;q<1024;q++) wsum[32*j+(q/4)%32]+=b[q];
+        }
+#endif
+    } else if(xt->zp) for(int32_t j=0;j<NB;j++) {
         const int8_t *b=wbase+(size_t)j*KB*1024;
 #if BLK_HVX
         HVX_Vector ones=Q6_V_vsplat_R(0x01010101),a=Q6_V_vzero();
@@ -375,8 +449,13 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
         if(post[k]!=14 || pre[k]<0 || pre[k]>15 || Mq[k]<1024 || Mq[k]>2047 || (off<0?-off:off)+bound>INT32_MAX) return 0;
         corr[k]=(int32_t)off;
     }
+    HMX_MARK(2);
     /* k order of the weight layout, enumerated without divides. */
-    {
+    if(s2) {
+        int32_t k=0;
+        for(int32_t ky=0;ky<2;ky++)for(int32_t kx=0;kx<2;kx++)for(int32_t cb=0;cb<cbs;cb++)
+            if(weight_tile(wt,1,0,0,ky,kx,cb*8,0)!=NO_TILE) ktab[k++]=(uint32_t)ky|(uint32_t)kx<<8|(uint32_t)cb<<16;
+    } else {
         int32_t k=0;
         if(packed) {for(int32_t h=0;h<H;h++)for(int32_t x=0;x<W;x++)for(int32_t cb=0;cb<cbs;cb++,k++)
             ktab[k]=(uint32_t)h|(uint32_t)x<<8|(uint32_t)cb<<16;}
@@ -385,14 +464,15 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     }
     /* Workspace: fi, finish record, completion, then A and C for mt tiles. */
     const int32_t total=(oh*ow+31)/32;
-    const size_t fixed=((size_t)NB*256+256+2048*2+2047)&~(size_t)2047,per=(size_t)(KB+NB)*2048;
-    if(c->workspace_bytes<fixed+per+2048) return 0;
-    int32_t mt=(int32_t)((c->workspace_bytes-fixed-2048)/per);
+    const size_t fixed=((size_t)NB*256+256+2048*2+2047)&~(size_t)2047,per=(size_t)(KB+NB)*2048,
+                 bsz=s2?((size_t)KB*NB*1024+2047)&~(size_t)2047:0;
+    if(c->workspace_bytes<fixed+bsz+per+2048) return 0;
+    int32_t mt=(int32_t)((c->workspace_bytes-fixed-bsz-2048)/per);
     if(mt>total) mt=total;
     size_t o_tyx=nbump(&at,(size_t)mt*8);
     if(at>c->near_bytes) return 0;
     g->wused=0;
-    uint8_t *ws=walloc(g,fixed+(size_t)mt*per+2048);
+    uint8_t *ws=walloc(g,fixed+bsz+(size_t)mt*per+2048);
     if(!ws){*err=E_MEMORY;return -1;}
     conv_path=3;
     if(g->fx.kind) g->fx_ok=1;
@@ -403,7 +483,12 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     if(g->dry) return 1;
     uint8_t *base=(uint8_t *)(((uintptr_t)ws+2047)&~(uintptr_t)2047);
     int32_t *fi=(int32_t *)base,*zero=(int32_t *)(base+(size_t)NB*256);
-    uint8_t *completion=base+fixed-2048,*A=base+fixed,*C=A+(size_t)mt*KB*2048;
+    uint8_t *completion=base+fixed-2048,*Bc=base+fixed,*A=Bc+bsz,*C=A+(size_t)mt*KB*2048;
+    if(s2) {
+        for(int32_t j=0;j<NB;j++)for(int32_t k=0;k<KB;k++)
+            qd_vcopy(Bc+((size_t)j*KB+(size_t)k)*1024,wbase+s2off[k]+(size_t)j*js,1024);
+        wbase=(const int8_t *)Bc;
+    }
     {
         /* Built in near with scalar stores, then one vector copy to VTCM. */
         int32_t *nf=(int32_t *)(n+o_fi),*nz=nf+NB*64;
@@ -417,6 +502,7 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     }
     uint16_t *mv=(uint16_t *)(n+o_multv);
     for(int32_t k=0;k<co;k++) mv[(k>>5)*64+2*(k&31)]=mv[(k>>5)*64+2*(k&31)+1]=(uint16_t)Mq[k];
+    HMX_MARK(3);
     uint8_t **xtab=use_tab?(uint8_t **)(n+o_xtab):NULL;
     if(xtab) hmx_tab(xtab,g->pool,xt,xt->p[1],xrows,xwb0,xnwb,cbs);
     uint8_t **otab=NULL,**etab=NULL,**btab=NULL;
@@ -425,6 +511,11 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
         if(g->fx.kind){etab=otab+otn;hmx_tab(etab,g->pool,&g->fx.oe,g->fx.oe.p[1],oh,owb0,onwb,NB);}
         if(g->fx.kind==2){btab=etab+otn;hmx_tab(btab,g->pool,&g->fx.ob,g->fx.ob.p[1],oh,owb0,onwb,NB);}
     }
+#ifdef CONV_SHAPES
+    if(!g->dry) fprintf(stderr,"HMXTAB xtab=%lu otab=%lu use=%d/%d\n",(unsigned long)(use_tab?ntab*sizeof(uint8_t *):0),
+                        (unsigned long)(use_otab?(size_t)ntabs*otn*sizeof(uint8_t *):0),use_tab,use_otab);
+#endif
+    HMX_MARK(4);
     HmxJob J={.g=g,.xtab=xtab,.xwb0=xwb0,.xnwb=xnwb,.cbs=cbs,.otab=otab,.etab=etab,.btab=btab,.owb0=owb0,.onwb=onwb,.xt=xt,.o=o,.oh=oh,.ow=ow,.KB=KB,.NB=NB,.total=total,.A=A,.C=C,.B=(const uint8_t *)wbase,
               .ktab=ktab,.corr=corr,.pre=pre,.Mq=Mq,.multv=(const uint8_t *)mv,.fx=g->fx.kind?&g->fx:NULL,
               .xnbw=((int64_t)xt->m[2]+7)/8,.xnbd=((int64_t)xt->m[3]+31)/32,
