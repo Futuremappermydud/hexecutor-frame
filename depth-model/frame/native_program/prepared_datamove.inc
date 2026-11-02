@@ -722,24 +722,23 @@ static int tr_wc_common_ok(const G *g, const T *xt, const T *o, uint32_t es, int
     if((xt->p[2]%pixw) || (xt->p[3]&31) || (o->p[2]%pixw) || (o->p[3]&31)) return 0;
     return dm_write_dims_match(o,n);
 }
-static int tr_wc_hook(G *g, const T *xt, const T *o, const int32_t *n, int id, int es) {
-    int e=xfer_check(g,xt,xt->d,xt->p,0);
-    if(!e)e=xfer_check(g,o,n,o->p,1);
-    if(e) return e;
-    if(!dm_clear(xt,xt->d,xt->p,o,n,o->p)) return -1;
-    if(g->dry) return 0;
-    (void)id;DM_COUNT(id,(uint64_t)n[0]*n[1]*n[2]*n[3]);
+typedef struct { const G *g; const T *xt, *o; const int32_t *n; int es; } TrWcJob;
+/* Row runs (b, h..h+run) are independent: part p takes every parts-th run. */
+static void tr_wc_part(void *ctx, uint32_t part, uint32_t parts) {
+    const TrWcJob *J=ctx;const G *g=J->g;const T *xt=J->xt,*o=J->o;const int32_t *n=J->n;const int es=J->es;
     BK bx,bo;
     bk_init(&bx,g,xt);bk_init(&bo,g,o);
     const int32_t H=xt->d[1],W=xt->d[2],C=xt->d[3];
     const int pb=es==2?2:4;      /* pixels per vector */
     const int nin=16/(es==2?1:2); /* input vectors per tile: 32 pixels / pixels per vector */
     const int64_t cw=es==2?4:8;  /* pixels per block column */
-    for(int32_t b=0;b<n[0];b++)for(int32_t h=0;h<H;) {
+    uint32_t runix=0;
+    for(int32_t b=0;b<n[0];b++)for(int32_t h=0;h<H;runix++) {
         const int64_t Hi=(int64_t)h+xt->p[1],Ho=(int64_t)h+o->p[1],B=b+(int64_t)xt->p[0],OB=b+(int64_t)o->p[0];
         int32_t run=8-(int32_t)(Hi&7);
         if(8-(int32_t)(Ho&7)<run)run=8-(int32_t)(Ho&7);
         if(H-h<run)run=H-h;
+        if(runix%parts!=part){h+=run;continue;}
         for(int32_t zc=0;zc*32<C;zc++) {
             const int32_t cn=C-32*zc<32?C-32*zc:32,nout=(cn+pb-1)/pb;
             for(int32_t w0=0;w0<W;w0+=32) {
@@ -770,6 +769,19 @@ static int tr_wc_hook(G *g, const T *xt, const T *o, const int32_t *n, int id, i
         }
         h+=run;
     }
+}
+static int tr_wc_hook(G *g, const T *xt, const T *o, const int32_t *n, int id, int es) {
+    int e=xfer_check(g,xt,xt->d,xt->p,0);
+    if(!e)e=xfer_check(g,o,n,o->p,1);
+    if(e) return e;
+    if(!dm_clear(xt,xt->d,xt->p,o,n,o->p)) return -1;
+    if(g->dry) return 0;
+    (void)id;DM_COUNT(id,(uint64_t)n[0]*n[1]*n[2]*n[3]);
+    TrWcJob J={g,xt,o,n,es};
+    int64_t runs=(int64_t)n[0]*((xt->d[1]+7)/8);
+    uint32_t parts=dm_parts(g,(uint64_t)n[0]*n[1]*n[2]*n[3],runs);
+    if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_DM,parts,tr_wc_part,&J);
+    else tr_wc_part(&J,0,1);
     return 0;
 }
 static int tr_wc16_fast(G *g, const T *xt, const T *o) {

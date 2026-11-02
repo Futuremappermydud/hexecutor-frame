@@ -737,11 +737,82 @@ static void dq_strip(const void *c_, const uint8_t *src, uint8_t *dst, size_t n,
     }
 }
 typedef struct { int32_t zp; uint32_t mi; int32_t ei, fast; double inv; } QCtx;
+#if BLK_HVX
+/* q_exact on 32 float lanes (bits sb): the clipped u16 values as int32 lanes,
+ * *bad = inf/NaN lanes. P = mant*mi (< 2^48) from 12-bit pieces as (hi,lo);
+ * with s1 = sh-1, the result is round-half-up of P/2^sh for s >= 0, i.e.
+ * ((P>>s1)+1)>>1, and -(((P-1)>>s1)+1)>>1 for s < 0 (P > 0). Q = M>>s1 is
+ * only needed below 2^20; anything larger, or k >= 0, saturates, which equals
+ * the reference clip because 0 <= zp <= 65535 (checked by the caller). */
+static inline HVX_Vector q_hvx32(HVX_Vector sb, uint32_t bl2, uint32_t bh2, int32_t ei, HVX_Vector vzp,
+                                 HVX_VectorPred *bad) {
+    const HVX_Vector zero=Q6_V_vzero(),one=Q6_V_vsplat_R(1),c31=Q6_V_vsplat_R(31),c32=Q6_V_vsplat_R(32);
+    HVX_Vector x=Q6_V_vand_VV(Q6_Vuw_vlsr_VuwR(sb,23),Q6_V_vsplat_R(255));
+    *bad=Q6_Q_vcmp_eq_VwVw(x,Q6_V_vsplat_R(255));
+    HVX_VectorPred xz=Q6_Q_vcmp_eq_VwVw(x,zero);
+    HVX_VectorPred neg=Q6_Q_vcmp_gt_VwVw(zero,sb);
+    HVX_Vector mant=Q6_V_vand_VV(sb,Q6_V_vsplat_R(0x7fffff));
+    mant=Q6_V_vmux_QVV(xz,mant,Q6_V_vor_VV(mant,Q6_V_vsplat_R(0x800000)));
+    HVX_Vector xe=Q6_V_vmux_QVV(xz,one,x);
+    HVX_Vector k=Q6_Vw_vadd_VwVw(xe,Q6_V_vsplat_R(ei-150));
+    HVX_Vector al=Q6_V_vand_VV(mant,Q6_V_vsplat_R(4095)),ah=Q6_Vuw_vlsr_VuwR(mant,12);
+    HVX_Vector t0=Q6_Vw_vmpyi_VwRh(al,(int32_t)bl2);
+    HVX_Vector t1=Q6_Vw_vadd_VwVw(Q6_Vw_vmpyi_VwRh(ah,(int32_t)bl2),Q6_Vw_vmpyi_VwRh(al,(int32_t)bh2));
+    HVX_Vector t2=Q6_Vw_vmpyi_VwRh(ah,(int32_t)bh2);
+    HVX_Vector s1=Q6_Vw_vadd_VwVw(t0,Q6_Vw_vasl_VwR(t1,12));
+    HVX_VectorPred c1=Q6_Q_vcmp_gt_VuwVuw(t0,s1);
+    HVX_Vector lo=Q6_Vw_vadd_VwVw(s1,Q6_Vw_vasl_VwR(t2,24));
+    HVX_VectorPred c2=Q6_Q_vcmp_gt_VuwVuw(s1,lo);
+    HVX_Vector hi=Q6_Vw_vadd_VwVw(Q6_Vuw_vlsr_VuwR(t1,20),Q6_Vuw_vlsr_VuwR(t2,8));
+    hi=Q6_Vw_condacc_QVwVw(c1,hi,one);hi=Q6_Vw_condacc_QVwVw(c2,hi,one);
+    HVX_VectorPred pz=Q6_Q_vcmp_eq_VwVw(mant,zero);
+    /* M = P-1 for negative nonzero s */
+    HVX_VectorPred dec=Q6_Q_and_QQn(neg,pz);
+    HVX_VectorPred borrow=Q6_Q_and_QQ(dec,Q6_Q_vcmp_eq_VwVw(lo,zero));
+    lo=Q6_Vw_condnac_QVwVw(dec,lo,one);hi=Q6_Vw_condnac_QVwVw(borrow,hi,one);
+    HVX_Vector s1s=Q6_Vw_vsub_VwVw(Q6_Vw_vsub_VwVw(zero,k),one);       /* sh-1 */
+    HVX_Vector tA=Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(Q6_Vw_vsub_VwVw(s1s,c32),zero),c31);
+    HVX_Vector QA=Q6_Vw_vlsr_VwVw(hi,tA);
+    HVX_Vector sB=Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(s1s,zero),c31);
+    HVX_Vector QB=Q6_V_vor_VV(Q6_Vw_vasl_VwVw(hi,Q6_Vw_vsub_VwVw(c32,sB)),Q6_Vw_vlsr_VwVw(lo,sB));
+    HVX_VectorPred sB0=Q6_Q_vcmp_eq_VwVw(sB,zero);
+    QB=Q6_V_vmux_QVV(sB0,lo,QB);
+    HVX_VectorPred bigB=Q6_Q_not_Q(Q6_Q_vcmp_eq_VwVw(Q6_Vw_vlsr_VwVw(hi,sB),zero));
+    HVX_VectorPred isA=Q6_Q_vcmp_gt_VwVw(s1s,c31);
+    HVX_Vector Q=Q6_V_vmux_QVV(isA,QA,QB);
+    HVX_VectorPred big=Q6_Q_or_QQ(Q6_Q_and_QQn(bigB,isA),Q6_Q_vcmp_gt_VuwVuw(Q,Q6_V_vsplat_R((1<<20)-1)));
+    big=Q6_Q_or_QQ(big,Q6_Q_vcmp_gt_VwVw(k,Q6_V_vsplat_R(-1)));
+    HVX_Vector R=Q6_Vuw_vlsr_VuwR(Q6_Vw_vadd_VwVw(Q,one),1);
+    R=Q6_V_vmux_QVV(neg,Q6_Vw_vsub_VwVw(zero,R),R);
+    HVX_Vector r=Q6_Vw_vadd_VwVw(R,vzp);
+    r=Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(r,zero),Q6_V_vsplat_R(65535));
+    HVX_Vector sat=Q6_V_vmux_QVV(neg,zero,Q6_V_vsplat_R(65535));
+    return Q6_V_vmux_QVV(big,sat,r);
+}
+#endif
 static void q_strip(const void *c_, const uint8_t *src, uint8_t *dst, size_t n, const int32_t *io) {
     (void)io;
     const QCtx *c=c_;
     const float *s=(const float *)src;uint16_t *d=(uint16_t *)dst;
-    for(size_t i=0;i<n;i++) {
+    size_t i0=0;
+#if BLK_HVX
+    if(c->fast && c->zp>=0 && c->zp<=65535 && !((uintptr_t)src&127u) && !((uintptr_t)dst&127u)) {
+        uint32_t bl=c->mi&4095u,bh=c->mi>>12;
+        HVX_Vector vzp=Q6_V_vsplat_R(c->zp),acc=Q6_V_vzero();
+        for(;i0+64<=n;i0+=64) {
+            HVX_VectorPred b0,b1;
+            HVX_Vector r0=q_hvx32(((const HVX_Vector *)(s+i0))[0],bl|bl<<16,bh|bh<<16,c->ei,vzp,&b0);
+            HVX_Vector r1=q_hvx32(((const HVX_Vector *)(s+i0))[1],bl|bl<<16,bh|bh<<16,c->ei,vzp,&b1);
+            acc=Q6_V_vor_VV(acc,Q6_V_vand_QR(Q6_Q_or_QQ(b0,b1),0x01010101u));
+            *(HVX_Vector *)(d+i0)=Q6_Vh_vpacke_VwVw(r1,r0);
+        }
+        HVX_Vector flag __attribute__((aligned(128)))=acc;
+        const uint32_t *fw=(const uint32_t *)&flag;uint32_t any=0;
+        for(int q=0;q<32;q++) any|=fw[q];
+        if(any) i0=0;
+    }
+#endif
+    for(size_t i=i0;i<n;i++) {
         uint32_t sb;memcpy(&sb,s+i,4);
         if(c->fast && q_exact(sb,c->mi,c->ei,c->zp,d+i)) continue;
         double v=floor((double)s[i]*c->inv+0.5)+c->zp;
@@ -1677,6 +1748,40 @@ static int k_convert_weights(G *g) {
         const uint8_t *src=x.p;const int32_t *sv=s.p;
         int32_t zp=i->zp;
         uint32_t I4=(uint32_t)I/4,uO=(uint32_t)O,hw=0;
+#if BLK_HVX
+        /* q = (v*sv+32768)>>16 in int32 lanes when |v*sv|+32768 < 2^31 for
+         * every channel: sv*u (mod 2^32, vmpyieacc) minus zp*sv. The four ii
+         * of a group are the four bytes of each output word. */
+        int64_t vmax=zp>255-zp?zp:255-zp,smax=0;
+        if(vmax<0) vmax=-vmax;
+        for(uint32_t oo=0;oo<uO;oo++){int64_t a=sv[oo]<0?-(int64_t)sv[oo]:sv[oo];if(a>smax)smax=a;}
+        if(zp>-65536 && zp<65536 && vmax*smax+32768<(1ll<<31)) {
+            const HVX_Vector lo8=Q6_V_vsplat_R(-128),hi8=Q6_V_vsplat_R(127),m255=Q6_V_vsplat_R(255);
+            for(uint32_t og=0;og<uO/32;og++) {
+                HVX_Vector svv,zs;
+                {
+                    int32_t tmpv[32] __attribute__((aligned(128)));
+                    memcpy(tmpv,sv+og*32,128);svv=*(const HVX_Vector *)tmpv;
+                    for(int q=0;q<32;q++) tmpv[q]=(int32_t)(32768-(int64_t)zp*sv[og*32+q]); /* |zp*sv| < 2^31 */
+                    zs=*(const HVX_Vector *)tmpv;
+                }
+                for(hw=0;hw<(uint32_t)(H*W);hw++)for(uint32_t i4=0;i4<I4;i4++) {
+                    HVX_Vector word=Q6_V_vzero();
+                    for(uint32_t r=0;r<4;r++) {
+                        const uint8_t *row=src+((size_t)hw*(uint32_t)I+i4*4+r)*uO+og*32;
+                        HVX_Vector u=Q6_V_lo_W(Q6_Wuw_vunpack_Vuh(Q6_V_lo_W(Q6_Wuh_vunpack_Vub(load_part(row,32)))));
+                        HVX_Vector q=Q6_Vw_vasr_VwR(Q6_Vw_vmpyieacc_VwVwVuh(zs,svv,u),16);
+                        q=Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(q,lo8),hi8);
+                        word=Q6_V_vor_VV(word,Q6_Vw_vasl_VwR(Q6_V_vand_VV(q,m255),8*r));
+                    }
+                    *(HVX_UVector *)(tmp+((size_t)og*(uint32_t)(H*W)*I4+(size_t)hw*I4+i4)*128u)=word;
+                }
+            }
+            qd_vcopy(out,tmp,total);
+            return 0;
+        }
+        hw=0;
+#endif
         for(int32_t h=0;h<H;h++)for(int32_t w=0;w<W;w++,hw++)for(uint32_t ii=0;ii<(uint32_t)I;ii++) {
             const uint8_t *row=src+((size_t)hw*(uint32_t)I+ii)*uO;
             uint32_t base=(hw*I4+(ii>>2))*128u+(ii&3u);
@@ -1743,7 +1848,35 @@ static void abs_strip(const void *c_, const uint8_t *src, uint8_t *dst, size_t n
     /* lane as k_abs: blocked W%2==0; direct parity of (offset+2*lin)/2. */
     int64_t lin=c->direct?((io[0]*c->m1+io[1])*c->m2+io[2])*c->m3+io[3]:0;
     int32_t W=io[2],k=0;
-    for(size_t j=0;j<n;j++) {
+    size_t j0=0;
+#if BLK_HVX
+    /* Blocked, 64 | D (one pixel, so one lane, per vector). mult = mh*2^15+ml:
+     * (centered*mult+L)>>15 = centered*mh + ((centered*ml+L)>>15) exactly, and
+     * every 32-bit term below is bounded by the checks. */
+    if(!c->direct && !(c->D&63) && c->mult>=0 && c->mult<(1ll<<29) && c->offset>-(1ll<<29) && c->offset<(1ll<<29) &&
+       c->zp>=0 && c->zp<=65535 && !((uintptr_t)src&127u) && !((uintptr_t)dst&127u)) {
+        int32_t mh=(int32_t)(c->mult>>15),ml=(int32_t)(c->mult&0x7fff);
+        const HVX_Vector zero=Q6_V_vzero(),vzp=Q6_V_vsplat_R(c->zp),c32k=Q6_V_vsplat_R(32768),
+                         voff=Q6_V_vsplat_R((int32_t)c->offset+4),vmax=Q6_V_vsplat_R(65535);
+        for(;j0+64<=n;j0+=64) {
+            int32_t Wj=W+(int32_t)(j0/(size_t)c->D);
+            HVX_Vector L=Q6_V_vsplat_R((Wj&1)?0:16384);
+            HVX_VectorPair w=Q6_Wuw_vunpack_Vuh(*(const HVX_Vector *)(v+j0));
+            HVX_Vector r[2];
+            for(int h=0;h<2;h++) {
+                HVX_Vector x=h?Q6_V_hi_W(w):Q6_V_lo_W(w);
+                HVX_Vector ce=Q6_Vw_vsub_VwVw(Q6_Vw_vabs_Vw(Q6_Vw_vsub_VwVw(x,vzp)),c32k);
+                HVX_Vector y=Q6_Vw_vasr_VwR(Q6_Vw_vadd_VwVw(Q6_Vw_vmpyi_VwRh(ce,ml|ml<<16),L),15);
+                y=Q6_Vw_vadd_VwVw(Q6_Vw_vadd_VwVw(y,Q6_Vw_vmpyi_VwRh(ce,mh|mh<<16)),voff);
+                y=Q6_Vw_vasr_VwR(y,3);
+                r[h]=Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(y,zero),vmax);
+            }
+            *(HVX_Vector *)(d+j0)=Q6_Vh_vpacke_VwVw(r[1],r[0]);
+        }
+        W+=(int32_t)(j0/(size_t)c->D);
+    }
+#endif
+    for(size_t j=j0;j<n;j++) {
         int64_t lane=c->direct?(((c->half_off+lin+(int64_t)j)&1)==0):((W&1)==0);
         int32_t x=(int32_t)v[j]-c->zp;
         int64_t centered=(int64_t)(x<0?-x:x)-32768;
