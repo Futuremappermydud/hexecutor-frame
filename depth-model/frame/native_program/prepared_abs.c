@@ -147,6 +147,37 @@ int nprg2_exec_abs_run(const Nprg2ExecCall *c, void *ctx) {
         uint32_t w_dim = (uint32_t)rdi16(ig + 10);
         uint32_t d_dim = (uint32_t)rdi16(ig + 12);
 
+        /* Fast form: one address per run of channels inside one block of
+         * both tensors (channel stride 4 bytes in a CH crouton), and
+         * 32x32 -> 64 products when mult fits 32 bits. Same arithmetic. */
+        if (mult >= INT32_MIN && mult <= INT32_MAX) {
+            uint32_t iod = (uint32_t)rdi16(ig + 28), ood = (uint32_t)rdi16(og + 28);
+            int32_t m32 = (int32_t)mult;
+            for (uint32_t bb = 0; bb < b_dim; bb++)
+            for (uint32_t h = 0; h < h_dim; h++)
+            for (uint32_t w = 0; w < w_dim; w++) {
+                int64_t lane16 = (w % 2u == 0) ? 16384 : 0;
+                for (uint32_t d = 0; d < d_dim;) {
+                    uint32_t n = 32u - (d + iod) % 32u, n2 = 32u - (d + ood) % 32u;
+                    if (n2 < n) n = n2;
+                    if (d_dim - d < n) n = d_dim - d;
+                    const uint8_t *ip = crouton_addr(c, &in, bb, h, w, d);
+                    uint8_t *op = crouton_addr(c, &out, bb, h, w, d);
+                    if (!ip || !op) return 0;
+                    for (uint32_t k = 0; k < n; k++) {
+                        int32_t val = (int32_t)rd16(ip + 4u * k) - i_zp;
+                        int32_t centered = (val < 0 ? -val : val) - 32768;
+                        int64_t y = (((int64_t)centered * m32 + lane16) >> 15) + offset;
+                        int64_t v = (y + 4) >> 3;
+                        v = v < 0 ? 0 : v > 65535 ? 65535 : v;
+                        op[4u * k] = (uint8_t)(v & 0xff);
+                        op[4u * k + 1] = (uint8_t)(v >> 8);
+                    }
+                    d += n;
+                }
+            }
+            return 1;
+        }
         for (uint32_t bb = 0; bb < b_dim; bb++) {
             for (uint32_t h = 0; h < h_dim; h++) {
                 for (uint32_t w = 0; w < w_dim; w++) {

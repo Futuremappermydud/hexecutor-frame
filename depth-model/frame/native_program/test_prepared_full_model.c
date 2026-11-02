@@ -484,6 +484,9 @@ int main(int argc, char **argv) {
     register_handlers(&s, mixed, fast);
     census(&s);
     if (strcmp(what, "whole")) lockstep(&s);
-    if (strcmp(what, "lockstep")) whole(&s);
+    /* QD_REPEAT=n: n whole runs (pools reset each time), so state carried
+     * between runs (memoised per-command decisions, caches) is exercised. */
+    int repeat = getenv("QD_REPEAT") ? atoi(getenv("QD_REPEAT")) : 1;
+    if (strcmp(what, "lockstep")) for (int k = 0; k < (repeat > 0 ? repeat : 1); k++) whole(&s);
     return 0;
 }

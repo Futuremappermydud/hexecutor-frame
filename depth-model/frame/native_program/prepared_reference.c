@@ -4,6 +4,7 @@
  * blocks guarded by !g->dry are skipped. */
 #include "prepared_reference.h"
 #include "prepared_vcopy.h"
+#include "prepared_exact_math.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -506,6 +507,92 @@ static void shp_t(const char *n,const T *t){if(t->flags&F_SV){fprintf(stderr,"  
 /* Exact direct-copy fast paths for the data-movement kernels below. */
 #include "prepared_datamove.inc"
 
+
+/* ------------------------------------------------- chunked elementwise strips
+ * Same-shape unary elementwise kernels without whole-tensor scratch arrays:
+ * strips of (1,1,cw,D) elements move tensor -> buffer -> tensor with xfer
+ * (HVX block/run copies on the Frame) and the scalar arithmetic runs on the
+ * buffers. The buffers are the near region (L2-TCM on the Frame) past what
+ * this command's scratch already uses, so no pass touches the uncached DDR
+ * heap; without a near region they come from scratch (host/sim). Results are
+ * identical to the whole-tensor form. Returns -1 when the shapes do not fit
+ * (the caller then runs its whole-tensor form). */
+/* io: the strip's first element in input coordinates (b, h, w, d); the
+ * strip is n/D consecutive pixels along w, D channels each. */
+typedef void (*StripFn)(const void *ctx, const uint8_t *src, uint8_t *dst, size_t n, const int32_t *io);
+enum { STRIP_BYTES=0x7000 };
+/* Up to STRIP_BYTES of fast buffer: the near region past this command's own
+ * scratch use, else (no near region) from scratch. */
+static uint8_t *strip_buffer(G *g, size_t *room) {
+    const Nprg2ExecBuffer *nr=&g->call->scratch_region[NPRG2_EXEC_SCRATCH_NEAR];
+    uint8_t *buf=NULL;
+    if(nr->data && nr->bytes && !((uintptr_t)nr->data&127u)) {
+        size_t skip=0;
+        if(g->scratch==nr->data) skip=(g->used+127)&~(size_t)127; /* this command's scratch is the near region */
+        if(skip<nr->bytes){buf=nr->data+skip;*room=nr->bytes-skip;}
+    }
+    if(!buf) {
+        buf=salloc(g,STRIP_BYTES);
+        if(!buf) return NULL;
+        *room=STRIP_BYTES;
+    }
+    if(*room>STRIP_BYTES) *room=STRIP_BYTES;
+    return buf;
+}
+static int ew_strips(G *g, const T *it, const T *ot, uint32_t ies, uint32_t oes, StripFn fn, const void *ctx) {
+    if(!(it->flags&F_SHAPE) || !(ot->flags&F_SHAPE) || it->esize!=ies || ot->esize!=oes) return -1;
+    for(int i=0;i<4;i++) if(it->d[i]!=ot->d[i] || it->d[i]<=0) return -1;
+    if(ot->crouton) { /* t_write would widen depth to the crouton boundary */
+        int32_t e=(ot->d[3]+ot->p[3]+31)/32*32;
+        if(e>ot->m[3])e=ot->m[3];
+        if(e-ot->p[3]!=ot->d[3]) return -1;
+    }
+    const int32_t D=it->d[3];
+    size_t per=(size_t)D*(ies+oes),room;
+    uint8_t *buf=strip_buffer(g,&room);
+    if(!buf) return -1;
+    int32_t cw=(int32_t)(room/(per+256)); /* src/dst split, 128-aligned */
+    if(cw<1) return -1;
+    if(cw>it->d[2]) cw=it->d[2];
+    uint8_t *src=buf,*dst=buf+(((size_t)cw*D*ies+127)&~(size_t)127);
+    for(int32_t b=0;b<it->d[0];b++)for(int32_t h=0;h<it->d[1];h++)for(int32_t w=0;w<it->d[2];w+=cw) {
+        int32_t n=it->d[2]-w<cw?it->d[2]-w:cw;
+        int32_t dims[4]={1,1,n,D};
+        int32_t io[4]={it->p[0]+b,it->p[1]+h,it->p[2]+w,it->p[3]},oo[4]={ot->p[0]+b,ot->p[1]+h,ot->p[2]+w,ot->p[3]};
+        TRY(xfer(g,it,src,dims,io,0));
+        if(!g->dry) fn(ctx,src,dst,(size_t)n*D,io);
+        TRY(xfer(g,ot,dst,dims,oo,1));
+    }
+    return 0;
+}
+typedef struct { int32_t zp; uint32_t m24; int32_t e, fast; double sc; uint32_t in_es; } DqCtx;
+static void dq_strip(const void *c_, const uint8_t *src, uint8_t *dst, size_t n, const int32_t *io) {
+    (void)io;
+    const DqCtx *c=c_;
+    float *d=(float *)dst;
+    for(size_t j=0;j<n;j++) {
+        int32_t v=c->in_es==2?(int32_t)((const uint16_t *)src)[j]:(int32_t)src[j];
+        uint32_t bits;
+        if(c->fast && dq_exact(v-c->zp,c->m24,c->e,&bits)){memcpy(d+j,&bits,4);continue;}
+        double exact=((double)v-c->zp)*c->sc;
+        float rounded=(float)exact;
+        float away=nextafterf(rounded,exact<0?-INFINITY:INFINITY);
+        d[j]=exact==((double)rounded+(double)away)*0.5?away:rounded;
+    }
+}
+typedef struct { int32_t zp; uint32_t mi; int32_t ei, fast; double inv; } QCtx;
+static void q_strip(const void *c_, const uint8_t *src, uint8_t *dst, size_t n, const int32_t *io) {
+    (void)io;
+    const QCtx *c=c_;
+    const float *s=(const float *)src;uint16_t *d=(uint16_t *)dst;
+    for(size_t i=0;i<n;i++) {
+        uint32_t sb;memcpy(&sb,s+i,4);
+        if(c->fast && q_exact(sb,c->mi,c->ei,c->zp,d+i)) continue;
+        double v=floor((double)s[i]*c->inv+0.5)+c->zp;
+        d[i]=(uint16_t)(v<0?0:v>65535?65535:v);
+    }
+}
+
 /* ------------------------------------------------------------------ kernels */
 static int k_input_slice_pad(G *g) {
     CHECK(g->nin==7 && g->nout==1 && g->io<2 && g->io<g->call->input_count,E_ARGS);
@@ -645,15 +732,26 @@ static int64_t f_add_u8(int64_t a,int64_t b,const int64_t *k){return (a*k[0]+b*k
 static int64_t f_add_u16(int64_t a,int64_t b,const int64_t *k){return (a*k[0]+b*k[1]+((int64_t)1<<k[2]))>>(k[2]+1);}
 static int64_t f_addsub_u16(int64_t a,int64_t b,const int64_t *k){return (a*k[0]-b*k[1]+k[3])>>k[2];}
 static int64_t f_add1111(int64_t x,int64_t s,const int64_t *k){return (x*k[0]+s*k[1]+k[3])>>k[2];}
+/* D is taken mod 2^32, so every product feeding it is formed in 32 bits;
+ * the remaining products are 32x32 -> 64 (one mpy on Hexagon). Equal to the
+ * int64 form for any 64-bit inputs (only their low 32 bits matter). */
 static inline int64_t mul_u16(int64_t a, int64_t b, int64_t P1, int64_t zb, int64_t za, int64_t K, int64_t P2) {
-    int64_t D=s32((uint64_t)(a*b)+(uint64_t)K-(uint64_t)(b*(zb&0xffff)+a*(za&0xffff)));
-    int64_t lo=P1&0xffff,hi=s32((uint64_t)P1)>>16;
-    int64_t e=(D*lo)>>16;
-    int64_t q=clip64((2*e+2*D*hi)>>16,-2147483648LL,2147483647LL);
-    int64_t s=clip64(q+s32((uint64_t)P2),-2147483648LL,2147483647LL);
+    uint32_t ua=(uint32_t)a,ub=(uint32_t)b;
+    int32_t D=(int32_t)(ua*ub+(uint32_t)K-(ub*((uint32_t)zb&0xffffu)+ua*((uint32_t)za&0xffffu)));
+    int32_t lo=(int32_t)((uint32_t)P1&0xffffu),hi=(int32_t)(uint32_t)P1>>16;
+    int64_t e=((int64_t)D*lo)>>16;
+    int64_t q=clip64((2*e+2*((int64_t)D*hi))>>16,-2147483648LL,2147483647LL);
+    int64_t s=clip64(q+(int32_t)(uint32_t)P2,-2147483648LL,2147483647LL);
     return clip64((s+4)>>3,0,65535);
 }
 static int64_t f_mul_u16(int64_t a,int64_t b,const int64_t *k){return mul_u16(a,b,k[0],k[1],k[2],k[3],k[4]);}
+typedef struct { int32_t b; int64_t k[5]; } MulCtx;
+static void mul_strip(const void *c_, const uint8_t *src, uint8_t *dst, size_t n, const int32_t *io) {
+    (void)io;
+    const MulCtx *c=c_;
+    const uint16_t *a=(const uint16_t *)src;uint16_t *d=(uint16_t *)dst;
+    for(size_t j=0;j<n;j++) d[j]=(uint16_t)mul_u16(a[j],c->b,c->k[0],c->k[1],c->k[2],c->k[3],c->k[4]);
+}
 static int64_t f_addsub_flat(int64_t a,int64_t b,const int64_t *k){return (a*k[0]+k[4]*b*k[1]+2*k[3]+((int64_t)1<<k[2]))>>(k[2]+1);}
 #define BINARY_BODY(F) do { \
     int32_t n[4];TRY(bshape(a,b,n)); \
@@ -764,9 +862,14 @@ static int k_mul_inline(G *g) {
         uint64_t z=(uint32_t)p[3];
         k[0]=p[2];k[1]=(int64_t)(z&65535);k[2]=(int64_t)(z>>16);k[3]=p[4];k[4]=p[5];
     }
-    A x;TRY(t_read(g,in(g,0),&x,0));
     TRY(read_scalar(g,in(g,1),&s));
     if(!g->dry)CHECK(s>=INT32_MIN && s<=INT32_MAX,E_ARGS);
+    if(in(g,0)->dtype==DT_U16 && out0(g)->dtype==DT_U16) {
+        MulCtx c={(int32_t)s,{k[0],k[1],k[2],k[3],k[4]}};
+        int r=ew_strips(g,in(g,0),out0(g),2,2,mul_strip,&c);
+        if(r>=0) return r;
+    }
+    A x;TRY(t_read(g,in(g,0),&x,0));
     int32_t sv=(int32_t)s;
     A b={{1,1,1,1},DT_I32,1,0,&sv};
     return b_mul_u16(g,&x,&b,k,DT_U16,out0(g));
@@ -1040,10 +1143,44 @@ static int k_slice_pad(G *g) {
     }
     return t_write(g,out0(g),&r);
 }
+/* DECIMATE by strips of output pixels: read the input span covering them,
+ * keep every sv[2]-th pixel, write. Same values as the whole-tensor form;
+ * -1 when the shapes are outside it. */
+static int decimate_strips(G *g, const T *it, const T *ot, const int32_t *sv) {
+    if(sv[3]!=1 || !(it->flags&F_SHAPE) || !(ot->flags&F_SHAPE) || it->esize!=ot->esize) return -1;
+    int32_t n[4];
+    for(int i=0;i<4;i++){n[i]=(it->d[i]+sv[i]-1)/sv[i];if(n[i]!=ot->d[i] || n[i]<=0) return -1;}
+    if(ot->crouton) {
+        int32_t e=(ot->d[3]+ot->p[3]+31)/32*32;
+        if(e>ot->m[3])e=ot->m[3];
+        if(e-ot->p[3]!=ot->d[3]) return -1;
+    }
+    const int32_t D=n[3];const size_t es=it->esize,pix=(size_t)D*es;
+    size_t room;uint8_t *buf=strip_buffer(g,&room);
+    if(!buf) return -1;
+    /* cw output pixels need ((cw-1)*sv2+1) input pixels plus cw output pixels */
+    int32_t cw=(int32_t)((room-256)/(pix*(size_t)(sv[2]+1)));
+    if(cw<1) return -1;
+    if(cw>n[2]) cw=n[2];
+    uint8_t *src=buf,*dst=buf+((((size_t)(cw-1)*sv[2]+1)*pix+127)&~(size_t)127);
+    for(int32_t b=0;b<n[0];b++)for(int32_t h=0;h<n[1];h++)for(int32_t w=0;w<n[2];w+=cw) {
+        int32_t k=n[2]-w<cw?n[2]-w:cw;
+        int32_t id[4]={1,1,(k-1)*sv[2]+1,D},io[4]={it->p[0]+b*sv[0],it->p[1]+h*sv[1],it->p[2]+w*sv[2],it->p[3]};
+        int32_t od[4]={1,1,k,D},oo[4]={ot->p[0]+b,ot->p[1]+h,ot->p[2]+w,ot->p[3]};
+        TRY(xfer(g,it,src,id,io,0));
+        if(!g->dry) for(int32_t j=0;j<k;j++) memcpy(dst+(size_t)j*pix,src+(size_t)j*sv[2]*pix,pix);
+        TRY(xfer(g,ot,dst,od,oo,1));
+    }
+    return 0;
+}
 static int k_decimate(G *g) {
     NEED(2);
     const T *s=in(g,1);
     CHECK(g->nin==2 && (s->flags&F_SV),E_ARGS);
+    if(s->sv[0]>0 && s->sv[1]>0 && s->sv[2]>0 && s->sv[3]>0) {
+        int r=decimate_strips(g,in(g,0),out0(g),s->sv);
+        if(r>=0) return r;
+    }
     A x;TRY(t_read(g,in(g,0),&x,0));
     int32_t n[4];
     for(int i=0;i<4;i++){CHECK(s->sv[i]>0,E_ARGS);n[i]=(x.n[i]+s->sv[i]-1)/s->sv[i];}
@@ -1173,16 +1310,30 @@ static int k_output_slice(G *g) {
     }
     return 0;
 }
+static float f32_from_bits(uint32_t b){float f;memcpy(&f,&b,4);return f;}
+static uint32_t f32_bits(float f){uint32_t b;memcpy(&b,&f,4);return b;}
 static int k_quantize(G *g) {
     NEED(1);
     const T *o=out0(g);
+    if(in(g,0)->dtype==DT_F32 && o->dtype==DT_U16 && (o->flags&F_QUANT)) {
+        float invf=(float)(1.0/o->scale);
+        QCtx c={o->zp,0,0,0,(double)invf};
+        c.fast=dq_scale(f32_bits(invf),&c.mi,&c.ei);
+        int r=ew_strips(g,in(g,0),o,4,2,q_strip,&c);
+        if(r>=0) return r;
+    }
     A x;TRY(t_read(g,in(g,0),&x,0));
     CHECK(x.dt==DT_F32 && o->dtype==DT_U16 && (o->flags&F_QUANT),E_TENSOR);
     A r;TRY(anew(g,&r,x.n,DT_U16));
     if(!g->dry) {
-        double inv=(double)(float)(1.0/o->scale);
+        float invf=(float)(1.0/o->scale);
+        double inv=(double)invf;
         const float *s=x.p;uint16_t *d=r.p;
+        uint32_t mi;int32_t ei;
+        int fast=dq_scale(f32_bits(invf),&mi,&ei);
         for(size_t i=0,n=count4(x.n);i<n;i++) {
+            uint32_t sb;memcpy(&sb,s+i,4);
+            if(fast && q_exact(sb,mi,ei,o->zp,d+i)) continue;
             double v=floor((double)s[i]*inv+0.5)+o->zp;
             d[i]=(uint16_t)(v<0?0:v>65535?65535:v);
         }
@@ -1192,13 +1343,26 @@ static int k_quantize(G *g) {
 static int k_dequantize(G *g) {
     NEED(1);
     const T *i=in(g,0);
+    if((i->dtype==DT_U16 || i->dtype==DT_U8) && out0(g)->dtype==DT_F32) {
+        float scf=(float)i->scale;
+        DqCtx c={i->zp,0,0,0,(double)scf,i->esize};
+        c.fast=dq_scale(f32_bits(scf),&c.m24,&c.e);
+        int r=ew_strips(g,i,out0(g),i->esize,4,dq_strip,&c);
+        if(r>=0) return r;
+    }
     A x;TRY(t_read(g,i,&x,0));
     int32_t *v;TRY(to_i32(g,&x,&v));
     A r;TRY(anew(g,&r,x.n,DT_F32));
     if(!g->dry) {
-        double sc=(double)(float)i->scale;
+        float scf=(float)i->scale;
+        double sc=(double)scf;
         float *d=r.p;
+        uint32_t m24;int32_t e;
+        int fast=dq_scale(f32_bits(scf),&m24,&e);
         for(size_t j=0,n=count4(x.n);j<n;j++) {
+            int64_t dv=(int64_t)v[j]-i->zp;
+            uint32_t bits;
+            if(fast && dv>INT32_MIN && dv<=INT32_MAX && dq_exact((int32_t)dv,m24,e,&bits)){memcpy(d+j,&bits,4);continue;}
             double exact=((double)v[j]-i->zp)*sc;
             float rounded=(float)exact;
             float away=nextafterf(rounded,exact<0?-INFINITY:INFINITY);
@@ -1230,8 +1394,6 @@ static int k_mean(G *g) {
     if(!g->dry){int64_t s=0;for(size_t j=0;j<32;j++)s+=aget(&x,j);from_i64(&r,0,clip64((s+33)>>5,0,65535));}
     return t_write(g,o,&r);
 }
-static float f32_from_bits(uint32_t b){float f;memcpy(&f,&b,4);return f;}
-static uint32_t f32_bits(float f){uint32_t b;memcpy(&b,&f,4);return b;}
 static int k_weight_scales(G *g) {
     NEED(1);
     const T *i=in(g,0),*o=out0(g);
@@ -1295,6 +1457,23 @@ static int k_convert_weights(G *g) {
     CHECK(o->pool<7 && g->pool[o->pool] && o->offset+(uint64_t)total<=g->write_limit[o->pool],E_RANGE);
     if(g->dry) return 0;
     int8_t *raw=(int8_t *)g->pool[o->pool]+o->offset;
+    /* Per-output-channel scales (the common case): 32-bit indices, the scale
+     * hoisted, the same arithmetic. total < 2^31 so u32 offsets are exact. */
+    if(s.n[0]==1 && s.n[1]==1 && s.n[2]==1 && s.n[3]==O && total<0x7fffffffu) {
+        const uint8_t *src=x.p;const int32_t *sv=s.p;
+        int32_t zp=i->zp;
+        uint32_t I4=(uint32_t)I/4,uO=(uint32_t)O,hw=0;
+        for(int32_t h=0;h<H;h++)for(int32_t w=0;w<W;w++,hw++)for(uint32_t ii=0;ii<(uint32_t)I;ii++) {
+            const uint8_t *row=src+((size_t)hw*(uint32_t)I+ii)*uO;
+            uint32_t base=(hw*I4+(ii>>2))*128u+(ii&3u);
+            for(uint32_t oo=0;oo<uO;oo++) {
+                int32_t v=(int32_t)row[oo]-zp;
+                int64_t q=((int64_t)v*sv[oo]+32768)>>16;
+                raw[((oo>>5)*(uint32_t)(H*W)*I4)*128u+base+(oo&31u)*4u]=(int8_t)(q<-128?-128:q>127?127:q);
+            }
+        }
+        return 0;
+    }
     for(int32_t h=0;h<H;h++)for(int32_t w=0;w<W;w++)for(int32_t ii=0;ii<I;ii++)for(int32_t oo=0;oo<O;oo++) {
         int64_t v=((uint8_t *)x.p)[(((size_t)h*W+w)*I+ii)*O+oo]-(int64_t)i->zp;
         int64_t sc=((int32_t *)s.p)[bindex(s.n,h,w,ii,oo)];
@@ -1342,9 +1521,36 @@ static int k_bias_shuffle(G *g) {
     if(!g->dry){int32_t *d=r.p;for(size_t row=0;row<na/32;row++){memcpy(d+row*64,a+row*32,128);memcpy(d+row*64+32,b+row*32,128);}}
     return t_write(g,o,&r);
 }
+typedef struct { int64_t mult, offset; int32_t zp, D, direct; int64_t m1, m2, m3, half_off; } AbsCtx;
+static void abs_strip(const void *c_, const uint8_t *src, uint8_t *dst, size_t n, const int32_t *io) {
+    const AbsCtx *c=c_;
+    const uint16_t *v=(const uint16_t *)src;uint16_t *d=(uint16_t *)dst;
+    /* lane as k_abs: blocked W%2==0; direct parity of (offset+2*lin)/2. */
+    int64_t lin=c->direct?((io[0]*c->m1+io[1])*c->m2+io[2])*c->m3+io[3]:0;
+    int32_t W=io[2],k=0;
+    for(size_t j=0;j<n;j++) {
+        int64_t lane=c->direct?(((c->half_off+lin+(int64_t)j)&1)==0):((W&1)==0);
+        int32_t x=(int32_t)v[j]-c->zp;
+        int64_t centered=(int64_t)(x<0?-x:x)-32768;
+        int64_t y=((centered*c->mult+lane*16384)>>15)+c->offset;
+        int64_t q=(y+4)>>3;
+        d[j]=(uint16_t)(q<0?0:q>65535?65535:q);
+        if(++k==c->D){k=0;W++;}
+    }
+}
 static int k_abs(G *g) {
     NEED(1);
     const T *i=in(g,0),*o=out0(g);
+    if(i->esize==2 && i->dtype==DT_U16 && o->esize==2 && (i->flags&(F_DIRECT|F_BLOCKED))) {
+        float ratio=(float)i->scale*(float)(1.0/o->scale);
+        volatile float a=ratio*32768.0f;
+        volatile float b=a+(float)o->zp;
+        volatile float e=b*8.0f;
+        AbsCtx c={(int64_t)rintf(ratio*262144.0f),(int64_t)rintf(e),i->zp,i->d[3],!!(i->flags&F_DIRECT),
+                  i->m[1],i->m[2],i->m[3],(int64_t)(i->offset>>1)};
+        int r=ew_strips(g,i,o,2,2,abs_strip,&c);
+        if(r>=0) return r;
+    }
     A x;TRY(t_read(g,i,&x,0));
     int32_t *v;TRY(to_i32(g,&x,&v));
     CHECK(i->esize==2,E_TENSOR);
@@ -2891,6 +3097,23 @@ int nprg2_exec_reference_validate(const Nprg2ExecCall *c, void *ctx) {
     if(setup(&g,c,1,0,ctx)) return 0;
     return run_kernel(&g)==0;
 }
+/* Per-command scratch need, memoised from the first dry pass so later runs
+ * of the same program skip it. The dry pass reads only geometry and the
+ * constant pool, so the need is a property of the bound program; if it ever
+ * were larger, salloc fails and the command errors (never silently wrong).
+ * Two programs (the two models) are kept. Not thread-safe: reference
+ * commands run on the executor's thread. */
+enum { MEMO_COMMANDS=8192 };
+static struct { const void *program; uint32_t need[MEMO_COMMANDS]; } scratch_memo[2];
+static uint32_t scratch_memo_next;
+static uint32_t *memo_slot(const Nprg2ExecCall *c) {
+    if(!c->program || c->command_index>=MEMO_COMMANDS) return NULL;
+    for(int i=0;i<2;i++) if(scratch_memo[i].program==c->program) return &scratch_memo[i].need[c->command_index];
+    uint32_t i=scratch_memo_next++&1u;
+    scratch_memo[i].program=c->program;
+    memset(scratch_memo[i].need,0xff,sizeof scratch_memo[i].need);
+    return &scratch_memo[i].need[c->command_index];
+}
 int nprg2_exec_reference_run(const Nprg2ExecCall *c, void *ctx) {
     G g;
     /* The dry pass measures the exact scratch need. A command that needs no
@@ -2908,7 +3131,12 @@ int nprg2_exec_reference_run(const Nprg2ExecCall *c, void *ctx) {
         if(setup(&g,c,0,0,ctx)) return 0;
         return run_kernel(&g)==0;
     }
-    if(setup(&g,c,1,0,ctx) || run_kernel(&g)) return 0;
+    uint32_t *memo=has_near?memo_slot(c):NULL;
+    if(memo && *memo!=0xffffffffu) g.used=*memo;
+    else {
+        if(setup(&g,c,1,0,ctx) || run_kernel(&g)) return 0;
+        if(memo && g.used<0xffffffffu) *memo=(uint32_t)g.used;
+    }
     if(has_near && g.used && !((uintptr_t)nr->data&63u) && g.used+64u<=nr->bytes) {
         Nprg2ExecCall w=*c;
         w.scratch=nr->data;w.scratch_bytes=nr->bytes;
