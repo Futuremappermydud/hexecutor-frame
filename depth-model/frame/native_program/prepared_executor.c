@@ -183,9 +183,42 @@ static uint64_t request_signature(const Nprg2Executor *e,const Nprg2ExecRequest 
 }
 /* Digest of the contents every validator reads through the program and the
  * bound tables (geometry, tensor, command, refs, vectors, calls, and the
- * expanded block tables). Four independent multiply-xor lanes over 32-bit
- * words; like the signature it guards against accidental change. */
+ * expanded block tables): lane sums over whole 128-byte chunks, then four
+ * multiply-xor lanes over the tail; like the signature it guards against
+ * accidental change. Leading whole 128-byte chunks: per 32-bit lane l, Fletcher sums
+ * s1[l]+=w, s2[l]+=s1[l] (mod 2^32), so a change anywhere or a reordering of
+ * chunks changes them. Scalar loads of the DDR-resident expanded block tables
+ * are latency-bound on the Frame (~190 cycles per uncached line, 1.9-2.3 ms per
+ * run for ~716 KB); HVX keeps eight loads in flight. Host builds compute the
+ * same sums in C. Returns the bytes consumed (a multiple of 128). */
+static size_t lane_sums(const uint8_t *b,size_t n,uint32_t *s1,uint32_t *s2){
+    const size_t nv=n/128u;
+#if defined(__HVX__) && __HVX_LENGTH__==128
+    const HVX_UVector *v=(const HVX_UVector *)(const void *)b;
+    HVX_Vector a=Q6_V_vzero(),c=Q6_V_vzero();size_t k=0;
+    for(;k+8<=nv;k+=8){
+        HVX_Vector x0=v[k],x1=v[k+1],x2=v[k+2],x3=v[k+3],x4=v[k+4],x5=v[k+5],x6=v[k+6],x7=v[k+7];
+        a=Q6_Vw_vadd_VwVw(a,x0);c=Q6_Vw_vadd_VwVw(c,a);a=Q6_Vw_vadd_VwVw(a,x1);c=Q6_Vw_vadd_VwVw(c,a);
+        a=Q6_Vw_vadd_VwVw(a,x2);c=Q6_Vw_vadd_VwVw(c,a);a=Q6_Vw_vadd_VwVw(a,x3);c=Q6_Vw_vadd_VwVw(c,a);
+        a=Q6_Vw_vadd_VwVw(a,x4);c=Q6_Vw_vadd_VwVw(c,a);a=Q6_Vw_vadd_VwVw(a,x5);c=Q6_Vw_vadd_VwVw(c,a);
+        a=Q6_Vw_vadd_VwVw(a,x6);c=Q6_Vw_vadd_VwVw(c,a);a=Q6_Vw_vadd_VwVw(a,x7);c=Q6_Vw_vadd_VwVw(c,a);
+    }
+    for(;k<nv;k++){a=Q6_Vw_vadd_VwVw(a,v[k]);c=Q6_Vw_vadd_VwVw(c,a);}
+    *(HVX_UVector *)(void *)s1=a;*(HVX_UVector *)(void *)s2=c;
+#else
+    for(unsigned l=0;l<32u;l++)s1[l]=s2[l]=0;
+    for(size_t k=0;k<nv;k++)for(unsigned l=0;l<32u;l++){
+        uint32_t w;memcpy(&w,b+k*128u+l*4u,4);s1[l]+=w;s2[l]+=s1[l];
+    }
+#endif
+    return nv*128u;
+}
 static uint64_t hash_bytes(uint64_t h,const void *p,size_t n){
+    {
+        uint32_t s1[32],s2[32];const size_t done=lane_sums(p,n,s1,s2);
+        for(unsigned l=0;l<32u;l++)h=sig_mix(h,(uint64_t)s1[l]|(uint64_t)s2[l]<<32);
+        p=(const uint8_t *)p+done;h=sig_mix(h,n);n-=done;
+    }
     const uint8_t *b=p;uint32_t a0=0x811c9dc5u,a1=0x01000193u,a2=0x9e3779b1u,a3=0x85ebca6bu;size_t i=0;
     if(!((uintptr_t)b&3u)){ /* the tables are 4-byte aligned in practice: plain word loads */
         const uint32_t *w=(const uint32_t *)(const void *)b;
