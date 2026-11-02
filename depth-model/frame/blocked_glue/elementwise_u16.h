@@ -154,6 +154,41 @@ static inline uint16_t qd_ew16_mul_lane(const QdEw16Params *p,uint16_t a,uint16_
     return qd_ew16_mul_stage2(p,(uint32_t)a*(uint32_t)b+(uint32_t)p->c);
 }
 
+/* ---- 16-bit "fast forms" (HVX, whole-block path). Same results as the lane
+ * forms above, proven for the parameter ranges their make functions accept;
+ * outside them the whole path falls back to the 32-bit lane forms.
+ *
+ * MUL fast form. With D = a*b+K (wrapped int32), the reference chain
+ *   e=(D*lo)>>16, q=(2e+2*D*hi)>>16, s=sat32(q+P2), out=clip((s+4)>>3)
+ * equals out = clip(floor((D*P1 + (P2+4)*2^31) / 2^34)) (nested floors merge;
+ * the q and s clips cannot change a result that is clipped to u16 anyway)
+ * for 0 <= hi <= 16384. Put D' = D + 2^31 (mod 2^32; Dh' = D'>>16 and Dl =
+ * D'&0xffff are unsigned, Dh = Dh' - 2^15), Qa = (P2+4)>>1, Qb = ((P2+4)&1)<<15:
+ *   t1 = (Dl*lo)>>16
+ *   X  = Dh'*lo + Dl*hi + t1 + (Qb - 2^15*lo)           (== Dh*lo + Dl*hi + t1 + Qb)
+ *   Y  = Dh'*hi + (Qa - 2^15*hi) + (X>>16)              (== Dh*hi + Qa + (X>>16))
+ *   out = clip(Y>>2, 0, 65535)
+ * with X and Y proven to fit int32 over the whole (Dh, Dl) range. */
+typedef struct { uint32_t kk,hi,lo,cx,cy; } QdEw16MulFast;
+static inline int qd_ew16_mul_fast_make(const QdEw16Params *p,QdEw16MulFast *f) {
+    if (p->kind!=QD_EW16_MUL||p->hi<0||p->hi>16384) return 0;
+    int64_t H=p->hi,lo=p->lo,P2=p->c2+4ll,Qa=P2>>1,Qb=(P2&1)<<15;
+    int64_t xmin=-32768*lo+Qb,xmax=32767*lo+65535*H+((65535*lo)>>16)+Qb;
+    if (!qd_ew16_fits_i32(xmin)||!qd_ew16_fits_i32(xmax)) return 0;
+    int64_t ymin=-32768*H+Qa+(xmin>>16),ymax=32767*H+Qa+(xmax>>16);
+    if (!qd_ew16_fits_i32(ymin)||!qd_ew16_fits_i32(ymax)) return 0;
+    f->kk=(uint32_t)p->c+0x80000000u;f->hi=(uint32_t)H;f->lo=(uint32_t)lo;
+    f->cx=(uint32_t)(Qb-32768*lo);f->cy=(uint32_t)(Qa-32768*H);return 1;
+}
+/* D' = D + 2^31 (mod 2^32), the word the HVX code forms as a*b + kk. */
+static inline uint16_t qd_ew16_mul_fast_stage2(const QdEw16MulFast *f,uint32_t dp) {
+    uint32_t dh=dp>>16,dl=dp&0xffffu,t1=(dl*f->lo)>>16;
+    int32_t x=(int32_t)(dh*f->lo+dl*f->hi+t1+f->cx);
+    int32_t y=(int32_t)(dh*f->hi+f->cy+(uint32_t)(x>>16));
+    int32_t r=y>>2;
+    return r<0?0:r>65535?65535:(uint16_t)r;
+}
+
 /* Applies the op over the logical region (dims/origin) of a, b and out.
  * b is NULL for REQUANT and ADD1111. bscalar>=0 supplies b as a splat u16
  * (MUL1111; b NULL); for ADD1111 the scalar is passed in bscalar (0..65535).
@@ -162,4 +197,13 @@ static inline uint16_t qd_ew16_mul_lane(const QdEw16Params *p,uint16_t a,uint16_
  * zero and are not stored. Returns 0 on bad arguments. */
 int qd_blocked_ew16_apply(const QdBlockedU16 *a,const QdBlockedU16 *b,const QdBlockedU16 *out,
                           const QdEw16Params *p,int32_t bscalar);
+/* Whole-block form: a, b, out are all whole 8x4x32 blocks (origins and dims
+ * multiples of 8, 4, 32 in H, W, C) with equal dims. Returns 1 if so. The
+ * apply processes blocks i = part, part+parts, ... of the region in (B,H,W,C)
+ * order, 16 full vectors each (absent inputs read zero, absent outputs are
+ * not stored), using the 16-bit fast forms where the parameters allow and the
+ * 32-bit lane forms otherwise. Returns 0 on bad arguments or a non-whole region. */
+int qd_blocked_ew16_whole(const QdBlockedU16 *a,const QdBlockedU16 *b,const QdBlockedU16 *out);
+int qd_blocked_ew16_apply_whole(const QdBlockedU16 *a,const QdBlockedU16 *b,const QdBlockedU16 *out,
+                                const QdEw16Params *p,int32_t bscalar,uint32_t part,uint32_t parts);
 #endif

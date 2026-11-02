@@ -13,6 +13,13 @@ int qd_blocked_ew16_apply(const QdBlockedU16 *a,const QdBlockedU16 *b,const QdBl
                           const QdEw16Params *p,int32_t bscalar) {
     (void)a;(void)b;(void)out;(void)p;(void)bscalar;return 1;
 }
+int qd_blocked_ew16_whole(const QdBlockedU16 *a,const QdBlockedU16 *b,const QdBlockedU16 *out) {
+    (void)a;(void)b;(void)out;return 0;
+}
+int qd_blocked_ew16_apply_whole(const QdBlockedU16 *a,const QdBlockedU16 *b,const QdBlockedU16 *out,
+                                const QdEw16Params *p,int32_t bscalar,uint32_t part,uint32_t parts) {
+    (void)a;(void)b;(void)out;(void)p;(void)bscalar;(void)part;(void)parts;return 0;
+}
 /* sign_blocked.h / linearclip_u16.h name their descriptor QdBlockedU16, which
  * elementwise_u16.h (above) already typedefs. */
 #define QdBlockedU16 QdBlockedU16Glue

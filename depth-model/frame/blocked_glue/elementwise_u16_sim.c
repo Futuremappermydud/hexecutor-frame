@@ -122,6 +122,12 @@ static int trials(int kind,const Raw *raw,const QdEw16Params *p,int n,int bulk,u
         }
         int rc=qd_blocked_ew16_apply(&a.t,(two&&!use_scalar)?&b.t:0,&o.t,p,bscalar);
         if(!rc){fprintf(stderr,"apply rejected kind=%d\n",kind);return 1;}
+        if(bulk&&!memcmp(expect,memA[2],sizeof expect)) {
+            /* the same region split over 3 parts (round-robin blocks) must give the same bytes */
+            memset(memA[2],0xa5,sizeof memA[2]);
+            for(uint32_t part=0;part<3;part++)
+                if(!qd_blocked_ew16_apply_whole(&a.t,(two&&!use_scalar)?&b.t:0,&o.t,p,bscalar,part,3)){fprintf(stderr,"apply_whole rejected kind=%d\n",kind);return 1;}
+        }
         if(memcmp(expect,memA[2],sizeof expect)){
             uint32_t i=0;while(expect[i]==memA[2][i])i++;
             fprintf(stderr,"MISMATCH kind=%d trial=%d byte=%u got=%02x want=%02x dims=%ld,%ld,%ld,%ld o2=%ld o3=%ld\n",kind,it,(unsigned)i,memA[2][i],expect[i],
@@ -138,11 +144,11 @@ int main(int argc,char **argv) {
     int fail=0;
     uint32_t total=0;
     /* observed schedule parameters (r[] = call arguments r0..r9) */
-    static const Raw req[]={{{0,0,0,16793600,0},0},{{0,0,0,16793600,2147516416},0},{{0,0,0,16793764,0},0},{{0,0,0,32765,0},0}};
+    static const Raw req[]={{{0,0,0,16793600,0},0},{{0,0,0,16793600,2147516416},0},{{0,0,0,16793764,0},0},{{0,0,0,32765,0},0},{{0,0,0,32765,9196ll<<16},0},{{0,0,0,16793600,2147516416ll},0}};
     static const Raw a1111[]={{{0,0,0,0,16384,16384,13,3758104576ll},0},{{0,0,0,0,16384,8192,13,4026531840ll},0}};
     static const Raw mul[]={{{0,0,0,0,262127,0,0,2147549184ll,262119},0},{{0,0,0,0,262148,0,0,2147549184ll,262140},0},
                             {{0,0,0,0,262156,0,0,2147549184ll,262148},0},{{0,0,0,0,262281,0,0,2147549184ll,262273},0},
-                            {{0,0,0,0,284378,0,0,2147549184ll,284369},0},
+                            {{0,0,0,0,284378,0,0,2147549184ll,284369},0},{{0,0,0,0,262251,0,0,2147549184ll,262243},0},{{0,0,0,0,262152,0,0,2147549184ll,262140},0},{{0,0,0,0,262150,0,0,2147549184ll,262142},0},
                             /* not in the schedules: P2 near the int32 limits so the saturating q+P2 add engages (|q| ~ 3e5) */
                             {{0,0,0,0,262148,0,0,2147549184ll,2147383648ll},0},{{0,0,0,0,262148,0,0,2147549184ll,2147483647ll},0},
                             {{0,0,0,0,262148,0,0,2147549184ll,2147600000ll},0},{{0,0,0,0,262148,0,0,2147549184ll,2147483648ll},0}};

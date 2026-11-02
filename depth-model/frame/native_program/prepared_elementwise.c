@@ -261,16 +261,10 @@ static void add_whole_part(void *ctx,uint32_t part,uint32_t parts) {
     (void)qd_blocked_add_u8_apply_whole(&j->pr,&j->p,part,parts);
 }
 static int add_apply_parts(const Nprg2ExecCall *c,const QdBlockedU8 *a,const QdBlockedU8 *b,const QdBlockedU8 *o,const QdAddU8Params *p) {
-#if defined(EXP_EW) && EXP_EW==1
-    (void)c;(void)a;(void)b;(void)o;(void)p;return 1;
-#endif
     {
         AddWholeJob j;j.pr.a=*a;j.pr.b=*b;j.pr.out=*o;j.pr.cookie=0x51444138u;j.p=*p;
         if (qd_blocked_add_u8_whole(&j.pr)) {
             uint32_t parts=ew_parts(c,a->dims);
-#if defined(EXP_EW) && EXP_EW==2
-            parts=1;
-#endif
             if (parts>1) nprg2_parallel_for(c->parallel,NPRG2_PAR_EW,parts,add_whole_part,&j);
             else return qd_blocked_add_u8_apply_whole(&j.pr,&j.p,0,1);
             return 1;
@@ -304,6 +298,11 @@ static void w16_part(void *ctx,uint32_t part,uint32_t parts) {
     if (!ew_range(j.a.dims[1],part,parts,&h0,&h1)) return;
     EW_SPLIT(0,j.a,h0,h1);EW_SPLIT(0,j.b,h0,h1);EW_SPLIT(0,j.o,h0,h1);
     (void)qd_blocked_ew16_apply(&j.a,j.has_b?&j.b:NULL,&j.o,&j.p,j.bs);
+}
+/* Whole 8x4x32 blocks: parts take blocks round-robin (no row split). */
+static void w16_whole_part(void *ctx,uint32_t part,uint32_t parts) {
+    const W16Job *j=(const W16Job *)ctx;
+    (void)qd_blocked_ew16_apply_whole(&j->a,j->has_b?&j->b:NULL,&j->o,&j->p,j->bs,part,parts);
 }
 
 static int add_run(const Nprg2ExecCall *c,void *ctx) {
@@ -396,7 +395,7 @@ static int requant_run(const Nprg2ExecCall *c,void *ctx) {
  * (-> reference kernel) everything outside the proven ranges. Same scratch as
  * the u8 handlers (alias proof), so the region demand is unchanged.
  * ------------------------------------------------------------------------ */
-enum { W16_REQ, W16_ADD1111, W16_MUL, W16_ADD, W16_ADDSUB, W16_MUL1111, W16_COUNT };
+enum { W16_REQ, W16_ADD1111, W16_MUL, W16_ADD, W16_ADDSUB, W16_MUL1111, W16_MULINL, W16_COUNT };
 typedef struct { uint8_t opcode,variant,nin; uint32_t fn,used; int two_tensors,scalar; } W16Spec;
 static const W16Spec w16_spec[W16_COUNT]={
     {QDR_REQUANT_U16,71,2,QDR_CALL_REQUANTIZE_CROUTON_U16,0x18,0,0},
@@ -405,6 +404,9 @@ static const W16Spec w16_spec[W16_COUNT]={
     {QDR_ADD_U16,14,2,QDR_CALL_ELEMENTWISE_ADD_CROUTON_U16,0x1f0,1,0},
     {QDR_ADDSUB_U16,60,3,QDR_CALL_ELEMENTWISE_ADDSUB_CROUTON_U16,0x70,1,0},
     {QDR_MUL1111_U16,73,3,QDR_CALL_ELEMENTWISE_MUL1111_CROUTON_U16,0x1f0,0,1},
+    /* MUL_INLINE/72 (mul_op@CH*2.cH.fi): no call record; the scalar is a 1-pixel
+     * "cH" crouton tensor and the six multiplier words an i32 tensor in pool 5. */
+    {QDR_MUL_INLINE,72,3,0,0,0,1},
 };
 
 static int make_u16(const Nprg2ExecCall *c,uint32_t slot,int output,QdBlockedU16Out *out) {
@@ -435,6 +437,41 @@ static const uint8_t *w16_scalar_addr(const Nprg2ExecCall *c,uint32_t slot) {
     return c->pools[v.pool].base+v.offset;
 }
 
+/* MUL_INLINE's scalar operand: element (0,0,0,0) of a 1x1x1x1 u16 "cH" crouton
+ * tensor, i.e. the first halfword of its first block. NULL unless that block is
+ * present and inside its pool. Read at run time like the direct scalar. */
+static const uint8_t *mulinl_scalar_addr(const Nprg2ExecCall *c,uint32_t slot) {
+    uint32_t id;Nprg2TensorView v;
+    if (nprg2_exec_input(c,slot,&id,&v)!=NPRG2_EXEC_OK) return NULL;
+    (void)id;
+    if (v.storage_kind!=2 || !v.blocks || v.geometry_record[0]!=3 || !(v.geometry_record[1]&GEOMETRY_CROUTON) ||
+        memcmp(v.geometry_record+2,"cH",2)) return NULL;
+    int32_t d[4],m[4],o[4];if (!view_shape(&v,d,m,o)) return NULL;
+    for (int i=0;i<4;i++) if (d[i]!=1||o[i]) return NULL;
+    if (m[0]!=1||m[1]>8||m[2]>4||m[3]>32) return NULL;
+    if (v.slice_origin>=v.block_count) return NULL;
+    uint32_t e=v.blocks[v.slice_origin],pool=e&127u;
+    if (!pool || pool>=7 || !c->pools[pool].base) return NULL;
+    uint32_t limit=c->pools[pool].bytes;
+    if ((e&~127u)>limit || BLOCK_BYTES>limit-(e&~127u)) return NULL;
+    return c->pools[pool].base+(e&~127u);
+}
+/* MUL_INLINE multipliers: six i32 words (pool 5, immutable), the reference's
+ * k[0]=p[2], zb=p[3]&0xffff, za=p[3]>>16, k[3]=p[4], k[4]=p[5] (needs >= 6 words). */
+static int mulinl_params(const Nprg2ExecCall *c,QdEw16Params *p) {
+    uint32_t id;Nprg2TensorView v;
+    if (nprg2_exec_input(c,2,&id,&v)!=NPRG2_EXEC_OK) return 0;
+    (void)id;
+    if (v.storage_kind!=1 || v.pool!=5 || !c->pools[5].base || v.geometry_record[0]!=5) return 0;
+    int32_t d[4],m[4],o[4];if (!view_shape(&v,d,m,o)) return 0;
+    if (d[0]!=1||d[1]!=1||d[2]!=1||d[3]<6||m[0]!=1||m[1]!=1||m[2]!=1||m[3]!=d[3]||o[0]|o[1]|o[2]|o[3]) return 0;
+    uint32_t limit=c->pools[5].bytes;
+    if (v.offset>limit || 24u>limit-v.offset) return 0;
+    const uint8_t *w=c->pools[5].base+v.offset;
+    uint32_t z=rd32e(w+12);
+    return qd_ew16_make_mul((int32_t)rd32e(w+8),(int64_t)(z&65535u),(int64_t)(z>>16),(int32_t)rd32e(w+16),(int32_t)rd32e(w+20),p);
+}
+
 /* The reference's call_args: exactly one matching call record, the "used"
  * arguments unmasked. Fills r[10]. */
 static int w16_call(const Nprg2ExecCall *c,const W16Spec *sp,int64_t r[10]) {
@@ -449,6 +486,7 @@ static int w16_call(const Nprg2ExecCall *c,const W16Spec *sp,int64_t r[10]) {
 }
 static int w16_params(const Nprg2ExecCall *c,int which,QdEw16Params *p) {
     const W16Spec *sp=&w16_spec[which];int64_t r[10];
+    if (which==W16_MULINL) return mulinl_params(c,p);
     if (!w16_call(c,sp,r)) return 0;
     switch (which) {
     case W16_REQ: return qd_ew16_make_requant(r[3],r[4],p);
@@ -489,7 +527,7 @@ static int w16_validate(const Nprg2ExecCall *c,int which) {
     if (!w16_params(c,which,&p) || !make_u16(c,0,0,&a) || !make_u16(c,0,1,&o)) return 0;
     if (sp->two_tensors && !make_u16(c,1,0,&b)) return 0;
     const uint8_t *scalar=NULL;
-    if (sp->scalar && !(scalar=w16_scalar_addr(c,1))) return 0;
+    if (sp->scalar && !(scalar=which==W16_MULINL?mulinl_scalar_addr(c,1):w16_scalar_addr(c,1))) return 0;
     if (!qd_valid(a.meta,a.dims,a.origin,4) || !qd_valid(o.meta,o.dims,o.origin,4)) return 0;
     if (sp->two_tensors && !qd_valid(b.meta,b.dims,b.origin,4)) return 0;
     for (int i=0;i<4;i++) if (a.dims[i]!=o.dims[i] || (sp->two_tensors && a.dims[i]!=b.dims[i])) return 0;
@@ -511,7 +549,7 @@ static int w16_run(const Nprg2ExecCall *c,int which) {
     if (!w16_params(c,which,&p) || !make_u16(c,0,0,&a) || !make_u16(c,0,1,&o)) return 0;
     if (sp->two_tensors && !make_u16(c,1,0,&b)) return 0;
     if (sp->scalar) {
-        const uint8_t *sa=w16_scalar_addr(c,1);
+        const uint8_t *sa=which==W16_MULINL?mulinl_scalar_addr(c,1):w16_scalar_addr(c,1);
         if (!sa) return 0;
         bs=(int32_t)rd16e(sa);
     }
@@ -519,6 +557,10 @@ static int w16_run(const Nprg2ExecCall *c,int which) {
     if (parts>1) {
         W16Job j={a,b,o,sp->two_tensors,p,bs};
         if (!sp->two_tensors) memset(&j.b,0,sizeof j.b);
+        if (qd_blocked_ew16_whole(&a,sp->two_tensors?&b:NULL,&o)) {
+            nprg2_parallel_for(c->parallel,NPRG2_PAR_EW,parts,w16_whole_part,&j);
+            return 1;
+        }
         nprg2_parallel_for(c->parallel,NPRG2_PAR_EW,parts,w16_part,&j);
         return 1;
     }
@@ -533,6 +575,7 @@ W16_HANDLERS(mul16,W16_MUL)
 W16_HANDLERS(add16,W16_ADD)
 W16_HANDLERS(addsub16,W16_ADDSUB)
 W16_HANDLERS(mul1111,W16_MUL1111)
+W16_HANDLERS(mulinl,W16_MULINL)
 
 
 /* ------------------------------------------------------------------------
@@ -710,7 +753,8 @@ int nprg2_executor_register_elementwise_region(Nprg2Executor *e, uint8_t region)
     static const struct { int w; Nprg2ExecValidate v; Nprg2ExecRun r; } h16[W16_COUNT]={
         {W16_REQ,req16_validate,req16_run},{W16_ADD1111,add1111_validate,add1111_run},
         {W16_MUL,mul16_validate,mul16_run},{W16_ADD,add16_validate,add16_run},
-        {W16_ADDSUB,addsub16_validate,addsub16_run},{W16_MUL1111,mul1111_validate,mul1111_run}};
+        {W16_ADDSUB,addsub16_validate,addsub16_run},{W16_MUL1111,mul1111_validate,mul1111_run},
+        {W16_MULINL,mulinl_validate,mulinl_run}};
     for (unsigned i=0;i<W16_COUNT;i++) {
         rc=nprg2_executor_register_scratch_region(e,w16_spec[h16[i].w].opcode,w16_spec[h16[i].w].variant,
                 h16[i].v,h16[i].r,NULL,NPRG2_ELEMENTWISE_SCRATCH_BYTES,0,region);
