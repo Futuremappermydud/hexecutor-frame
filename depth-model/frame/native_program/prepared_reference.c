@@ -2528,6 +2528,12 @@ static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o
     uint32_t nt=p->nt;
     const int8_t *wbase=(const int8_t *)g->pool[wt->pool]+wt->offset;
     const uint8_t *rows=g->pool[ft->pool]+ft->offset;
+    /* The filter rows are in VTCM: one vector copy into the (not yet used)
+     * row ring, then scalar reads from near, not ~45-cycle scalar VTCM loads. */
+    if((size_t)kh*p->rowbytes>=(size_t)blocks*256) {
+        near_copy(n+p->lo,rows,(size_t)blocks*256);
+        rows=n+p->lo;
+    }
     for(int32_t k=0;k<co;k++){memcpy(mult+k,rows+(size_t)(k/32)*256+(k%32)*4,4);memcpy(bias+k,rows+(size_t)(k/32)*256+128+(k%32)*4,4);}
     requant_params(mult,co,sixteen,M,pre,post);
     build_taps(wt,s2,reverse,packed,kh,kw,groups,blocks,wbase,ci,p->lead,0,0,nt,wp,xoff,segend);
