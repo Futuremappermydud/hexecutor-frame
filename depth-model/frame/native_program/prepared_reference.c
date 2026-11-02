@@ -218,11 +218,36 @@ static uint32_t *memo_slot(const Nprg2ExecCall *c) {
 }
 
 /* ------------------------------------------------------------ tensor access */
+/* Geometry records are packed little-endian fields at 2-byte offsets: with a
+ * 2-byte aligned record, halfword loads replace byte-by-byte assembly (the
+ * per-run decode of every tensor view was ~1/3 loads). */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__==__ORDER_LITTLE_ENDIAN__
+typedef uint16_t __attribute__((may_alias)) u16a;
+static inline uint32_t h32(const uint8_t *p){const u16a *h=(const u16a *)p;return (uint32_t)h[0]|(uint32_t)h[1]<<16;}
+static inline int32_t h16s(const uint8_t *p){return (int16_t)*(const u16a *)p;}
+#define DEC_HALF 1
+#else
+#define DEC_HALF 0
+#endif
 static int decode(const Nprg2TensorView *v, T *t) {
     const uint8_t *r=v->geometry_record;
     if(!r) return 0;
     memset(t,0,sizeof *t);
     t->dtype=r[0];t->flags=r[1]&~(uint32_t)(F_BLOCKED|F_DIRECT);
+#if DEC_HALF
+    if(!((uintptr_t)r&1u)) {
+        t->cls=h32(r+2);t->esize=dsize(t->dtype);t->crouton=!!(t->flags&F_CROUTON);
+        if(t->flags&F_SHAPE) {
+            t->flags&=~(uint32_t)(F_SV|F_SCALAR);
+            for(int i=0;i<4;i++){t->d[i]=h16s(r+6+2*i);t->m[i]=h16s(r+14+2*i);t->p[i]=h16s(r+22+2*i);}
+        } else if(t->flags&F_SV) {
+            t->flags&=~(uint32_t)F_SCALAR;
+            for(int i=0;i<4;i++)t->sv[i]=(int32_t)h32(r+6+4*i);
+        } else if(t->flags&F_SCALAR) t->scalar=h32(r+6);
+        t->zp=(int32_t)h32(r+30);{uint64_t sb=(uint64_t)h32(r+34)|(uint64_t)h32(r+38)<<32;memcpy(&t->scale,&sb,8);}
+        goto storage;
+    }
+#endif
     t->cls=rd32(r+2);t->esize=dsize(t->dtype);t->crouton=!!(t->flags&F_CROUTON);
     /* The record payload is a union. A shape tensor whose QDRX source also
      * had a value/scalar payload loses those flags, so their users reject. */
@@ -234,6 +259,9 @@ static int decode(const Nprg2TensorView *v, T *t) {
         for(int i=0;i<4;i++)t->sv[i]=(int32_t)rd32(r+6+4*i);
     } else if(t->flags&F_SCALAR) t->scalar=rd32(r+6);
     t->zp=(int32_t)rd32(r+30);memcpy(&t->scale,r+34,8);
+#if DEC_HALF
+storage:
+#endif
     if(v->storage_kind==1){t->flags|=F_DIRECT;t->pool=v->pool;t->offset=v->offset;}
     else if(v->storage_kind==2) {
         if(!v->blocks || !v->block_count) return 0;
@@ -1477,12 +1505,78 @@ static int k_transpose(G *g) {
     }
     return t_write(g,out0(g),&r);
 }
+/* Flat (direct) concatenation straight input -> output with the data-mover
+ * run copy, no staging arrays. Same checks, in the same order, as the generic
+ * form below (shape/dtype, then every region's range); -1 = not covered. */
+enum { CC_MAX=256 };
+/* fl_copy with runs below 512 bytes moved by unaligned vector load/masked store (fl_move uses a libc memcpy there). */
+static void cc_copy(const G *g, const T *d, const int32_t *dorg, const T *s, const int32_t *sorg, const int32_t *dims) {
+    uint8_t *db=g->pool[d->pool]+d->offset;
+    const uint8_t *sb=g->pool[s->pool]+s->offset;
+    const size_t es=d->esize;
+    size_t run=(size_t)dims[3];
+    int k=3;
+    while(k>0 && dims[k]==s->m[k] && dims[k]==d->m[k]){k--;run*=(size_t)dims[k];}
+    const size_t rb=run*es;
+    for(int32_t i0=0;i0<(k>0?dims[0]:1);i0++)for(int32_t i1=0;i1<(k>1?dims[1]:1);i1++)for(int32_t i2=0;i2<(k>2?dims[2]:1);i2++) {
+        int32_t so[4]={sorg[0]+(k>0?i0:0),sorg[1]+(k>1?i1:0),sorg[2]+(k>2?i2:0),sorg[3]};
+        int32_t dd[4]={dorg[0]+(k>0?i0:0),dorg[1]+(k>1?i1:0),dorg[2]+(k>2?i2:0),dorg[3]};
+        uint8_t *dp=db+fl_lin(d,dd)*es;const uint8_t *sp=sb+fl_lin(s,so)*es;
+#if BLK_HVX
+        gt_row(dp,sp,rb);
+#else
+        fl_move(dp,sp,rb);
+#endif
+    }
+}
+static int concat_fast(G *g, int axis) {
+    const T *o=out0(g);
+    const uint32_t cnt=g->nin-1;
+    if(!DM_ENABLED || !dm_flat(o) || cnt<1 || cnt>CC_MAX) return -1;
+    T *ts=salloc(g,(size_t)cnt*sizeof(T));
+    if(!ts || g->measure_only) return -1; /* sizing pass: salloc hands out no memory; the generic form's need is an upper bound */
+    int32_t n[4]={0,0,0,0};uint32_t dt=0;
+    int flat=1;
+    for(uint32_t i=0;i<cnt;i++) {
+        T *t=&ts[i];
+        TRY(input_at(g,i+1,t));
+        CHECK(t->flags&F_SHAPE,E_TENSOR);
+        if(i==0){memcpy(n,t->d,16);dt=t->dtype;}
+        else {
+            for(int d=0;d<4;d++)CHECK(d==axis || t->d[d]==n[d],E_SHAPE);
+            CHECK(t->dtype==dt,E_TENSOR);
+            n[axis]+=t->d[axis];
+        }
+        if(!dm_flat(t) || t->esize!=o->esize || t->dtype!=o->dtype) flat=0;
+        for(int d=0;d<4;d++) if(t->d[d]<=0 || t->p[d]<0 || o->p[d]<0) flat=0;
+    }
+    if(!flat || !dm_write_dims_match(o,n)) return -1;
+    for(int d=0;d<4;d++) if(n[d]<=0) return -1;
+    for(uint32_t i=0;i<cnt;i++) {
+        /* raw: with more inputs than CHK_SLOTS the memo would only thrash */
+        int e=xfer_check_raw(g,&ts[i],ts[i].d,ts[i].p,0);
+        if(e) return e;
+    }
+    {int e=xfer_check(g,o,n,o->p,1);if(e) return e;}
+    for(uint32_t i=0;i<cnt;i++) if(!fl_apart(&ts[i],ts[i].d,ts[i].p,o,n,o->p)) return -1;
+    if(g->dry) return 0;
+    int32_t at=0;
+    for(uint32_t i=0;i<cnt;i++) {
+        int32_t dorg[4]={o->p[0],o->p[1],o->p[2],o->p[3]};
+        dorg[axis]+=at;
+        cc_copy(g,o,dorg,&ts[i],ts[i].p,ts[i].d);
+        at+=ts[i].d[axis];
+    }
+    DM_COUNT(7,count4(n));
+    return 0;
+}
 static int k_concat(G *g) {
     CHECK(g->nin>=2 && g->nout>=1,E_ARGS);
     int64_t axis;
     CHECK(!sv_or_scalar(in(g,0),&axis),E_ARGS);
     if(axis<0)axis+=4;
     CHECK(axis>=0 && axis<4,E_ARGS);
+    {int fr=concat_fast(g,(int)axis);DMPATH(g,"concat",fr);if(fr>=0)return fr;}
     int32_t n[4];uint32_t dt=0;
     for(uint32_t i=1;i<g->nin;i++) {
         T t;TRY(input_at(g,i,&t));
@@ -1721,7 +1815,8 @@ static int k_spill_fill(G *g, int spill) {
         if(!g->dry) {
             uint8_t *dst=spill?g->pool[SPILL_POOL]+offset:g->pool[pool]+addr;
             const uint8_t *src=spill?g->pool[pool]+addr:g->pool[SPILL_POOL]+offset;
-            qd_vcopy(dst,src,n);
+            if(spill) qd_vcopy(dst,src,n);
+            else qd_vcopy_deep(dst,src,n); /* DDR spill -> pool: more loads in flight */
         }
         offset+=n;
     }
@@ -2128,6 +2223,79 @@ static void abs_strip(const void *c_, const uint8_t *src, uint8_t *dst, size_t n
         if(++k==c->D){k=0;W++;}
     }
 }
+#if BLK_HVX
+/* Blocked u16 -> blocked u16, no staging: a block row is 4 pixels x 32
+ * channels in two vectors whose halfwords alternate pixel (2m, 2m+1) per
+ * channel, so one lane constant (16384 on even halfwords: even W) serves every
+ * vector, and abs_strip's HVX arithmetic runs directly on the block bytes.
+ * One item = one input/output block pair (16 vectors). */
+typedef struct { const G *g; const T *it, *ot; const AbsCtx *c; int64_t items; int32_t nwb, nhb, nz; } AbsJob;
+static void abs_blk_part(void *ctx, uint32_t part, uint32_t parts) {
+    const AbsJob *J=ctx;
+    const T *it=J->it,*ot=J->ot;const AbsCtx *c=J->c;
+    BK bi,bo;
+    bk_init(&bi,J->g,it);bk_init(&bo,J->g,ot);
+    const int32_t mh=(int32_t)(c->mult>>15),ml=(int32_t)(c->mult&0x7fff);
+    const HVX_Vector zero=Q6_V_vzero(),vzp=Q6_V_vsplat_R(c->zp),c32k=Q6_V_vsplat_R(32768),
+                     voff=Q6_V_vsplat_R((int32_t)c->offset+4),vmax=Q6_V_vsplat_R(65535);
+    HVX_Vector Lv,Lt;
+    dv_shuffk(zero,Q6_V_vsplat_R(16384),2,&Lv,&Lt); /* words 16384,0,16384,0,... */
+    const int32_t sml=ml|ml<<16,smh=mh|mh<<16;
+    int64_t a,b;
+    dm_range(J->items,part,parts,&a,&b);
+    const int64_t ih0=it->p[1]>>3,iw0=it->p[2]>>2,iz0=it->p[3]>>5,oh0=ot->p[1]>>3,ow0=ot->p[2]>>2,oz0=ot->p[3]>>5;
+    for(int64_t k=a;k<b;k++) {
+        const int32_t z=(int32_t)(k%J->nz);
+        const int64_t r1=k/J->nz,wb=r1%J->nwb,r2=r1/J->nwb,hb=r2%J->nhb,bb=r2/J->nhb;
+        const uint8_t *src=bk_blk_or(&bi,(((it->p[0]+bb)*bi.nbh+ih0+hb)*bi.nbw+iw0+wb)*bi.nbd+bi.slice+iz0+z,(uint8_t *)dm_zblk);
+        uint8_t *dst=bk_blk_or(&bo,(((ot->p[0]+bb)*bo.nbh+oh0+hb)*bo.nbw+ow0+wb)*bo.nbd+bo.slice+oz0+z,NULL);
+        if(!dst) continue;
+        #pragma clang loop unroll_count(4)
+        for(int v=0;v<16;v++) {
+            HVX_VectorPair w=Q6_Wuw_vunpack_Vuh(*(const HVX_Vector *)(src+128*v));
+            HVX_Vector r[2];
+            for(int h=0;h<2;h++) {
+                HVX_Vector x=h?Q6_V_hi_W(w):Q6_V_lo_W(w);
+                HVX_Vector ce=Q6_Vw_vsub_VwVw(Q6_Vw_vabs_Vw(Q6_Vw_vsub_VwVw(x,vzp)),c32k);
+                HVX_Vector y=Q6_Vw_vasr_VwR(Q6_Vw_vadd_VwVw(Q6_Vw_vmpyi_VwRh(ce,sml),Lv),15);
+                y=Q6_Vw_vadd_VwVw(Q6_Vw_vadd_VwVw(y,Q6_Vw_vmpyi_VwRh(ce,smh)),voff);
+                y=Q6_Vw_vasr_VwR(y,3);
+                r[h]=Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(y,zero),vmax);
+            }
+            *(HVX_Vector *)(dst+128*v)=Q6_Vh_vpacke_VwVw(r[1],r[0]);
+        }
+    }
+}
+#endif
+/* Whole-block Abs; -1 = not covered (strip path), else k_abs's result. Chosen
+ * from geometry and constants only, so the dry and wet passes agree. */
+static int abs_blk_fast(G *g, const T *it, const T *ot, const AbsCtx *c) {
+#if BLK_HVX
+    if(!DM_ENABLED || !(it->flags&F_BLOCKED) || !(ot->flags&F_BLOCKED) || !(it->flags&F_SHAPE) || !(ot->flags&F_SHAPE)) return -1;
+    if(c->direct || it->esize!=2 || ot->esize!=2) return -1;
+    if(!(c->mult>=0 && c->mult<(1ll<<29) && c->offset>-(1ll<<29) && c->offset<(1ll<<29) && c->zp>=0 && c->zp<=65535)) return -1;
+    for(int k=0;k<4;k++)if(it->d[k]!=ot->d[k] || it->d[k]<=0 || it->p[k]<0 || ot->p[k]<0) return -1;
+    if((it->d[1]&7) || (it->d[2]&3) || (it->d[3]&31) || (it->p[1]&7) || (it->p[2]&3) || (it->p[3]&31) ||
+       (ot->p[1]&7) || (ot->p[2]&3) || (ot->p[3]&31)) return -1;
+    if(!dm_write_dims_match(ot,it->d) || !dm_pools_aligned(g)) return -1;
+    int e=xfer_check(g,it,it->d,it->p,0);
+    if(!e)e=xfer_check(g,ot,ot->d,ot->p,1);
+    if(e) return e;
+    if(!strip_disjoint(g,it,ot)) return -1; /* overlapping blocks keep the ordered strip path */
+    if(g->dry) return 0;
+    AbsJob J={g,it,ot,c,0,it->d[2]>>2,it->d[1]>>3,it->d[3]>>5};
+    J.items=(int64_t)it->d[0]*J.nhb*J.nwb*J.nz;
+    const uint64_t elems=(uint64_t)it->d[0]*it->d[1]*it->d[2]*(uint64_t)it->d[3];
+    uint32_t parts=dm_parts(g,elems,J.items);
+    if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_DM,parts,abs_blk_part,&J);
+    else abs_blk_part(&J,0,1);
+    DM_COUNT(8,elems);
+    return 0;
+#else
+    (void)g;(void)it;(void)ot;(void)c;
+    return -1;
+#endif
+}
 static int k_abs(G *g) {
     NEED(1);
     const T *i=in(g,0),*o=out0(g);
@@ -2138,6 +2306,7 @@ static int k_abs(G *g) {
         volatile float e=b*8.0f;
         AbsCtx c={(int64_t)rintf(ratio*262144.0f),(int64_t)rintf(e),i->zp,i->d[3],!!(i->flags&F_DIRECT),
                   i->m[1],i->m[2],i->m[3],(int64_t)(i->offset>>1)};
+        {int fr=abs_blk_fast(g,i,o,&c);DMPATH(g,"abs",fr);if(fr>=0)return fr;}
         int r=ew_strips(g,i,o,2,2,abs_strip,&c);
         if(r>=0) return r;
     }
@@ -2202,8 +2371,11 @@ static void unpack_weights(int8_t *o, const int8_t *raw, int32_t H, int32_t W, i
         o[k++]=raw[off];
     }
 }
-static int is_class(const T *t, const char *a, const char *b) {
-    uint32_t x=0,y=0;memcpy(&x,a,strlen(a));memcpy(&y,b,strlen(b));
+/* Three-character class names only. (The generic strlen/variable-memcpy form
+ * was two libc calls per use on the -fno-builtin Hexagon build.) */
+static inline int is_class(const T *t, const char *a, const char *b) {
+    uint32_t x=(uint32_t)(uint8_t)a[0]|(uint32_t)(uint8_t)a[1]<<8|(uint32_t)(uint8_t)a[2]<<16;
+    uint32_t y=(uint32_t)(uint8_t)b[0]|(uint32_t)(uint8_t)b[1]<<8|(uint32_t)(uint8_t)b[2]<<16;
     return t->cls==x || t->cls==y;
 }
 /* qd_graph conv_weights without its static-source cache: dense HWIO int8
@@ -3556,7 +3728,11 @@ static int fuse_cached(G *g, const T *xt, const T *wt, const T *ft, const T *o) 
     if(slot && *slot) {
         uint32_t i=*slot-1u;
         if(fz_cache[i].valid && fz_cache[i].program==c->program && fz_cache[i].limits==lim && fz_cache[i].cmd==c->command_index) {
-            g->fx=fz_cache[i].fx;g->fx.dead=c->epilogue_dead;
+            /* Field-wise: the other operand's view (ob) only exists for ADD. */
+            const Fuse *src=&fz_cache[i].fx;
+            g->fx.kind=src->kind;g->fx.dead=c->epilogue_dead;g->fx.mc=src->mc;g->fx.mo=src->mo;g->fx.rd=src->rd;g->fx.sh=src->sh;
+            g->fx.eb=src->eb;g->fx.bb=src->bb;g->fx.oe=src->oe;
+            if(src->kind==2) g->fx.ob=src->ob;
             return 0;
         }
     }
@@ -3723,7 +3899,9 @@ static int setup_ex(G *g, const Nprg2ExecCall *c, int dry, int measure, const Np
         key[n++]=(uintptr_t)scr;key[n++]=scrb;key[n++]=c->pool1_writable_bytes;
         for(unsigned i=0;i<7;i++){key[n++]=(uintptr_t)c->pools[i].base;key[n++]=c->pools[i].bytes;}
         while(n<SK_WORDS)key[n++]=0;
-        if(setup_ck.valid && !memcmp(setup_ck.key,key,sizeof key)) {
+        uintptr_t kd=0;
+        for(unsigned i=0;i<SK_WORDS;i++) kd|=setup_ck.key[i]^key[i];
+        if(setup_ck.valid && !kd) {
             ck_hit=1;g->par_slots=setup_ck.par_slots;
             for(unsigned i=0;i<7;i++) g->pool_bytes[i]=setup_ck.pool_bytes[i];
         } else memcpy(setup_ck.key,key,sizeof key),setup_ck.valid=0;
@@ -3861,7 +4039,11 @@ static int nprg2_exec_reference_run_inner(const Nprg2ExecCall *c, void *ctx) {
         if(setup(&g,c,0,0,ctx)) return 0;
         return run_kernel(&g)==0;
     }
-    uint32_t *memo=has_near?memo_slot(c):NULL;
+    /* One memo/limits lookup per call: handed to the final setup so the
+     * kernel's gmemo() does not repeat it (setup_ex resets them). */
+    uint64_t mlim=0;Memo *mm=NULL;
+    if(has_near){mlim=memo_limits(c);mm=memo_for_lim(c,mlim);}
+    uint32_t *memo=mm?&mm->need[c->command_index]:NULL;
     if(memo && *memo!=0xffffffffu) g.used=*memo;
     else {
         if(setup(&g,c,1,0,ctx) || run_kernel(&g)) return 0;
@@ -3869,6 +4051,7 @@ static int nprg2_exec_reference_run_inner(const Nprg2ExecCall *c, void *ctx) {
     }
     if(has_near && g.used && !((uintptr_t)nr->data&63u) && g.used+64u<=nr->bytes) {
         if(setup_ex(&g,c,0,0,ctx,nr->data,nr->bytes)) return 0;
+        if(has_near){g.lim=mlim;g.lim_ok=1;g.cm=mm;g.cm_ok=1;}
         return run_kernel(&g)==0;
     }
     if(setup(&g,c,0,0,ctx)) return 0;
