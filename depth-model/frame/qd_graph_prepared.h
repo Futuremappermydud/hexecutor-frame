@@ -103,6 +103,7 @@ static const volatile char prepared_compact3_feature[]="QD_PREPARED_A3_1";
 void qd_hmx_wide(void *,void *,void *,void *,uint32_t);
 void qd_hmx_finish(void *,void *);
 void qd_hmx_wide_n(void *,void *,void *,void *,uint32_t,uint32_t);
+void qd_hmx_native_n(void *,void *,void *,void *const *,uint32_t,uint32_t);
 static uint32_t prepared_hmx_enter(void) {
     uint32_t saved;__asm__ volatile("%0=ssr":"=r"(saved));
     uint32_t on=saved|(1u<<26);__asm__ volatile("ssr=%0\n isync\n barrier"::"r"(on):"memory");
@@ -112,7 +113,7 @@ static void prepared_hmx_leave(uint32_t saved) {__asm__ volatile("ssr=%0\n isync
 static uint64_t now_ns(void);
 static uint64_t prepared_hmx_clock(void) {return now_ns();}
 static const Nprg2HmxOps prepared_hmx_ops={prepared_hmx_enter,prepared_hmx_leave,qd_hmx_wide,qd_hmx_finish,prepared_hmx_clock,
-    qd_hmx_wide_n};
+    qd_hmx_wide_n,qd_hmx_native_n};
 #endif
 #ifndef QDS_PREPARED_FUSE
 #define QDS_PREPARED_FUSE 0

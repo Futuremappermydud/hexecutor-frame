@@ -70,11 +70,13 @@ static uint8_t *hmx_vtcm;
 extern void qd_hmx_wide(void *, void *, void *, void *, uint32_t);
 extern void qd_hmx_finish(void *, void *);
 extern void qd_hmx_wide_n(void *, void *, void *, void *, uint32_t, uint32_t);
+extern void qd_hmx_native_n(void *, void *, void *, void *const *, uint32_t, uint32_t);
 /* SIM_HMX_N=0 keeps the per-tile qd_hmx_wide (the v6 call). */
 #ifndef SIM_HMX_N
 #define SIM_HMX_N 1
 #endif
-static const Nprg2HmxOps sim_hmx = {.wide = qd_hmx_wide, .finish = qd_hmx_finish, .wide_n = SIM_HMX_N ? qd_hmx_wide_n : NULL};
+static const Nprg2HmxOps sim_hmx = {.wide = qd_hmx_wide, .finish = qd_hmx_finish, .wide_n = SIM_HMX_N ? qd_hmx_wide_n : NULL,
+                                    .native_n = qd_hmx_native_n};
 static void hmx_map_vtcm(void) {
     uint32_t base = __rdcfg(__vtcm_base) << 16, pn = base >> 12, index = 120;
     uint64_t entry = ((uint64_t)(0xc0000000u | pn) << 32) | (0xf6000000u | (pn << 1) | 0x40u);
@@ -357,7 +359,7 @@ static void env_census(Env *v, uint32_t first, uint32_t count) {
         if (need > peak) { peak = need; peak_cmd = i; }
         if (ws > ws_peak) ws_peak = ws;
         if (call.command.opcode == QDR_HMX_CONV && nprg2_exec_reference_conv_path() == 2) near++;
-        if (call.command.opcode == QDR_HMX_CONV && nprg2_exec_reference_conv_path() == 3) hmx++;
+        if (call.command.opcode == QDR_HMX_CONV && nprg2_exec_reference_conv_path() >= 3) hmx++;  /* 4: native int8 */
     }
     if (use_fast)
         printf("%s: fast convolution workspace peak %lu bytes, %lu convolutions with near memory, %lu on HMX\n", v->model,

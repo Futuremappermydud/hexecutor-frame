@@ -79,6 +79,9 @@ typedef struct Nprg2HmxOps {
     /* Optional qd_hmx_wide_n: one N block over mt M tiles with one bias load
      * and clear (kbnb = KB | NB<<16); used instead of wide when present. */
     void (*wide_n)(void *a, void *b, void *fi, void *c, uint32_t kbnb, uint32_t mt);
+    /* Optional qd_hmx_native_n (NPRG2_HW_ROUNDING builds): native int8, one N
+     * block over mt 64-pixel crouton tiles, cvt.ub stored :cm at out[t]. */
+    void (*native_n)(void *a, void *b, void *fi, void *const *out, uint32_t kb, uint32_t mt);
 } Nprg2HmxOps;
 /* Fuse hook registered with the conv keys: the conv handler can run the
  * REQUANT_U8/70 or ADD_U8/13 command `epilogue` fused into its output step
