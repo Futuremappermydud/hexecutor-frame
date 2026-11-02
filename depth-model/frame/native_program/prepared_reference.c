@@ -180,8 +180,12 @@ typedef struct {
     uint8_t slide[MEMO_COMMANDS]; /* hmx_slide's input-block alignment: 0 unknown, 1 aligned, 2 not */
     uint32_t chk[MEMO_COMMANDS][CHK_SLOTS]; /* data-mover check verdicts, see chk_hit */
     uint16_t fz[MEMO_COMMANDS]; /* fuse_cached: fz_cache entry + 1 of the command's decoded epilogue, 0 none */
+    uint32_t dmv[MEMO_COMMANDS][4]; /* data-mover constants read once from pool 5 (resize row map, transpose permutation), see DMV_* */
 } Memo;
-static Memo memos[2];
+/* On the heap, not static: the resident engine's 1 MiB code region holds its
+ * static data too, and the per-command arrays are ~0.3 MB per Memo. Allocated
+ * on first use; if that fails, memo_for returns NULL (no memoisation). */
+static Memo *memos[2];
 static uint32_t memo_next;
 /* The key is a hash of the pool table: remembered for the last table seen
  * (compared field by field, cheaper than 15 64-bit multiplies per call). */
@@ -201,11 +205,14 @@ static uint64_t memo_limits(const Nprg2ExecCall *c) {
 }
 static Memo *memo_for_lim(const Nprg2ExecCall *c, uint64_t lim) {
     if(!c->program || c->command_index>=MEMO_COMMANDS) return NULL;
-    for(int i=0;i<2;i++) if(memos[i].program==c->program && memos[i].limits==lim) return &memos[i];
-    Memo *m=&memos[memo_next++&1u];
+    for(int i=0;i<2;i++) if(memos[i] && memos[i]->program==c->program && memos[i]->limits==lim) return memos[i];
+    uint32_t slot=memo_next++&1u;
+    if(!memos[slot] && !(memos[slot]=malloc(sizeof(Memo)))) return NULL;
+    Memo *m=memos[slot];
     m->program=c->program;m->limits=lim;
     memset(m->need,0xff,sizeof m->need);memset(m->conv_checked,0,sizeof m->conv_checked);memset(m->chain,0,sizeof m->chain);memset(m->slide,0,sizeof m->slide);memset(m->chk,0,sizeof m->chk);
     memset(m->fz,0,sizeof m->fz);
+    memset(m->dmv,0,sizeof m->dmv);
     return m;
 }
 static Memo *memo_for(const Nprg2ExecCall *c) {return memo_for_lim(c,memo_limits(c));}
@@ -1435,6 +1442,7 @@ static int k_copy_values(G *g) {
         if(fr<0)fr=copy_c2_fast(g,o,in(g,0),0);   /* padded blocked -> flat flow */
 #ifndef CV_OFF
         if(fr<0)fr=copy_vals_fast(g,in(g,0),o);
+        if(fr<0)fr=copy_flat_fast(g,in(g,0),o);
 #endif
         if(fr<0)fr=copy_runs(g,in(g,0),o);
         DMPATH(g,"copy_values",fr);
@@ -1459,6 +1467,16 @@ static int k_transpose(G *g) {
     SHP("transpose",g,0);
     CHECK(g->nin>=2,E_ARGS);
     NEED(1);
+    {
+        /* a constant permutation decoded by an earlier run (Memo.dmv, 2 bits per axis) */
+        const uint32_t *e=dmv_slot(g);
+        if(e && e[0]==DMV_TRANSPOSE) {
+            const int32_t pm[4]={(int32_t)(e[1]&3u),(int32_t)(e[1]>>2&3u),(int32_t)(e[1]>>4&3u),(int32_t)(e[1]>>6&3u)};
+            int fr=tr_fast_dispatch(g,in(g,0),out0(g),pm);
+            DMPATH(g,"transpose",fr);
+            if(fr>=0) return fr;
+        }
+    }
     T pt;TRY(input_at(g,g->nin-1,&pt));
     int32_t *perm;size_t np;
     TRY(read_i32(g,&pt,&perm,&np));
@@ -1472,7 +1490,14 @@ static int k_transpose(G *g) {
             int32_t pm[4]={(int32_t)pv[0],(int32_t)pv[1],(int32_t)pv[2],(int32_t)pv[3]};
             int fr=tr_fast_dispatch(g,in(g,0),out0(g),pm);
             DMPATH(g,"transpose",fr);
-            if(fr>=0) return fr;
+            if(fr>=0) {
+                uint32_t *e=dmv_slot(g);
+                if(e && pm[0]>=0 && pm[0]<4 && pm[1]>=0 && pm[1]<4 && pm[2]>=0 && pm[2]<4 && pm[3]>=0 && pm[3]<4) {
+                    e[1]=(uint32_t)pm[0]|(uint32_t)pm[1]<<2|(uint32_t)pm[2]<<4|(uint32_t)pm[3]<<6;
+                    e[0]=DMV_TRANSPOSE;
+                }
+                return fr;
+            }
         }
     }
     A x;TRY(t_read(g,in(g,0),&x,0));
@@ -1730,6 +1755,14 @@ static int k_decimate(G *g) {
     return t_write(g,out0(g),&r);
 }
 static int k_resize(G *g) {
+    {
+        const uint32_t *e=dmv_slot(g);
+        if(e && e[0]==DMV_RESIZE && g->nin==3 && resize_geom_ok(g,in(g,0),out0(g))) {
+            int fr=resize_go(g,in(g,0),out0(g),(int32_t)e[1],(int32_t)e[2],(int32_t)e[3]);
+            DMPATH(g,"resize",fr);
+            if(fr>=0) return fr;
+        }
+    }
     CHECK(g->nin==3,E_ARGS);
     NEED(3);
     int32_t *hp,*wp;size_t nh,nw;

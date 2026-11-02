@@ -482,71 +482,117 @@ static int s2d_fast(G *g, const T *i, const T *o, int32_t ph, int32_t pw, int32_
  * become 8 output pixels (two vectors) with each pixel doubled. The column map
  * is read from the immutable constant tensor, so dry and wet agree. */
 enum { RS_HMAX=512 };
-static int resize_fast_ok(const G *g, const T *xt, const T *wpt, const T *o) {
+/* Per-command constants read once from pool 5 (Memo.dmv). The verdicts depend
+ * only on immutable constants and the bound geometry, so a wet pass that took
+ * the fast path leaves them for every later run, which then skips the scratch
+ * reads (t_read of the parameter tensors) and the constant decoding. */
+enum { DMV_RESIZE=0x52535a31u, DMV_TRANSPOSE=0x54525031u };
+static uint32_t *dmv_slot(G *g) {
+    if(g->dry) return NULL;
+    Memo *m=gmemo(g);
+    return m?m->dmv[g->call->command_index]:NULL;
+}
+static int resize_geom_ok(const G *g, const T *xt, const T *o) {
     if(!DM_ENABLED || !dm_blocked_u8(xt) || !dm_blocked_u8(o) || !dm_pools_aligned(g)) return 0;
-    int64_t v2,v4,v5;
-    if(!const_value(g,wpt,2,&v2) || !const_value(g,wpt,4,&v4) || !const_value(g,wpt,5,&v5)) return 0;
-    if(v2!=-2147483648LL || (uint32_t)v4>=0x80000000u || v5!=0) return 0; /* (w*2^31 + v4) >> 32 == w >> 1 */
     int32_t c=xt->d[3],n[4]={xt->d[0],o->d[1],o->d[2],c};
     if(c<=0 || (c&31) || xt->p[3] || o->p[3] || n[0]<=0 || n[1]<=0 || n[1]>RS_HMAX || n[2]<=0 || (n[2]&7)) return 0;
     if(xt->d[2]<n[2]/2 || (xt->p[2]&3) || (o->p[2]&7) || xt->d[1]<=0) return 0;
     return dm_write_dims_match(o,n);
 }
-typedef struct { const G *g; const T *xt, *o; const int32_t *hi; int32_t n[4]; int64_t nohb, ohb0; } RsJob;
+static int resize_const_ok(const G *g, const T *wpt) {
+    int64_t v2,v4,v5;
+    if(!const_value(g,wpt,2,&v2) || !const_value(g,wpt,4,&v4) || !const_value(g,wpt,5,&v5)) return 0;
+    return v2==-2147483648LL && (uint32_t)v4<0x80000000u && v5==0; /* (w*2^31 + v4) >> 32 == w >> 1 */
+}
+/* Per output row h of the call: source block row, byte offset of the source row in its block (256 * (H & 7))
+ * and of the destination row in its block; the same for every column, depth group and batch. */
+typedef struct { const G *g; const T *xt, *o; const int32_t *srow; const uint16_t *soff, *ooff; int32_t n[4]; int64_t nohb, ohb0; } RsJob;
 /* One item = (batch, depth group, output block row, output block column): the
- * output block is looked up once and its input block only when the (monotone
- * in practice) row map moves to a new input block row. */
+ * output block is looked up once, its input block once per run of rows that
+ * share an input block row (the row map is monotone in practice), and each
+ * output row is one vector load, one interleave and two stores. The item index
+ * is decoded once and then stepped (no divides per item). */
 static void resize_part(void *ctx, uint32_t part, uint32_t parts) {
-    const RsJob *J=ctx;const G *g=J->g;const T *xt=J->xt,*o=J->o;const int32_t *hi=J->hi,*n=J->n;
+    const RsJob *J=ctx;const G *g=J->g;const T *xt=J->xt,*o=J->o;
+    const int32_t *srow=J->srow;const uint16_t *soff=J->soff,*ooff=J->ooff;const int32_t *n=J->n;
     BK bx,bo;
     bk_init(&bx,g,xt);bk_init(&bo,g,o);
-    const int64_t ng=n[3]/32,nq=n[2]/8,xw=xt->p[2]/4,ow=o->p[2]/8,nohb=J->nohb;
+    const int32_t ng=n[3]/32,nq=n[2]/8,nohb=(int32_t)J->nohb;
+    const int64_t xw=xt->p[2]/4,ow=o->p[2]/8;
     const int64_t xrow=bx.nbw*bx.nbd,orow=bo.nbw*bo.nbd;
     const int64_t zi=bx.slice+xt->p[3]/32,zo=bo.slice+o->p[3]/32;
     int64_t i0,i1;
     dm_range((int64_t)n[0]*ng*nohb*nq,part,parts,&i0,&i1);
+    if(i0>=i1) return;
+    int32_t q,oh,z,b;
+    {
+        uint32_t r=(uint32_t)i0;
+        q=(int32_t)(r%(uint32_t)nq);r/=(uint32_t)nq;
+        oh=(int32_t)(r%(uint32_t)nohb);r/=(uint32_t)nohb;
+        z=(int32_t)(r%(uint32_t)ng);b=(int32_t)(r/(uint32_t)ng);
+    }
     for(int64_t it=i0;it<i1;it++) {
-        const int64_t q=it%nq,ohb=J->ohb0+(it/nq)%nohb,z=(it/nq/nohb)%ng,b=it/nq/nohb/ng;
+        const int64_t ohb=J->ohb0+oh;
         const int64_t B=b+(int64_t)xt->p[0],OB=b+(int64_t)o->p[0];
         int32_t h0=(int32_t)(8*ohb-o->p[1]),h1=h0+8;
         if(h0<0)h0=0;
         if(h1>n[1])h1=n[1];
         uint8_t *d=bk_blk_or(&bo,(OB*bo.nbh+ohb)*orow+zo+z+(ow+q)*bo.nbd,NULL);
-        if(!d) continue;
-        const int64_t xc=xw+q,xcol=(xc>>1)*bx.nbd;
-        const uint32_t half=128u*(uint32_t)(xc&1);
-        int64_t cH=-1;const uint8_t *s=NULL;
-        for(int32_t h=h0;h<h1;h++) {
-            const int64_t H=(int64_t)hi[h]+xt->p[1];
-            if((H>>3)!=cH){cH=H>>3;s=bk_blk_or(&bx,(B*bx.nbh+cH)*xrow+zi+z+xcol,(uint8_t *)dm_zblk);}
-            DV lo,hi2;
-            dv_dup32(dv_ld(s+256u*(uint32_t)(H&7)+half),&lo,&hi2);
-            const uint32_t oro=256u*(uint32_t)((h+(int64_t)o->p[1])&7);
-            dv_st(d+oro,lo);dv_st(d+oro+128,hi2);
+        if(d) {
+            const int64_t xc=xw+q,xcol=(xc>>1)*bx.nbd;
+            const uint32_t half=128u*(uint32_t)(xc&1);
+            const int64_t sbase=B*bx.nbh*xrow+zi+z+xcol;
+            int32_t h=h0;
+            while(h<h1) {
+                const int32_t cH=srow[h];
+                const uint8_t *s=bk_blk_or(&bx,sbase+(int64_t)cH*xrow,(uint8_t *)dm_zblk)+half;
+                int32_t he=h+1;
+                while(he<h1 && srow[he]==cH) he++;
+                for(;h<he;h++) {
+                    DV lo,hi2;
+                    dv_dup32(dv_ld(s+soff[h]),&lo,&hi2);
+                    uint8_t *dp=d+ooff[h];
+                    dv_st(dp,lo);dv_st(dp+128,hi2);
+                }
+            }
         }
+        if(++q==nq){q=0;if(++oh==nohb){oh=0;if(++z==ng){z=0;b++;}}}
     }
 }
-static int resize_fast(G *g, const T *xt, const T *wpt, const T *o, const int32_t *hp) {
-    if(!resize_fast_ok(g,xt,wpt,o)) return -1;
+/* The checked run: geometry and constants were accepted by the caller. */
+static int resize_go(G *g, const T *xt, const T *o, int32_t h2, int32_t h4, int32_t h5) {
     int32_t n[4]={xt->d[0],o->d[1],o->d[2],xt->d[3]};
     int e=xfer_check(g,xt,xt->d,xt->p,0);
     if(!e)e=xfer_check(g,o,n,o->p,1);
     if(e) return e;
     if(!dm_clear(xt,xt->d,xt->p,o,n,o->p)) return -1;
     if(g->dry) return 0;
-    int32_t hi[RS_HMAX];
+    int32_t srow[RS_HMAX];
+    uint16_t soff[RS_HMAX],ooff[RS_HMAX];
     for(int32_t i=0;i<n[1];i++) {
-        int64_t v=(int64_t)((((uint64_t)i*(uint32_t)hp[2])+(uint32_t)hp[4])>>32)+hp[5];
+        int64_t v=(int64_t)((((uint64_t)i*(uint32_t)h2)+(uint32_t)h4)>>32)+h5;
         if(v<0)v+=xt->d[1];
-        CHECK(v>=0 && v<xt->d[1],E_RANGE);hi[i]=(int32_t)v;
+        CHECK(v>=0 && v<xt->d[1],E_RANGE);
+        const int64_t H=v+xt->p[1];
+        srow[i]=(int32_t)(H>>3);soff[i]=(uint16_t)(256u*(uint32_t)(H&7));
+        ooff[i]=(uint16_t)(256u*(uint32_t)((i+(int64_t)o->p[1])&7));
     }
     DM_COUNT(1,(uint64_t)n[0]*n[1]*n[2]*n[3]);
-    RsJob J={g,xt,o,hi,{n[0],n[1],n[2],n[3]},0,0};
+    RsJob J={g,xt,o,srow,soff,ooff,{n[0],n[1],n[2],n[3]},0,0};
     J.ohb0=o->p[1]>>3;J.nohb=((o->p[1]+n[1]-1)>>3)-J.ohb0+1;
     uint32_t parts=dm_parts(g,(uint64_t)n[0]*n[1]*n[2]*n[3],(int64_t)n[0]*(n[3]/32)*J.nohb*(n[2]/8));
     if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_DM,parts,resize_part,&J);
     else resize_part(&J,0,1);
     return 0;
+}
+static int resize_fast(G *g, const T *xt, const T *wpt, const T *o, const int32_t *hp) {
+    if(!resize_geom_ok(g,xt,o) || !resize_const_ok(g,wpt)) return -1;
+    int r=resize_go(g,xt,o,hp[2],hp[4],hp[5]);
+    if(r>=0 && !g->dry) {
+        uint32_t *e=dmv_slot(g);
+        if(e){e[1]=(uint32_t)hp[2];e[2]=(uint32_t)hp[4];e[3]=(uint32_t)hp[5];e[0]=DMV_RESIZE;}
+    }
+    return r;
 }
 
 /* --------------------------------------------------------------- Transpose */
@@ -1098,13 +1144,15 @@ static int copy_c2_fast(G *g, const T *f, const T *b, int to_blocked) {
         if(H-h<run)run=H-h;
         for(int32_t w0=0;w0<W;w0+=32) {
             uint8_t *bp[16];
+            int64_t pcol=-1;uint8_t *pblk=NULL;   /* a block column holds two pixel pairs: one lookup serves both */
             for(int p=0;p<16;p++) {
                 const int64_t aw=(int64_t)b->p[2]+w0+2*p;
-                uint8_t *blk=bk_blk(&bk,b->p[0],Hb>>3,aw>>2,b->p[3]/32);
-                bp[p]=blk?blk+128*((aw>>1)&1):NULL;
+                if((aw>>2)!=pcol){pcol=aw>>2;pblk=bk_blk(&bk,b->p[0],Hb>>3,pcol,b->p[3]/32);}
+                bp[p]=pblk?pblk+128*((aw>>1)&1):NULL;
             }
-            for(int32_t r=0;r<run;r++) {
-                uint8_t *fp=fb+fl_lin(f,(int32_t[4]){f->p[0],f->p[1]+h+r,f->p[2]+w0,f->p[3]})*2;
+            uint8_t *fp=fb+fl_lin(f,(int32_t[4]){f->p[0],f->p[1]+h,f->p[2]+w0,f->p[3]})*2;
+            const size_t frow=(size_t)f->m[2]*f->m[3]*2;
+            for(int32_t r=0;r<run;r++,fp+=frow) {
                 const uint32_t ro=256u*(uint32_t)((Hb&7)+r);
                 if(to_blocked) {
                     DV m=dv_dealh(dv_ldu(fp)),z,zh;
@@ -1138,6 +1186,38 @@ static int copy_c2_fast(G *g, const T *f, const T *b, int to_blocked) {
  *     unit of the block row; units move through partial vector stores. A crouton
  *     destination whose depth widens to a multiple of 32 zero fills the unit's
  *     tail, as the padded t_write does. */
+static int dm_dense_run(const T *t, const int32_t *d) {
+    if(t->m[3]!=d[3] || t->p[3]!=0 || t->m[2]!=d[2] || t->p[2]!=0) return 0;
+    return d[0]==1 || (t->m[1]==d[1] && t->p[1]==0);
+}
+/* u8 blocked -> dense flat, NZ (1, 2 or 4) depth groups, whole block columns: per (batch, row) a run of
+ * 8-pixel block-row units, each NZ*2 vectors stored in order (pixels are contiguous in the output). */
+static inline __attribute__((always_inline)) void cv_b2f_dense(const BK *bi, const T *it, uint8_t *dp, const int NZ) {
+    const int64_t nbw8=it->d[2]>>3,wb0=it->p[2]>>3,z0=bi->slice+it->p[3]/32;
+    for(int32_t b=0;b<it->d[0];b++)for(int32_t h=0;h<it->d[1];h++) {
+        const int64_t Hi=(int64_t)h+it->p[1];
+        const int64_t base=((((int64_t)b+it->p[0])*bi->nbh+(Hi>>3))*bi->nbw+wb0)*bi->nbd+z0;
+        const uint32_t rowo=256u*(uint32_t)(Hi&7);
+        for(int64_t wb=0;wb<nbw8;wb++,dp+=NZ*256) {
+            DV a[4],bh[4],ov[8];
+            #pragma clang loop unroll(full)
+            for(int z=0;z<NZ;z++) {
+                const uint8_t *sb=bk_blk_or(bi,base+wb*bi->nbd+z,NULL);
+                if(sb){sb+=rowo;a[z]=dv_ld(sb);bh[z]=dv_ld(sb+128);}
+                else {a[z]=dv_zero();bh[z]=dv_zero();}
+            }
+            if(NZ==1){ov[0]=a[0];ov[1]=bh[0];}
+            else if(NZ==2){dv_shuffk(a[1],a[0],5,&ov[0],&ov[1]);dv_shuffk(bh[1],bh[0],5,&ov[2],&ov[3]);}
+            else {
+                dv_ladder(a,4,dm_lad_u32,2);dv_ladder(bh,4,dm_lad_u32,2);
+                #pragma clang loop unroll(full)
+                for(int i=0;i<4;i++){ov[i]=a[i];ov[4+i]=bh[i];}
+            }
+            #pragma clang loop unroll(full)
+            for(int i=0;i<NZ*2;i++)dv_st(dp+128*i,ov[i]);
+        }
+    }
+}
 typedef struct { int32_t b, h, w; } CvCur;
 static inline void cv_adv(CvCur *c, int32_t n, int32_t d1, int32_t d2) {
     if((c->w+=n)==d2){c->w=0;if(++c->h==d1){c->h=0;c->b++;}}
@@ -1165,7 +1245,10 @@ static int copy_vals_fast(G *g, const T *it, const T *ot) {
     if(ibk && obk) {
         if((D&31) || Dw!=D || (it->d[2]%cw) || (ot->d[2]%cw) || (it->p[2]%cw) || (ot->p[2]%cw)) return -1;
     } else {
-        if(es!=1 || ibk) return -1;   /* blocked -> flat measured slower than copy_runs */
+        if(es!=1) return -1;
+        /* blocked -> flat only as whole-vector interleaves of 1, 2 or 4 depth groups into dense pixels
+         * (the per-pixel partial stores of the general unit move measured slower than copy_runs) */
+        if(ibk && (ot->crouton || (D!=32 && D!=64 && D!=128) || (D&31) || ot->m[3]!=D || ot->p[3]!=0)) return -1;
         if(obk && ((Dw&31) || (!ot->crouton && (D&31)))) return -1;
     }
     const int32_t ow[4]={ot->d[0],ot->d[1],ot->d[2],Dw};
@@ -1186,7 +1269,14 @@ static int copy_vals_fast(G *g, const T *it, const T *ot) {
     const int64_t total=(int64_t)it->d[0]*it->d[1]*it->d[2];
     const uint8_t *fsrc=ibk?NULL:g->pool[it->pool]+it->offset;
     uint8_t *fdst=obk?NULL:g->pool[ot->pool]+ot->offset;
-    const size_t fsi=ibk?0:(size_t)it->m[3],fso=obk?0:(size_t)ot->m[3];
+    const size_t fsi=ibk?0:(size_t)it->m[3];
+    if(ibk && !obk && !((it->p[2]|it->d[2])&7) && dm_dense_run(ot,ot->d)) {
+        uint8_t *dp=fdst+fl_lin(ot,ot->p);
+        if(!((uintptr_t)dp&127u)) {
+            if(nz==1)cv_b2f_dense(&bi,it,dp,1);else if(nz==2)cv_b2f_dense(&bi,it,dp,2);else cv_b2f_dense(&bi,it,dp,4);
+            return 0;
+        }
+    }
     CvCur ci={0,0,0},co={0,0,0};
     for(int64_t P=0;P<total;) {
         int32_t n=cw;
@@ -1219,19 +1309,25 @@ static int copy_vals_fast(G *g, const T *it, const T *ot) {
             }
         } else if(ibk) {
             uint8_t *fd=fdst+fl_lin(ot,(int32_t[4]){ot->p[0]+co.b,ot->p[1]+co.h,ot->p[2]+co.w,ot->p[3]});
+            /* the n pixels of the segment sit in one block row: halves a (pixels 0..3) and b (4..7) of each
+             * depth group; the dense output of the whole 8-pixel row is nz*2 vectors, of which pixels
+             * pxi..pxi+n-1 are stored */
+            DV a[4],bh[4],ov[8];
             for(int32_t z=0;z<nz;z++) {
-                const uint32_t nb=(D-32*z)<32?(uint32_t)(D-32*z):32u;
                 const uint8_t *sb=bk_blk_or(&bi,ixi+z,NULL);
-                if(sb) {
-                    sb+=rowi;
-                    const DV va=dv_ld(sb),vb=dv_ld(sb+128);
-                    for(int32_t k=0;k<n;k++) {
-                        const int32_t px=pxi+k;
-                        dv_stup(fd+(size_t)k*fso+32*(size_t)z,px<4?va:vb,32u*(uint32_t)(px&3),nb);
-                    }
-                } else {
-                    for(int32_t k=0;k<n;k++)dv_stup(fd+(size_t)k*fso+32*(size_t)z,dv_zero(),0,nb);
-                }
+                if(sb){sb+=rowi;a[z]=dv_ld(sb);bh[z]=dv_ld(sb+128);}
+                else {a[z]=dv_zero();bh[z]=dv_zero();}
+            }
+            if(nz==1){ov[0]=a[0];ov[1]=bh[0];}
+            else if(nz==2){dv_shuffk(a[1],a[0],5,&ov[0],&ov[1]);dv_shuffk(bh[1],bh[0],5,&ov[2],&ov[3]);}
+            else {
+                dv_ladder(a,4,dm_lad_u32,2);dv_ladder(bh,4,dm_lad_u32,2);
+                for(int i=0;i<4;i++){ov[i]=a[i];ov[4+i]=bh[i];}
+            }
+            const uint32_t lo=(uint32_t)pxi*(uint32_t)D,hi=(uint32_t)(pxi+n)*(uint32_t)D;
+            for(uint32_t vi=0;vi<(uint32_t)nz*2;vi++) {
+                const uint32_t vlo=128u*vi,s0=vlo>lo?vlo:lo,e0=vlo+128<hi?vlo+128:hi;
+                if(s0<e0)dv_stup(fd+(s0-lo),ov[vi],s0-vlo,e0-s0);
             }
         } else {
             const uint8_t *fs=fsrc+fl_lin(it,(int32_t[4]){it->p[0]+ci.b,it->p[1]+ci.h,it->p[2]+ci.w,it->p[3]});
@@ -1249,6 +1345,31 @@ static int copy_vals_fast(G *g, const T *it, const T *ot) {
         }
         P+=n;cv_adv(&ci,n,it->d[1],it->d[2]);cv_adv(&co,n,ot->d[1],ot->d[2]);
     }
+    return 0;
+}
+
+/* COPY_VALUES between two dense flat regions (any element type, raw bytes, as
+ * copy_runs moves them): each side is one contiguous run in pixel order, so
+ * the reshape is a copy. Disjoint regions only. -1 when not covered. */
+static int copy_flat_fast(G *g, const T *it, const T *ot) {
+    if(!DM_ENABLED || !(it->flags&F_SHAPE) || !(ot->flags&F_SHAPE) || !(it->flags&F_DIRECT) || !(ot->flags&F_DIRECT) ||
+       it->esize!=ot->esize || it->dtype!=ot->dtype || it->esize==0) return -1;
+    if(count4(it->d)!=count4(ot->d) || it->d[3]!=ot->d[3] || it->d[3]<=0) return -1;
+    for(int i=0;i<4;i++) if(it->d[i]<=0 || ot->d[i]<=0) return -1;
+    if(ot->crouton) {
+        int32_t e=(ot->d[3]+ot->p[3]+31)/32*32;
+        if(e>ot->m[3])e=ot->m[3];
+        if(e-ot->p[3]!=ot->d[3]) return -1;
+    }
+    if(!dm_dense_run(it,it->d) || !dm_dense_run(ot,ot->d)) return -1;
+    int e=xfer_check(g,it,it->d,it->p,0);
+    if(!e)e=xfer_check(g,ot,ot->d,ot->p,1);
+    if(e) return e;
+    if(!fl_apart(it,it->d,it->p,ot,ot->d,ot->p)) return -1;
+    if(g->dry) return 0;
+    DM_COUNT(5,count4(it->d));
+    const size_t es=it->esize;
+    fl_move(g->pool[ot->pool]+ot->offset+fl_lin(ot,ot->p)*es,g->pool[it->pool]+it->offset+fl_lin(it,it->p)*es,count4(it->d)*es);
     return 0;
 }
 
@@ -1379,10 +1500,58 @@ static int tr_flat_il(G *g, const T *xt, const T *o, const int32_t *perm) {
 }
 
 /* ------------------------------------------------------ flat u8 matrix transpose */
-/* {0,1,3,2} of a flat u8 tensor: per (a,b) a R x C byte matrix with R a multiple
- * of 16. A tile is 16 rows x up to 128 columns: 16 row vectors, a 16x16 byte
- * transpose (dm_lad_t16), and each output vector then holds 8 output rows of
- * 16 bytes, stored as masked pieces. */
+/* {0,1,3,2} of a flat u8 tensor: per (a,b) an R x C byte matrix with R a multiple
+ * of 16. A tile is up to 128 rows (8 groups of 16) x up to 128 columns. Phase 1
+ * transposes each group of 16 rows (16 row vectors, dm_lad_t16): vector m then
+ * holds 8 columns x 16 rows, 16-byte unit u = column 8m+u. Phase 2 transposes
+ * the 8 x 8 units of the 8 groups for one m (dm_lad_u16x8): vector u holds
+ * column 8m+u for all 128 rows, which is one (partial for a last chunk) store
+ * per output row instead of eight 16-byte pieces. The 8 group vectors per m go
+ * through a stack buffer (16 KiB). */
+static const uint8_t dm_lad_u16x8[3][3]={{0,2,4},{0,1,4},{0,0,4}};
+typedef struct { const G *g; const T *xt, *o; int32_t n[4]; int32_t ntile; } T8Job;
+static void tr_t8_part(void *ctx, uint32_t part, uint32_t parts) {
+    const T8Job *J=ctx;const G *g=J->g;const T *xt=J->xt,*o=J->o;
+    const int32_t R=xt->d[2],Cn=xt->d[3],ntile=J->ntile;
+    const size_t sm=(size_t)xt->m[3],om=(size_t)o->m[3];
+    int64_t i0,i1;
+    dm_range((int64_t)J->n[0]*J->n[1]*ntile,part,parts,&i0,&i1);
+    if(i0>=i1) return;
+    int32_t ct,b,a;
+    {
+        uint32_t r=(uint32_t)i0;
+        ct=(int32_t)(r%(uint32_t)ntile);r/=(uint32_t)ntile;
+        b=(int32_t)(r%(uint32_t)J->n[1]);a=(int32_t)(r/(uint32_t)J->n[1]);
+    }
+    DV tmp[8][16];
+    for(int64_t it=i0;it<i1;it++) {
+        const int32_t c0=ct*128,nbc=Cn-c0<128?Cn-c0:128,nm=(nbc+7)>>3;
+        const uint8_t *sb=g->pool[xt->pool]+xt->offset+fl_lin(xt,(int32_t[4]){xt->p[0]+a,xt->p[1]+b,xt->p[2],xt->p[3]+c0});
+        uint8_t *db=g->pool[o->pool]+o->offset+fl_lin(o,(int32_t[4]){o->p[0]+a,o->p[1]+b,o->p[2]+c0,o->p[3]});
+        for(int32_t r0=0;r0<R;r0+=128) {
+            const int32_t ng=(R-r0)>>4<8?(R-r0)>>4:8;
+            for(int32_t gi=0;gi<ng;gi++) {
+                DV v[16];
+                const uint8_t *rp=sb+(size_t)(r0+16*gi)*sm;
+                #pragma clang loop unroll(full)
+                for(int i=0;i<16;i++)v[i]=dv_ldn(rp+(size_t)i*sm,(uint32_t)nbc);
+                dv_ladder(v,16,dm_lad_t16,4);
+                #pragma clang loop unroll(full)
+                for(int m=0;m<16;m++)if(m<nm)tmp[gi][m]=v[m];
+            }
+            for(int32_t m=0;m<nm;m++) {
+                DV w[8];
+                #pragma clang loop unroll(full)
+                for(int gi=0;gi<8;gi++)w[gi]=gi<ng?tmp[gi][m]:dv_zero();
+                dv_ladder(w,8,dm_lad_u16x8,3);
+                #pragma clang loop unroll(full)
+                for(int u=0;u<8;u++)
+                    if(8*m+u<nbc)dv_stun(db+(size_t)(8*m+u)*om+(size_t)r0,w[u],16u*(uint32_t)ng);
+            }
+        }
+        if(++ct==ntile){ct=0;if(++b==J->n[1]){b=0;a++;}}
+    }
+}
 static int tr_flat_t8(G *g, const T *xt, const T *o, const int32_t *perm) {
     if(!DM_ENABLED || perm[0]!=0 || perm[1]!=1 || perm[2]!=3 || perm[3]!=2 || !dm_flat(xt) || !dm_flat(o) || xt->esize!=1 || o->esize!=1) return -1;
     const int32_t n[4]={xt->d[0],xt->d[1],xt->d[3],xt->d[2]};
@@ -1393,16 +1562,10 @@ static int tr_flat_t8(G *g, const T *xt, const T *o, const int32_t *perm) {
     if(!fl_apart(xt,xt->d,xt->p,o,n,o->p)) return -1;
     if(g->dry) return 0;
     DM_COUNT(14,count4(n));
-    const int32_t R=xt->d[2],Cn=xt->d[3];
-    for(int32_t a=0;a<n[0];a++)for(int32_t b=0;b<n[1];b++)for(int32_t r0=0;r0<R;r0+=16)for(int32_t c0=0;c0<Cn;c0+=128) {
-        const uint32_t nb=Cn-c0<128?(uint32_t)(Cn-c0):128u;
-        DV v[16];
-        for(int i=0;i<16;i++)
-            v[i]=dv_ldn(g->pool[xt->pool]+xt->offset+fl_lin(xt,(int32_t[4]){xt->p[0]+a,xt->p[1]+b,xt->p[2]+r0+i,xt->p[3]+c0}),nb);
-        dv_ladder(v,16,dm_lad_t16,4);
-        for(int32_t c=0;c<(int32_t)nb;c++)
-            dv_stup(g->pool[o->pool]+o->offset+fl_lin(o,(int32_t[4]){o->p[0]+a,o->p[1]+b,o->p[2]+c0+c,o->p[3]+r0}),v[c>>3],16u*(uint32_t)(c&7),16);
-    }
+    T8Job J={g,xt,o,{n[0],n[1],n[2],n[3]},(xt->d[3]+127)/128};
+    uint32_t parts=dm_parts(g,count4(n),(int64_t)n[0]*n[1]*J.ntile);
+    if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_DM,parts,tr_t8_part,&J);
+    else tr_t8_part(&J,0,1);
     return 0;
 }
 

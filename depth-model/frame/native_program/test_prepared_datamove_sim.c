@@ -37,7 +37,7 @@ static uint8_t tile[4096];
 static uint32_t slot_order[SLOTS];
 static uint32_t used_slots, lim = 160;   /* slots in play: only these bytes are filled and compared */
 static uint32_t tabs[8][MAXB];
-static int bad, cases, fast_taken;
+static int bad, cases, fast_taken, movers;
 static int want_id = -1;   /* dm_stat counter the case must (expect 1) or must not (expect 0) advance */
 enum { FLAT_BASE = 768 * 1024 };
 static uint32_t ext_len;   /* bytes at FLAT_BASE that are also copied, compared and filled (flat tensors) */
@@ -68,8 +68,14 @@ static uint32_t *mk_blocked(T *t, uint32_t es, const int32_t *d, const int32_t *
     t->blocks = tab; t->nblocks = n; t->slice = slice;
     return tab;
 }
+static Nprg2ExecCall tcall;
+static Nprg2Pool tpools[7];
+static int tmemo = 0;   /* 1: the harness call carries a program, so the per-command memos are live */
+static uint32_t tcmd = 0;
 static void mk_g(G *g, uint8_t *mem, int dry, uint8_t *scr, size_t cap, int measure) {
     memset(g, 0, sizeof *g);
+    tcall.pools = tpools; tcall.program = tmemo ? (const void *)&tcall : NULL; tcall.command_index = tcmd;
+    g->call = &tcall;
     g->dry = dry; g->measure_only = (uint8_t)measure; g->scratch = scr; g->cap = cap;
     g->pool[PI] = mem; g->pool_bytes[PI] = POOL_BYTES; g->write_limit[PI] = POOL_BYTES;
     g->pool[PC] = konst; g->pool_bytes[PC] = sizeof konst; g->write_limit[PC] = 0;
@@ -95,9 +101,13 @@ static int compare(Kernel k, const Ops *ops, int base_shift, const char *name, i
         if (f && want_id >= 0) st0 = dm_stat[want_id];
         rc[f] = rcd[f] ? rcd[f] : k(&g);
         if (f && want_id >= 0) st1 = dm_stat[want_id];
+        if (tmemo && !rc[f]) { /* the second wet run of a command takes the per-command memo (Memo.dmv); the reference runs twice too */
+            mk_g(&g, f ? mb : ma, 0, scratch, need[f], 0); load_ops(&g, ops);
+            rc[f] = k(&g);
+        }
     }
     dm_on = 1;
-    cases++;
+    cases++; tcmd = (uint32_t)cases % 8000;
     int same = !memcmp(ma, mb, (size_t)lim * 2048) && !memcmp(ma + FLAT_BASE, mb + FLAT_BASE, ext_len);
     int ok = rc[0] == rc[1] && rcd[0] == rcd[1] && same && need[1] <= need[0];
     int taken = need[1] != need[0] || (rcd[0] == 0 && expect_fast == 2);
@@ -298,6 +308,39 @@ static int copyc2_case(int to_blocked, int H, int W, int p1, int p2, int slice, 
     return r;
 }
 
+/* ---- u8 blocked -> flat COPY_VALUES (reshape: the pixel count and depth D are kept) */
+static int cvb2f_align;
+static int cvb2f_case(int H, int W, int D, int p1, int p2, int slice, int absent, int shift, int oh, int ow, int fstride, int overlap, int expect) {
+    int32_t bd[4] = {1, H, W, D}, bm[4] = {1, H + p1, W + p2, (D + 31) / 32 * 32}, bp[4] = {0, p1, p2, 0};
+    int32_t fd[4] = {1, oh, ow, D}, fm[4] = {1, oh, ow + fstride, D}, fp[4] = {0, 0, 0, 0};
+    { int nbk = (H + p1 + 7) / 8 * ((W + p2 + 7) / 8) * ((D + 31) / 32) + slice; lim = nbk + 8 > 160 ? (uint32_t)(nbk + 8) : 160; if (lim > SLOTS) lim = SLOTS; }
+    shuffle_slots(); fill_image();
+    uint32_t foff = overlap ? 2048u * 3 + 4 * (rnd() % 8) : FLAT_BASE + (cvb2f_align ? 0 : 4 * (rnd() % 64));
+    fill_ext((uint32_t)(oh * (ow + fstride) * D) + 512);
+    Ops ops; memset(&ops, 0, sizeof ops);
+    T bt, ft;
+    mk_blocked(&bt, 1, bd, bm, bp, (uint32_t)slice, absent, tabs[0]);
+    mk_flat(&ft, 1, foff, fd, fm, fp);
+    if (overlap) for (uint32_t i = 0; i < bt.nblocks; i++) if (tabs[0][i]) { ft.offset = (tabs[0][i] & ~127u) + 4 * (rnd() % 8); break; }
+    ops.in[0] = bt; ops.out = ft; ops.nin = 1;
+    char name[100]; snprintf(name, sizeof name, "copy_values u8 blocked->flat %dx%dx%d -> %dx%d p%d,%d sl%d abs%d sh%d fs%d ov%d", H, W, D, oh, ow, p1, p2, slice, absent, shift, fstride, overlap);
+    want_id = 5;
+    int r = compare(k_copy_values, &ops, shift, name, expect);
+    want_id = -1; ext_len = 0; lim = 160;
+    return r;
+}
+
+/* ---- flat -> flat COPY_VALUES */
+static int cvf2f_case(uint32_t es, uint32_t dt, const int32_t *xd, const int32_t *xm, const int32_t *xp, const int32_t *od, const int32_t *om, const int32_t *op, int alias, int expect) {
+    Ops ops; memset(&ops, 0, sizeof ops);
+    flat_pair(&ops.in[0], &ops.out, es, xd, xm, xp, od, om, op, alias);
+    ops.in[0].dtype = dt; ops.out.dtype = dt; ops.nin = 1;
+    want_id = 5;
+    int r = compare(k_copy_values, &ops, 0, "copy_values flat->flat", expect);
+    want_id = -1;
+    return r;
+}
+
 /* ---- IM2COL */
 static int im2col_case(int u16, int oh, int ow, int po1, int po2, int slice, int absent, int shift, int ipad1, int ipad2, int stride, int overlap, int expect) {
     uint32_t es = u16 ? 2 : 1;
@@ -476,9 +519,102 @@ static void cycles_new(void) {
     }
 }
 
+/* Warm timing of the data movers the Frame profile ranks lowest (kernel only, not setup): reference
+ * (fast paths off) and fast, the fast run after one untimed run so the per-command memos are live. */
+static void cyc_warm(const char *nm, Kernel k, const Ops *ops, uint32_t ext) {
+    uint64_t t[2] = {0, 0};
+    for (int f = 0; f < 2; f++) {
+        dm_on = f; tcmd = (tcmd + 1) % 8000;
+        memcpy(memA, image, (size_t)lim * 2048); memcpy(memA + FLAT_BASE, image + FLAT_BASE, ext);
+        G g; mk_g(&g, memA, 1, NULL, SIZE_MAX, 1); load_ops(&g, ops); int r = k(&g); size_t need = g.used;
+        if (r) { printf("cycles case %s dry failed %d (f=%d line %u)\n", nm, r, f, (unsigned)reference_error_line); bad++; return; }
+        mk_g(&g, memA, 0, scratch, need, 0); load_ops(&g, ops); r = k(&g);
+        if (r) { printf("cycles case %s warm run failed %d\n", nm, r); bad++; return; }
+        mk_g(&g, memA, 0, scratch, need, 0); load_ops(&g, ops);
+        uint64_t c0 = TICKS(); r = k(&g); t[f] = TICKS() - c0;
+        if (r) { printf("cycles case %s run failed %d\n", nm, r); bad++; }
+    }
+    dm_on = 1;
+    printf("%-40s %12llu %12llu\n", nm, (unsigned long long)t[0], (unsigned long long)t[1]);
+}
+static void cyc_resize(const char *nm, int c, int win, int h) {
+    int32_t im[4] = {1, h, win, c}, om[4] = {1, h, 2 * win, c}, z4[4] = {0, 0, 0, 0};
+    lim = 300; rs = 99; shuffle_slots(); fill_image();
+    Ops ops; memset(&ops, 0, sizeof ops);
+    mk_blocked(&ops.in[0], 1, im, im, z4, 0, 0, tabs[0]); mk_blocked(&ops.out, 1, om, om, z4, 0, 0, tabs[1]);
+    int32_t hp[7] = {h, h, (int32_t)0x80000000, 0, 0x40000000, 0, h}, wp[7] = {win, 2 * win, (int32_t)0x80000000, 0, 0x40000000, 0, 2 * win};
+    mk_const(&ops.in[1], 0, hp, 7); mk_const(&ops.in[2], 32, wp, 7); ops.nin = 3;
+    cyc_warm(nm, k_resize, &ops, 0);
+    lim = 160;
+}
+static void cyc_tr(const char *nm, uint32_t es, int flat, const int32_t *xd, const int32_t *xm, const int32_t *od, const int32_t *om) {
+    static const int32_t perm[4] = {0, 1, 3, 2}, z4[4] = {0, 0, 0, 0};
+    lim = SLOTS; rs = 99; shuffle_slots(); fill_image();
+    Ops ops; memset(&ops, 0, sizeof ops);
+    uint32_t ext = 0;
+    if (flat) {
+        flat_pair(&ops.in[0], &ops.out, es, xd, xm, z4, od, om, z4, 0);
+    } else {
+        mk_blocked(&ops.in[0], es, xd, xm, z4, 0, 0, tabs[0]); mk_blocked(&ops.out, es, od, om, z4, 0, 0, tabs[1]);
+    }
+    for (int i = 0; i < 4; i++) ft_perm[i] = perm[i];
+    ft_x = ops.in[0]; ft_o = ops.out; ops.nin = 1;   /* k_transpose itself needs the executor's tensor views: time the fast dispatch */
+    cyc_warm(nm, ft_kernel, &ops, ext);
+    lim = 160;
+}
+static void cyc_cv(const char *nm, int kind) {
+    static const int32_t z4[4] = {0, 0, 0, 0};
+    lim = 300; rs = 99; shuffle_slots(); fill_image();
+    Ops ops; memset(&ops, 0, sizeof ops);
+    uint32_t ext = 0;
+    T bt, ft;
+    if (kind == 0) {   /* 16/44 */
+        int32_t bd[4] = {1, 1, 128, 64}, bm[4] = {1, 8, 128, 64};
+        mk_blocked(&bt, 1, bd, bm, z4, 0, 0, tabs[0]); mk_flat(&ft, 1, FLAT_BASE, bd, bd, z4); fill_ext(8192 + 512); ext = ext_len; ext_len = 0;
+        ops.in[0] = bt; ops.out = ft;
+    } else if (kind == 1) {   /* 16/50 */
+        int32_t bd[4] = {1, 8, 8, 64}, fd[4] = {1, 1, 64, 64};
+        mk_blocked(&bt, 1, bd, bd, z4, 0, 0, tabs[0]); mk_flat(&ft, 1, FLAT_BASE, fd, fd, z4); fill_ext(4096 + 512); ext = ext_len; ext_len = 0;
+        ops.in[0] = bt; ops.out = ft;
+    } else if (kind == 2) {   /* 16/65 */
+        int32_t fd[4] = {1, 1, 1, 64};
+        mk_flat(&ops.in[0], 4, FLAT_BASE, fd, fd, z4); mk_flat(&ops.out, 4, FLAT_BASE + 1024, fd, fd, z4);
+        ops.in[0].dtype = DT_F32; ops.out.dtype = DT_F32; fill_ext(2048); ext = ext_len; ext_len = 0;
+    } else {   /* 16/43 (flat -> CH) and 16/45 (CH -> flat) */
+        int32_t bd[4] = {1, 32, 256, 2}, bm[4] = {1, 32, 256, 32};
+        mk_blocked(&bt, 2, bd, bm, z4, 0, 0, tabs[0]); mk_flat(&ft, 2, FLAT_BASE, bd, bd, z4); fill_ext(4 * 32 * 256 + 512); ext = ext_len; ext_len = 0;
+        if (kind == 3) { ops.in[0] = ft; ops.out = bt; } else { ops.in[0] = bt; ops.out = ft; }
+    }
+    ops.nin = 1;
+    cyc_warm(nm, k_copy_values, &ops, ext);
+    lim = 160;
+}
+static void cycles_movers(void) {
+    printf("%-40s %12s %12s\n", "warm kernel pcycles", "reference", "fast");
+    cyc_resize("24/51 resize 8x128x32 -> 8x256x32", 32, 128, 8);
+    cyc_resize("24/51 resize 8x64x64 -> 8x128x64", 64, 64, 8);
+    cyc_resize("24/51 resize 8x32x128 -> 8x64x128", 128, 32, 8);
+    { int32_t xd[4] = {1, 1, 64, 128}, xm[4] = {1, 8, 64, 128}, od[4] = {1, 1, 128, 64}, om[4] = {1, 8, 128, 64};
+      cyc_tr("18/55 transpose wc8 1x64x128", 1, 0, xd, xm, od, om); }
+    { int32_t xd[4] = {1, 80, 64, 32}, od[4] = {1, 80, 32, 64};
+      cyc_tr("18/56 transpose wc16 80x64x32", 2, 0, xd, xd, od, od); }
+    { int32_t xd[4] = {1, 1, 256, 80}, od[4] = {1, 1, 80, 256};
+      cyc_tr("18/57 transpose flat u8 256x80", 1, 1, xd, xd, od, od); }
+    { int32_t xd[4] = {1, 1, 80, 4096}, od[4] = {1, 1, 4096, 80};
+      cyc_tr("18/57 transpose flat u8 80x4096", 1, 1, xd, xd, od, od); }
+    cyc_cv("16/44 copy_values CB->FB 128x64", 0);
+    cyc_cv("16/50 copy_values CB 8x8x64 -> FB", 1);
+    cyc_cv("16/65 copy_values f32 flat 64", 2);
+    cyc_cv("16/43 copy_values FH -> CH 32x256x2", 3);
+    cyc_cv("16/45 copy_values CH -> FH 32x256x2", 4);
+}
+
 int main(int argc, char **argv) {
     int cycles = argc > 1 && !strcmp(argv[1], "cycles");
+    tmemo = argc > 1 && (!strcmp(argv[1], "memo") || !strcmp(argv[1], "movers"));
+    movers = argc > 1 && !strcmp(argv[1], "movers");
     (void)cycles;
+    if (!movers) {
     vcopy_tests();
     /* space to depth: real-like, edges, variants that must decline */
     s2d_case(32, 8, 68, 7, 7, 0, 0, 0, 0, 0, 1);
@@ -490,6 +626,7 @@ int main(int argc, char **argv) {
     }
     s2d_case(32, 2, 6, 7, 7, 0, 0, 0, 0, 0, 0);   /* ow not a multiple of 4 */
     s2d_case(32, 2, 8, 7, 5, 0, 0, 0, 0, 0, 0);   /* pw not 7 mod 8 */
+    }
     /* resize */
     resize_case(32, 16, 128, 8, 256, 4, 0, 0, 0x40000000, 1, 0, 0);
     resize_case(64, 8, 64, 8, 128, 0, 0, 0, 0, 1, 0, 0);
@@ -500,6 +637,7 @@ int main(int argc, char **argv) {
         resize_case(c, hin, win, hout, 2 * win, hoff, absent, it % 5 == 0 ? 8 : 0, it % 4 ? 0x40000000 : 0x7fffffff, it % 5 != 0 ? 1 : 0, it % 6 == 0 ? 8 : 0, it % 6 == 0 ? 8 : 0);
     }
     resize_case(32, 4, 16, 4, 32, 0, 0, 0, (int)0x80000000, 0, 0, 0);   /* v4 too large: generic */
+    if (!movers) {
     /* transpose */
     tr_case(8, 8, 32, 0, 0, 1, 0, 0);
     tr_case(16, 8, 64, 10, 0, 1, 0, 0);
@@ -593,6 +731,7 @@ int main(int argc, char **argv) {
         int32_t w2[4] = {1, 24, 2, 64};
         trb_case(2, phw, w2, z4, z4, 0, 0, 0, 0, 0, 1, "w=2");
     }
+    }
     /* flat u8 matrix transposes, flat interleave */
     {
         int32_t td1[4] = {1, 1, 32, 200}, td2[4] = {2, 2, 16, 129}, td3[4] = {1, 1, 48, 19}, tz[4] = {0, 0, 0, 0};
@@ -603,6 +742,16 @@ int main(int argc, char **argv) {
         ftr_case(1, td3, td3, tz, p0132, 0, 1);
         int32_t tm[4] = {3, 3, 20, 140}, tp[4] = {1, 1, 3, 5}, om4[4] = {3, 3, 149, 40}, op4[4] = {1, 0, 4, 7};
         ftr_case2(1, td2, tm, tp, p0132, om4, op4, 0, 1);
+        int32_t tb1[4] = {1, 1, 256, 80}, tb2[4] = {1, 2, 80, 300}, tb3[4] = {2, 1, 208, 130}, tb4[4] = {1, 1, 144, 8}, tb5[4] = {1, 1, 16, 1};
+        ftr_case(1, tb1, tb1, tz, p0132, 0, 1);
+        ftr_case(1, tb2, tb2, tz, p0132, 0, 1);
+        ftr_case(1, tb3, tb3, tz, p0132, 0, 1);
+        ftr_case(1, tb4, tb4, tz, p0132, 0, 1);
+        ftr_case(1, tb5, tb5, tz, p0132, 0, 1);
+        int32_t tb6[4] = {1, 1, 80, 4096};
+        ftr_case(1, tb6, tb6, tz, p0132, 0, 1);
+        int32_t tm2[4] = {2, 2, 300, 150}, tp2[4] = {1, 1, 5, 7}, om5[4] = {2, 2, 150, 299}, op5[4] = {0, 1, 3, 11};
+        ftr_case2(1, tb1, tm2, tp2, p0132, om5, op5, 0, 1);
         int32_t te[4] = {1, 1, 20, 100};
         ftr_case(1, te, te, tz, p0132, 0, 0);   /* rows not a multiple of 16: generic tiles */
         ftr_case(1, td3, td3, tz, p0132, 1, 0);
@@ -635,6 +784,40 @@ int main(int argc, char **argv) {
         copyc2_case(dir, 3, 48, 0, 0, 0, 0, 0, 0, 0, 0);    /* width not a multiple of 32 */
         copyc2_case(dir, 3, 64, 0, 1, 0, 0, 0, 0, 0, 0);    /* odd pixel origin */
     }
+    /* u8 blocked -> flat */
+    cvb2f_case(1, 128, 64, 0, 0, 0, 0, 0, 1, 128, 0, 0, 1);      /* 16/44 */
+    cvb2f_case(8, 8, 64, 0, 0, 0, 0, 0, 1, 64, 0, 0, 1);         /* 16/50 */
+    for (int it = 0; it < 48; it++) {
+        cvb2f_align = it >= 24;
+        int D = it % 3 == 0 ? 32 : it % 3 == 1 ? 64 : 128;
+        int H = 1 + (int)(rnd() % 5), W = 8 * (1 + (int)(rnd() % 3)) + (it % 4 == 1 ? 3 : 0);
+        int oh = it % 2 ? H * W : H, ow = it % 2 ? 1 : W;
+        if (it % 5 == 2) { oh = 1; ow = H * W; }
+        cvb2f_case(H, W, D, it % 4 ? (int)(rnd() % 9) : 0, it % 3 ? (int)(rnd() % 9) : 0, it % 5 == 0 ? 3 : 0, it % 2 ? 15 : 0, it % 7 == 0 ? 8 : 0, oh, ow, it % 6 == 0 ? 5 : 0, 0, it % 7 == 0 ? 0 : 1);
+    }
+    cvb2f_align = 1;   /* 128-byte aligned flat output with whole block columns: the dense run */
+    cvb2f_case(1, 128, 64, 0, 0, 0, 0, 0, 1, 128, 0, 0, 1);
+    cvb2f_case(8, 8, 64, 0, 0, 0, 0, 0, 1, 64, 0, 0, 1);
+    cvb2f_case(3, 16, 128, 5, 8, 0, 20, 0, 3, 16, 0, 0, 1);
+    cvb2f_case(2, 24, 32, 0, 16, 1, 10, 0, 6, 8, 0, 0, 1);
+    cvb2f_case(2, 24, 64, 3, 8, 0, 30, 0, 2, 24, 0, 0, 1);
+    cvb2f_case(2, 8, 128, 0, 0, 0, 0, 0, 16, 1, 0, 0, 1);
+    cvb2f_align = 0;
+    cvb2f_case(2, 16, 64, 0, 0, 0, 0, 0, 2, 16, 0, 1, 0);        /* flat inside the blocks */
+    cvb2f_case(2, 16, 96, 0, 0, 0, 0, 0, 2, 16, 0, 0, 0);        /* D=96 stays on copy_runs */
+    {
+        int32_t z[4] = {0, 0, 0, 0}, a[4] = {1, 1, 1, 64}, b[4] = {1, 1, 8, 16}, c[4] = {2, 3, 4, 5}, c2[4] = {2, 1, 12, 5}, c3[4] = {1, 6, 10, 5}, cm[4] = {3, 3, 4, 5}, cp[4] = {1, 0, 0, 0};
+        cvf2f_case(4, DT_F32, a, a, z, a, a, z, 0, 1);
+        cvf2f_case(1, DT_U8, a, a, z, b, b, z, 0, 1);
+        cvf2f_case(2, DT_U16, b, b, z, b, b, z, 0, 1);
+        cvf2f_case(4, DT_F32, c, c, z, c2, c2, z, 0, 1);
+        cvf2f_case(4, DT_F32, c, c, z, c3, c3, z, 0, 1);
+        cvf2f_case(1, DT_U8, c, cm, cp, c2, c2, z, 0, 1);       /* batch origin: still one run */
+        cvf2f_case(1, DT_U8, c, c, z, c2, c2, z, 1, 0);          /* aliased */
+        int32_t d1[4] = {1, 4, 8, 16}, d1m[4] = {1, 4, 9, 16};
+        cvf2f_case(1, DT_U8, d1, d1m, z, b, b, z, 0, 0);         /* source rows with a stride */
+    }
+    if (!movers) {
     /* IM2COL */
     for (int u16 = 0; u16 < 2; u16++) {
         int ows[4] = {u16 ? 8 : 128, u16 ? 16 : 256, u16 ? 64 : 128, u16 ? 24 : 256};
@@ -649,7 +832,9 @@ int main(int argc, char **argv) {
     im2col_case(0, 2, 64, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0);    /* width not a multiple of 128 */
     im2col_case(0, 2, 128, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0);   /* stride 2 */
     im2col_case(0, 2, 128, 0, 4, 0, 0, 0, 0, 0, 1, 0, 0);   /* pixel origin not a multiple of 8 */
+    }
     printf("%s: %d cases, %d took a fast path, %d mismatches\n", bad ? "FAIL" : "PASS", cases, fast_taken, bad);
     if (cycles) { cycles_tests(); cycles_new(); }
+    if (movers) cycles_movers();
     return bad != 0;
 }
