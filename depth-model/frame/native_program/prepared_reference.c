@@ -538,8 +538,10 @@ static int small(const int64_t *r, uint32_t mask) {
 #ifdef DM_SHAPES
 static void shp_t(const char *n,const T *t){if(t->flags&F_SV){fprintf(stderr,"  %s sv%d,%d,%d,%d\n",n,t->sv[0],t->sv[1],t->sv[2],t->sv[3]);return;}fprintf(stderr,"  %s fl%u es%u cr%u d%d,%d,%d,%d m%d,%d,%d,%d p%d,%d,%d,%d sl%u nb%u pool%u off%u\n",n,t->flags,t->esize,t->crouton,t->d[0],t->d[1],t->d[2],t->d[3],t->m[0],t->m[1],t->m[2],t->m[3],t->p[0],t->p[1],t->p[2],t->p[3],t->slice,t->nblocks,t->pool,t->offset);}
 #define SHP(name,g,np) do{ if(!(g)->dry){fprintf(stderr,"SHP %s op=%u var=%u\n",name,(g)->op,(g)->variant); for(uint32_t q_=0;q_<(g)->nin&&q_<CACHED_INPUTS;q_++)shp_t("in",&(g)->in[q_]); shp_t("out",&(g)->out);} }while(0)
+#define DMPATH(g,name,fr) do{ if(!(g)->dry) fprintf(stderr,"  path %s %s\n",name,(fr)>=0?"FAST":"generic"); }while(0)
 #else
 #define SHP(name,g,np) ((void)0)
+#define DMPATH(g,name,fr) ((void)0)
 #endif
 /* Exact direct-copy fast paths for the data-movement kernels below. */
 #include "prepared_datamove.inc"
@@ -576,6 +578,62 @@ static uint8_t *strip_buffer(G *g, size_t *room) {
     if(*room>STRIP_BYTES) *room=STRIP_BYTES;
     return buf;
 }
+/* 1 when the regions of it and ot (both d at p) share no byte, so strips
+ * can run in any order. Memoised per command (conv_checked bits 6..7). */
+static int strip_disjoint(G *g, const T *it, const T *ot) {
+    Memo *mm=memo_for(g->call);
+    uint8_t *mb=mm?&mm->conv_checked[g->call->command_index]:NULL;
+    if(mb && (*mb&64u)) return !!(*mb&128u);
+    int ok=0;
+    if((it->flags&F_BLOCKED) && (ot->flags&F_BLOCKED)) ok=dm_clear(it,it->d,it->p,ot,ot->d,ot->p);
+    else if((it->flags&F_DIRECT) && (ot->flags&F_DIRECT)) {
+        /* byte spans of the bounding boxes, as direct_check computes them */
+        uint64_t a0,a1,b0,b1;
+        const T *t[2]={it,ot};uint64_t *lo[2]={&a0,&b0},*hi[2]={&a1,&b1};
+        for(int k=0;k<2;k++) {
+            const T *x=t[k];
+            uint64_t f=((((uint64_t)x->p[0]*x->m[1]+x->p[1])*x->m[2]+x->p[2])*x->m[3]+x->p[3]);
+            uint64_t l=((((uint64_t)(x->p[0]+x->d[0]-1)*x->m[1]+x->p[1]+x->d[1]-1)*x->m[2]+x->p[2]+x->d[2]-1)*x->m[3]+x->p[3]+x->d[3]-1);
+            *lo[k]=x->offset+f*x->esize;*hi[k]=x->offset+(l+1)*x->esize;
+        }
+        ok=it->pool!=ot->pool || a1<=b0 || b1<=a0;
+    } else {
+        /* one direct, one blocked: the blocked region's extent in the direct tensor's pool */
+        const T *dt=(it->flags&F_DIRECT)?it:ot,*bt=dt==it?ot:it;
+        DMExt x;dm_extent(bt,bt->d,bt->p,&x);
+        uint64_t l=((((uint64_t)(dt->p[0]+dt->d[0]-1)*dt->m[1]+dt->p[1]+dt->d[1]-1)*dt->m[2]+dt->p[2]+dt->d[2]-1)*dt->m[3]+dt->p[3]+dt->d[3]-1);
+        uint64_t f=((((uint64_t)dt->p[0]*dt->m[1]+dt->p[1])*dt->m[2]+dt->p[2])*dt->m[3]+dt->p[3]);
+        uint64_t d0=dt->offset+f*dt->esize,d1=dt->offset+(l+1)*dt->esize;
+        uint32_t pl=dt->pool;
+        ok=pl>=8 || x.lo[pl]>x.hi[pl] || (uint64_t)x.hi[pl]+BLOCK_BYTES<=d0 || d1<=x.lo[pl];
+    }
+    if(mb) *mb|=(uint8_t)(64u|(ok?128u:0u));
+    return ok;
+}
+typedef struct {
+    G *g; const T *it, *ot; StripFn fn; const void *ctx;
+    uint32_t ies, oes; int32_t D, cw, nchunk;
+    uint8_t *buf; size_t room; /* per part */
+    int64_t strips;
+} StripJob;
+static void strip_part(void *c_, uint32_t part, uint32_t parts) {
+    const StripJob *J=c_;
+    const T *it=J->it,*ot=J->ot;
+    uint8_t *src=J->buf+(size_t)part*J->room,*dst=src+(((size_t)J->cw*J->D*J->ies+127)&~(size_t)127);
+    for(int64_t s=part;s<J->strips;s+=parts) {
+        int64_t q=s/J->nchunk;
+        int32_t w=(int32_t)(s-q*J->nchunk)*J->cw,h=(int32_t)(q%it->d[1]),b=(int32_t)(q/it->d[1]);
+        int32_t n=it->d[2]-w<J->cw?it->d[2]-w:J->cw;
+        int32_t dims[4]={1,1,n,J->D};
+        int32_t io[4]={it->p[0]+b,it->p[1]+h,it->p[2]+w,it->p[3]},oo[4]={ot->p[0]+b,ot->p[1]+h,ot->p[2]+w,ot->p[3]};
+        xfer_copy(J->g,it,src,dims,io,0);
+        J->fn(J->ctx,src,dst,(size_t)n*J->D,io);
+        xfer_copy(J->g,ot,dst,dims,oo,1);
+    }
+}
+#ifndef PAR_STRIP_MIN_ELEMS
+#define PAR_STRIP_MIN_ELEMS 8192u
+#endif
 static int ew_strips(G *g, const T *it, const T *ot, uint32_t ies, uint32_t oes, StripFn fn, const void *ctx) {
     if(!(it->flags&F_SHAPE) || !(ot->flags&F_SHAPE) || it->esize!=ies || ot->esize!=oes) return -1;
     for(int i=0;i<4;i++) if(it->d[i]!=ot->d[i] || it->d[i]<=0) return -1;
@@ -588,18 +646,24 @@ static int ew_strips(G *g, const T *it, const T *ot, uint32_t ies, uint32_t oes,
     size_t per=(size_t)D*(ies+oes),room;
     uint8_t *buf=strip_buffer(g,&room);
     if(!buf) return -1;
-    int32_t cw=(int32_t)(room/(per+256)); /* src/dst split, 128-aligned */
-    if(cw<1) return -1;
-    if(cw>it->d[2]) cw=it->d[2];
-    uint8_t *src=buf,*dst=buf+(((size_t)cw*D*ies+127)&~(size_t)127);
-    for(int32_t b=0;b<it->d[0];b++)for(int32_t h=0;h<it->d[1];h++)for(int32_t w=0;w<it->d[2];w+=cw) {
-        int32_t n=it->d[2]-w<cw?it->d[2]-w:cw;
-        int32_t dims[4]={1,1,n,D};
-        int32_t io[4]={it->p[0]+b,it->p[1]+h,it->p[2]+w,it->p[3]},oo[4]={ot->p[0]+b,ot->p[1]+h,ot->p[2]+w,ot->p[3]};
-        TRY(xfer(g,it,src,dims,io,0));
-        if(!g->dry) fn(ctx,src,dst,(size_t)n*D,io);
-        TRY(xfer(g,ot,dst,dims,oo,1));
-    }
+    if(room/(per+256)<1) return -1;
+    /* The strips tile the region: checking the whole region checks them all. */
+    TRY(xfer_check(g,it,it->d,it->p,0));
+    TRY(xfer_check(g,ot,ot->d,ot->p,1));
+    if(g->dry) return 0;
+    uint64_t elems=(uint64_t)it->d[0]*it->d[1]*it->d[2]*(uint64_t)D;
+    uint32_t parts=1;
+    if(elems>=PAR_STRIP_MIN_ELEMS && room/3>=per+256+128 && strip_disjoint(g,it,ot))
+        parts=nprg2_parallel_parts(g->call->parallel,3);
+    StripJob J={g,it,ot,fn,ctx,ies,oes,D,0,0,buf,(room/parts)&~(size_t)127,0};
+    J.cw=(int32_t)(J.room/(per+256));
+    if(J.cw<1){parts=1;J.room=room&~(size_t)127;J.cw=(int32_t)(J.room/(per+256));}
+    if(J.cw>it->d[2]) J.cw=it->d[2];
+    J.nchunk=(it->d[2]+J.cw-1)/J.cw;
+    J.strips=(int64_t)it->d[0]*it->d[1]*J.nchunk;
+    if(parts>1 && J.strips<2) parts=1;
+    if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_EW,parts,strip_part,&J);
+    else strip_part(&J,0,1);
     return 0;
 }
 typedef struct { int32_t zp; uint32_t m24; int32_t e, fast; double sc; uint32_t in_es; } DqCtx;
@@ -723,7 +787,7 @@ static int k_space_to_depth(G *g) {
     int32_t ow=(i->m[2]-pw)/2;
     if(o->m[2]<ow)ow=o->m[2];
     CHECK(i->dtype==DT_U8 && i->m[0]>=1 && oh>0 && ow>0 && ph+2*(oh-1)+1<i->m[1] && pw+2*(ow-1)<i->m[2] && pw>=1,E_SHAPE);
-    {int fr=s2d_fast(g,i,o,ph,pw,oh,ow,ci,oc);if(fr>=0)return fr;}
+    {int fr=s2d_fast(g,i,o,ph,pw,oh,ow,ci,oc);DMPATH(g,"s2d",fr);if(fr>=0)return fr;}
     int32_t rd[4]={1,2*oh,2*ow,ci},ro[4]={0,ph,pw-1,0};
     A xf;TRY(t_read_region(g,i,&xf,rd,ro));
     ph=0;pw=1;
@@ -1004,6 +1068,54 @@ static int k_linearclip(G *g) {
     }
     return t_write(g,o,&r);
 }
+/* COPY_VALUES (a reshape: same element count, dense order kept) when both
+ * sides have the same channel count D: runs of pixels contiguous in an
+ * input row and an output row move through the strip buffer. A crouton
+ * output widened to its 32-lane boundary gets zero channels, as t_write's
+ * pad path. Same bytes as t_read + t_write; -1 when the shapes differ. */
+static int copy_runs(G *g, const T *it, const T *ot) {
+    if(!(it->flags&F_SHAPE) || !(ot->flags&F_SHAPE) || it->esize!=ot->esize || it->dtype!=ot->dtype) return -1;
+    if(count4(it->d)!=count4(ot->d) || it->d[3]!=ot->d[3] || it->d[3]<=0) return -1;
+    for(int i=0;i<4;i++) if(it->d[i]<=0 || ot->d[i]<=0) return -1;
+    const int32_t D=it->d[3];
+    int32_t Dw=D;
+    if(ot->crouton) {
+        int32_t e=(ot->d[3]+ot->p[3]+31)/32*32;
+        if(e>ot->m[3])e=ot->m[3];
+        Dw=e-ot->p[3];
+        if(Dw<D) return -1;
+    }
+    const size_t es=it->esize,pin=(size_t)D*es,pout=(size_t)Dw*es;
+    size_t room;uint8_t *buf=strip_buffer(g,&room);
+    if(!buf) return -1;
+    int32_t cw=(int32_t)((room-256)/(pin+pout));
+    if(cw<1) return -1;
+    int32_t ow[4]={ot->d[0],ot->d[1],ot->d[2],Dw};
+    TRY(xfer_check(g,it,it->d,it->p,0));
+    TRY(xfer_check(g,ot,ow,ot->p,1));
+    if(g->dry) return 0;
+    uint8_t *src=buf,*dst=buf+(((size_t)cw*pin+127)&~(size_t)127);
+    if(Dw>D) memset(dst,0,(size_t)cw*pout);
+    const int64_t total=(int64_t)it->d[0]*it->d[1]*it->d[2];
+    int32_t ib=0,ih=0,iw=0,ob=0,oh=0,oww=0;
+    for(int64_t P=0;P<total;) {
+        int32_t n=it->d[2]-iw;
+        if(ot->d[2]-oww<n) n=ot->d[2]-oww;
+        if(cw<n) n=cw;
+        int32_t id[4]={1,1,n,D},io[4]={it->p[0]+ib,it->p[1]+ih,it->p[2]+iw,it->p[3]};
+        int32_t od[4]={1,1,n,Dw},oo[4]={ot->p[0]+ob,ot->p[1]+oh,ot->p[2]+oww,ot->p[3]};
+        xfer_copy(g,it,src,id,io,0);
+        if(Dw==D) xfer_copy(g,ot,src,od,oo,1);
+        else {
+            for(int32_t k=0;k<n;k++) memcpy(dst+(size_t)k*pout,src+(size_t)k*pin,pin);
+            xfer_copy(g,ot,dst,od,oo,1);
+        }
+        P+=n;
+        if((iw+=n)==it->d[2]){iw=0;if(++ih==it->d[1]){ih=0;ib++;}}
+        if((oww+=n)==ot->d[2]){oww=0;if(++oh==ot->d[1]){oh=0;ob++;}}
+    }
+    return 0;
+}
 static int k_copy_values(G *g) {
     SHP("copy_values",g,0);
     CHECK(g->nin>=1 && g->nout==1,E_ARGS);
@@ -1011,6 +1123,8 @@ static int k_copy_values(G *g) {
     {
         int fr=copy_c2_fast(g,in(g,0),o,1);   /* flat flow -> padded blocked */
         if(fr<0)fr=copy_c2_fast(g,o,in(g,0),0);   /* padded blocked -> flat flow */
+        if(fr<0)fr=copy_runs(g,in(g,0),o);
+        DMPATH(g,"copy_values",fr);
         if(fr>=0) return fr;
     }
     A x;TRY(t_read(g,in(g,0),&x,0));
@@ -1044,6 +1158,7 @@ static int k_transpose(G *g) {
         if(const_value(g,&pt,0,&pv[0]) && const_value(g,&pt,1,&pv[1]) && const_value(g,&pt,2,&pv[2]) && const_value(g,&pt,3,&pv[3])) {
             int32_t pm[4]={(int32_t)pv[0],(int32_t)pv[1],(int32_t)pv[2],(int32_t)pv[3]};
             int fr=tr_fast_dispatch(g,in(g,0),out0(g),pm);
+            DMPATH(g,"transpose",fr);
             if(fr>=0) return fr;
         }
     }
@@ -1156,7 +1271,7 @@ static int k_slice_pad(G *g) {
     const T *pad=in(g,1),*st=in(g,2),*sz=in(g,3);
     CHECK(pad->flags&st->flags&sz->flags&F_SV,E_ARGS);
     int64_t fill;TRY(read_scalar(g,in(g,4),&fill));
-    {int fr=slice_pad_fast(g,in(g,0),out0(g),pad,st,sz,fill);if(fr>=0)return fr;}
+    {int fr=slice_pad_fast(g,in(g,0),out0(g),pad,st,sz,fill);DMPATH(g,"slice_pad",fr);if(fr>=0)return fr;}
     A x;TRY(t_read(g,in(g,0),&x,0));
     CHECK(x.dt!=DT_F32,E_ARGS);
     A r;TRY(anew(g,&r,sz->sv,x.dt));
@@ -1240,7 +1355,7 @@ static int k_resize(G *g) {
     TRY(read_i32(g,in(g,1),&hp,&nh));
     TRY(read_i32(g,in(g,2),&wp,&nw));
     CHECK(nh>=6 && nw>=6,E_ARGS);
-    {int fr=resize_fast(g,in(g,0),in(g,2),out0(g),hp);if(fr>=0)return fr;}
+    {int fr=resize_fast(g,in(g,0),in(g,2),out0(g),hp);DMPATH(g,"resize",fr);if(fr>=0)return fr;}
     A x;TRY(t_read(g,in(g,0),&x,0));
     const T *o=out0(g);
     CHECK((o->flags&F_SHAPE) && o->d[1]>=0 && o->d[2]>=0,E_SHAPE);
@@ -1492,11 +1607,18 @@ static int k_convert_weights(G *g) {
     int32_t bn[4];CHECK(!bshape(&x,&s,bn) && !memcmp(bn,x.n,16),E_SHAPE);
     size_t total=count4(x.n);
     CHECK(o->pool<7 && g->pool[o->pool] && o->offset+(uint64_t)total<=g->write_limit[o->pool],E_RANGE);
+    /* Per-output-channel scales (the common case): built in scratch (near
+     * memory when it fits) with 32-bit indices and the scale hoisted, then one
+     * vector copy to the pool instead of scattered scalar VTCM stores. */
+    int8_t *tmp=NULL;
+    if(s.n[0]==1 && s.n[1]==1 && s.n[2]==1 && s.n[3]==O && total<0x7fffffffu) {
+        tmp=salloc(g,total);
+        if(!tmp) FAIL(E_MEMORY);
+    }
     if(g->dry) return 0;
     int8_t *raw=(int8_t *)g->pool[o->pool]+o->offset;
-    /* Per-output-channel scales (the common case): 32-bit indices, the scale
-     * hoisted, the same arithmetic. total < 2^31 so u32 offsets are exact. */
-    if(s.n[0]==1 && s.n[1]==1 && s.n[2]==1 && s.n[3]==O && total<0x7fffffffu) {
+    if(tmp) {
+        int8_t *const out=raw;raw=tmp;
         const uint8_t *src=x.p;const int32_t *sv=s.p;
         int32_t zp=i->zp;
         uint32_t I4=(uint32_t)I/4,uO=(uint32_t)O,hw=0;
@@ -1509,6 +1631,7 @@ static int k_convert_weights(G *g) {
                 raw[((oo>>5)*(uint32_t)(H*W)*I4)*128u+base+(oo&31u)*4u]=(int8_t)(q<-128?-128:q>127?127:q);
             }
         }
+        qd_vcopy(out,tmp,total);
         return 0;
     }
     for(int32_t h=0;h<H;h++)for(int32_t w=0;w<W;w++)for(int32_t ii=0;ii<I;ii++)for(int32_t oo=0;oo<O;oo++) {

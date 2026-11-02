@@ -171,7 +171,7 @@ static const uint8_t dm_lad_u32[2][3]={{0,1,5},{0,0,5}};
  * the destination and only reads the source (the blocks are disjoint), so
  * parts are independent. Small jobs stay on the caller. */
 #ifndef PAR_DM_MIN_ELEMS
-#define PAR_DM_MIN_ELEMS 262144u
+#define PAR_DM_MIN_ELEMS 8192u /* Frame sweep: flat below 8K (t4c) */
 #endif
 static uint32_t dm_parts(const G *g, uint64_t elems, int64_t items) {
     if(elems<PAR_DM_MIN_ELEMS || items<2) return 1;

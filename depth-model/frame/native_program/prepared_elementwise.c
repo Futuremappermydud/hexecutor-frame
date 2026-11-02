@@ -235,7 +235,7 @@ static int linearclip_validate(const Nprg2ExecCall *c,void *ctx) {
  * pixel rows are distinct 256-byte rows of the blocks and the stores are
  * byte-masked, so parts write disjoint bytes and read only inputs. */
 #ifndef PAR_EW_MIN_ELEMS
-#define PAR_EW_MIN_ELEMS 131072u
+#define PAR_EW_MIN_ELEMS 8192u /* Frame sweep 2K-32K: flat below 8K (t4c) */
 #endif
 #define EW_SPLIT(T,t,h0,h1) do { (t).dims[1]=(h1)-(h0); (t).origin[1]+=(h0); } while(0)
 static int ew_range(int32_t H,uint32_t part,uint32_t parts,int32_t *h0,int32_t *h1) {
