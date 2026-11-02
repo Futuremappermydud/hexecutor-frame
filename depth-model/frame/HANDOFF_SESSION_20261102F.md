@@ -10,7 +10,7 @@ the hw oracle first; a QNN-like non-exact mode later, behind a flag. All gating 
 1. **Alternate gate on HEAD.** `sh frame/bench/ab.sh -t alt l2hw` (full: both models). Nothing this session was
    checked on the alternate model on silicon (host gates pass on both). `QDS_POOL1_NOCOPY` was also only checked on
    primary (session E).
-2. **Read the concurrency bisect result** (section 3). It was still running on the Frame when this was written:
+2. **Concurrency bisect finished: exact, no gain** (section 3). Results:
    report dir `../spatial-stuff-wt/gate/depth-model/frame/build/ab/ovlp/`, log in the session scratchpad
    (`gate_ovlp.log`). Variants `base` (flag off), `o1` (`QDS_OVERLAP_LIMIT=1`), `o64`, `ofull`. If the Frame hung,
    recover it (session E section 6) before anything else.
@@ -70,10 +70,27 @@ removed ~1.2 ms of that. Re-profile before more work here: `HMX_PROF=k` moves su
 (prepared_hmx_conv.inc line ~35 lists the steps; 5 and 9 add the normally-untimed entry segments). Build all steps in
 one `ab.sh -q` call: `p1:<l2hw set>+-DHMX_PROF=1 p2:... ` (session scratch has the loop).
 
-## 3. In flight: command-level concurrency (`-DNPRG2_OVERLAP=1`, off by default)
+## 3. Command-level concurrency (`-DNPRG2_OVERLAP=1`, off by default): exact on silicon, NO gain yet
 
 Patch: `../spatial-stuff-wt/a-exec/depth-model/.work/agent.patch` (merges cleanly on 252e279; host gates incl. the
 permuted-order tests pass on both models). Not committed.
+
+**Frame bisect result (tag `ovlp`, all exact, no hang):**
+
+| Variant | Steady | Random | First run |
+|---|---:|---:|---:|
+| `base` (flag off) | 28.7 | 28.5 / 28.3 | 123 ms |
+| `o1` (LIMIT=1) | 28.8 | 28.9 / 28.9 | 398 ms |
+| `o64` | 29.0 | 29.0 / 29.0 | 391 ms |
+| `ofull` | 28.9 | 29.2 / 28.7 | 399 ms |
+
+Conv u8 MAC (HMX wait) stayed 5.3 ms in every variant, so nothing was hidden under it. **Unknown whether any
+command actually ran early**: `Nprg2ExecStats` has `nested_cmds, nested_cycles, polls, hosts_with_work`
+(prepared_executor.h ~228) but they are not exported to the report. Next step: export them through the result/trace
+words in `qd_graph_prepared.h` into the JSON, re-run `ofull`. If `polls` is ~0, the wait loops find HMX already done
+on first check (poll placement is wrong: it must run before/independently of the first completion test); if polls
+and nested_cmds are high but MAC didn't shrink, the nested work is serialising with HMX on worker 0 (then it has to
+go to the follower threads instead). The first-run cost (+275 ms plan build) must also come down before committing.
 - `nprg2_overlap_plan` (prepared_fuse.c): per conv, later commands with no RAW/WAR/WAW conflict with the conv, its
   fused epilogue, or anything in between (pool-1 2 KiB blocks + whole-pool masks). Built at preflight (~180 ms
   one-time on first run), stored in stats.
@@ -92,7 +109,7 @@ permuted-order tests pass on both models). Not committed.
 
 Kernel-by-kernel patching is now worth ~0.2-1 ms per item. The remaining 2.8x needs structural changes.
 
-1. **Concurrency** (section 3). Biggest single item if silicon tolerates it. If `ofull` is exact and faster, commit
+1. **Concurrency** (section 3). Exact on silicon but no gain yet; first find out whether anything ran early. If it can be made faster, commit
    with the flag on in `l2hw`, then tune WINDOW/PER_HOST/BLOCKS.
 2. **6/33 HMX throughput (8.4 ms, 5.3 ms of it HMX wait).** Staging, setup, rolling windows and chunk overlap all
    gave nothing. Model runs these convs much faster, so QNN's issue pattern differs (larger ops per call,
