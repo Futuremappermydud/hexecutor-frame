@@ -40,6 +40,35 @@
 #define HMX_PROF 0
 #endif
 #define HMX_MARK(step) do { if(clock){t1=clock();c->phase[HMX_PROF==(step)?3:HMX_SETUP_SLOT]+=t1-t0;t0=t1;} } while(0)
+/* Fi words (per 32 channels: 32 requant words, 32 offsets; then a block of
+ * 32 x 0x404000 and 32 zeros) into the workspace at base. fipre, when given,
+ * holds the first NB*256 bytes already built (HVX vectors, 128-aligned);
+ * otherwise they are built in the near buffer nf from corr/pre/Mq. */
+static void hmx_fi_put(uint8_t *base, int32_t NB, int32_t co, const uint8_t *fipre, int32_t *nf, const int32_t *corr,
+                       const int32_t *pre, const int32_t *Mq) {
+#if BLK_HVX
+    if(fipre) {
+        const HVX_Vector *s=(const HVX_Vector *)fipre;HVX_Vector *d=(HVX_Vector *)base;
+        int32_t n=NB*2,i=0;
+        for(;i+4<=n;i+=4) {
+            HVX_Vector a0=s[i],a1=s[i+1],a2=s[i+2],a3=s[i+3];
+            d[i]=a0;d[i+1]=a1;d[i+2]=a2;d[i+3]=a3;
+        }
+        for(;i<n;i++) d[i]=s[i];
+        d[n]=Q6_V_vsplat_R(0x404000);d[n+1]=Q6_V_vzero();
+        return;
+    }
+#else
+    (void)fipre;
+#endif
+    int32_t *nz=nf+NB*64;
+    for(int32_t k=0;k<co;k++) {
+        nf[(k>>5)*64+(k&31)]=(int32_t)(0x400000u|((uint32_t)(20-pre[k])<<10)|(uint32_t)(Mq[k]-1024));
+        nf[(k>>5)*64+32+(k&31)]=corr[k];
+    }
+    for(int k=0;k<64;k++) nz[k]=k<32?0x404000:0;
+    near_copy(base,(const uint8_t *)nf,(size_t)NB*256+256);
+}
 typedef struct {
     G *g; const T *xt, *o;
     int32_t oh, ow, KB, NB, total, m0, mt; /* tiles m0..m0+mt-1 of total */
@@ -529,7 +558,7 @@ static uint32_t slide_used;
  * 1 ran (or would, dry), 0 not eligible (no side effects), -1 error. */
 static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int32_t cbs, int32_t co, int32_t oh,
                      int32_t ow, const uint32_t *ktab, const int32_t *corr, const int32_t *pre, const int32_t *Mq,
-                     const int8_t *wbase, int staged, size_t at, int32_t *err) {
+                     const int8_t *wbase, int staged, const uint8_t *fipre, size_t at, int32_t *err) {
     const Nprg2ReferenceConv *c=g->conv;
     if(!c->hmx->slide3_n || KB!=9*cbs || cbs<1 || cbs>8) return 0;
 #ifdef SLIDE_LIMIT
@@ -547,7 +576,7 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
     const int32_t R0=xt->p[1]>>3,C0=xt->p[2]>>3;
     /* every present input block of the windows 2048-aligned (else not eligible) */
     {
-        Memo *mm=g->dry?NULL:memo_for(g->call);
+        Memo *mm=g->dry?NULL:gmemo(g);
         uint8_t *mb=mm?&mm->slide[g->call->command_index]:NULL;
         if(!mb || !*mb) {
             int ok=1;
@@ -597,16 +626,12 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
     (void)S;
     uint8_t *n=c->near;
     {
-        int32_t *nf=(int32_t *)n; /* the start of near is free again here (o_fi area of hmx_native) */
-        nf=(int32_t *)(n+nbump(&at,(size_t)NB*256+256));
-        if(at>c->near_bytes) return 0;
-        int32_t *nz=nf+NB*64;
-        for(int32_t k=0;k<co;k++) {
-            nf[(k>>5)*64+(k&31)]=(int32_t)(0x400000u|((uint32_t)(20-pre[k])<<10)|(uint32_t)(Mq[k]-1024));
-            nf[(k>>5)*64+32+(k&31)]=corr[k];
+        int32_t *nf=NULL;
+        if(!fipre) {
+            nf=(int32_t *)(n+nbump(&at,(size_t)NB*256+256));
+            if(at>c->near_bytes) return 0;
         }
-        for(int k=0;k<64;k++) nz[k]=k<32?0x404000:0;
-        near_copy(base,(const uint8_t *)nf,(size_t)NB*256+256);
+        hmx_fi_put(base,NB,co,fipre,nf,corr,pre,Mq);
     }
     {HVX_Vector z=Q6_V_vzero();for(int i=0;i<16;i++)((HVX_Vector *)zblk)[i]=z;}
     /* HVX stores (Fi, zero block) must land before HMX reads them: on silicon
@@ -705,12 +730,12 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
 static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int32_t cbs, int32_t co, int32_t oh,
                       int32_t ow, const uint32_t *ktab, const int32_t *corr, const int32_t *pre, const int32_t *Mq,
                       const int8_t *wbase, int bcopy, int32_t kvec, const uint32_t *s2off, uint32_t js, int32_t xrows, int32_t xwb0,
-                      int32_t xnwb, uint8_t **xtab, size_t at, int32_t *err) {
+                      int32_t xnwb, uint8_t **xtab, const uint8_t *fipre, int hit, size_t at, int32_t *err) {
     const Nprg2ReferenceConv *c=g->conv;
     if(!xtab || (BLK_HVX && !c->hmx->native_n)) return 0;
     if(oh%8 || ow%8 || o->p[1]%8 || o->p[2]%8) return 0;
     if(g->fx.kind && (g->fx.oe.p[1]%8 || g->fx.oe.p[2]%8 || (g->fx.kind==2 && (g->fx.ob.p[1]%8 || g->fx.ob.p[2]%8)))) return 0;
-    for(int32_t k=0;k<co;k++) if(pre[k]<0 || pre[k]>20) return 0;
+    if(!hit) for(int32_t k=0;k<co;k++) if(pre[k]<0 || pre[k]>20) return 0;
     uint64_t (*clock)(void)=c->phase && !g->dry?c->clock:NULL,t0=clock?clock():0,t1;
     const int32_t bw=ow/8,total=(oh/8)*bw;
     /* :cm stores need 2048-aligned blocks; pool blocks are only 128-aligned.
@@ -719,7 +744,7 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
      * of conv_checked are free for convs). */
     int fused=g->fx.kind!=0,staged=fused;
     if(!staged) {
-        Memo *mm=g->dry?NULL:memo_for(g->call);
+        Memo *mm=g->dry?NULL:gmemo(g);
         uint8_t *mb=mm?&mm->conv_checked[g->call->command_index]:NULL;
         if(mb && (*mb&64u)) staged=!!(*mb&128u);
         else {
@@ -733,7 +758,7 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
     }
 #if BLK_HVX && defined(NPRG2_SLIDE3) && NPRG2_SLIDE3
     if(!bcopy) {
-        int r=hmx_slide(g,xt,o,KB,NB,cbs,co,oh,ow,ktab,corr,pre,Mq,wbase,staged,at,err);
+        int r=hmx_slide(g,xt,o,KB,NB,cbs,co,oh,ow,ktab,corr,pre,Mq,wbase,staged,fipre,at,err);
         if(r) return r;
     }
 #endif
@@ -743,7 +768,7 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
     int32_t mt=(int32_t)((c->workspace_bytes-fixed-bsz-2048-2048)/per);
     if(mt>total) mt=total;
     uint8_t *n=c->near;
-    size_t o_fi=nbump(&at,(size_t)NB*256+256),o_tyx=nbump(&at,(size_t)mt*8),o_out=nbump(&at,(size_t)NB*mt*sizeof(uint8_t *));
+    size_t o_fi=fipre?0:nbump(&at,(size_t)NB*256+256),o_tyx=nbump(&at,(size_t)mt*8),o_out=nbump(&at,(size_t)NB*mt*sizeof(uint8_t *));
     if(at>c->near_bytes) return 0;
     g->wused=0;
     uint8_t *ws=walloc(g,fixed+bsz+2048+(size_t)mt*per+2048);
@@ -765,15 +790,7 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
         }
         wbase=(const int8_t *)Bc;
     }
-    {
-        int32_t *nf=(int32_t *)(n+o_fi),*nz=nf+NB*64;
-        for(int32_t k=0;k<co;k++) {
-            nf[(k>>5)*64+(k&31)]=(int32_t)(0x400000u|((uint32_t)(20-pre[k])<<10)|(uint32_t)(Mq[k]-1024));
-            nf[(k>>5)*64+32+(k&31)]=corr[k];
-        }
-        for(int k=0;k<64;k++) nz[k]=k<32?0x404000:0;
-        near_copy(base,(const uint8_t *)nf,(size_t)NB*256+256);
-    }
+    hmx_fi_put(base,NB,co,fipre,fipre?NULL:(int32_t *)(n+o_fi),corr,pre,Mq);
     HMX_MARK(6);
     hmx_tab(xtab,g->pool,xt,xt->p[1],xrows,xwb0,xnwb,cbs);
     HMX_MARK(7);
@@ -876,7 +893,7 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     int32_t on[4]={1,oh,ow,co},oorigin[4]={0,o->p[1],o->p[2],0};
     {
         /* bits 0..2: checks passed with epilogue kind 0..2 (bits 3..5 are fast_conv's) */
-        Memo *mm=g->dry || g->fx.kind<0 || g->fx.kind>2?NULL:memo_for(g->call);
+        Memo *mm=g->dry || g->fx.kind<0 || g->fx.kind>2?NULL:gmemo(g);
         uint8_t bit=(uint8_t)(1u<<(g->fx.kind&3));
         if(!mm || !(mm->conv_checked[g->call->command_index]&bit)) {
             if(xfer_check(g,xt,dims,origin,0) || xfer_check(g,o,on,oorigin,1) ||
@@ -913,39 +930,60 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     const int64_t bound=(int64_t)KB*32*255*128;
     /* The filter rows (per 32 channels: 32 mults, 32 biases) are in VTCM:
      * one vector copy to near instead of scalar VTCM loads. */
-    int vec_done=0;
+    int vec_done=0,fic_hit=0;
+    const uint8_t *fipre=NULL;
+#if BLK_HVX && NPRG2_HW_ROUNDING
+    /* Static weights (class Xwb) and constant filter rows: the Fi words are the same on every run. */
+    Memo *cm=NULL;
+    if(!g->dry && wt->cls==('X'|'w'<<8|'b'<<16) && ft->pool==5 && !g->write_limit[5]) cm=gmemo(g);
+    if(cm && cm->fic[g->call->command_index]) {
+        fipre=cm->fic_buf+(cm->fic[g->call->command_index]-1u);
+        fic_hit=1;vec_done=1;
+    }
+#endif
 #if BLK_HVX
-    /* Vector form of everything up to HMX_MARK(2) for the plain (not bcopy)
-     * layout: per block, M = 1024+(mult&1023), pre = 20-((mult>>10)&31)
-     * (post is 14 by construction), wsum by vrmpy, corr = bias - zp*wsum in
-     * int32 (|wsum| <= KB*4096 and 0 <= zp <= 255, |bias| < 2^30 checked).
+    /* Vector form of everything up to HMX_MARK(2): per block, M = 1024+(mult&1023),
+     * pre = 20-((mult>>10)&31) (post is 14 by construction), wsum by vrmpy,
+     * corr = bias - zp*wsum in int32 (|wsum| <= KB*4096 and 0 <= zp <= 255,
+     * |bias| < 2^30 checked). The native Fi word is 0x400000|(mult&0x7fff).
      * Any lane outside the scalar checks: the scalar code decides. */
-    if(!bcopy && xt->zp>=0 && xt->zp<=255 && bound<(1ll<<30)) {
+    if(!vec_done && xt->zp>=0 && xt->zp<=255 && bound<(1ll<<30)) {
         uint8_t *nr=n+o_rows;
         near_copy(nr,g->pool[ft->pool]+ft->offset,(size_t)NB*256);
         const HVX_Vector ones=Q6_V_vsplat_R(0x01010101),m1023=Q6_V_vsplat_R(1023),m31=Q6_V_vsplat_R(31),
                          c1024=Q6_V_vsplat_R(1024),c20=Q6_V_vsplat_R(20),zero=Q6_V_vzero(),c15=Q6_V_vsplat_R(15),
-                         lim=Q6_V_vsplat_R((int32_t)(INT32_MAX-bound)),b30=Q6_V_vsplat_R(1<<30);
+                         lim=Q6_V_vsplat_R((int32_t)(INT32_MAX-bound)),b30=Q6_V_vsplat_R(1<<30),
+                         m7fff=Q6_V_vsplat_R(0x7fff),f40=Q6_V_vsplat_R(0x400000);
         HVX_VectorPred badq=Q6_Q_vcmp_gt_VwVw(zero,zero);
+        HVX_Vector *fiq=(HVX_Vector *)(n+o_fi);
         for(int32_t j=0;j<NB;j++) {
             HVX_Vector mv=*(const HVX_Vector *)(nr+(size_t)j*256),bv=*(const HVX_Vector *)(nr+(size_t)j*256+128);
             HVX_Vector Mv=Q6_Vw_vadd_VwVw(c1024,Q6_V_vand_VV(mv,m1023));
             HVX_Vector pv=Q6_Vw_vsub_VwVw(c20,Q6_V_vand_VV(Q6_Vuw_vlsr_VuwR(mv,10),m31));
             HVX_Vector a=zero;
             if(xt->zp) {
-                const int8_t *b=wbase+(size_t)j*KB*1024;
-                for(int32_t r=0;r<KB*8;r++) a=Q6_Vw_vrmpyacc_VwVbVb(a,((const HVX_Vector *)b)[r],ones);
+                if(bcopy) {
+                    for(int32_t k=0;k<KB;k++) {
+                        const int8_t *b=wbase+s2off[k]+(size_t)j*js;
+                        for(int32_t r=0;r<kvec;r++) a=Q6_Vw_vrmpyacc_VwVbVb(a,*(const HVX_UVector *)(b+128*r),ones);
+                    }
+                } else {
+                    const int8_t *b=wbase+(size_t)j*KB*1024;
+                    for(int32_t r=0;r<KB*8;r++) a=Q6_Vw_vrmpyacc_VwVbVb(a,((const HVX_Vector *)b)[r],ones);
+                }
             }
             HVX_Vector off=Q6_Vw_vsub_VwVw(bv,Q6_Vw_vmpyi_VwRh(a,(int32_t)((uint32_t)xt->zp|(uint32_t)xt->zp<<16)));
             badq=Q6_Q_or_QQ(badq,Q6_Q_or_QQ(Q6_Q_vcmp_gt_VwVw(zero,pv),Q6_Q_vcmp_gt_VwVw(pv,c15)));
             badq=Q6_Q_or_QQ(badq,Q6_Q_vcmp_gt_VwVw(Q6_Vw_vabs_Vw_sat(bv),b30));
             badq=Q6_Q_or_QQ(badq,Q6_Q_vcmp_gt_VwVw(Q6_Vw_vabs_Vw_sat(off),lim));
             *(HVX_Vector *)(Mq+32*j)=Mv;*(HVX_Vector *)(pre+32*j)=pv;*(HVX_Vector *)(corr+32*j)=off;
+            fiq[2*j]=Q6_V_vor_VV(f40,Q6_V_vand_VV(mv,m7fff));fiq[2*j+1]=off;
         }
         HVX_Vector flag __attribute__((aligned(128)))=Q6_V_vand_QR(badq,0x01010101u);
         const uint32_t *fw=(const uint32_t *)&flag;uint32_t any=0;
         for(int q=0;q<32;q++) any|=fw[q];
         vec_done=!any;
+        if(vec_done) fipre=(const uint8_t *)fiq;
     }
 #endif
     if(!vec_done) {
@@ -1009,8 +1047,24 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     uint8_t *nat_snap=NULL;int32_t nat_dims[4]={1,oh,ow,co},nat_org[4]={0,o->p[1],o->p[2],0};
 #endif
     {
+#if BLK_HVX && NPRG2_HW_ROUNDING
+        uint32_t fic_at=0;
+        if(cm && vec_done && !fic_hit && cm->fic_used+(uint32_t)NB*256<=(uint32_t)FIC_BYTES) {
+            /* first run of a static-weight conv: keep its Fi words (committed below once it ran native) */
+            fic_at=cm->fic_used;
+            const HVX_Vector *fs=(const HVX_Vector *)fipre;HVX_Vector *fd=(HVX_Vector *)(cm->fic_buf+fic_at);
+            for(int32_t i=0;i<NB*2;i++) fd[i]=fs[i];
+        }
+#endif
         int r=hmx_native(g,xt,o,KB,NB,cbs,co,oh,ow,ktab,corr,pre,Mq,wbase,bcopy,kvec,s2off,js,xrows,xwb0,xnwb,
-                         use_tab?(uint8_t **)(n+o_xtab):NULL,at,err);
+                         use_tab?(uint8_t **)(n+o_xtab):NULL,vec_done?fipre:NULL,fic_hit,at,err);
+#if BLK_HVX && NPRG2_HW_ROUNDING
+        if(r==1 && cm && !g->dry && vec_done && !fic_hit && cm->fic_used+(uint32_t)NB*256<=(uint32_t)FIC_BYTES) {
+            cm->fic[g->call->command_index]=fic_at+1u;
+            cm->fic_used=fic_at+(uint32_t)NB*256;
+        }
+        if(fic_hit && r==0) return 0; /* cannot differ from the first run; the other paths do not need the tables */
+#endif
 #ifdef NAT_CHECK
         if(r==1 && !g->dry && !g->fx.kind) {
             nat_snap=malloc((size_t)oh*ow*co);
@@ -1261,7 +1315,7 @@ static int hmx_native16(G *g, const T *xt, const T *wt, const T *ft, const T *o,
     int32_t on[4]={1,oh,ow,co},oorigin[4]={0,o->p[1],o->p[2],0};
     {
         /* bit 0 of conv_checked (the u8 HMX bits are free for u16 convs) */
-        Memo *mm=g->dry?NULL:memo_for(g->call);
+        Memo *mm=g->dry?NULL:gmemo(g);
         if(!mm || !(mm->conv_checked[g->call->command_index]&1u)) {
             if(xfer_check(g,xt,dims,origin,0) || xfer_check(g,o,on,oorigin,1) ||
                blocked_overlap(xt,dims,origin,o,on,oorigin)) return 0;

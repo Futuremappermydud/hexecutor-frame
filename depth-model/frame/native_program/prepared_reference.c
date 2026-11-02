@@ -103,6 +103,7 @@ typedef struct {
     uint32_t par_slots; /* usable helper near slots (Nprg2ReferenceConv.par_near) */
     void *chk_memo;     /* data-mover check memo (chk_slots), resolved lazily */
     int chk_state;      /* 0 unresolved, 1 resolved (chk_memo may be NULL) */
+    void *cm; uint64_t lim; int cm_ok, lim_ok; /* memo_limits / memo_for of g->call, computed once per call */
 } G;
 
 static uint32_t rd32(const uint8_t *p){return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
@@ -160,6 +161,9 @@ static int64_t clip64(int64_t v, int64_t lo, int64_t hi) {return v<lo?lo:v>hi?hi
 static int64_t dtmax(uint32_t dt) {return dt==DT_U8?255:dt==DT_U16?65535:dt==DT_I8?127:dt==DT_I16?32767:2147483647;}
 static int64_t s32(uint64_t v) {return (int64_t)(int32_t)(uint32_t)v;}
 
+#ifndef FIC_BYTES_CFG
+#define FIC_BYTES_CFG (64*1024)
+#endif
 /* Per-command memos, keyed by (program, command index); two programs (the
  * two models) are kept. Not thread-safe: reference commands run on the
  * executor's thread.
@@ -169,7 +173,7 @@ static int64_t s32(uint64_t v) {return (int64_t)(int32_t)(uint32_t)v;}
  * conv_checked: bit k set once hmx_conv's bounds checks (xfer_check,
  *   blocked_overlap: geometry and pool limits only) passed with epilogue kind
  *   k, so later runs skip them. Pool bases/limits are part of the key. */
-enum { MEMO_COMMANDS=8192, CHK_SLOTS=4 };
+enum { MEMO_COMMANDS=8192, CHK_SLOTS=4, FIC_BYTES=FIC_BYTES_CFG };
 typedef struct {
     const void *program;
     uint64_t limits;
@@ -178,6 +182,13 @@ typedef struct {
     uint8_t chain[MEMO_COMMANDS]; /* chain_run's wrapped validate: 0 unknown, 1 passed, 2 rejected */
     uint8_t slide[MEMO_COMMANDS]; /* hmx_slide's input-block alignment: 0 unknown, 1 aligned, 2 not */
     uint32_t chk[MEMO_COMMANDS][CHK_SLOTS]; /* data-mover check verdicts, see chk_hit */
+    /* hmx_conv: per-command Fi words (NB*256 bytes: requant word and offset vectors per 32 channels) of
+     * static-weight convs (class Xwb weights, constant filter pool), built from the weights and filter
+     * rows once. fic[cmd] = 0 or arena byte offset + 1. Weights are written only by weights_to_vtcm
+     * from constants, filter rows are constants, so the Fi words are a property of the bound program. */
+    uint32_t fic[MEMO_COMMANDS];
+    uint32_t fic_used;
+    uint8_t fic_buf[FIC_BYTES] __attribute__((aligned(128)));
 } Memo;
 static Memo memos[2];
 static uint32_t memo_next;
@@ -197,15 +208,19 @@ static uint64_t memo_limits(const Nprg2ExecCall *c) {
     last.wr=c->pool1_writable_bytes;last.h=h;last.valid=1;
     return h;
 }
-static Memo *memo_for(const Nprg2ExecCall *c) {
+static Memo *memo_for_lim(const Nprg2ExecCall *c, uint64_t lim) {
     if(!c->program || c->command_index>=MEMO_COMMANDS) return NULL;
-    uint64_t lim=memo_limits(c);
     for(int i=0;i<2;i++) if(memos[i].program==c->program && memos[i].limits==lim) return &memos[i];
     Memo *m=&memos[memo_next++&1u];
     m->program=c->program;m->limits=lim;
     memset(m->need,0xff,sizeof m->need);memset(m->conv_checked,0,sizeof m->conv_checked);memset(m->chain,0,sizeof m->chain);memset(m->slide,0,sizeof m->slide);memset(m->chk,0,sizeof m->chk);
+    memset(m->fic,0,sizeof m->fic);m->fic_used=0;
     return m;
 }
+static Memo *memo_for(const Nprg2ExecCall *c) {return memo_for_lim(c,memo_limits(c));}
+/* The same, computed once per call (the hash of the pool table is not free). */
+static uint64_t g_limits(G *g) {if(!g->lim_ok){g->lim=memo_limits(g->call);g->lim_ok=1;}return g->lim;}
+static Memo *gmemo(G *g) {if(!g->cm_ok){g->cm=memo_for_lim(g->call,g_limits(g));g->cm_ok=1;}return (Memo *)g->cm;}
 static uint32_t *memo_slot(const Nprg2ExecCall *c) {
     Memo *m=memo_for(c);
     return m?&m->need[c->command_index]:NULL;
@@ -702,7 +717,7 @@ static uint8_t *strip_buffer(G *g, size_t *room) {
 /* 1 when the regions of it and ot (both d at p) share no byte, so strips
  * can run in any order. Memoised per command (conv_checked bits 6..7). */
 static int strip_disjoint(G *g, const T *it, const T *ot) {
-    Memo *mm=memo_for(g->call);
+    Memo *mm=gmemo(g);
     uint8_t *mb=mm?&mm->conv_checked[g->call->command_index]:NULL;
     if(mb && (*mb&64u)) return !!(*mb&128u);
     int ok=0;
@@ -3040,7 +3055,7 @@ static int fast_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, in
         /* checked/direct depend on geometry and pool limits only: memoised
          * per command after the first non-dry evaluation (bits 3..5 of
          * conv_checked: known, checked, direct). */
-        Memo *mm=g->dry?NULL:memo_for(g->call);
+        Memo *mm=g->dry?NULL:gmemo(g);
         uint8_t *mb=mm?&mm->conv_checked[g->call->command_index]:NULL;
         if(mb && (*mb&8u)) {checked=!!(*mb&16u);direct=!!(*mb&32u);}
         else {
@@ -3539,7 +3554,7 @@ enum { FZ_CACHE=256 };
 static struct { const void *program; uint64_t limits; uint32_t cmd, valid; Fuse fx; } fz_cache[FZ_CACHE];
 static int fuse_cached(G *g, const T *xt, const T *wt, const T *ft, const T *o) {
     const Nprg2ExecCall *c=g->call;
-    uint64_t lim=memo_limits(c);
+    uint64_t lim=g_limits(g);
     uint32_t i=c->command_index&(FZ_CACHE-1u);
     if(!g->dry && fz_cache[i].valid && fz_cache[i].program==c->program && fz_cache[i].limits==lim &&
        fz_cache[i].cmd==c->command_index) {
@@ -3689,7 +3704,7 @@ static int setup_ex(G *g, const Nprg2ExecCall *c, int dry, int measure, const Np
     memset(g,0,offsetof(G,in));
     g->measure_only=0;g->conv=NULL;g->wused=0;
     g->fx.kind=g->fx.dead=0;g->fx.mc=g->fx.mo=g->fx.rd=g->fx.sh=0;g->fx.eb=g->fx.bb=NULL;
-    g->fx_ok=0;g->par_slots=0;g->chk_memo=NULL;g->chk_state=0;
+    g->fx_ok=0;g->par_slots=0;g->chk_memo=NULL;g->chk_state=0;g->cm=NULL;g->lim=0;g->cm_ok=g->lim_ok=0;
     if(!c || !c->program || !c->bound || !c->pools) FAIL(E_ARGS);
     const Nprg2Command *k=&c->command;
     if(!variant_matches(k->opcode,k->variant)) FAIL(E_ARGS);
