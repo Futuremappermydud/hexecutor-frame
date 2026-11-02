@@ -25,11 +25,24 @@ typedef struct { volatile uint32_t active,error; uint64_t saved[QDO_SLOTS]; } Qd
  * L2 is configured as TCM. Invalidate every private page on both transitions:
  * an earlier session may have used a different cache attribute. */
 static int qdo_cached_page(uint32_t i){return i==0 || i==2 || i==3;}
+static uint32_t qdo_page_attr(uint32_t i){
+#if QDS_L2_CACHE
+    if(i==7)return 7u;
+    if(i==0 || i==2 || i==3)return QDO_SCALAR_CACHE;
+    return 6u;
+#else
+    return qdo_cached_page(i)?QDO_SCALAR_CACHE:6u;
+#endif
+}
 static void qdo_clean(int publish) {
     for(uint32_t i=0;i<QDO_SLOTS;i++)
         for(uint32_t off=0;off<0x1000000u;off+=32) {
             uint32_t p=QDO_BASE+i*0x1000000u+off;
-            if(publish && qdo_cached_page(i))
+            if(publish && (qdo_cached_page(i)
+#if QDS_L2_CACHE
+                           || i==7
+#endif
+                           ))
                 __asm__ volatile("dccleaninva(%0)"::"r"(p):"memory");
             else __asm__ volatile("dcinva(%0)"::"r"(p):"memory");
         }
@@ -56,7 +69,7 @@ static uint32_t qdo_map(QdoMap *s) {
     for(uint32_t i=0;i<QDO_SLOTS;i++) {
         uint32_t pn=(QDO_BASE>>12)+i*0x1000u;
         uint64_t e=((uint64_t)(0xc0000000u|pn)<<32)|
-                   ((qdo_cached_page(i)?(0xf0000000u|((uint32_t)QDO_SCALAR_CACHE<<24)):0xf6000000u)|(pn<<1)|0x40u);
+                   ((0xf0000000u|(qdo_page_attr(i)<<24))|(pn<<1)|0x40u);
         qdo_tlbw(QDO_FIRST+i,e);
     }
     qdo_clean(0);

@@ -7,8 +7,8 @@
 #define QDS_L2_CACHE 0
 #endif
 #if QDS_L2_CACHE
-#include "qd_l2_cache.h"
-static const char qds_l2_boot_feature[] __attribute__((used))="QDL2BOOT01";
+/* Boot is unchanged in L2 mode; the engine owns the lease (qd_l2_cache.h). */
+static const char qds_l2_boot_feature[] __attribute__((used))="QDL2BOOT02";
 #endif
 #ifndef QDS_PRESERVE_VTCM
 #define QDS_PRESERVE_VTCM 0
@@ -130,17 +130,11 @@ __attribute__((section(".text.entry"))) void payload(void) {
     }
     __asm__ volatile("barrier":::"memory");
     if(!sync[4]) {
-        volatile uint32_t *guard=(volatile uint32_t *)(
-#if QDS_L2_CACHE
-            tid==0?QDS_L2_STACK_BASE:
-#endif
-            0x30080000u+tid*0x10000u);
+        /* L2 mode too: the engine switches worker 0 to a DDR stack only
+         * inside its cache lease (qd_l2_cache.h). */
+        volatile uint32_t *guard=(volatile uint32_t *)(0x30080000u+tid*0x10000u);
         for(uint32_t i=0;i<32;i++)guard[i]=0x7154c9a3u;
-        qds_on_stack((void (*)(uint32_t))QDO_BASE,tid,
-#if QDS_L2_CACHE
-            tid==0?QDS_L2_STACK_TOP:
-#endif
-            0x30090000u+tid*0x10000u);
+        qds_on_stack((void (*)(uint32_t))QDO_BASE,tid,0x30090000u+tid*0x10000u);
         for(uint32_t i=0;i<32;i++)if(guard[i]!=0x7154c9a3u)sync[4]=9;
     }
     __asm__ volatile("barrier":::"memory");sync[1+tid]=1;

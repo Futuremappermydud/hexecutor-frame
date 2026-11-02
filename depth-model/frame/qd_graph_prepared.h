@@ -9,7 +9,7 @@
 #endif
 #if QDS_L2_CACHE
 #include "qd_l2_cache.h"
-static const volatile char qds_l2_engine_feature[] __attribute__((used))="QDL2ENGN01";
+static const volatile char qds_l2_engine_feature[] __attribute__((used))="QDL2ENGN03";
 #endif
 #if QDS_PREPARED_PREPROCESS
 #include "native_program/prepared_preprocess.h"
@@ -30,7 +30,14 @@ static const volatile char qds_l2_engine_feature[] __attribute__((used))="QDL2EN
  * Profiles: per-variant cycles in g->stats, conv phases (staging, MAC,
  * requant, output write) in g->dsp_conv_phase[0..3]. */
 #define QDS_REFERENCE_SCRATCH_BYTES 0x100000u
+#if QDS_L2_CACHE
+/* Scalar-heavy conv state: C7 DDR hits L1/L2; VTCM scalar loads are slow. */
+#define QDS_REFERENCE_NEAR QDS_L2_NEAR
+#define QDS_ELEMENTWISE_L2 QDS_L2_ELEMENTWISE
+#else
 #define QDS_REFERENCE_NEAR 0x30078000u
+#define QDS_ELEMENTWISE_L2 0x300f8000u
+#endif
 #define QDS_REFERENCE_NEAR_BYTES 0x8000u
 #define QDS_REFERENCE_CHAINS 64u
 /* With QDS_PREPARED_ELEMENTWISE the HVX add/requant/linearclip handlers (13,
@@ -41,7 +48,6 @@ static const volatile char qds_l2_engine_feature[] __attribute__((used))="QDL2EN
  * ends at 0x300ef000 and the worker stacks at 0x300b0000. Demand is 30,748
  * bytes on Hexagon. They stay chained to the reference kernel, so a command
  * their validator rejects still runs the reference kernel in region 0. */
-#define QDS_ELEMENTWISE_L2 0x300f8000u
 #define QDS_ELEMENTWISE_L2_BYTES 0x8000u
 static const volatile char prepared_reference_feature[]="QD_PREPARED_REF_1";
 #endif
@@ -182,8 +188,13 @@ static QdPreparedState *prepared_open(QdgGraph *g,const QdsConfig *cfg,
         .constants_sha256=(const uint8_t *)g->image+64,
         .source_sha256=source_sha,.prepared_sha256=(const uint8_t *)p->sha256};
     int e=nprg2_runner_open(&s->runner,(const void *)(QDO_BASE+p->offset),p->bytes,
-        &hashes,pools,(Nprg2Allocator){0},(void *)0x30002000u,0x76000u,
-        (void *)0x300b0000u,0x3f000u,0x3f000u,1);
+        &hashes,pools,(Nprg2Allocator){0},
+#if QDS_L2_CACHE
+        (void *)0xa7100000u,0x76000u,(void *)0xa7180000u,0x3f000u,
+#else
+        (void *)0x30002000u,0x76000u,(void *)0x300b0000u,0x3f000u,
+#endif
+        0x3f000u,1);
     if(e){free(s);return NULL;}
     nprg2_executor_init(&s->executor);
     s->native=(Nprg2NativeConfig){.active_vtcm_bytes=QD_DIRECT_ACTIVE_BYTES,
@@ -245,6 +256,50 @@ static QdPreparedState *prepared_open(QdgGraph *g,const QdsConfig *cfg,
     return s;
 }
 
+/* VTCM in, execute, VTCM out. In L2 mode this runs on the C7 DDR stack
+ * with L2 as cache, so it must not touch any 0x30xxxxxx address. */
+static int prepared_active(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t last,
+                           void *scratch,uint32_t scratch_bytes) {
+    volatile uint32_t *trace=(volatile uint32_t *)(SERVICE+1024u);
+    uint64_t t=now_ns();
+    dsp_clean_range(g->pool[1],QD_DIRECT_ACTIVE_BYTES);
+    dsp_packet_copy((void *)QD_DIRECT_VTCM_BASE,g->pool[1],QD_DIRECT_ACTIVE_BYTES);
+    g->dsp_read_cycles+=now_ns()-t;trace[1]=2;
+    qdrc_invalidate_native();g->resident_key=0;
+    int e=nprg2_runner_execute(&s->runner,&s->executor,first,last-first,QD_DIRECT_ACTIVE_BYTES,
+        s->inputs,4,s->outputs,2,g,scratch,scratch_bytes,prepared_cancel,NULL,&s->stats);
+    qdrc_invalidate_native();g->resident_key=0;
+    if(e)return e;
+    t=now_ns();dsp_packet_copy(g->pool[1],(void *)QD_DIRECT_VTCM_BASE,QD_DIRECT_ACTIVE_BYTES);
+    g->dsp_write_cycles+=now_ns()-t;trace[1]=7;
+    return 0;
+}
+#if QDS_L2_CACHE
+typedef struct {QdgGraph *g;QdPreparedState *s;uint32_t first,last;void *scratch;uint32_t scratch_bytes;
+                int e;uint32_t l2_error;} QdsLeaseCall;
+static QdsLeaseCall qds_lease_call;
+void qds_on_stack(void (*entry)(uint32_t),uint32_t arg,uint32_t stack_top);
+static void __attribute__((noinline)) prepared_leased(uint32_t unused) {
+    (void)unused;QdsLeaseCall *c=&qds_lease_call;QdsL2Cache l2;
+    volatile uint32_t *trace=(volatile uint32_t *)(SERVICE+1024u);
+    uint64_t t=now_ns();
+    if(qds_l2_begin(&l2)){c->l2_error=1;if(qds_l2_end(&l2))c->l2_error|=4;return;}
+    trace[4]=(uint32_t)(now_ns()-t);
+#if QDS_L2_POOL_C7
+    if(qds_l2_pool_cache(1)){c->l2_error=16;if(qds_l2_end(&l2))c->l2_error|=4;return;}
+#endif
+    qds_l2_lease_active=1;
+    c->e=prepared_active(c->g,c->s,c->first,c->last,c->scratch,c->scratch_bytes);
+    qds_l2_lease_active=0;
+    t=now_ns();
+#if QDS_L2_POOL_C7
+    if(qds_l2_pool_cache(0))c->l2_error|=32;
+#endif
+    if(qds_l2_end(&l2))c->l2_error|=8;
+    trace[5]=(uint32_t)(now_ns()-t);
+}
+#endif
+
 static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t last) {
     volatile uint32_t *trace=(volatile uint32_t *)(SERVICE+1024u);
     for(uint32_t q=0;q<16;q++)trace[q]=0;
@@ -285,29 +340,22 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
     if(e)goto failed;
     trace[1]=1;
 #if QDS_L2_CACHE
-    QdsL2Cache l2;
-    e=qds_l2_begin(&l2);
-    if(e){qds_l2_end(&l2);goto failed;}
+    /* Metadata was written by scalar code with L2 as TCM; publish it. */
+    dsp_clean_range(s->runner.l2_expanded_blocks,s->runner.l2_expanded_bytes);
+    dsp_clean_range(s->runner.l2_hot,s->runner.l2_hot_bytes);
+    volatile uint32_t *guard=(volatile uint32_t *)QDS_L2_STACK_BASE;
+    for(uint32_t i=0;i<32;i++)guard[i]=0x7154c9a3u;
+    qds_lease_call=(QdsLeaseCall){g,s,first,last,scratch,scratch_bytes,0,0};
+    qds_on_stack(prepared_leased,0,QDS_L2_STACK_TOP);
+    for(uint32_t i=0;i<32;i++)if(guard[i]!=0x7154c9a3u)qds_lease_call.l2_error|=2;
+    e=qds_lease_call.e;
+    trace[13]=qds_lease_call.l2_error;
+    if(qds_lease_call.l2_error){e=NPRG2_EXEC_ARGUMENT;goto failed;}
+#else
+    e=prepared_active(g,s,first,last,scratch,scratch_bytes);
 #endif
-    uint64_t t=now_ns();
-    dsp_clean_range(g->pool[1],QD_DIRECT_ACTIVE_BYTES);
-    dsp_packet_copy((void *)QD_DIRECT_VTCM_BASE,g->pool[1],QD_DIRECT_ACTIVE_BYTES);
-    g->dsp_read_cycles+=now_ns()-t;trace[1]=2;
-    qdrc_invalidate_native();g->resident_key=0;
-    e=nprg2_runner_execute(&s->runner,&s->executor,first,last-first,QD_DIRECT_ACTIVE_BYTES,
-        s->inputs,4,s->outputs,2,g,scratch,scratch_bytes,prepared_cancel,NULL,&s->stats);
-    qdrc_invalidate_native();g->resident_key=0;
-    if(e)goto failed_active;
-    t=now_ns();dsp_packet_copy(g->pool[1],(void *)QD_DIRECT_VTCM_BASE,QD_DIRECT_ACTIVE_BYTES);
-    g->dsp_write_cycles+=now_ns()-t;trace[1]=7;
-#if QDS_L2_CACHE
-    if(qds_l2_end(&l2)){e=NPRG2_EXEC_ARGUMENT;goto failed;}
-#endif
+    if(e)goto failed;
     trace[8]=s->stats.executed_commands;trace[9]=s->stats.validated_commands;return 0;
-failed_active:
-#if QDS_L2_CACHE
-    if(qds_l2_end(&l2))e=NPRG2_EXEC_ARGUMENT;
-#endif
 failed:
     trace[8]=s->stats.executed_commands;trace[9]=s->stats.validated_commands;
     g->stats.error_command=s->stats.failed_command;

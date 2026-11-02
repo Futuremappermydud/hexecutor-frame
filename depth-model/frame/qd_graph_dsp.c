@@ -129,12 +129,22 @@ void free(void *p) {
 }
 void *calloc(size_t n,size_t size){if(size && n>SIZE_MAX/size)return NULL;size_t b=n*size;void *p=malloc(b);if(p)memset(p,0,b);return p;}
 void *realloc(void *p,size_t n){if(!p)return malloc(n);Heap *h=(Heap *)((uint8_t *)p-128);if(n<=h->bytes)return p;void *q=malloc(n);if(q){memcpy(q,p,h->bytes);free(p);}return q;}
+#if QDS_L2_CACHE
+/* Set only inside the L2CFG=5 lease, where L2 keeps scalar L1 and HVX
+ * coherent for C7 page 7. Outside it page 7 stays scalar-only. */
+static uint32_t qds_l2_lease_active;
+#define QDS_PAGE7(p) (!qds_l2_lease_active && (uintptr_t)(p)>=QDO_BASE+0x7000000u && (uintptr_t)(p)<QDO_BASE+0x8000000u)
+#endif
 void *memcpy(void *dst,const void *src,size_t n) {
     uint8_t *d=dst;const uint8_t *s=src;
     int cached=(((uintptr_t)d>=QDO_BASE && (uintptr_t)d<QDO_BASE+0x1000000u) ||
                 ((uintptr_t)d>=QDO_BASE+0x2000000u && (uintptr_t)d<QDO_BASE+0x4000000u) ||
                 ((uintptr_t)s>=QDO_BASE && (uintptr_t)s<QDO_BASE+0x1000000u) ||
-                ((uintptr_t)s>=QDO_BASE+0x2000000u && (uintptr_t)s<QDO_BASE+0x4000000u));
+                ((uintptr_t)s>=QDO_BASE+0x2000000u && (uintptr_t)s<QDO_BASE+0x4000000u)
+#if QDS_L2_CACHE
+                || QDS_PAGE7(d) || QDS_PAGE7(s)
+#endif
+                );
     if(!cached)while(n>=128){*(HVX_UVector *)d=*(const HVX_UVector *)s;d+=128;s+=128;n-=128;}
     if(!(((uintptr_t)d|(uintptr_t)s)&3)) {
         while(n>=4){*(uint32_t *)d=*(const uint32_t *)s;d+=4;s+=4;n-=4;}
@@ -144,7 +154,11 @@ void *memcpy(void *dst,const void *src,size_t n) {
 void *memset(void *dst,int c,size_t n) {
     uint8_t *d=dst;HVX_Vector v=Q6_V_vsplat_R((uint32_t)(uint8_t)c*0x01010101u);
     int cached=(((uintptr_t)d>=QDO_BASE && (uintptr_t)d<QDO_BASE+0x1000000u) ||
-                ((uintptr_t)d>=QDO_BASE+0x2000000u && (uintptr_t)d<QDO_BASE+0x4000000u));
+                ((uintptr_t)d>=QDO_BASE+0x2000000u && (uintptr_t)d<QDO_BASE+0x4000000u)
+#if QDS_L2_CACHE
+                || QDS_PAGE7(d)
+#endif
+                );
     if(!cached)while(n>=128){*(HVX_UVector *)d=v;d+=128;n-=128;}
     if(!((uintptr_t)d&3))while(n>=4){*(uint32_t *)d=(uint32_t)(uint8_t)c*0x01010101u;d+=4;n-=4;}
     while(n--)*d++=(uint8_t)c;return dst;

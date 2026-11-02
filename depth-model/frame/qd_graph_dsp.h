@@ -5,7 +5,11 @@
 #define QDS_MAGIC 0x31534451u
 #define QDS_CONFIG 4096u
 #define QDS_WORK 8192u
+#if QDS_L2_CACHE
+#define QDS_WORK_L2 0xf1802000u
+#else
 #define QDS_WORK_L2 0x300f0000u
+#endif
 #define QDS_RESULT 2048u
 #define QDS_PROFILE 16384u
 /* Prepared per-handler profile, see prepared_export_profile (qd_graph_prepared.h). */

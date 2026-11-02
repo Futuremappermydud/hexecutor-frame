@@ -2517,9 +2517,15 @@ static int setup(G *g, const Nprg2ExecCall *c, int dry, int measure, const Nprg2
         if(n<w+conv->workspace_bytes && w<ne) FAIL(E_MEMORY);
         if(c->scratch && c->scratch_bytes && n<(uintptr_t)c->scratch+c->scratch_bytes && (uintptr_t)c->scratch<ne)
             FAIL(E_MEMORY);
-        for(unsigned i=0;i<7;i++)
-            if(c->pools[i].bytes && n<(uintptr_t)c->pools[i].base+c->pools[i].bytes && (uintptr_t)c->pools[i].base<ne)
-                FAIL(E_MEMORY);
+        for(unsigned i=0;i<7;i++) {
+            uintptr_t b=(uintptr_t)c->pools[i].base;
+            if(!c->pools[i].bytes || n>=b+c->pools[i].bytes || b>=ne)continue;
+            /* Pool 1's final 512 KiB is reserved for executor workspace.
+             * The near slot can live there as long as it is above the
+             * advertised writable boundary and disjoint from workspace. */
+            if(i==1 && n>=b+c->pool1_writable_bytes && ne<=b+c->pools[i].bytes)continue;
+            FAIL(E_MEMORY);
+        }
     }
     for(unsigned i=0;i<7;i++) {
         g->pool[i]=c->pools[i].bytes?c->pools[i].base:NULL;

@@ -65,13 +65,9 @@ if [ "$QDS_PREPARED_ELEMENTWISE" = 1 ] && { [ "$QDS_NATIVE_PREPARED" != 1 ] || [
   echo "QDS_PREPARED_ELEMENTWISE requires prepared and blocked glue" >&2; exit 1
 fi
 case "$QDS_PREPARED_REFERENCE" in 0|1) ;; *) echo "QDS_PREPARED_REFERENCE must be 0 or 1" >&2; exit 1;; esac
-case "$QDS_L2_CACHE" in 0|1) ;; *) echo "QDS_L2_CACHE must be 0 or 1" >&2; exit 1;; esac
-if [ "$QDS_L2_CACHE" = 1 ] && { [ "$QDS_NATIVE_PREPARED" != 1 ] || [ "$QDS_PRESERVE_VTCM" != 1 ]; }; then
-  echo "QDS_L2_CACHE requires prepared dispatch and preserving bootstrap" >&2; exit 1
-fi
-if [ "$QDS_L2_CACHE" = 1 ]; then
-  echo "QDS_L2_CACHE executor mode is disabled: field 1 displaces 512 KiB of TCM under load; see L2_HANDOFF.md and use the restored bench/l2sweep_probe.py" >&2
-  exit 1
+case "$QDS_L2_CACHE" in 0|5) ;; *) echo "QDS_L2_CACHE must be 0 or 5" >&2; exit 1;; esac
+if [ "$QDS_L2_CACHE" = 5 ] && { [ "$QDS_NATIVE_PREPARED" != 1 ] || [ "$QDS_PRESERVE_VTCM" != 1 ] || [ "$QDS_PREPARED_REFERENCE" != 1 ]; }; then
+  echo "QDS_L2_CACHE=5 requires prepared reference dispatch and preserving bootstrap" >&2; exit 1
 fi
 # Reference scratch is L1-cached heap: no HVX may touch it, so no
 # autovectorized engine. Elementwise handlers are allowed: with the reference
@@ -195,8 +191,9 @@ if [ "$QDS_PRESERVE_VTCM" = 1 ]; then
   engine="${engine%.elf}-vtcm-lease.elf"
   bootstrap="${bootstrap%.elf}-preserve-vtcm-guarded-entry.elf"
 fi
-if [ "$QDS_L2_CACHE" = 1 ]; then
+if [ "$QDS_L2_CACHE" = 5 ]; then
   engine="${engine%.elf}-l2cache.elf"
+  native_src="$native_src qd_graph_stack.S"
   bootstrap="${bootstrap%.elf}-l2cache.elf"
 fi
 $cc $engine_flags -ffunction-sections -fdata-sections -nostdlib -Wl,--gc-sections,-T,qd_graph_dsp.ld \

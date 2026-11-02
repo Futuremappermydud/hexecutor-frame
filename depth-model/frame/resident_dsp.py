@@ -33,8 +33,8 @@ class ResidentDSP:
         self.bootstrap=Path(bootstrap) if bootstrap else FRAME/'build/qd_graph_boot.elf'
         features=self.bootstrap.read_bytes().find(b'QDBOOT01\x01\x00\x00\x00')
         self.preserve_vtcm=features>=0
-        self.l2_cache=b'QDL2BOOT01' in self.bootstrap.read_bytes()
-        if self.l2_cache != (b'QDL2ENGN01' in self.engine.read_bytes()):
+        self.l2_cache=b'QDL2BOOT02' in self.bootstrap.read_bytes()
+        if self.l2_cache != (b'QDL2ENGN03' in self.engine.read_bytes()):
             raise ValueError('L2 cache bootstrap and engine features differ')
         self.direct_hmx=bool(direct_hmx)
         self.prepared_program=Path(prepared_program).read_bytes() if prepared_program else None
@@ -84,7 +84,12 @@ class ResidentDSP:
             self.guards.extend((((80<<20)-4096,4096),((88<<20),4096),((64<<20)-4096,4096)))
             self.guards.append((SIZE-4096,4096))
             if self.preserve_vtcm:self.guards.extend((((96<<20)-128,128),(104<<20,128)))
-            if self.l2_cache:self.guards.extend(((112<<20,128),((112<<20)+0x20000,128)))
+            if self.l2_cache:
+                # qd_l2_cache.h: worker-0 lease stack 0x07030000..0x07040000
+                # (the engine checks its bottom 128 B), elementwise scratch
+                # 0x07050000..0x07058000, conv near 0x07060000..0x07068000, metadata
+                # from 0x07100000.
+                self.guards.extend(((112<<20,128),((112<<20)+0x40000,128),((112<<20)+0x58000,128),((112<<20)+0x68000,128)))
             for off,n in self.guards:self.mem[off:off+n]=b'\xa5'*n
             t=self.transport;t.arena[:32768]=bytes(32768)
             config=[MAGIC,1,image,len(self.image),*self.pools,*self.sizes,*self.inputs,*self.input_bytes,
