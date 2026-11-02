@@ -70,8 +70,14 @@ static const volatile char prepared_reference_feature[]="QD_PREPARED_REF_1";
 #ifndef QDS_PREPARED_THREADS
 #define QDS_PREPARED_THREADS 1
 #endif
+#if QDS_L2_CACHE
+/* Inside the lease no L2-TCM address is usable: page 7 (qd_l2_cache.h). */
+#define QDS_PAR_L2_0 QDS_L2_PAR_0
+#define QDS_PAR_L2_1 QDS_L2_PAR_1
+#else
 #define QDS_PAR_L2_0 0x300f0200u
 #define QDS_PAR_L2_1 0x300f4000u
+#endif
 #define QDS_PAR_L2_BYTES 0x3e00u
 
 #if QDS_NATIVE_PADDED_1X1
@@ -441,8 +447,20 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
     volatile uint32_t *guard=(volatile uint32_t *)QDS_L2_STACK_BASE;
     for(uint32_t i=0;i<32;i++)guard[i]=0x7154c9a3u;
     qds_lease_call=(QdsLeaseCall){g,s,first,last,scratch,scratch_bytes,0,0};
+#if QDS_PREPARED_THREADS>1
+    /* Followers leave their L2-TCM stacks for page-7 stacks (op 5) before the
+     * lease and come back (op 6) after TCM is restored; in between they only
+     * poll the uncached QdsWork and run op-4 jobs. */
+    for(uint32_t t=1;t<3;t++)for(uint32_t i=0;i<32;i++)((volatile uint32_t *)QDS_L2_FSTACK(t))[i]=0x7154c9a3u;
+    if(prepared_par_fault || send_work(5,0)){prepared_par_fault=1;trace[13]=64;e=NPRG2_EXEC_ARGUMENT;goto failed;}
+#endif
     qds_on_stack(prepared_leased,0,QDS_L2_STACK_TOP);
     for(uint32_t i=0;i<32;i++)if(guard[i]!=0x7154c9a3u)qds_lease_call.l2_error|=2;
+#if QDS_PREPARED_THREADS>1
+    if(send_work(6,0)){prepared_par_fault=1;qds_lease_call.l2_error|=64;}
+    for(uint32_t t=1;t<3;t++)for(uint32_t i=0;i<32;i++)
+        if(((volatile uint32_t *)QDS_L2_FSTACK(t))[i]!=0x7154c9a3u)qds_lease_call.l2_error|=128;
+#endif
     e=qds_lease_call.e;
     trace[13]=qds_lease_call.l2_error;
     if(qds_lease_call.l2_error){e=NPRG2_EXEC_ARGUMENT;goto failed;}

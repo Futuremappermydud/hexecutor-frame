@@ -3334,6 +3334,23 @@ int nprg2_exec_reference_run(const Nprg2ExecCall *c, void *ctx) {
     const Nprg2ReferenceConv *pc=ctx;
     uint64_t prof_t0=pc && pc->clock && pc->phase && c->command.opcode==QDR_HMX_CONV?pc->clock():0;
     ref_t_entry=prof_t0;
+#if HMX_PROF==12
+    /* Two extra setup() calls back to back: the first sees whatever the
+     * previous command left in L1, the second is warm. Cold -> u8 output
+     * slot (phase[3]), warm -> u16 output slot (phase[7]); conv commands only. */
+    static uint64_t *prof_phase;static uint64_t (*prof_clock)(void);
+    if(prof_t0){prof_phase=pc->phase;prof_clock=pc->clock;}
+    if(prof_phase) {
+        uint64_t a=prof_clock();
+        (void)setup(&g,c,0,0,ctx);
+        uint64_t b=prof_clock();
+        (void)setup(&g,c,0,0,ctx);
+        uint64_t d=prof_clock();
+        if(prof_t0){prof_phase[3]+=b-a;prof_phase[7]+=d-b;}
+        else {prof_phase[2]+=b-a;prof_phase[6]+=d-b;}  /* non-conv: u8/u16 setup slots */
+        ref_t_entry=d;
+    }
+#endif
 #if HMX_PROF==11
     (void)g;
     int rr=nprg2_exec_reference_run_inner(c,ctx);

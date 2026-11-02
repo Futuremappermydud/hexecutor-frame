@@ -142,9 +142,7 @@ engine_flags="$engine_flags -DQDS_PREPARED_FUSE=$QDS_PREPARED_FUSE"
 engine_flags="$engine_flags -DQDS_L2_CACHE=$QDS_L2_CACHE"
 case "$QDS_PREPARED_THREADS" in 1|3) ;; *) echo "QDS_PREPARED_THREADS must be 1 or 3" >&2; exit 1;; esac
 if [ "$QDS_PREPARED_THREADS" = 3 ] && [ "$QDS_PREPARED_REFERENCE" != 1 ]; then echo "QDS_PREPARED_THREADS=3 requires QDS_PREPARED_REFERENCE=1" >&2; exit 1; fi
-if [ "$QDS_PREPARED_THREADS" = 3 ] && [ "$QDS_L2_CACHE" != 0 ]; then
-  echo "QDS_PREPARED_THREADS=3 with QDS_L2_CACHE: helper slots and follower stacks are L2-TCM, unusable during the lease" >&2; exit 1
-fi
+# QDS_PREPARED_THREADS=3 with QDS_L2_CACHE=5: followers and helper slots move to page 7 for the lease.
 engine_flags="$engine_flags -DQDS_PREPARED_THREADS=$QDS_PREPARED_THREADS"
 case "$QDS_PREPARED_HMX" in 0|1) ;; *) echo "QDS_PREPARED_HMX must be 0 or 1" >&2; exit 1;; esac
 if [ "$QDS_PREPARED_HMX" = 1 ] && [ "$QDS_PREPARED_REFERENCE" != 1 ]; then echo "QDS_PREPARED_HMX=1 requires QDS_PREPARED_REFERENCE=1" >&2; exit 1; fi

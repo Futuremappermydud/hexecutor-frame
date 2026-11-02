@@ -458,12 +458,39 @@ static void status(uint32_t tid,uint32_t seq) {
     volatile QdStatus *st=(volatile QdStatus *)(SERVICE+128)+tid;
     st->error=st->rows=st->reserved=0;__asm__ volatile("barrier":::"memory");st->done_sequence=seq;
 }
+#if QDS_L2_CACHE && QDS_PREPARED_THREADS>1
+/* op 5 (prepared_run, L2 mode): this follower runs here on its page-7 stack
+ * for the whole cache lease, touching no L2-TCM address; op 6 returns to the
+ * TCM stack, whose bytes the lease saved and restored. */
+static void follower_leased(uint32_t tid) {
+    uint32_t seen=work->generation;
+    __asm__ volatile("barrier":::"memory");work->done[tid]=seen;
+    for(;;) {
+        while(work->generation==seen)__asm__ volatile("pause(#32)");
+        __asm__ volatile("barrier":::"memory");seen=work->generation;
+        uint32_t op=work->op;
+        if(op==6)return;
+        if(op==4 && tid<work->job_parts) {
+            work->job_started[tid]++;__asm__ volatile("barrier":::"memory");
+            work->job_fn(work->job_ctx,tid,work->job_parts);
+            __asm__ volatile("barrier":::"memory");work->job_finished[tid]++;
+        }
+        __asm__ volatile("barrier":::"memory");work->done[tid]=seen;
+    }
+}
+#endif
 static void follower(uint32_t tid) {
     uint32_t seen=0;
     for(;;) {
         while(work->generation==seen)__asm__ volatile("pause(#32)");
         __asm__ volatile("barrier":::"memory");seen=work->generation;
         uint32_t op=work->op;
+#if QDS_L2_CACHE && QDS_PREPARED_THREADS>1
+        if(op==5 && tid && tid<3) {
+            qds_on_stack(follower_leased,tid,QDS_L2_FSTACK(tid)+0x10000u);
+            __asm__ volatile("barrier":::"memory");seen=work->generation; /* op 6 */
+        }
+#endif
         if(op==1){uint32_t e=qdrc_execute(&work->conv,(uint8_t *)work->arena,tid,work->prepared_a);if(e)work->error=e;}
         if(op==2)status(tid,work->sequence);
         if(op==4 && tid<work->job_parts) {

@@ -19,6 +19,11 @@
 #define QDS_L2_STACK_TOP   0xa7040000u
 #define QDS_L2_ELEMENTWISE 0xa7050000u
 #define QDS_L2_NEAR        0xa7060000u
+/* QDS_PREPARED_THREADS=3: the helper conv near slots and the two followers'
+ * lease stacks (64 KiB each, bottom 128 B guarded by the engine) on page 7. */
+#define QDS_L2_PAR_0       0xa7070000u
+#define QDS_L2_PAR_1       0xa7074000u
+#define QDS_L2_FSTACK(tid) (0xa7080000u+((tid)-1u)*0x10000u)
 #define QDS_L2_BACKUP      0xf1c00000u
 #define QDS_L2_TCM         0x30000000u
 #define QDS_L2_TCM_BYTES   0x100000u

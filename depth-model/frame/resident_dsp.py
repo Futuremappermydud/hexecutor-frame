@@ -89,7 +89,10 @@ class ResidentDSP:
                 # (the engine checks its bottom 128 B), elementwise scratch
                 # 0x07050000..0x07058000, conv near 0x07060000..0x07068000, metadata
                 # from 0x07100000.
-                self.guards.extend(((112<<20,128),((112<<20)+0x40000,128),((112<<20)+0x58000,128),((112<<20)+0x68000,128)))
+                # Threads: helper slots 0x07070000..0x07077e00, follower lease
+                # stacks 0x07080000..0x070a0000.
+                self.guards.extend(((112<<20,128),((112<<20)+0x40000,128),((112<<20)+0x58000,128),((112<<20)+0x68000,128),
+                                    ((112<<20)+0x78000,128),((112<<20)+0xa0000,128)))
             for off,n in self.guards:self.mem[off:off+n]=b'\xa5'*n
             t=self.transport;t.arena[:32768]=bytes(32768)
             config=[MAGIC,1,image,len(self.image),*self.pools,*self.sizes,*self.inputs,*self.input_bytes,
