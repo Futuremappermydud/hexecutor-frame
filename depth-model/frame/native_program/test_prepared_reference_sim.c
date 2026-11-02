@@ -4,7 +4,7 @@
  *   test_prepared_reference_sim <primary|alternate> split <segments> <dir>
  *   test_prepared_reference_sim segment <file.rseg> [log every N commands]
  *   test_prepared_reference_sim [primary|alternate|both] profile   (host)
- *   test_prepared_reference_sim <primary|alternate> tail <first> <dir>   (host)
+ *   test_prepared_reference_sim <primary|alternate> tail <first> <dir> [count]   (host)
  *
  * Any mode also accepts "fast" (fast exact convolution in a VTCM-tail-sized
  * workspace), "ew" (Hexagon only: the HVX elementwise handlers, chained over the
@@ -27,6 +27,7 @@
  * nprg2_exec_reference_scratch, one preflight covers the range without writing
  * any pool, and one run executes it. Run from the depth-model directory. */
 #include "prepared_reference.h"
+#include "prepared_fuse.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +48,10 @@ enum { MPFX_HEADER = 64, RSEG_HEADER = 72, POOL1_CEILING = 0x780000, MAX_SEGMENT
  * times every command and prints the cost per (opcode, variant) and the fast
  * convolution's phases after each run. */
 static int use_fast, use_cycles;
+/* "fuse": conv epilogue fusion plan (prepared_fuse.h) for every request. A
+ * dead conv output is never stored, so pool 1 may differ from the unfused
+ * host end state in those blocks (env_pools_match masks exactly them). */
+static int use_fuse;
 /* "ew" (Hexagon builds only): register the HVX elementwise handlers for scratch
  * region 1, chained in front of the reference kernel as the Frame build does. */
 static int use_ew;
@@ -131,6 +136,8 @@ typedef struct {
     Nprg2Executor e;
     uint8_t *out[2];
     Nprg2ExecBuffer in[4], ob[2];
+    Nprg2FusePlan plan;
+    uint8_t mask[4096];
 } Env;
 
 static void env_open(Env *v, const char *model, uint8_t *const *inputs, const uint32_t *input_bytes) {
@@ -159,6 +166,13 @@ static void env_open(Env *v, const char *model, uint8_t *const *inputs, const ui
     Nprg2BindConfig bc = {.hot_memory = v->hot, .hot_capacity = 300000, .l2_available_bytes = 786432,
                           .pool1_is_verified_vtcm = 1, .resolve = resolve_all};
     CHECK(nprg2_bind_mock(&v->p, v->pools, &bc, &v->b) == NPRG2_OK);
+    if (use_fuse) {
+        uint64_t t0 = ticks();
+        int frc = nprg2_fuse_plan_build(&v->plan, &v->p, &v->b, (Nprg2Allocator){0});
+        CHECK(frc == NPRG2_FUSE_OK);
+        printf("%s: fusion plan %lu pairs, build cost %llu %s\n", model, (unsigned long)v->plan.count,
+               (unsigned long long)(ticks() - t0), tick_unit());
+    }
     nprg2_executor_init(&v->e);
     uint32_t added = 0;
     if (use_fast) {
@@ -196,6 +210,7 @@ static void env_open(Env *v, const char *model, uint8_t *const *inputs, const ui
 }
 
 static void env_close(Env *v) {
+    nprg2_fuse_plan_free(&v->plan);
     free(v->scratch);
     free(v->hot);
     nprg2_close(&v->p);
@@ -239,6 +254,22 @@ static void env_census(Env *v, uint32_t first, uint32_t count) {
     fflush(stdout);
 }
 
+/* Marks the pool-1 blocks of command cmd's output (a u8 CH tensor) as deliberately stale. */
+static void mask_conv_out(Env *v, uint32_t cmd) {
+    Nprg2Command c;
+    CHECK(nprg2_command_at(&v->b, cmd, &c) == NPRG2_OK && c.output_count == 1);
+    uint32_t ix = v->b.refs.data[c.output_first * 2u] | (uint32_t)v->b.refs.data[c.output_first * 2u + 1u] << 8;
+    Nprg2TensorView tv;
+    CHECK(nprg2_bound_tensor_at(&v->p, &v->b, ix, &tv) == NPRG2_OK && tv.storage_kind == 2);
+    const uint8_t *g = tv.geometry_record;
+    int m1 = (int16_t)(g[16] | g[17] << 8), m2 = (int16_t)(g[18] | g[19] << 8), m3 = (int16_t)(g[20] | g[21] << 8);
+    uint64_t n = (uint64_t)(m1 / 8) * (m2 / 8) * (m3 / 32);
+    for (uint64_t i = 0; i < n; i++) {
+        uint32_t e = tv.blocks[tv.slice_origin + i];
+        if ((e & 127u) == 1u) v->mask[(e & ~127u) / 2048u] = 1;
+    }
+}
+
 /* One preflight, then one run. With start (seven pools, then two outputs; a
  * NULL entry means all zero), the preflight must leave every pool and output
  * equal to it. The simulator heap has no room for a separate copy. */
@@ -247,7 +278,7 @@ static void env_run(Env *v, uint32_t first, uint32_t count, const uint8_t *const
     Nprg2ExecRequest r = {.program = &v->p, .bound = &v->b, .pool1_writable_bytes = POOL1_CEILING,
                           .inputs = v->in, .input_count = 4, .outputs = v->ob, .output_count = 2,
                           .scratch = v->scratch, .scratch_bytes = v->scratch_bytes,
-                          .command_first = first, .command_count = count, .stats = &st};
+                          .command_first = first, .command_count = count, .stats = &st, .fuse = use_fuse ? &v->plan : NULL};
     memcpy(r.pools, v->pools, sizeof v->pools);
 #ifdef __hexagon__
     if (use_ew) r.extra_scratch[0] = (Nprg2ExecBuffer){ew_scratch, NPRG2_ELEMENTWISE_SCRATCH_BYTES};
@@ -275,10 +306,21 @@ static void env_run(Env *v, uint32_t first, uint32_t count, const uint8_t *const
     memset(calls, 0, sizeof calls);
     memset(conv_phase, 0, sizeof conv_phase);
     uint64_t started = ticks(), total = 0;
+    uint32_t fused_spans = 0;
     uint32_t step = v->progress ? v->progress : count, logged = 0;
     for (uint32_t done = 0; done < count; done += r.command_count) {
         r.command_first = first + done;
         r.command_count = use_cycles ? 1u : count - done < step ? count - done : step;
+        if (use_fuse && use_cycles) {
+            /* One step spans the overlapping fusion pairs, so fused conv and epilogue run in one request. */
+            uint32_t end = r.command_first;
+            for (uint32_t k = r.command_first; k <= end; k++) {
+                uint16_t role = v->plan.role[k];
+                if (role && !(role & NPRG2_FUSE_EPI) && v->plan.pairs[role - 1u].epi < first + count && v->plan.pairs[role - 1u].epi > end)
+                    end = v->plan.pairs[role - 1u].epi;
+            }
+            r.command_count = end + 1u - r.command_first;
+        }
         uint64_t t0 = ticks();
         rc = nprg2_executor_run(&v->e, &r);
         uint64_t spent = ticks() - t0;
@@ -291,6 +333,7 @@ static void env_run(Env *v, uint32_t first, uint32_t count, const uint8_t *const
         if (use_cycles) {
             Nprg2Command c;
             CHECK(nprg2_command_at(&v->b, r.command_first, &c) == NPRG2_OK && c.opcode <= QDR_OPCODES && c.variant <= QDR_VARIANTS);
+            if (r.command_count > 1) { c.opcode = 0; c.variant = 0; fused_spans++; }   /* conv + gap + epilogue */
             cost[c.opcode][c.variant] += spent;
             calls[c.opcode][c.variant]++;
             total += spent;
@@ -304,7 +347,20 @@ static void env_run(Env *v, uint32_t first, uint32_t count, const uint8_t *const
             fflush(stdout);
         }
     }
+    if (use_fuse) {
+        uint32_t act = 0, dead = 0, inside = 0;
+        for (uint32_t k = 0; k < v->plan.count; k++) {
+            const Nprg2FusePair *pr = &v->plan.pairs[k];
+            if (pr->conv < first || pr->epi >= first + count) continue;
+            inside++;
+            if (use_cycles || (pr->active)) { act += pr->active; }
+            if (pr->active && pr->dead) { dead++; mask_conv_out(v, pr->conv); }
+        }
+        printf("%s: fusion pairs inside commands %lu..%lu: %lu, active %lu, dead %lu\n", v->model, (unsigned long)first,
+               (unsigned long)(first + count - 1u), (unsigned long)inside, (unsigned long)act, (unsigned long)dead);
+    }
     if (!use_cycles) return;
+    if (fused_spans) printf("  (%lu fused spans are costed under op 0 var 0: conv + commands in between + epilogue)\n", (unsigned long)fused_spans);
     printf("%s: commands %lu..%lu cost %llu %s in handlers (validate + run)\n  share        %-7s  commands  op var\n",
            v->model, (unsigned long)first, (unsigned long)(first + count - 1u), (unsigned long long)total, tick_unit(),
            tick_unit());
@@ -329,7 +385,17 @@ static int env_pools_match(Env *v, const uint8_t *const *want) {
     for (int i = 0; i < 7; i++) {
         if (!v->pools[i].bytes || !memcmp(v->pools[i].base, want[i], v->pools[i].bytes)) continue;
         uint32_t diff = 0;
-        while (v->pools[i].base[diff] == want[i][diff]) diff++;
+        if (i == 1 && use_fuse) {
+            int bad = 0;
+            for (uint32_t b = 0; b * 2048u < v->pools[1].bytes && !bad; b++) {
+                uint32_t n = v->pools[1].bytes - b * 2048u < 2048u ? v->pools[1].bytes - b * 2048u : 2048u;
+                if (v->mask[b] || !memcmp(v->pools[1].base + b * 2048u, want[1] + b * 2048u, n)) continue;
+                diff = b * 2048u;
+                while (v->pools[1].base[diff] == want[1][diff]) diff++;
+                bad = 1;
+            }
+            if (!bad) continue;
+        } else while (v->pools[i].base[diff] == want[i][diff]) diff++;
         fprintf(stderr, "%s pool mismatch: pool=%d off=0x%lx prepared=%u want=%u\n", v->model, i, (unsigned long)diff,
                 v->pools[i].base[diff], want[i][diff]);
         return 0;
@@ -494,7 +560,7 @@ static void split(const char *model, uint32_t segments, const char *dir) {
 /* One segment covering [first, end): the host runs the schedule once, keeping the state before
  * `first`, so a simulator run can start in the late part of a schedule without simulating
  * everything before it. */
-static void tail(const char *model, uint32_t first, const char *dir) {
+static void tail(const char *model, uint32_t first, const char *dir, uint32_t limit) {
     uint8_t *inputs[4], *constants;
     uint32_t input_bytes[4], cn;
     read_smoke(model, inputs, input_bytes, &constants, &cn);
@@ -505,16 +571,17 @@ static void tail(const char *model, uint32_t first, const char *dir) {
     memcpy(v.pools[5].base, constants, cn);
     env_census(&v, 0, n);
     env_run(&v, 0, first, NULL);
-    uint32_t state_bytes;
+    uint32_t state_bytes, last = limit && limit < n - first ? first + limit : n;
     uint8_t *start = snapshot(&v, &state_bytes);
-    env_run(&v, first, n - first, NULL);
+    env_run(&v, first, last - first, NULL);
     uint8_t *end = snapshot(&v, &state_bytes);
-    write_segment(&v, dir, 0, first, n - first, input_bytes, start, end, state_bytes);
+    write_segment(&v, dir, 0, first, last - first, input_bytes, start, end, state_bytes);
     free(start);
     free(end);
-    if (!outputs_match_emulator(model, v.out)) exit(1);
-    printf("PASS %s tail: commands %lu..%lu written; final outputs match the emulator smoke sha256\n", model,
-           (unsigned long)first, (unsigned long)n - 1u);
+    /* The graph outputs are complete only for a segment that runs to the end. */
+    if (last == n && !outputs_match_emulator(model, v.out)) exit(1);
+    printf("PASS %s tail: commands %lu..%lu written%s\n", model, (unsigned long)first, (unsigned long)last - 1u,
+           last == n ? "; final outputs match the emulator smoke sha256" : "");
     env_close(&v);
     free(constants);
     for (int j = 0; j < 4; j++) free(inputs[j]);
@@ -608,6 +675,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "fast")) use_fast = 1;
         else if (!strcmp(argv[i], "cycles")) use_cycles = 1;
         else if (!strcmp(argv[i], "ew")) use_ew = 1;
+        else if (!strcmp(argv[i], "fuse")) use_fuse = 1;
         else argv[kept++] = argv[i];
     }
     argc = kept;
@@ -631,7 +699,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "tail")) {
         CHECK(argc > 4 && strcmp(which, "both"));
-        tail(which, (uint32_t)strtoul(argv[3], NULL, 10), argv[4]);
+        tail(which, (uint32_t)strtoul(argv[3], NULL, 10), argv[4], argc > 5 ? (uint32_t)strtoul(argv[5], NULL, 10) : 0);
         return 0;
     }
     CHECK(!strcmp(mode, "prefix") || !strcmp(mode, "full"));

@@ -52,6 +52,17 @@ int nprg2_runner_open(Nprg2PreparedRunner *r,const void *raw,uint32_t raw_bytes,
     r->l2_hot_bytes=r->bound.hot_bytes;r->ready=1;return NPRG2_RUNNER_OK;
 }
 
+int nprg2_runner_build_fuse(Nprg2PreparedRunner *r,Nprg2Allocator allocator){
+    if(!r||!r->ready)return NPRG2_RUNNER_ARGUMENT;
+    nprg2_fuse_plan_free(&r->fuse_plan);r->fuse=NULL;
+    int x=nprg2_fuse_plan_build(&r->fuse_plan,&r->program,&r->bound,allocator);
+    if(x)return x;
+    r->fuse=&r->fuse_plan;return NPRG2_RUNNER_OK;
+}
+int nprg2_runner_enable_fuse(Nprg2PreparedRunner *r,int enable){
+    if(!r||!r->ready)return NPRG2_RUNNER_ARGUMENT;
+    r->fuse=enable&&r->fuse_plan.pairs?&r->fuse_plan:NULL;return NPRG2_RUNNER_OK;
+}
 static int runner_request(Nprg2PreparedRunner *r,uint32_t first,uint32_t count,uint32_t pool1_writable,
                           const Nprg2ExecBuffer *inputs,uint32_t input_count,
                           const Nprg2ExecBuffer *outputs,uint32_t output_count,
@@ -63,7 +74,7 @@ static int runner_request(Nprg2PreparedRunner *r,uint32_t first,uint32_t count,u
         .inputs=inputs,.input_count=input_count,.outputs=outputs,.output_count=output_count,
         .user=user,.scratch=scratch,.scratch_bytes=scratch_bytes,.command_first=first,
         .command_count=count,.cancelled=cancelled,.cancel_ctx=cancel_ctx,.stats=stats,
-        .profile=r->profile,.reuse_preflight=r->reuse_preflight};
+        .profile=r->profile,.reuse_preflight=r->reuse_preflight,.fuse=r->fuse};
     memcpy(q->pools,r->pools,sizeof q->pools);
     memcpy(q->extra_scratch,r->extra_scratch,sizeof q->extra_scratch);return NPRG2_EXEC_OK;
 }
@@ -94,4 +105,4 @@ int nprg2_runner_execute(Nprg2PreparedRunner *r,const Nprg2Executor *e,
     return x?x:nprg2_executor_run(e,&q);
 }
 
-void nprg2_runner_close(Nprg2PreparedRunner *r){if(!r)return;close_restore(r);memset(r,0,sizeof *r);}
+void nprg2_runner_close(Nprg2PreparedRunner *r){if(!r)return;nprg2_fuse_plan_free(&r->fuse_plan);close_restore(r);memset(r,0,sizeof *r);}

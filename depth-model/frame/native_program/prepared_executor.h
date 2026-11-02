@@ -2,6 +2,7 @@
 #define NPRG2_PREPARED_EXECUTOR_H
 
 #include "nprg2_runtime.h"
+#include "prepared_fuse.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,7 +25,8 @@ typedef struct { uint8_t *data; uint32_t bytes; } Nprg2ExecBuffer;
  * the control arrays and the other regions. */
 #define NPRG2_EXEC_SCRATCH_REGIONS 2u
 enum { NPRG2_EXEC_SCRATCH_DEFAULT=0, NPRG2_EXEC_SCRATCH_NEAR=1 };
-typedef struct {
+typedef struct Nprg2ExecCall Nprg2ExecCall;
+struct Nprg2ExecCall {
     uint32_t command_index;
     Nprg2Command command;
     const Nprg2Program *program;
@@ -47,10 +49,22 @@ typedef struct {
      * may skip a purely repeated dry-run of its own validator. Always 0 in
      * validation calls. */
     uint8_t preflighted;
-} Nprg2ExecCall;
+    /* Conv epilogue fusion (see prepared_fuse.h): set on the conv's call when
+     * the executor activated a pair for this request; the epilogue command's
+     * call, and whether the conv's raw output is dead (need not be stored).
+     * NULL/0 otherwise, in validation as well as run calls. */
+    const Nprg2ExecCall *epilogue;
+    uint8_t epilogue_dead;
+};
 
 typedef int (*Nprg2ExecValidate)(const Nprg2ExecCall *call, void *handler_ctx);
 typedef int (*Nprg2ExecRun)(const Nprg2ExecCall *call, void *handler_ctx);
+/* Optional handler hook: can this conv handler execute `epilogue` fused into
+ * its own output step, exactly, for this request? Called in preflight for
+ * every plan pair whose two commands lie in the interval; nonzero activates
+ * the pair (the conv is then validated and run with call->epilogue set and
+ * the epilogue command is not run). It must validate the epilogue's views. */
+typedef int (*Nprg2ExecFuse)(const Nprg2ExecCall *conv, const Nprg2ExecCall *epilogue, int dead, void *handler_ctx);
 typedef int (*Nprg2ExecCancel)(void *ctx, uint32_t next_command);
 /* Optional hardware profile, passed in the request (never in the stats, which
  * preflight clears). All arrays are caller-owned and accumulate until the
@@ -101,6 +115,10 @@ typedef struct {
     void *cancel_ctx;
     Nprg2ExecStats *stats;
     Nprg2ExecProfile *profile;
+    /* Optional epilogue fusion plan (NULL = off). Pairs are active only when
+     * their handler's fuse hook accepted them in the preflight of this
+     * interval; the plan's `active` flags are written by preflight. */
+    Nprg2FusePlan *fuse;
     /* Run only. When set, stats is non-NULL and the same stats object holds
      * the signature of a successful preflight of this exact request (program,
      * bound tables, pools, ceiling, I/O and scratch buffers, interval,
@@ -116,6 +134,7 @@ typedef struct {
     uint8_t no_effect;
     Nprg2ExecValidate validate;
     Nprg2ExecRun run;
+    Nprg2ExecFuse fuse;
     void *ctx;
     uint32_t scratch_bytes, concurrent_worker_scratch_bytes;
 } Nprg2ExecHandler;
@@ -138,6 +157,8 @@ int nprg2_executor_register_scratch_region(Nprg2Executor *executor, uint8_t opco
                                            uint8_t scratch_region);
 /* Declares a registered handler's run callback effect-free given a passed
  * validation, so run may skip calling it. UNSUPPORTED if not registered. */
+/* Installs the fuse hook of a registered conv handler. */
+int nprg2_executor_set_fuse(Nprg2Executor *executor, uint8_t opcode, uint8_t variant, Nprg2ExecFuse fuse);
 int nprg2_executor_mark_no_effect(Nprg2Executor *executor, uint8_t opcode, uint8_t variant);
 int nprg2_exec_input(const Nprg2ExecCall *call, uint32_t slot,
                      uint32_t *tensor_index, Nprg2TensorView *view);

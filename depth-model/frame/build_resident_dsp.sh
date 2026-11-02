@@ -24,6 +24,7 @@ docker run --rm --platform linux/amd64 -v "$task_sdk_root:/sdk:ro" -v "$PWD/fram
    -e QDS_PREPARED_ELEMENTWISE="${QDS_PREPARED_ELEMENTWISE:-0}" \
    -e QDS_PREPARED_REFERENCE="${QDS_PREPARED_REFERENCE:-0}" \
    -e QDS_PREPARED_PROFILE="${QDS_PREPARED_PROFILE:-1}" \
+   -e QDS_PREPARED_FUSE="${QDS_PREPARED_FUSE:-0}" \
    depth-model-hmx-tools:latest sh -eu -c '
 cc=/sdk/tools/HEXAGON_Tools/19.0.07/Tools/bin/hexagon-clang
 flags="-mv75 -mhvx -mhvx-length=128b -O2 -G0 -ffreestanding -fno-builtin -fno-vectorize -fno-slp-vectorize -ffp-contract=off -fno-strict-aliasing -Wall -Wextra -DQDO_SCALAR_CACHE=$QDS_SCALAR_CACHE"
@@ -124,6 +125,11 @@ engine_flags="$engine_flags -DQDS_PRESERVE_VTCM=$QDS_PRESERVE_VTCM"
 engine_flags="$engine_flags -DQDS_PREPARED_REFERENCE=$QDS_PREPARED_REFERENCE"
 case "$QDS_PREPARED_PROFILE" in 0|1) ;; *) echo "QDS_PREPARED_PROFILE must be 0 or 1" >&2; exit 1;; esac
 engine_flags="$engine_flags -DQDS_PREPARED_PROFILE=$QDS_PREPARED_PROFILE"
+case "$QDS_PREPARED_FUSE" in 0|1) ;; *) echo "QDS_PREPARED_FUSE must be 0 or 1" >&2; exit 1;; esac
+if [ "$QDS_PREPARED_FUSE" = 1 ] && [ "$QDS_PREPARED_REFERENCE" != 1 ]; then
+  echo "QDS_PREPARED_FUSE requires QDS_PREPARED_REFERENCE (the fast conv runs the fused epilogue)" >&2; exit 1
+fi
+engine_flags="$engine_flags -DQDS_PREPARED_FUSE=$QDS_PREPARED_FUSE"
 glue_src=
 native_src=
 if [ "$QDS_DYNAMIC_TCM" = 1 ]; then engine="${engine%.elf}-dynamic-tcm.elf"; fi
@@ -152,7 +158,7 @@ if [ "$QDS_NATIVE_DIRECT_RANGE" = 1 ]; then
 fi
 if [ "$QDS_NATIVE_PREPARED" = 1 ]; then
   engine="${engine%.elf}-prepared.elf"
-  native_src="$native_src native_program/nprg2_runtime.c native_program/prepared_executor.c native_program/prepared_native.c native_program/prepared_io.c native_program/prepared_runner.c"
+  native_src="$native_src native_program/nprg2_runtime.c native_program/prepared_executor.c native_program/prepared_native.c native_program/prepared_io.c native_program/prepared_runner.c native_program/prepared_fuse.c"
 fi
 if [ "$QDS_DIRECT_COMPACT_INPUT" != 0 ]; then engine="${engine%.elf}-compact-input.elf"; fi
 if [ "$QDS_DIRECT_COMPACT_INPUT" = 2 ]; then engine="${engine%.elf}-aliases.elf"; fi
@@ -169,6 +175,7 @@ if [ "$QDS_PREPARED_QUANTIZE" = 1 ]; then
   engine="${engine%.elf}-quantize.elf"
   native_src="$native_src native_program/prepared_quantize.c native_program/prepared_quantize_core.c"
 fi
+if [ "$QDS_PREPARED_FUSE" = 1 ]; then engine="${engine%.elf}-fuse.elf"; fi
 if [ "$QDS_PREPARED_COMPACT_3X3" = 1 ]; then engine="${engine%.elf}-compact-3x3.elf"; fi
 if [ "$QDS_PREPARED_REFERENCE" = 1 ]; then
   engine="${engine%.elf}-reference.elf"

@@ -24,6 +24,9 @@ typedef struct {
     /* Optional profile and preflight reuse for every request (set after open). */
     Nprg2ExecProfile *profile;
     uint8_t reuse_preflight;
+    /* Conv epilogue fusion plan (NULL = off), see nprg2_runner_build_fuse. */
+    Nprg2FusePlan fuse_plan;
+    Nprg2FusePlan *fuse;
     uint8_t ready;
 } Nprg2PreparedRunner;
 
@@ -46,6 +49,15 @@ int nprg2_runner_open(Nprg2PreparedRunner *runner,
  * interval was just validated; otherwise it preflights as usual. The caller
  * must not change graph metadata between the two calls (pool bytes may change). */
 int nprg2_runner_set_profile(Nprg2PreparedRunner *runner,Nprg2ExecProfile *profile,int reuse_preflight);
+
+/* Builds the conv epilogue fusion plan from the bound schedule (analysis only,
+ * no graph-pool access) and enables it for every later request. Pairs the
+ * conv handler's fuse hook rejects run unfused. Returns OK with zero pairs
+ * when nothing qualifies and NOT_READY-free UNSUPPORTED codes from
+ * nprg2_fuse_plan_build otherwise (fusion then stays off). */
+int nprg2_runner_build_fuse(Nprg2PreparedRunner *runner,Nprg2Allocator allocator);
+/* Turns a built plan on or off (A/B switch). */
+int nprg2_runner_enable_fuse(Nprg2PreparedRunner *runner,int enable);
 
 /* Executes exactly [command_first, command_first+command_count). The executor
  * preflights the complete requested interval before the first graph-pool

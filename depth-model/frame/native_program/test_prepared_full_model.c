@@ -22,6 +22,7 @@
 #include "prepared_reshape_cb.h"
 #include "prepared_sign.h"
 #include "prepared_spill_fill.h"
+#include "prepared_fuse.h"
 #include "../qd_graph.h"
 
 #include <stdio.h>
@@ -70,6 +71,9 @@ typedef struct {
     uint32_t *need;
     int reference_only;
     Nprg2ReferenceConv conv;
+    Nprg2FusePlan plan;
+    int fuse;
+    uint8_t mask[4096];     /* pool-1 blocks a fused dead conv deliberately left stale */
 } Session;
 
 /* The Frame VTCM tail less its 8 KiB control area, and the Frame's L2-TCM
@@ -164,7 +168,7 @@ static void register_handlers(Session *s, int mixed, int fast) {
 
 static Nprg2ExecRequest request(Session *s, Nprg2ExecBuffer *in, Nprg2ExecBuffer *out, uint32_t first, uint32_t count,
                                 Nprg2ExecStats *stats) {
-    Nprg2ExecRequest r = {.program = &s->program, .bound = &s->bound, .pool1_writable_bytes = s->pools[1].bytes,
+    Nprg2ExecRequest r = {.fuse = s->fuse ? &s->plan : NULL, .program = &s->program, .bound = &s->bound, .pool1_writable_bytes = s->pools[1].bytes,
                           .inputs = in, .input_count = 4, .outputs = out, .output_count = 2,
                           .scratch = s->scratch, .scratch_bytes = s->scratch_bytes,
                           .command_first = first, .command_count = count, .stats = stats};
@@ -240,9 +244,25 @@ static void census(Session *s) {
 
 static int same_pools(Session *s, uint8_t *const *ref, uint32_t cmd) {
     for (int p = 0; p < 7; p++) {
-        if (!s->pools[p].bytes || !memcmp(s->pools[p].base, ref[p], s->pools[p].bytes)) continue;
+        if (!s->pools[p].bytes) continue;
         uint32_t diff = 0;
-        while (s->pools[p].base[diff] == ref[p][diff]) diff++;
+        if (p == 1 && s->fuse) {
+            /* Dead conv outputs stay stale until rewritten: allowed in masked 2 KiB blocks only. */
+            int bad = 0;
+            for (uint32_t b = 0; b * 2048u < s->pools[1].bytes; b++) {
+                uint32_t n = s->pools[1].bytes - b * 2048u < 2048u ? s->pools[1].bytes - b * 2048u : 2048u;
+                if (!memcmp(s->pools[1].base + b * 2048u, ref[1] + b * 2048u, n)) { s->mask[b] = 0; continue; }
+                if (s->mask[b]) continue;
+                diff = b * 2048u;
+                while (s->pools[1].base[diff] == ref[1][diff]) diff++;
+                bad = 1;
+                break;
+            }
+            if (!bad) continue;
+        } else {
+            if (!memcmp(s->pools[p].base, ref[p], s->pools[p].bytes)) continue;
+            while (s->pools[p].base[diff] == ref[p][diff]) diff++;
+        }
         Nprg2Command c;
         nprg2_command_at(&s->bound, cmd, &c);
         fprintf(stderr, "%s pool mismatch after cmd=%lu op=%u var=%u seq=%u: pool=%d off=0x%lx prepared=%u cpu=%u\n",
@@ -251,6 +271,22 @@ static int same_pools(Session *s, uint8_t *const *ref, uint32_t cmd) {
         return 0;
     }
     return 1;
+}
+
+/* Marks the pool-1 blocks of command cmd's first output (a u8 CH tensor). */
+static void mask_conv_out(Session *s, uint32_t cmd) {
+    Nprg2Command c;
+    CHECK(nprg2_command_at(&s->bound, cmd, &c) == NPRG2_OK && c.output_count == 1);
+    uint32_t ix = s->bound.refs.data[c.output_first * 2u] | (uint32_t)s->bound.refs.data[c.output_first * 2u + 1u] << 8;
+    Nprg2TensorView v;
+    CHECK(nprg2_bound_tensor_at(&s->program, &s->bound, ix, &v) == NPRG2_OK && v.storage_kind == 2);
+    const uint8_t *g = v.geometry_record;
+    int m1 = (int16_t)(g[16] | g[17] << 8), m2 = (int16_t)(g[18] | g[19] << 8), m3 = (int16_t)(g[20] | g[21] << 8);
+    uint64_t n = (uint64_t)(m1 / 8) * (m2 / 8) * (m3 / 32);
+    for (uint64_t i = 0; i < n; i++) {
+        uint32_t e = v.blocks[v.slice_origin + i];
+        if ((e & 127u) == 1u) s->mask[(e & ~127u) / 2048u] = 1;
+    }
 }
 
 static void check_outputs(Session *s, uint8_t *const *out, const char *what) {
@@ -299,11 +335,21 @@ static void lockstep(Session *s) {
     Nprg2ExecBuffer in[4], ob[2] = {{out[0], 163840}, {out[1], 655360}};
     for (int k = 0; k < 4; k++) in[k] = (Nprg2ExecBuffer){s->inputs[k], s->input_bytes[k]};
     CHECK((uint32_t)qdg_commands(g) == s->program.command_count);
-    for (uint32_t i = 0; i < s->program.command_count; i++) {
-        int rc = qdg_run(g, qin, qin_bytes, qout, qout_bytes, i, i + 1);
+    uint32_t steps = 0, fused_steps = 0, fused_active = 0, fused_dead = 0;
+    for (uint32_t i = 0, end; i < s->program.command_count; i = end + 1) {
+        /* A step is one command, or the span of overlapping fusion pairs (compared after its last command). */
+        end = i;
+        if (s->fuse)
+            for (uint32_t k = i; k <= end; k++) {
+                uint16_t role = s->plan.role[k];
+                if (role && !(role & NPRG2_FUSE_EPI) && s->plan.pairs[role - 1u].epi > end) end = s->plan.pairs[role - 1u].epi;
+            }
+        steps++;
+        if (end > i) fused_steps++;
+        int rc = qdg_run(g, qin, qin_bytes, qout, qout_bytes, i, end + 1);
         if (rc) { fprintf(stderr, "qd_graph failed cmd=%lu rc=%d line=%u\n", (unsigned long)i, rc, qdg_stats(g)->error_detail); exit(1); }
         Nprg2ExecStats st;
-        Nprg2ExecRequest r = request(s, in, ob, i, 1, &st);
+        Nprg2ExecRequest r = request(s, in, ob, i, end + 1 - i, &st);
         /* The run must fit in exactly the scratch its own dry pass measured. */
         if (s->reference_only) r.scratch_bytes = s->need[i];
         rc = nprg2_executor_run(&s->executor, &r);
@@ -314,14 +360,25 @@ static void lockstep(Session *s) {
                     (unsigned long)i, c.opcode, c.variant, rc, (unsigned long)nprg2_exec_reference_error_line());
             exit(1);
         }
-        if (!same_pools(s, ref, i)) exit(1);
+        if (s->fuse)
+            for (uint32_t k = i; k <= end; k++) {
+                uint16_t role = s->plan.role[k];
+                if (role && !(role & NPRG2_FUSE_EPI) && s->plan.pairs[role - 1u].epi <= end && s->plan.pairs[role - 1u].active) {
+                    fused_active++;
+                    if (s->plan.pairs[role - 1u].dead) { fused_dead++; mask_conv_out(s, k); }
+                }
+            }
+        if (!same_pools(s, ref, end)) exit(1);
         if (memcmp(out[0], ref_out[0], 163840) || memcmp(out[1], ref_out[1], 655360)) {
-            fprintf(stderr, "%s graph output mismatch after cmd=%lu\n", s->model, (unsigned long)i);
+            fprintf(stderr, "%s graph output mismatch after cmd=%lu\n", s->model, (unsigned long)end);
             exit(1);
         }
     }
     printf("PASS %s lockstep: %lu commands, all seven pools identical to qd_graph CPU after every command\n",
            s->model, (unsigned long)s->program.command_count);
+    if (s->fuse)
+        printf("%s lockstep fusion: %lu steps (%lu spanning fused pairs), %lu pairs active (%lu dead, raw output not stored)\n",
+               s->model, (unsigned long)steps, (unsigned long)fused_steps, (unsigned long)fused_active, (unsigned long)fused_dead);
     check_outputs(s, out, "lockstep");
     qdg_destroy(g);
     for (int p = 0; p < 7; p++) free(ref[p]);
@@ -352,6 +409,11 @@ static void whole(Session *s) {
         exit(1);
     }
     CHECK(st.executed_commands == s->program.command_count && st.validated_commands == s->program.command_count);
+    if (s->fuse) {
+        uint32_t act = 0, dead = 0;
+        for (uint32_t k = 0; k < s->plan.count; k++) { act += s->plan.pairs[k].active; dead += s->plan.pairs[k].active && s->plan.pairs[k].dead; }
+        printf("%s whole fusion: %lu of %lu pairs active (%lu dead)\n", s->model, (unsigned long)act, (unsigned long)s->plan.count, (unsigned long)dead);
+    }
     printf("PASS %s whole schedule: one preflight validated %lu commands without pool writes, one run executed all\n",
            s->model, (unsigned long)st.executed_commands);
     check_outputs(s, out, "whole");
@@ -369,6 +431,13 @@ int main(int argc, char **argv) {
     open_session(&s, model);
     int mixed = !strncmp(mode, "mixed", 5), fast = !!strstr(mode, "fast");
     s.reference_only = !mixed;
+    s.fuse = getenv("QD_FUSE") && atoi(getenv("QD_FUSE")) && fast;
+    if (s.fuse) {
+        int frc = nprg2_fuse_plan_build(&s.plan, &s.program, &s.bound, (Nprg2Allocator){0});
+        CHECK(frc == NPRG2_FUSE_OK);
+        printf("%s fusion plan: %lu pairs\n", model, (unsigned long)s.plan.count);
+        CHECK(s.plan.count > 0);
+    }
     register_handlers(&s, mixed, fast);
     census(&s);
     if (strcmp(what, "whole")) lockstep(&s);

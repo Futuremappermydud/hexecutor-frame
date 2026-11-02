@@ -43,6 +43,10 @@ int nprg2_executor_register_scratch_region(Nprg2Executor *e,uint8_t op,uint8_t v
     return NPRG2_EXEC_REGISTRY_FULL;
 }
 
+int nprg2_executor_set_fuse(Nprg2Executor *e,uint8_t op,uint8_t variant,Nprg2ExecFuse fuse){
+    if(!e)return NPRG2_EXEC_ARGUMENT;int hi=handler_index(e,op,variant);if(hi<0)return NPRG2_EXEC_UNSUPPORTED;
+    e->handlers[hi].fuse=fuse;return NPRG2_EXEC_OK;
+}
 int nprg2_executor_mark_no_effect(Nprg2Executor *e,uint8_t op,uint8_t variant){
     if(!e)return NPRG2_EXEC_ARGUMENT;int hi=handler_index(e,op,variant);if(hi<0)return NPRG2_EXEC_UNSUPPORTED;
     e->handlers[hi].no_effect=1;return NPRG2_EXEC_OK;
@@ -76,7 +80,23 @@ static void fill_call(const Nprg2ExecRequest *r,uint32_t index,Nprg2ExecCall *ca
     call->user=r->user;call->scratch=r->scratch;call->scratch_bytes=r->scratch_bytes;
     call->scratch_region[0]=(Nprg2ExecBuffer){(uint8_t *)r->scratch,r->scratch_bytes};
     for(uint32_t k=1;k<NPRG2_EXEC_SCRATCH_REGIONS;k++)call->scratch_region[k]=r->extra_scratch[k-1u];
-    call->preflighted=0;
+    call->preflighted=0;call->epilogue=NULL;call->epilogue_dead=0;
+}
+/* The plan pair this command is the conv of, for a request whose interval
+ * contains both commands; NULL otherwise. */
+static Nprg2FusePair *fuse_pair_of_conv(const Nprg2ExecRequest *r,uint32_t ix){
+    const Nprg2FusePlan *p=r->fuse;if(!p||!p->role||ix>=p->commands)return NULL;
+    uint16_t role=p->role[ix];if(!role||(role&NPRG2_FUSE_EPI))return NULL;
+    Nprg2FusePair *pr=&p->pairs[role-1u];
+    if(pr->epi<r->command_first||pr->epi-r->command_first>=r->command_count)return NULL;
+    return pr;
+}
+static Nprg2FusePair *fuse_pair_of_epi(const Nprg2ExecRequest *r,uint32_t ix){
+    const Nprg2FusePlan *p=r->fuse;if(!p||!p->role||ix>=p->commands)return NULL;
+    uint16_t role=p->role[ix];if(!(role&NPRG2_FUSE_EPI))return NULL;
+    Nprg2FusePair *pr=&p->pairs[(role&~NPRG2_FUSE_EPI)-1u];
+    if(pr->conv<r->command_first||pr->conv-r->command_first>=r->command_count)return NULL;
+    return pr;
 }
 /* Hands the handler the region it registered for. */
 static void select_scratch(Nprg2ExecCall *call,const Nprg2ExecHandler *h){
@@ -143,11 +163,11 @@ static uint64_t request_signature(const Nprg2Executor *e,const Nprg2ExecRequest 
     h=sig_mix(h,(uintptr_t)r->inputs);h=sig_mix(h,r->input_count);h=sig_mix(h,(uintptr_t)r->outputs);h=sig_mix(h,r->output_count);
     for(uint32_t i=0;i<r->input_count&&r->inputs;i++){h=sig_mix(h,(uintptr_t)r->inputs[i].data);h=sig_mix(h,r->inputs[i].bytes);}
     for(uint32_t i=0;i<r->output_count&&r->outputs;i++){h=sig_mix(h,(uintptr_t)r->outputs[i].data);h=sig_mix(h,r->outputs[i].bytes);}
-    h=sig_mix(h,r->command_first);h=sig_mix(h,r->command_count);h=sig_mix(h,e->count);
+    h=sig_mix(h,r->command_first);h=sig_mix(h,r->command_count);h=sig_mix(h,e->count);h=sig_mix(h,(uintptr_t)r->fuse);h=sig_mix(h,(uintptr_t)r->fuse);
     for(uint32_t i=0;i<NPRG2_EXEC_REGISTRY_CAPACITY;i++){
         const Nprg2ExecHandler *x=&e->handlers[i];if(!x->used)continue;
         h=sig_mix(h,((uint64_t)x->opcode<<8|x->variant)<<8|x->scratch_region);
-        h=sig_mix(h,(uintptr_t)x->validate);h=sig_mix(h,(uintptr_t)x->ctx);
+        h=sig_mix(h,(uintptr_t)x->validate);h=sig_mix(h,(uintptr_t)x->fuse);h=sig_mix(h,(uintptr_t)x->ctx);
         h=sig_mix(h,((uint64_t)x->scratch_bytes<<32)|x->concurrent_worker_scratch_bytes);
     }
     return h|1u;
@@ -170,6 +190,15 @@ int nprg2_executor_preflight(const Nprg2Executor *e,const Nprg2ExecRequest *r){
         if(h->scratch_bytes>UINT32_MAX-h->concurrent_worker_scratch_bytes||
            h->scratch_bytes+h->concurrent_worker_scratch_bytes>call.scratch_bytes){
             s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_REJECTED;
+        }
+        Nprg2ExecCall ecall;
+        Nprg2FusePair *fp=fuse_pair_of_conv(r,ix);
+        if(fp){
+            fp->active=0;
+            if(h->fuse&&nprg2_command_at(r->bound,fp->epi,&ecall.command)==NPRG2_OK){
+                fill_call(r,fp->epi,&ecall);
+                if(h->fuse(&call,&ecall,fp->dead,h->ctx)){fp->active=1;call.epilogue=&ecall;call.epilogue_dead=fp->dead;}
+            }
         }
         uint64_t v0=pr?pr->clock():0;
         int valid=h->validate(&call,h->ctx);
@@ -200,11 +229,25 @@ int nprg2_executor_run(const Nprg2Executor *e,const Nprg2ExecRequest *r){
         if(r->cancelled&&r->cancelled(r->cancel_ctx,ix)){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_CANCELLED;}
         int hi=handler_index(e,call.command.opcode,call.command.variant);if(hi<0)return NPRG2_EXEC_UNSUPPORTED;
         const Nprg2ExecHandler *h=&e->handlers[hi];
+        {
+            Nprg2FusePair *ep=fuse_pair_of_epi(r,ix);
+            if(ep&&ep->active){   /* done by the conv's fused output step */
+                if(pr&&pr->handler_run_count)pr->handler_run_count[hi]++;
+                s->executed_commands++;continue;
+            }
+        }
         if(h->no_effect){
             if(pr&&pr->handler_run_count)pr->handler_run_count[hi]++;
             s->executed_commands++;continue;
         }
         fill_call(r,ix,&call);call.preflighted=1;select_scratch(&call,h);
+        Nprg2ExecCall ecall;
+        {
+            Nprg2FusePair *fp=fuse_pair_of_conv(r,ix);
+            if(fp&&fp->active&&nprg2_command_at(r->bound,fp->epi,&ecall.command)==NPRG2_OK){
+                fill_call(r,fp->epi,&ecall);ecall.preflighted=1;call.epilogue=&ecall;call.epilogue_dead=fp->dead;
+            }
+        }
         uint32_t v=call.command.variant;
         int timed=pr&&pr->variant_cycles&&pr->variant_count&&v<NPRG2_EXEC_PROFILE_VARIANTS;
         uint64_t t0=pr?pr->clock():0;

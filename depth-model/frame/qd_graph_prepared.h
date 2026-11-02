@@ -52,6 +52,14 @@ static const volatile char prepared_compact3_feature[]="QD_PREPARED_A3_1";
 #define QDS_PREPARED_PROFILE 1
 #endif
 
+/* Conv epilogue fusion (QDS_PREPARED_FUSE, default off): a schedule pass at
+ * open marks conv -> REQUANT_U8/ADD_U8 pairs, the fast conv then writes the
+ * epilogue's output from registers (prepared_fuse.h, EXECUTOR.md). trace[12]
+ * reports the pair count. */
+#ifndef QDS_PREPARED_FUSE
+#define QDS_PREPARED_FUSE 0
+#endif
+
 typedef struct {
     Nprg2PreparedRunner runner;
     Nprg2Executor executor;
@@ -221,6 +229,10 @@ static QdPreparedState *prepared_open(QdgGraph *g,const QdsConfig *cfg,
         free(s->scratch);nprg2_runner_close(&s->runner);free(s);return NULL;
     }
 #endif
+#if QDS_PREPARED_FUSE
+    /* A schedule the analysis cannot model simply runs unfused. */
+    (void)nprg2_runner_build_fuse(&s->runner,(Nprg2Allocator){0});
+#endif
     for(uint32_t k=0;k<4;k++)s->inputs[k]=(Nprg2ExecBuffer){(uint8_t *)inputs[k],(uint32_t)input_bytes[k]};
     for(uint32_t k=0;k<2;k++)s->outputs[k]=(Nprg2ExecBuffer){outputs[k],(uint32_t)output_bytes[k]};
     return s;
@@ -234,6 +246,7 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
        !native_1x1_hmx_owned() || !native_1x1_workers_idle())return QDG_ERR_UNSUPPORTED;
     trace[6]=s->runner.l2_hot_bytes;trace[7]=s->runner.l2_expanded_bytes;
     trace[10]=(uint32_t)(uintptr_t)s->runner.l2_hot;
+    trace[12]=s->runner.fuse?s->runner.fuse->count:0;
     trace[11]=(uint32_t)(uintptr_t)s->runner.l2_expanded_blocks;
     void *scratch=NULL;uint32_t scratch_bytes=0;
 #if QDS_PREPARED_ELEMENTWISE && !QDS_PREPARED_REFERENCE

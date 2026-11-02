@@ -39,7 +39,7 @@ if [ "$MODE" = segments ]; then
   rm -f "$SEGDIR"/*.rseg "$SEGDIR"/*.log
   host="$SEGDIR/test_refsim_split"
   cc -O2 -std=c11 -ffp-contract=off -fno-fast-math -fno-strict-aliasing -Wall -Wextra -Werror -I$N \
-    $N/test_prepared_reference_sim.c $N/prepared_reference.c $N/prepared_executor.c $N/nprg2_runtime.c \
+    $N/test_prepared_reference_sim.c $N/prepared_reference.c $N/prepared_executor.c $N/prepared_fuse.c $N/nprg2_runtime.c \
     -lm -o "$host"
   for model in primary alternate; do
     if [ "$WHICH" = both ] || [ "$WHICH" = "$model" ]; then
@@ -62,6 +62,7 @@ docker run --rm --platform linux/amd64 $SDKARG ${DOCKER_EXTRA:-} \
       frame/native_program/test_prepared_reference_sim.c \
       frame/native_program/prepared_reference.c \
       frame/native_program/prepared_executor.c \
+      frame/native_program/prepared_fuse.c \
       frame/native_program/prepared_elementwise.c \
       frame/blocked_glue/add_u8.c \
       frame/blocked_glue/linearclip_u8_u16.c \

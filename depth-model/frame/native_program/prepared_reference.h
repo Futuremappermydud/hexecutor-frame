@@ -55,6 +55,10 @@ typedef struct {
     uint8_t *near; uint32_t near_bytes;
     uint64_t (*clock)(void); uint64_t *phase;
 } Nprg2ReferenceConv;
+/* Fuse hook registered with the conv keys: the conv handler can run the
+ * REQUANT_U8/70 or ADD_U8/13 command `epilogue` fused into its output step
+ * (Nprg2ExecFuse; see prepared_fuse.h). */
+int nprg2_exec_reference_fuse(const Nprg2ExecCall *conv, const Nprg2ExecCall *epilogue, int dead, void *ctx);
 int nprg2_executor_register_reference_conv(Nprg2Executor *executor, Nprg2ReferenceConv *conv, uint32_t *added);
 /* nprg2_exec_reference_scratch as the handler registered with conv sees the
  * command: call-scratch bytes, and workspace bytes (0 off the fast path). */

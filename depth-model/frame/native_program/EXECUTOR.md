@@ -820,3 +820,65 @@ copy (`.work/engine-build`), and builds with `QDS_PREPARED_PROFILE=0`. Not run
 on hardware. Hardware must check: `executor_profile.preflights_reused==1`,
 `validated_commands==commands`, outputs still equal emulator sha256, and that
 arena bytes 20480..24640 are unused by anything else.
+
+## Conv epilogue fusion (2026-11-01, simulator and host only; not run on hardware)
+
+Fuses 1x8xWxC u8 full-tile convolutions directly into following elementwise
+epilogues: `conv -> REQUANT_U8/70` and `conv -> ADD_U8/13`. The fused epilogue
+evaluates the elementwise transform immediately in registers during the
+convolution's block emission loop (`rq_emit_fx` on HVX or `fuse_scalar`),
+saving the intermediate memory readback from VTCM. When the convolution's
+intermediate output is not consumed by any other command (proven dead by
+pool-1 block liveness tracking), storing the raw intermediate output is
+completely skipped.
+
+- Files:
+  - `native_program/prepared_fuse.{h,c}`: schedule builder analysis (`nprg2_fuse_plan`),
+    identifies fusable pairs, validates shape/block table identity, builds
+    block-level pool-1 liveness plan, tags dead intermediate outputs.
+  - `native_program/prepared_executor.{h,c}`: `Nprg2ExecFuse` hook; adds
+    `epilogue` and `epilogue_dead` to `Nprg2ExecCall`; request carries `fuse`
+    plan; `nprg2_executor_preflight` activates fusable pairs; run loop skips
+    active epilogue commands (their work is performed inside the conv).
+  - `native_program/prepared_runner.{h,c}`: `nprg2_runner_build_fuse` /
+    `nprg2_runner_enable_fuse`; plan lifecycle managed on runner close.
+  - `native_program/prepared_reference.{h,c}`: `Fuse` state decoded and
+    verified in `fuse_decode`; `rq_emit_fx` (HVX vector requant/add) and
+    `fuse_scalar` evaluate epilogue operations during block stores; patches
+    integrated into `fast_conv`, `near_compute`, `k_hmx_conv`, and `tile_block`;
+    `nprg2_exec_reference_fuse` hook registered with conv keys.
+  - `qd_graph_prepared.h`, `build_resident_dsp.sh`: build flag `QDS_PREPARED_FUSE`
+    (default 0, requires `QDS_PREPARED_REFERENCE=1`), export trace[12]=active pairs.
+  - `native_program/test_fuse_lanes_host.c`: exhaustive vector lane oracle.
+  - `native_program/test_prepared_full_model.c` (`QD_FUSE=1`),
+    `native_program/test_prepared_reference_sim.c` (`fuse` argument).
+
+- Schedule patterns:
+  - primary: 121 `conv -> REQUANT_U8/70` pairs (7.29M elements; 2 dead, 119 live),
+    89 `conv -> ADD_U8/13` pairs (4.83M elements; 72 dead, 17 live); 210 pairs total.
+  - alternate: 122 `conv -> REQUANT_U8/70` pairs (7.36M elements; 2 dead, 120 live),
+    94 `conv -> ADD_U8/13` pairs (5.15M elements; 76 dead, 18 live); 216 pairs total.
+  - Live pairs still write the raw intermediate conv output (saving readback). Dead
+    pairs skip intermediate writes entirely. Other epilogues (u16 or non-adjacent)
+    remain unfused.
+
+- Verification and measurements:
+  - Host full-model lockstep and whole schedule (`QD_FUSE=1`): PASS on both primary
+    and alternate; all 7 pools and final outputs match emulator smoke sha256.
+    Also verified clean under AddressSanitizer and UndefinedBehaviorSanitizer.
+  - Lane exactness (`test_fuse_lanes_host`): all 256 requant inputs (all m 0..65535,
+    s 1..31) and 65536 (a,b) pairs for every model pair and 3,000 random ADD sets:
+    0 mismatches across >722M cases per model.
+  - V75 simulator: `run_prepared_reference_sim.sh both prefix 6 fast ew fuse` PASS
+    (all pools match CPU capture). Segment 3500..3999 handler pcycles base -> fuse:
+    primary 140.69M -> 134.25M (4.6% speedup), alternate 178.87M -> 171.10M (4.3% speedup).
+  - Engine build: Hexagon ELF compiles cleanly with `QDS_PREPARED_FUSE=1`.
+
+- Caveats and known limitations:
+  - Single-threaded only: epilogue evaluation happens inside block emission (`rq_emit_fx`);
+    multithreading across worker threads is not supported when fusion is active.
+  - Dead intermediate blocks leave unwritten pool-1 space: safe for downstream consumers
+    since blocks are unreferenced, but tests that diff the entire unmasked pool memory
+    will observe stale bytes.
+  - Hardware run on Frame CDSP pending.
+

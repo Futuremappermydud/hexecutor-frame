@@ -59,6 +59,21 @@ typedef struct {
 
 typedef struct { int32_t n[4]; uint32_t dt, scalar, unknown; void *p; } A;
 
+/* Conv epilogue fused into the conv's output step (see prepared_fuse.h and
+ * EXECUTOR.md): per output byte q (the conv's requantized u8 value),
+ *   kind 1 (REQUANT_U8):  e = min((q*mc + rd) >> sh, 255)
+ *   kind 2 (ADD_U8):      e = min((q*mc + b*mo + rd) >> sh, 255)
+ * in unsigned 32-bit arithmetic that fuse_decode proves cannot overflow;
+ * b is the other operand's byte at the same position. The epilogue's output
+ * oe is written, the conv's own output only unless dead. eb/bb are the
+ * scalar path's chunk buffers (workspace). */
+typedef struct {
+    int kind, dead;
+    uint32_t mc, mo, rd, sh;
+    T oe, ob;
+    uint8_t *eb, *bb;
+} Fuse;
+
 typedef struct {
     const Nprg2ExecCall *call;
     int dry;
@@ -72,6 +87,8 @@ typedef struct {
     uint8_t measure_only;
     const Nprg2ReferenceConv *conv;
     size_t wused;
+    Fuse fx;
+    int fx_ok;
 } G;
 
 static uint32_t rd32(const uint8_t *p){return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
@@ -1475,7 +1492,11 @@ static int rq_prepare(int32_t *par, int32_t co, int sixteen, int64_t bound, int3
  * blk[b][i] is the start (row H%8 included) of the i-th block that the 8
  * pixels touch, a is the first pixel's slot in its block (W%8 for u8, W%4 for
  * u16, even for u16) and a NULL entry is an absent block, which stores skip. */
-typedef struct { const HVX_Vector *par; uint8_t *out; uint32_t pstride; int sixteen, blocked, a; uint8_t *blk[2][3]; } RqOut;
+/* Fused epilogue (u8, aligned full 8-pixel blocks only; see Fuse): block b's
+ * row start in the epilogue's output (eblk) and, for kind 2, in the other
+ * operand (bblk). */
+typedef struct { uint32_t mc, mo, rd, sh; int kind, dead; uint8_t *eblk[2]; const uint8_t *bblk[2]; } FxOut;
+typedef struct { const HVX_Vector *par; uint8_t *out; uint32_t pstride; int sixteen, blocked, a; uint8_t *blk[2][3]; const FxOut *fx; } RqOut;
 #define RQ_INLINE static inline __attribute__((always_inline))
 /* Constant trip counts (np only guards), so every copy unrolls fully and the
  * accumulator arrays below stay in registers. */
@@ -1563,6 +1584,39 @@ static __attribute__((noinline)) void rq_emit_part(const RqOut *o, const HVX_Vec
                                                    int32_t nb, int32_t np) {
     rq_emit(o,acc,lo,nb,np,0);
 }
+/* Fused conv output step for u8 blocked output with a == 0 and np == 8:
+ * the conv's requantized value q (clipped to the u8 range exactly as the
+ * saturating pack would) feeds the epilogue's integer formula, e =
+ * min((q*mc + b*mo + rd) >> sh, 255), whose u32 sum Fuse proved cannot wrap;
+ * vmpyieacc multiplies by the low unsigned halfword (all multipliers are
+ * <= 65535) and wraps mod 2^32, vlsr is logical. The raw q is stored too
+ * unless dead. Out of line so the unfused emit keeps its register budget. */
+static __attribute__((noinline)) void rq_emit_fx(const RqOut *o, const HVX_Vector *acc, int32_t nb) {
+    const FxOut *f=o->fx;
+    HVX_Vector rdv=Q6_V_vsplat_R((int32_t)f->rd),mcv=Q6_V_vsplat_R((int32_t)f->mc),mov=Q6_V_vsplat_R((int32_t)f->mo),
+               shv=Q6_V_vsplat_R((int32_t)f->sh),c255=Q6_V_vsplat_R(255);
+    for(int32_t b=0;b<nb;b++) {
+        const HVX_Vector *k=o->par+(size_t)b*RQ_VECS;
+        for(int32_t p0=0;p0<PIXEL_BLOCK;p0+=4) {
+            HVX_Vector q[4],r[4];
+            for(int i=0;i<4;i++) q[i]=rq_lane(acc[b*PIXEL_BLOCK+p0+i],NULL,k,0);
+            if(!f->dead) rq_put8(o,b,rq_pack8(q[0],q[1],q[2],q[3]),p0,4,1);
+            HVX_Vector u[4];
+            if(f->kind==2) {
+                HVX_Vector bv=*(const HVX_Vector *)(f->bblk[b]+32*p0);
+                HVX_VectorPair w=Q6_Wuh_vunpack_Vub(bv);
+                HVX_VectorPair w0=Q6_Wuw_vunpack_Vuh(Q6_V_lo_W(w)),w1=Q6_Wuw_vunpack_Vuh(Q6_V_hi_W(w));
+                u[0]=Q6_V_lo_W(w0);u[1]=Q6_V_hi_W(w0);u[2]=Q6_V_lo_W(w1);u[3]=Q6_V_hi_W(w1);
+            }
+            for(int i=0;i<4;i++) {
+                HVX_Vector t=Q6_Vw_vmpyieacc_VwVwVuh(rdv,Q6_Vw_vmin_VwVw(q[i],c255),mcv);
+                if(f->kind==2) t=Q6_Vw_vmpyieacc_VwVwVuh(t,u[i],mov);
+                r[i]=Q6_Vw_vmin_VwVw(Q6_Vw_vlsr_VwVw(t,shv),c255);
+            }
+            *(HVX_Vector *)(f->eblk[b]+32*p0)=rq_pack8(r[0],r[1],r[2],r[3]);
+        }
+    }
+}
 #else
 typedef struct RqOut RqOut;
 typedef int32_t HVX_Vector;
@@ -1611,6 +1665,12 @@ static void tile_block(int32_t *acc, int32_t np, const uint8_t *const *xb, uint3
                 MAC8(a,w0);MAC8(b,w1);
             }
         }
+        if(rq && rq->fx) {
+            o[0]=a0;o[1]=a1;o[2]=a2;o[3]=a3;o[4]=a4;o[5]=a5;o[6]=a6;o[7]=a7;
+            o[8]=b0;o[9]=b1;o[10]=b2;o[11]=b3;o[12]=b4;o[13]=b5;o[14]=b6;o[15]=b7;
+            rq_emit_fx(rq,(const HVX_Vector *)acc,2);
+            return;
+        }
         if(rq && !rq->a) {
             HVX_Vector v[2*PIXEL_BLOCK]={a0,a1,a2,a3,a4,a5,a6,a7,b0,b1,b2,b3,b4,b5,b6,b7};
             rq_emit(rq,v,lo,2,PIXEL_BLOCK,1);
@@ -1632,6 +1692,11 @@ static void tile_block(int32_t *acc, int32_t np, const uint8_t *const *xb, uint3
                 SPLAT(0);SPLAT(1);SPLAT(2);SPLAT(3);SPLAT(4);SPLAT(5);SPLAT(6);SPLAT(7);
                 MAC8(a,w0);
             }
+        }
+        if(rq && rq->fx) {
+            o[0]=a0;o[1]=a1;o[2]=a2;o[3]=a3;o[4]=a4;o[5]=a5;o[6]=a6;o[7]=a7;
+            rq_emit_fx(rq,(const HVX_Vector *)acc,1);
+            return;
         }
         if(rq && !rq->a) {
             HVX_Vector v[PIXEL_BLOCK]={a0,a1,a2,a3,a4,a5,a6,a7};
@@ -1909,12 +1974,31 @@ static void fast_conv_compute(G *g, const T *xt, const T *wt, const T *ft, int s
 static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o, int s2, int reverse, int packed,
                          int sixteen, int32_t kh, int32_t kw, int32_t ci, int32_t co, int32_t oh, int32_t ow,
                          const uint8_t *x, const NearPlan *p);
+/* Scalar fused epilogue for one output row chunk: q holds nc pixels x co
+ * requantized bytes; the epilogue formula of Fuse is applied and written to
+ * the epilogue's output (the other operand read from its blocks first). */
+static void fuse_scalar(G *g, const Fuse *fx, const uint8_t *q, int32_t nc, int32_t co, int32_t y, int32_t x0) {
+    size_t n=(size_t)nc*(size_t)co;
+    int32_t dims[4]={1,1,nc,co};
+    if(fx->kind==2) {
+        int32_t bo[4]={0,fx->ob.p[1]+y,fx->ob.p[2]+x0,0};
+        xfer_copy(g,&fx->ob,fx->bb,dims,bo,0);
+    }
+    for(size_t i=0;i<n;i++) {
+        uint32_t t=(uint32_t)q[i]*fx->mc+fx->rd;
+        if(fx->kind==2) t+=(uint32_t)fx->bb[i]*fx->mo;
+        t>>=fx->sh;
+        fx->eb[i]=(uint8_t)(t>255?255:t);
+    }
+    int32_t eo[4]={0,fx->oe.p[1]+y,fx->oe.p[2]+x0,0};
+    xfer_copy(g,&fx->oe,fx->eb,dims,eo,1);
+}
 static uint32_t conv_path;
 /* Returns 1 when the command took the fast path (or would, in a dry pass),
  * 0 to use the reference convolution, or a negative error. */
 static int fast_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int s2, int sixteen, int32_t co,
                      int32_t oh, int32_t ow, int32_t *err) {
-    *err=0;conv_path=0;
+    *err=0;conv_path=0;g->fx_ok=0;
     if(!g->conv) return 0;
     int32_t H=wt->m[0],W=wt->m[1],I=wt->m[2],O=wt->m[3];
     int packed=is_class(wt,"Xpb","xpb"),reverse=!s2 && wt->cls==('X'|'w'<<8|'b'<<16);
@@ -1957,6 +2041,15 @@ static int fast_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, in
         if(g->wused>g->conv->workspace_bytes) return 0;
         if(!x){*err=E_MEMORY;return -1;}
         if(o->esize!=es){*err=E_TENSOR;return -1;}
+        if(g->fx.kind) {
+            /* The fused epilogue must cover exactly the region the conv writes. */
+            if(sixteen || oh!=o->d[1] || ow!=o->d[2] || co!=o->d[3] || ow%8) return 0;
+            g->fx.eb=walloc(g,(size_t)plan.cols*co);
+            g->fx.bb=g->fx.kind==2?walloc(g,(size_t)plan.cols*co):NULL;
+            if(g->wused>g->conv->workspace_bytes) return 0;
+            if(!g->fx.eb || (g->fx.kind==2 && !g->fx.bb)){*err=E_MEMORY;return -1;}
+            g->fx_ok=1;
+        }
         if(!checked && ((*err=xfer_check(g,xt,dims,origin,0)) || (*err=xfer_check(g,o,on,oorigin,1)))) return -1;
         conv_path=2;
         if(g->dry) return 1;
@@ -2022,7 +2115,7 @@ static void fast_conv_compute(G *g, const T *xt, const T *wt, const T *ft, int s
             if(vec) {
                 size_t es=sixteen?2:1;
                 RqOut ro={(const HVX_Vector *)rqp+(size_t)j*RQ_VECS,r+(((size_t)y*ow+x0)*co+(size_t)j*32)*es,
-                          (uint32_t)(co*es),sixteen,0,0,{{NULL}}};
+                          (uint32_t)(co*es),sixteen,0,0,{{NULL}},NULL};
                 if(sixteen) {
                     tile_block(acc,np,&xbl,1,segend,stride,wpp,nb==2,xoff,wbase,NULL,NULL);
                     tile_block(hi,np,&xbh,1,segend,stride,wpp,nb==2,xoff,wbase,&ro,(const HVX_Vector *)acc);
@@ -2058,6 +2151,17 @@ static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o
                          const uint8_t *x, const NearPlan *p) {
     const Nprg2ReferenceConv *c=g->conv;
     uint8_t *n=c->near,*out=n+p->out,*lo=n+p->lo,*hi=sixteen?n+p->hi:NULL;
+    const Fuse *fx=g->fx.kind?&g->fx:NULL;
+#ifdef NPRG2_FUSE_POISON
+    /* Host test: a dead conv output must not be observable, so scribble over it. */
+    if(fx && fx->dead) {
+        uint64_t nblk=(uint64_t)(o->m[1]/8)*(uint64_t)(o->m[2]/8)*(uint64_t)(o->m[3]/32);
+        for(uint64_t i=0;i<nblk;i++) {
+            uint32_t e=o->blocks[o->slice+i];
+            if((e&127u)==1u) memset(g->pool[1]+(e&~127u),0xA5,2048);
+        }
+    }
+#endif
     int32_t *acc=(int32_t *)(n+p->acc),*mult=(int32_t *)(n+p->mult),*bias=(int32_t *)(n+p->bias);
     int32_t *M=(int32_t *)(n+p->M),*pre=(int32_t *)(n+p->pre),*post=(int32_t *)(n+p->post);
     uint32_t *wp=(uint32_t *)(n+p->wp),*xoff=(uint32_t *)(n+p->xoff),*segend=(uint32_t *)(n+p->segend);
@@ -2119,12 +2223,22 @@ static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o
                     /* Fused: requant time lands in the mac phase. */
                     if(vec) {
                         RqOut ro={(const HVX_Vector *)rqp+(size_t)j*RQ_VECS,out+((size_t)px*co+(size_t)j*32)*es,
-                                  (uint32_t)(co*es),sixteen,0,0,{{NULL}}};
+                                  (uint32_t)(co*es),sixteen,0,0,{{NULL}},NULL};
+                        FxOut fo;
                         if(dchunk) {
                             int32_t wb=(o->p[2]+x0+px-oa)>>rwsh;
                             ro.blocked=1;ro.a=oa;
                             for(int32_t b=0;b<nb;b++)for(int32_t i=0;i<L;i++)
                                 ro.blk[b][i]=blocked_rowptr(g->pool,o,o->p[1]+y,wb+i,onbw,onbd,j+b);
+                            if(fx) {
+                                /* Same geometry as o (proved by fuse_decode), so the same slots. */
+                                fo=(FxOut){fx->mc,fx->mo,fx->rd,fx->sh,fx->kind,fx->dead,{NULL,NULL},{NULL,NULL}};
+                                for(int32_t b=0;b<nb;b++) {
+                                    fo.eblk[b]=blocked_rowptr(g->pool,&fx->oe,fx->oe.p[1]+y,wb,onbw,onbd,j+b);
+                                    if(fx->kind==2) fo.bblk[b]=blocked_rowptr(g->pool,&fx->ob,fx->ob.p[1]+y,wb,onbw,onbd,j+b);
+                                }
+                                ro.fx=&fo;
+                            }
                         }
                         if(sixteen) {
                             tile_block(acc,np,xl,(uint32_t)kh,segend,(uint32_t)ci,wpp,nb==2,xoff,wbase,NULL,NULL);
@@ -2151,12 +2265,129 @@ static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o
             }
             if(!dchunk) {
                 int32_t dims[4]={1,1,nc,co},origin[4]={0,o->p[1]+y,o->p[2]+x0,0};
-                xfer_copy(g,o,out,dims,origin,1);
+                if(!(fx && fx->dead)) xfer_copy(g,o,out,dims,origin,1);
+                if(fx) fuse_scalar(g,fx,out,nc,co,y,x0);
             }
             LAP(3);
         }
     }
 #undef LAP
+}
+
+/* ------------------------------------------------------- conv epilogue fusion */
+static int setup(G *g, const Nprg2ExecCall *c, int dry, int measure, const Nprg2ReferenceConv *conv);
+enum { FZ_BLOCKS=4096, FZ_WORDS=FZ_BLOCKS/32 };
+static int fz_tensor_ok(const T *t) {
+    if(!(t->flags&F_SHAPE) || !(t->flags&F_BLOCKED) || t->dtype!=DT_U8 || t->esize!=1) return 0;
+    for(int i=0;i<4;i++) if(t->p[i]!=0 || t->d[i]!=t->m[i]) return 0;
+    if(!(t->m[0]==1 && t->m[1]>0 && t->m[1]%8==0 && t->m[2]>0 && t->m[2]%8==0 && t->m[3]>0 && t->m[3]%32==0)) return 0;
+    return (uint64_t)t->slice+(uint64_t)(t->m[1]/8)*(uint64_t)(t->m[2]/8)*(uint64_t)(t->m[3]/32)<=t->nblocks;
+}
+static uint64_t fz_count(const T *t) {return (uint64_t)(t->m[1]/8)*(uint64_t)(t->m[2]/8)*(uint64_t)(t->m[3]/32);}
+/* Strict: every entry a present, aligned, distinct pool-1 block inside limit. */
+static int fz_mark(const T *t, uint32_t *bm, uint64_t limit) {
+    uint64_t n=fz_count(t);
+    if((uint64_t)t->slice+n>t->nblocks) return 0;
+    for(uint64_t i=0;i<n;i++) {
+        uint32_t e=t->blocks[t->slice+i],off=e&~127u;
+        if((e&127u)!=1 || (off&2047u) || off/2048u>=FZ_BLOCKS || (uint64_t)off+2048>limit) return 0;
+        uint32_t b=off/2048u;
+        if(bm[b>>5]&(1u<<(b&31))) return 0;
+        bm[b>>5]|=1u<<(b&31);
+    }
+    return 1;
+}
+/* Lenient: marks whatever pool-1 blocks the tensor's extent may touch. */
+static int fz_mark_any(const T *t, uint32_t *bm) {
+    if(t->flags&F_DIRECT) {
+        if(t->pool!=1) return 1;
+        uint64_t n=t->esize;
+        for(int i=0;i<4;i++){if(t->m[i]<=0) return 0;n*=(uint64_t)t->m[i];}
+        for(uint64_t b=t->offset/2048u;b<=((uint64_t)t->offset+n-1)/2048u;b++){
+            if(b>=FZ_BLOCKS) return 0;
+            bm[b>>5]|=1u<<(b&31);
+        }
+        return 1;
+    }
+    uint64_t lo=t->slice,hi=t->nblocks;
+    if((t->flags&F_SHAPE) && t->esize) {
+        int64_t cw=t->esize==1?8:t->esize==2?4:2;
+        uint64_t n=(uint64_t)(t->m[0]>0?t->m[0]:0)*(uint64_t)((t->m[1]+7)/8)*(uint64_t)((t->m[2]+cw-1)/cw)*(uint64_t)((t->m[3]+31)/32);
+        if(lo+n<hi) hi=lo+n;
+    }
+    for(uint64_t i=lo;i<hi;i++) {
+        uint32_t e=t->blocks[i],off=e&~127u;
+        if((e&127u)!=1) continue;
+        if((off&2047u) || off/2048u>=FZ_BLOCKS) return 0;
+        uint32_t b=off/2048u;
+        bm[b>>5]|=1u<<(b&31);
+    }
+    return 1;
+}
+static int fz_same_table(const T *a, const T *b) {
+    uint64_t n=fz_count(a);
+    for(uint64_t i=0;i<n;i++) if(a->blocks[a->slice+i]!=b->blocks[b->slice+i]) return 0;
+    return 1;
+}
+static int fz_meet(const uint32_t *a, const uint32_t *b) {
+    for(int i=0;i<FZ_WORDS;i++) if(a[i]&b[i]) return 1;
+    return 0;
+}
+/* Decodes and proves the epilogue command ec against the conv (output o,
+ * input xt, weights wt, Fi ft). Fills g->fx or rejects. Everything about the
+ * epilogue is checked here, not trusted from the plan: command key,
+ * parameters (the u32 lane arithmetic below cannot overflow), tensor shape
+ * and block tables, and block-level aliasing between its views and the
+ * conv's. */
+static int fuse_decode(G *g, const T *xt, const T *wt, const T *ft, const T *o) {
+    const Nprg2ExecCall *ec=g->call->epilogue;
+    Fuse *fx=&g->fx;
+    memset(fx,0,sizeof *fx);
+    CHECK(ec && !ec->epilogue && g->pool[1] && !((uintptr_t)g->pool[1]&127u),E_ARGS);
+    G h;
+    TRY(setup(&h,ec,1,0,NULL));
+    int add;
+    if(h.op==QDR_REQUANT_U8 && h.variant==70) add=0;
+    else if(h.op==QDR_ADD_U8 && h.variant==13) add=1;
+    else FAIL(E_UNSUPPORTED);
+    CHECK(h.nout==1 && h.nin>=(add?2u:1u) && h.nin<=CACHED_INPUTS,E_ARGS);
+    CHECK(!add || h.nin==2,E_ARGS);
+    int64_t r[10];
+    const T *a=in(&h,0),*b=add?in(&h,1):NULL,*e=out0(&h);
+    uint32_t mc,mo=0,rd,sh;
+    int conv_op=0;
+    CHECK(fz_tensor_ok(o) && fz_tensor_ok(a) && fz_tensor_ok(e) && (!add || fz_tensor_ok(b)),E_UNSUPPORTED);
+    CHECK(!memcmp(o->m,a->m,16) && !memcmp(o->m,e->m,16) && (!add || !memcmp(o->m,b->m,16)),E_UNSUPPORTED);
+    if(!add) {
+        TRY(call_args(&h,QDR_CALL_REQUANTIZE_CROUTON_U8,r,0x38));
+        CHECK(r[4]==0 && r[5]==0 && small(r,0x8),E_UNSUPPORTED);
+        int64_t m=r[3]&0xffff,s=15-(r[3]>>24);
+        CHECK(s>=1 && s<=31,E_ARGS);
+        mc=(uint32_t)m;rd=1u<<(s-1);sh=(uint32_t)s;
+        CHECK(fz_same_table(o,a),E_UNSUPPORTED);
+    } else {
+        TRY(call_args(&h,QDR_CALL_ELEMENTWISE_ADD_CROUTON_U8,r,0x1f0));
+        CHECK(r[7]==0 && small(r,0x70),E_UNSUPPORTED);
+        int64_t k0=r[4],k1=r[5],k2=r[6]+8;
+        CHECK(shift_ok(k2) && k2>=1,E_ARGS);
+        CHECK(k0>=0 && k1>=0 && k0<=65535 && k1<=65535 && k2<=31 &&
+              ((uint64_t)k0+(uint64_t)k1)*255+(1ull<<(k2-1))<=0xffffffffull,E_UNSUPPORTED);
+        int ma=fz_same_table(o,a),mb=fz_same_table(o,b);
+        CHECK(ma!=mb,E_UNSUPPORTED);
+        conv_op=mb;
+        mc=(uint32_t)(conv_op?k1:k0);mo=(uint32_t)(conv_op?k0:k1);rd=1u<<(k2-1);sh=(uint32_t)k2;
+        fx->ob=*in(&h,conv_op?0:1);
+    }
+    fx->kind=add?2:1;fx->dead=g->call->epilogue_dead;fx->mc=mc;fx->mo=mo;fx->rd=rd;fx->sh=sh;fx->oe=*e;
+    /* Strict tables, then aliasing. */
+    uint32_t O[FZ_WORDS]={0},Z[FZ_WORDS]={0},B[FZ_WORDS]={0},X[FZ_WORDS]={0},W[FZ_WORDS]={0};
+    CHECK(fz_mark(o,O,g->write_limit[1]) && fz_mark(e,Z,g->write_limit[1]),E_UNSUPPORTED);
+    if(add) CHECK(fz_mark(&fx->ob,B,g->pool_bytes[1]),E_UNSUPPORTED);
+    CHECK(fz_mark_any(xt,X) && fz_mark_any(wt,W) && fz_mark_any(ft,W),E_UNSUPPORTED);
+    int inplace=fz_meet(O,Z);
+    if(inplace) CHECK(fz_same_table(o,e) && fx->dead,E_UNSUPPORTED);
+    CHECK(!fz_meet(Z,X) && !fz_meet(Z,W) && !fz_meet(Z,B) && !fz_meet(B,O),E_UNSUPPORTED);
+    return 0;
 }
 static int k_hmx_conv(G *g) {
     CHECK(g->nin>=3 && g->nout==1,E_ARGS);
@@ -2174,8 +2405,15 @@ static int k_hmx_conv(G *g) {
     if(co>wco)co=wco;
     if((size_t)co>nm)co=(int32_t)nm;
     int32_t ferr;
+    int fused=g->call->epilogue!=NULL;
+    if(fused) {
+        CHECK(!sixteen,E_UNSUPPORTED);
+        TRY(fuse_decode(g,xt,wt,ft,o));
+    }
     int fast=fast_conv(g,xt,wt,ft,o,s2,sixteen,co,oh,ow,&ferr);
     if(fast<0) FAIL(ferr);
+    /* A fused conv must take the fused path: its epilogue command is skipped. */
+    if(fused) CHECK(fast==1 && g->fx_ok,E_UNSUPPORTED);
     if(fast) return 0;
     int32_t *mult=salloc(g,nm*4+4),*bias=salloc(g,nm*4+4);
     CHECK(mult && bias,E_MEMORY);
@@ -2337,7 +2575,9 @@ int nprg2_exec_reference_run(const Nprg2ExecCall *c, void *ctx) {
      * the repeated dry pass (same pass as nprg2_exec_reference_validate). */
     const Nprg2ExecBuffer *nr=&c->scratch_region[NPRG2_EXEC_SCRATCH_NEAR];
     int has_near=nr->data && nr->bytes;
-    if(!has_near && c->preflighted) {
+    /* A fused conv takes no call scratch (the fused path lives in the workspace and near
+     * memory), so its executor-validated run skips the repeated dry pass too. */
+    if((!has_near || c->epilogue) && c->preflighted) {
         if(setup(&g,c,0,0,ctx)) return 0;
         return run_kernel(&g)==0;
     }
@@ -2382,6 +2622,16 @@ int nprg2_executor_register_reference_missing(Nprg2Executor *e, uint32_t *added)
     if(added)*added=n;
     return NPRG2_EXEC_OK;
 }
+/* Fuse hook of the conv keys (Nprg2ExecFuse): dry-runs the conv with the
+ * epilogue; accepted only when the fused near path would run. */
+int nprg2_exec_reference_fuse(const Nprg2ExecCall *c, const Nprg2ExecCall *epi, int dead, void *ctx) {
+    G g;
+    if(!c || !epi || c->command.opcode!=QDR_HMX_CONV || c->epilogue) return 0;
+    Nprg2ExecCall w=*c;
+    w.epilogue=epi;w.epilogue_dead=dead?1:0;
+    if(setup(&g,&w,1,0,ctx) || run_kernel(&g)) return 0;
+    return g.fx_ok;
+}
 int nprg2_executor_register_reference_conv(Nprg2Executor *e, Nprg2ReferenceConv *conv, uint32_t *added) {
     if(!e || !conv || !conv->workspace || !conv->workspace_bytes) return NPRG2_EXEC_ARGUMENT;
     uint32_t n=0;
@@ -2390,6 +2640,7 @@ int nprg2_executor_register_reference_conv(Nprg2Executor *e, Nprg2ReferenceConv 
         int r=nprg2_executor_register(e,QDR_HMX_CONV,(uint8_t)v,nprg2_exec_reference_validate,nprg2_exec_reference_run,conv);
         if(r==NPRG2_EXEC_DUPLICATE) continue;
         if(r!=NPRG2_EXEC_OK){if(added)*added=n;return r;}
+        nprg2_executor_set_fuse(e,QDR_HMX_CONV,(uint8_t)v,nprg2_exec_reference_fuse);
         n++;
     }
     if(added)*added=n;
