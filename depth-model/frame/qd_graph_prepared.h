@@ -212,9 +212,13 @@ static int prepared_submit(void *ctx,const Nprg2ExecCall *call,
  * still be running our code): par_fault stops further jobs and cancels the
  * run, and the arena record shows started != finished for that worker. */
 static volatile uint32_t prepared_par_fault;
+/* The lease is validated once per run (prepared_run, below) and nothing in a
+ * run changes it; re-reading it per job meant ~10 uncached arena loads and two
+ * TLB reads for every conv and three per HMX batch. */
+static uint32_t prepared_par_lease_ok;
 static int prepared_par_ready(void *impl) {
     (void)impl;
-    return !prepared_par_fault && native_1x1_workers_idle() && native_1x1_lease_valid();
+    return !prepared_par_fault && prepared_par_lease_ok && native_1x1_workers_idle();
 }
 static int prepared_par_run(void *impl,uint32_t parts,Nprg2ParallelFn fn,void *ctx) {
     if(parts<2 || parts>3 || !prepared_par_ready(impl))return 0;
@@ -392,6 +396,9 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
 #endif
     if(!s || first>=last || last>g->ncommands || !native_1x1_lease_valid() ||
        !native_1x1_hmx_owned() || !native_1x1_workers_idle())return QDG_ERR_UNSUPPORTED;
+#if QDS_PREPARED_THREADS>1
+    prepared_par_lease_ok=1;
+#endif
     trace[6]=s->runner.l2_hot_bytes;trace[7]=s->runner.l2_expanded_bytes;
     trace[10]=(uint32_t)(uintptr_t)s->runner.l2_hot;
     trace[12]=s->runner.fuse?s->runner.fuse->count:0;
@@ -441,9 +448,15 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
 #else
     e=prepared_active(g,s,first,last,scratch,scratch_bytes);
 #endif
+#if QDS_PREPARED_THREADS>1
+    prepared_par_lease_ok=0;
+#endif
     if(e)goto failed;
     trace[8]=s->stats.executed_commands;trace[9]=s->stats.validated_commands;return 0;
 failed:
+#if QDS_PREPARED_THREADS>1
+    prepared_par_lease_ok=0;
+#endif
     trace[8]=s->stats.executed_commands;trace[9]=s->stats.validated_commands;
     g->stats.error_command=s->stats.failed_command;
     g->error_detail=0x4e505200u|(uint32_t)e;trace[14]=(uint32_t)e;

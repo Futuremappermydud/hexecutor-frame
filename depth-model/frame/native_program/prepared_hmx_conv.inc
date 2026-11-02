@@ -26,6 +26,9 @@
  * A tiles hold the raw quads (32 pixels x 32 u8 per tile), C holds x as u16
  * [pixel][channel]; the host full-model test checks it against the emulator. */
 #define HMX_TERMS_MAX 2304 /* largest K the v6 cases proved exact: 3x3x256 */
+#ifndef HMX_SETUP_SLOT
+#define HMX_SETUP_SLOT 2 /* phase slot that HMX per-command setup is charged to */
+#endif
 typedef struct {
     G *g; const T *xt, *o;
     int32_t oh, ow, KB, NB, total, m0, mt; /* tiles m0..m0+mt-1 of total */
@@ -324,7 +327,7 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     size_t o_ktab=nbump(&at,(size_t)KB*4),o_corr=nbump(&at,(size_t)co*4),o_pre=nbump(&at,(size_t)co*4),
            o_M=nbump(&at,(size_t)co*4),o_mult=nbump(&at,(size_t)co*4),o_bias=nbump(&at,(size_t)co*4),
            o_post=nbump(&at,(size_t)co*4),o_wsum=nbump(&at,(size_t)co*8),o_multv=nbump(&at,(size_t)NB*128),
-           o_rows=nbump(&at,(size_t)NB*256);
+           o_rows=nbump(&at,(size_t)NB*256),o_fi=nbump(&at,(size_t)NB*256+256);
     /* Input row pointers for every (row, block column, channel block) the
      * quads read: rows p1..p1+oh+H-2, columns p2..p2+ow+W-2 (a straddling quad
      * reads one block further). */
@@ -372,11 +375,13 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
         if(post[k]!=14 || pre[k]<0 || pre[k]>15 || Mq[k]<1024 || Mq[k]>2047 || (off<0?-off:off)+bound>INT32_MAX) return 0;
         corr[k]=(int32_t)off;
     }
-    for(int32_t k=0;k<KB;k++) {
-        int32_t h,x,cb;
-        if(packed){cb=k%cbs;h=(k/cbs)/W;x=(k/cbs)%W;} else {x=k%W;h=(k/W)%H;cb=k/(W*H);}
-        int32_t kx=reverse?W-1-x:x;
-        ktab[k]=(uint32_t)h|(uint32_t)kx<<8|(uint32_t)cb<<16;
+    /* k order of the weight layout, enumerated without divides. */
+    {
+        int32_t k=0;
+        if(packed) {for(int32_t h=0;h<H;h++)for(int32_t x=0;x<W;x++)for(int32_t cb=0;cb<cbs;cb++,k++)
+            ktab[k]=(uint32_t)h|(uint32_t)x<<8|(uint32_t)cb<<16;}
+        else for(int32_t cb=0;cb<cbs;cb++)for(int32_t h=0;h<H;h++)for(int32_t x=0;x<W;x++,k++)
+            ktab[k]=(uint32_t)h|(uint32_t)(reverse?W-1-x:x)<<8|(uint32_t)cb<<16;
     }
     /* Workspace: fi, finish record, completion, then A and C for mt tiles. */
     const int32_t total=(oh*ow+31)/32;
@@ -399,12 +404,17 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     uint8_t *base=(uint8_t *)(((uintptr_t)ws+2047)&~(uintptr_t)2047);
     int32_t *fi=(int32_t *)base,*zero=(int32_t *)(base+(size_t)NB*256);
     uint8_t *completion=base+fixed-2048,*A=base+fixed,*C=A+(size_t)mt*KB*2048;
-    for(int32_t k=0;k<co;k++) {
-        uint32_t p=(uint32_t)pre[k];
-        fi[(k>>5)*64+(k&31)]=(int32_t)(0x400000u|((16u-p)<<10));
-        fi[(k>>5)*64+32+(k&31)]=corr[k]-(p?(int32_t)(1u<<(p-1)):0);
+    {
+        /* Built in near with scalar stores, then one vector copy to VTCM. */
+        int32_t *nf=(int32_t *)(n+o_fi),*nz=nf+NB*64;
+        for(int32_t k=0;k<co;k++) {
+            uint32_t p=(uint32_t)pre[k];
+            nf[(k>>5)*64+(k&31)]=(int32_t)(0x400000u|((16u-p)<<10));
+            nf[(k>>5)*64+32+(k&31)]=corr[k]-(p?(int32_t)(1u<<(p-1)):0);
+        }
+        for(int k=0;k<64;k++) nz[k]=k<32?0x404000:0;
+        near_copy(base,(const uint8_t *)nf,(size_t)NB*256+256);
     }
-    for(int k=0;k<64;k++) zero[k]=k<32?0x404000:0;
     uint16_t *mv=(uint16_t *)(n+o_multv);
     for(int32_t k=0;k<co;k++) mv[(k>>5)*64+2*(k&31)]=mv[(k>>5)*64+2*(k&31)+1]=(uint16_t)Mq[k];
     uint8_t **xtab=use_tab?(uint8_t **)(n+o_xtab):NULL;
@@ -432,7 +442,7 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
                 for(x+=32;x>=ow;x-=ow) y++;
             }
         }
-        if(clock){t1=clock();c->phase[2]+=t1-t0;t0=t1;}
+        if(clock){t1=clock();c->phase[HMX_SETUP_SLOT]+=t1-t0;t0=t1;}
         if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,hmx_prep_part,&J);
         else hmx_prep_part(&J,0,1);
         if(clock){t1=clock();c->phase[0]+=t1-t0;t0=t1;}
