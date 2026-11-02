@@ -237,6 +237,46 @@ static void blocked_run8(uint8_t *const *pools, const uint32_t *blocks, int64_t 
         d+=n;
     }
 }
+/* u16 blocked_impl for the 4 pixels W..W+3 (W%4==0) of one row: per
+ * 32-channel group a block row is two 128-byte pixel pairs, channel c of pixel
+ * 2q+r at u16 index 2c+r of pair q (hin: the row's byte offset). values holds
+ * the pixels pixel-major with nd u16 channels each. Whole groups move as
+ * vectors (vdeal/vshuff of halfwords); partial groups element by element. */
+static void blocked_run4_16(uint8_t *const *pools, const uint32_t *blocks, int64_t count, uint8_t *values,
+                            int64_t wrow, size_t hin, int64_t nd, int64_t d0, int store) {
+    const size_t ps=(size_t)nd*2;
+    for(int64_t d=0;d<nd;) {
+        int64_t D=d+d0,n=32-D%32;
+        if(n>nd-d)n=nd-d;
+        int64_t index=wrow+D/32;
+        uint32_t e=(index>=0 && index<count)?blocks[index]:0,pool=e&127;
+        uint8_t *base=pool?pools[pool]:NULL,*v=values+(size_t)d*2;
+        if(!base) {
+            if(!store)for(int k=0;k<4;k++)memset(v+k*ps,0,(size_t)n*2);
+        } else {
+            uint8_t *blk=base+(e&~127u)+hin;
+            if(n==32) {
+                for(int q=0;q<2;q++) {
+                    uint8_t *pv=v+(size_t)(2*q)*ps,*bq=blk+128*q;
+                    if(store) {
+                        HVX_Vector a=load_part(pv,64),b=load_part(pv+ps,64);
+                        HVX_Vector x=Q6_V_vmux_QVV(Q6_Q_vsetq_R(64),a,Q6_V_vror_VR(b,64));
+                        *(HVX_Vector *)bq=Q6_Vh_vshuff_Vh(x);
+                    } else {
+                        HVX_Vector x=Q6_Vh_vdeal_Vh(*(const HVX_Vector *)bq);
+                        store_part(pv,x,0,64);store_part(pv+ps,x,64,64);
+                    }
+                }
+            } else {
+                for(int k=0;k<4;k++)for(int64_t c=0;c<n;c++) {
+                    uint8_t *ptr=blk+(size_t)(k>>1)*128+((size_t)(D%32+c)*2+(size_t)(k&1))*2,*val=v+k*ps+(size_t)c*2;
+                    if(store)memcpy(ptr,val,2);else memcpy(val,ptr,2);
+                }
+            }
+        }
+        d+=n;
+    }
+}
 #endif
 static inline __attribute__((always_inline)) void blocked_impl(uint8_t *const *pools, const T *t, uint8_t *values,
         const int32_t *dims, const int32_t *origin, const uint32_t size, const int store) {
@@ -256,6 +296,11 @@ static inline __attribute__((always_inline)) void blocked_impl(uint8_t *const *p
             if(size==1 && W%8==0 && dims[2]-w>=8) {
                 blocked_run8(pools,blocks,count,values+pos,wrow,hin,dims[3],origin[3],store);
                 pos+=(size_t)8*dims[3];w+=7;
+                continue;
+            }
+            if(size==2 && W%4==0 && dims[2]-w>=4) {
+                blocked_run4_16(pools,blocks,count,values+pos,wrow,(size_t)(H%8)*256,dims[3],origin[3],store);
+                pos+=(size_t)8*dims[3];w+=3;
                 continue;
             }
 #endif
@@ -2458,6 +2503,7 @@ static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o
                          const uint8_t *x, const NearPlan *p) {
     const Nprg2ReferenceConv *c=g->conv;
     uint8_t *n=c->near;
+    uint64_t t_setup=c->clock && c->phase?c->clock():0;
 #ifdef NPRG2_FUSE_POISON
     /* Host test: a dead conv output must not be observable, so scribble over it. */
     if(g->fx.kind && g->fx.dead) {
@@ -2507,6 +2553,8 @@ static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o
         parts=nprg2_parallel_parts(g->call->parallel,want);
     }
     J.parts=parts;
+    /* Setup (tables, requant parameters) runs once, before the parts: phase slot 2. */
+    if(c->clock && c->phase) c->phase[(sixteen?4:0)+2]+=c->clock()-t_setup;
 #ifdef CONV_SHAPES
     fprintf(stderr,"PARTS s16=%d k=%dx%d ci=%d co=%d oh=%d ow=%d parts=%u slots=%u qcols=%d\n",sixteen,kh,kw,ci,co,oh,ow,parts,
             g->par_slots,parts>1?J.q.cols:0);
@@ -2692,6 +2740,9 @@ static int k_hmx_conv(G *g) {
 
 /* ------------------------------------------------------------------ dispatch */
 static int run_kernel(G *g) {
+#ifdef ALL_SHAPES
+    if(g->op!=QDR_HMX_CONV) SHP("op",g,0);
+#endif
     switch(g->op) {
     case QDR_NOP: return 0;
     case QDR_INPUT_SLICE_PAD: return k_input_slice_pad(g);

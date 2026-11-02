@@ -56,7 +56,7 @@ def main():
                 # u8 convs in 0..3, u16 in 4..7, summed over thread parts.
                 phases=list(dsp.last.get('conv_phases_ms',{}).values())
                 if len(phases)==8:
-                    keys=('staging','mac','requant','output')
+                    keys=('staging','mac','setup','output')
                     row['near_conv_phases_ms']=dict(zip(keys,(phases[k]+phases[4+k] for k in range(4))))
                     row['near_conv_phases_u8_ms']=dict(zip(keys,phases[:4]))
                     row['near_conv_phases_u16_ms']=dict(zip(keys,phases[4:]))

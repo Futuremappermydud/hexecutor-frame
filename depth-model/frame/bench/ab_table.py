@@ -52,7 +52,7 @@ def main():
         f"{l['executor_profile'].get('dispatch_ms', 0):.1f}")
     row('vtcm in / out ms', lambda p, a, ms, l: f"{l.get('read_ms', 0):.1f}/{l.get('write_ms', 0):.1f}")
     for kind in ('u8', 'u16'):
-        for ph in ('staging', 'mac', 'output'):
+        for ph in ('staging', 'mac', 'setup', 'output'):
             row(f'conv {kind} {ph} (cpu, all parts)',
                 lambda p, a, ms, l, k=kind, h=ph: f"{l.get(f'near_conv_phases_{k}_ms', {}).get(h, float('nan')):.1f}")
     # Families.
