@@ -365,19 +365,33 @@ static QdPreparedState *prepared_open(QdgGraph *g,const QdsConfig *cfg,
 
 /* VTCM in, execute, VTCM out. In L2 mode this runs on the C7 DDR stack
  * with L2 as cache, so it must not touch any 0x30xxxxxx address. */
+/* QDS_POOL1_NOCOPY: pool 1 holds only activations and per-run weight copies
+ * (weights_to_vtcm); every byte the schedule reads from it is written earlier
+ * in the same run, so its starting contents don't matter (host check: the
+ * primary schedule matches with pool 1 pre-filled with 0, 0x37, 0xff and
+ * random bytes). The run then works on VTCM as it finds it, with no DDR
+ * copy in or out; the DDR pool 1 image is no longer a mirror. */
+#ifndef QDS_POOL1_NOCOPY
+#define QDS_POOL1_NOCOPY 0
+#endif
 static int prepared_active(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t last,
                            void *scratch,uint32_t scratch_bytes) {
     volatile uint32_t *trace=(volatile uint32_t *)(SERVICE+1024u);
     uint64_t t=now_ns();
+#if !QDS_POOL1_NOCOPY
     dsp_clean_range(g->pool[1],QD_DIRECT_ACTIVE_BYTES);
     dsp_packet_copy((void *)QD_DIRECT_VTCM_BASE,g->pool[1],QD_DIRECT_ACTIVE_BYTES);
+#endif
     g->dsp_read_cycles+=now_ns()-t;trace[1]=2;
     qdrc_invalidate_native();g->resident_key=0;
     int e=nprg2_runner_execute(&s->runner,&s->executor,first,last-first,QD_DIRECT_ACTIVE_BYTES,
         s->inputs,4,s->outputs,2,g,scratch,scratch_bytes,prepared_cancel,NULL,&s->stats);
     qdrc_invalidate_native();g->resident_key=0;
     if(e)return e;
-    t=now_ns();dsp_packet_copy(g->pool[1],(void *)QD_DIRECT_VTCM_BASE,QD_DIRECT_ACTIVE_BYTES);
+    t=now_ns();
+#if !QDS_POOL1_NOCOPY
+    dsp_packet_copy(g->pool[1],(void *)QD_DIRECT_VTCM_BASE,QD_DIRECT_ACTIVE_BYTES);
+#endif
     g->dsp_write_cycles+=now_ns()-t;trace[1]=7;
     return 0;
 }
