@@ -18,6 +18,10 @@ docker run --rm --platform linux/amd64 \
       frame/native_program/prepared_executor.c \
       frame/native_program/nprg2_runtime.c \
       frame/blocked_glue/add_u8.c \
-      frame/blocked_glue/linearclip_u8_u16.c -o "$ELF"
+      frame/blocked_glue/linearclip_u8_u16.c \
+      frame/blocked_glue/elementwise_u16.c \
+      frame/blocked_glue/linearclip_u16.c \
+      frame/blocked_glue/sign_levels.c \
+      frame/blocked_glue/sign_blocked.c -o "$ELF"
     "$SDK/bin/hexagon-sim" -mv75 --quiet "$ELF"
   '

@@ -89,6 +89,7 @@ typedef struct {
     size_t wused;
     Fuse fx;
     int fx_ok;
+    uint32_t par_slots; /* usable helper near slots (Nprg2ReferenceConv.par_near) */
 } G;
 
 static uint32_t rd32(const uint8_t *p){return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
@@ -303,12 +304,23 @@ static int xfer_check(G *g, const T *t, const int32_t *dims, const int32_t *orig
 /* The data movement of xfer for a region xfer_check accepted. */
 static void xfer_copy(G *g, const T *t, void *values, const int32_t *dims, const int32_t *origin, int store) {
     if(t->flags&F_DIRECT) {
+        /* Rows that are adjacent in the tensor (the region spans the whole of
+         * the faster dimensions) move as one run; a run goes through
+         * qd_vcopy (memmove below 512 bytes and off Hexagon). */
         uint8_t *base=g->pool[t->pool];
         size_t es=t->esize,row=(size_t)dims[3]*es,pos=0;
-        for(int32_t b=0;b<dims[0];b++)for(int32_t h=0;h<dims[1];h++)for(int32_t w=0;w<dims[2];w++) {
+        int32_t n0=dims[0],n1=dims[1],n2=dims[2];
+        if(dims[3]==t->m[3]) {
+            row*=(size_t)n2;n2=1;
+            if(dims[2]==t->m[2]) {
+                row*=(size_t)n1;n1=1;
+                if(dims[1]==t->m[1]){row*=(size_t)n0;n0=1;}
+            }
+        }
+        for(int32_t b=0;b<n0;b++)for(int32_t h=0;h<n1;h++)for(int32_t w=0;w<n2;w++) {
             size_t lin=(((size_t)(b+origin[0])*t->m[1]+h+origin[1])*t->m[2]+w+origin[2])*t->m[3]+origin[3];
             uint8_t *ptr=base+t->offset+lin*es;
-            if(store)memmove(ptr,(uint8_t *)values+pos,row);else memmove((uint8_t *)values+pos,ptr,row);
+            if(store)qd_vcopy(ptr,(uint8_t *)values+pos,row);else qd_vcopy((uint8_t *)values+pos,ptr,row);
             pos+=row;
         }
         return;
@@ -437,6 +449,13 @@ static int small(const int64_t *r, uint32_t mask) {
     return 1;
 }
 
+#ifdef DM_SHAPES
+#include <stdio.h>
+static void shp_t(const char *n,const T *t){if(t->flags&F_SV){fprintf(stderr,"  %s sv%d,%d,%d,%d\n",n,t->sv[0],t->sv[1],t->sv[2],t->sv[3]);return;}fprintf(stderr,"  %s fl%u es%u cr%u d%d,%d,%d,%d m%d,%d,%d,%d p%d,%d,%d,%d sl%u nb%u pool%u off%u\n",n,t->flags,t->esize,t->crouton,t->d[0],t->d[1],t->d[2],t->d[3],t->m[0],t->m[1],t->m[2],t->m[3],t->p[0],t->p[1],t->p[2],t->p[3],t->slice,t->nblocks,t->pool,t->offset);}
+#define SHP(name,g,np) do{ if(!(g)->dry){fprintf(stderr,"SHP %s op=%u var=%u\n",name,(g)->op,(g)->variant); for(uint32_t q_=0;q_<(g)->nin&&q_<CACHED_INPUTS;q_++)shp_t("in",&(g)->in[q_]); shp_t("out",&(g)->out);} }while(0)
+#else
+#define SHP(name,g,np) ((void)0)
+#endif
 /* Exact direct-copy fast paths for the data-movement kernels below. */
 #include "prepared_datamove.inc"
 
@@ -492,9 +511,15 @@ static int k_weights_to_vtcm(G *g) {
     return 0;
 }
 static int k_im2col(G *g) {
+    SHP("im2col",g,0);
     CHECK(g->nin==3 && g->nout==1,E_ARGS);
     const T *i=in(g,0),*k=in(g,1),*s=in(g,2),*o=out0(g);
     CHECK(k->flags&s->flags&F_SV,E_ARGS);
+    {
+        int fr=im2col_u8_fast(g,i,o,k->sv[0],k->sv[1],k->sv[2],s->sv[1],s->sv[2]);
+        if(fr<0)fr=im2col_u16_fast(g,i,o,k->sv[0],k->sv[1],k->sv[2],s->sv[1],s->sv[2]);
+        if(fr>=0) return fr;
+    }
     A x;TRY(t_read(g,i,&x,0));
     CHECK(x.n[0]==1,E_SHAPE);
     int32_t kh=k->sv[0],kw=k->sv[1],cin=k->sv[2],sh=s->sv[1],sw=s->sv[2],oh=o->d[1],ow=o->d[2];
@@ -793,8 +818,14 @@ static int k_linearclip(G *g) {
     return t_write(g,o,&r);
 }
 static int k_copy_values(G *g) {
+    SHP("copy_values",g,0);
     CHECK(g->nin>=1 && g->nout==1,E_ARGS);
     const T *o=out0(g);
+    {
+        int fr=copy_c2_fast(g,in(g,0),o,1);   /* flat flow -> padded blocked */
+        if(fr<0)fr=copy_c2_fast(g,o,in(g,0),0);   /* padded blocked -> flat flow */
+        if(fr>=0) return fr;
+    }
     A x;TRY(t_read(g,in(g,0),&x,0));
     CHECK(o->flags&F_SHAPE,E_TENSOR);
     CHECK(count4(x.n)==count4(o->d),E_SHAPE);
@@ -811,22 +842,21 @@ static int k_copy_activation(G *g) {
     return t_write_region(g,o,&x,zero);
 }
 static int k_transpose(G *g) {
+    SHP("transpose",g,0);
     CHECK(g->nin>=2,E_ARGS);
     NEED(1);
     T pt;TRY(input_at(g,g->nin-1,&pt));
     int32_t *perm;size_t np;
     TRY(read_i32(g,&pt,&perm,&np));
     CHECK(np==4,E_ARGS);
+#ifdef DM_SHAPES
+    if(!g->dry){int64_t q[4];if(const_value(g,&pt,0,&q[0])&&const_value(g,&pt,1,&q[1])&&const_value(g,&pt,2,&q[2])&&const_value(g,&pt,3,&q[3]))fprintf(stderr,"  perm %d%d%d%d\n",(int)q[0],(int)q[1],(int)q[2],(int)q[3]);else fprintf(stderr,"  perm dynamic\n");}
+#endif
     {
         int64_t pv[4];
-        if(const_value(g,&pt,0,&pv[0]) && const_value(g,&pt,1,&pv[1]) && const_value(g,&pt,2,&pv[2]) && const_value(g,&pt,3,&pv[3]) &&
-           pv[0]==0 && pv[1]==2 && pv[2]==1 && pv[3]==3) {
-            int fr=tr_hw_fast(g,in(g,0),out0(g));
-            if(fr>=0) return fr;
-        }
         if(const_value(g,&pt,0,&pv[0]) && const_value(g,&pt,1,&pv[1]) && const_value(g,&pt,2,&pv[2]) && const_value(g,&pt,3,&pv[3])) {
             int32_t pm[4]={(int32_t)pv[0],(int32_t)pv[1],(int32_t)pv[2],(int32_t)pv[3]};
-            int fr=tr_flat_fast(g,in(g,0),out0(g),pm);
+            int fr=tr_fast_dispatch(g,in(g,0),out0(g),pm);
             if(fr>=0) return fr;
         }
     }
@@ -884,7 +914,7 @@ static int k_concat(G *g) {
         T t;TRY(input_at(g,i,&t));
         A part;TRY(t_read(g,&t,&part,0));
         size_t chunk=inner*part.n[axis];
-        if(!g->dry)for(size_t o=0;o<outer;o++)memcpy((uint8_t *)r.p+o*inner*n[axis]+at,(uint8_t *)part.p+o*chunk,chunk);
+        if(!g->dry)for(size_t o=0;o<outer;o++)qd_vcopy((uint8_t *)r.p+o*inner*n[axis]+at,(uint8_t *)part.p+o*chunk,chunk);
         at+=chunk;
     }
     return t_write(g,out0(g),&r);
@@ -1061,7 +1091,7 @@ static int k_spill_fill(G *g, int spill) {
         if(!g->dry) {
             uint8_t *dst=spill?g->pool[SPILL_POOL]+offset:g->pool[pool]+addr;
             const uint8_t *src=spill?g->pool[pool]+addr:g->pool[SPILL_POOL]+offset;
-            memmove(dst,src,n);
+            qd_vcopy(dst,src,n);
         }
         offset+=n;
     }
@@ -1079,9 +1109,20 @@ static int k_output_slice(G *g) {
     for(int i=0;i<4;i++)CHECK(st->sv[i]>=0 && (int64_t)st->sv[i]+x.n[i]<=sh->sv[i],E_RANGE);
     if(g->dry) return 0;
     uint8_t *o=output->data;
-    for(int32_t b=0;b<x.n[0];b++)for(int32_t h=0;h<x.n[1];h++)for(int32_t w=0;w<x.n[2];w++) {
+    /* x is dense; output rows that are adjacent in the destination (the slice
+     * spans the whole of the faster dimensions) move as one qd_vcopy run. */
+    size_t row=(size_t)x.n[3]*es;
+    int32_t n0=x.n[0],n1=x.n[1],n2=x.n[2];
+    if(x.n[3]==sh->sv[3]) {
+        row*=(size_t)n2;n2=1;
+        if(x.n[2]==sh->sv[2]) {
+            row*=(size_t)n1;n1=1;
+            if(x.n[1]==sh->sv[1]){row*=(size_t)n0;n0=1;}
+        }
+    }
+    for(int32_t b=0;b<n0;b++)for(int32_t h=0;h<n1;h++)for(int32_t w=0;w<n2;w++) {
         size_t di=((((size_t)b+st->sv[0])*sh->sv[1]+h+st->sv[1])*sh->sv[2]+w+st->sv[2])*sh->sv[3]+st->sv[3];
-        memcpy(o+di*es,(uint8_t *)x.p+(((size_t)b*x.n[1]+h)*x.n[2]+w)*x.n[3]*es,x.n[3]*es);
+        qd_vcopy(o+di*es,(uint8_t *)x.p+(((size_t)b*x.n[1]+h)*x.n[2]+w)*x.n[3]*es,row);
     }
     return 0;
 }
@@ -1426,6 +1467,10 @@ static void *walloc(G *g, size_t bytes) {
 }
 #define NO_TILE 0xffffffffu
 enum { PIXEL_BLOCK=8 };
+/* Smallest conv (multiply-accumulates) worth waking helper threads for. */
+#ifndef PAR_CONV_MIN_MACS
+#define PAR_CONV_MIN_MACS 2000000ull
+#endif
 /* Byte offset in the raw weight tensor of the [O%32][I%4] tile that feeds
  * final tap (ky,kx), final input channels 4*group..+3 and output block j, or
  * NO_TILE where the stride-2 regrouping leaves zeros. Mirrors unpack_weights,
@@ -2139,63 +2184,82 @@ static void fast_conv_compute(G *g, const T *xt, const T *wt, const T *ft, int s
         }
     }
 }
-/* fast_conv_compute over near memory, one column chunk at a time: the input
- * rows live in a ring of kh staged rows (each input row is staged once per
- * chunk, not kh times); a row is staged from the blocked input (x NULL) or
- * from the workspace copy x. Each output row accumulates, requantizes and,
- * for blocked outputs on the vector path, stores straight into o's blocks
- * (u8 or u16, any column alignment; u16 needs even pixel pairs), else into a
- * near output chunk written by xfer_copy. */
-static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o, int s2, int reverse, int packed,
-                         int sixteen, int32_t kh, int32_t kw, int32_t ci, int32_t co, int32_t oh, int32_t ow,
-                         const uint8_t *x, const NearPlan *p) {
-    const Nprg2ReferenceConv *c=g->conv;
-    uint8_t *n=c->near,*out=n+p->out,*lo=n+p->lo,*hi=sixteen?n+p->hi:NULL;
-    const Fuse *fx=g->fx.kind?&g->fx:NULL;
-#ifdef NPRG2_FUSE_POISON
-    /* Host test: a dead conv output must not be observable, so scribble over it. */
-    if(fx && fx->dead) {
-        uint64_t nblk=(uint64_t)(o->m[1]/8)*(uint64_t)(o->m[2]/8)*(uint64_t)(o->m[3]/32);
-        for(uint64_t i=0;i<nblk;i++) {
-            uint32_t e=o->blocks[o->slice+i];
-            if((e&127u)==1u) memset(g->pool[1]+(e&~127u),0xA5,2048);
-        }
+/* Per-thread part of the near layout: accumulators, an output chunk and the
+ * staged row ring. Everything else near_layout places (tap tables, requant
+ * parameters) is read-only while rows run, so all parts share it. */
+typedef struct { int32_t cols; size_t rowbytes, acc, out, lo, hi, bytes; } PrivPlan;
+static size_t priv_layout(PrivPlan *q, int32_t cols, int32_t kh, int32_t kw, int32_t ci, int32_t co, int sixteen,
+                          int direct, int32_t lead, int with_out) {
+    size_t at=0;
+    q->cols=cols;
+    size_t npix=(size_t)lead+(size_t)cols+(size_t)kw-1;
+    if(direct && ci%128) npix=(npix+7)&~(size_t)7;
+    q->rowbytes=(npix*(size_t)ci+127)&~(size_t)127;
+    q->acc=nbump(&at,(size_t)2*PIXEL_BLOCK*32*4*(sixteen?2:1));
+    q->out=with_out?nbump(&at,(size_t)cols*co*(sixteen?2:1)):0;
+    q->lo=nbump(&at,(size_t)kh*q->rowbytes);q->hi=sixteen?nbump(&at,(size_t)kh*q->rowbytes):0;
+    q->bytes=at;
+    return at;
+}
+/* Helper-thread slots (Nprg2ReferenceConv.par_near): the widest chunk that
+ * fits a slot, or 0. with_out: the part also needs an output chunk (output
+ * not stored straight into the blocks; host only). */
+static int priv_plan_slot(const Nprg2ReferenceConv *c, PrivPlan *q, int32_t ow, int32_t kh, int32_t kw, int32_t ci,
+                          int32_t co, int sixteen, int direct, int32_t lead, int with_out) {
+    for(int32_t cols=(ow+PIXEL_BLOCK-1)/PIXEL_BLOCK*PIXEL_BLOCK;cols>0;cols-=PIXEL_BLOCK)
+        if(priv_layout(q,cols,kh,kw,ci,co,sixteen,direct,lead,with_out)<=c->par_near_bytes) return 1;
+    return 0;
+}
+/* Everything the row loop reads, shared by all parts of one command. */
+typedef struct {
+    G *g; const T *xt, *o;
+    int sixteen, vec, direct_out;
+    int32_t kh, kw, ci, co, oh, ow, oa, rwsh, onbw, onbd, L;
+    const uint8_t *x;
+    const NearPlan *p;
+    uint32_t parts;
+    PrivPlan q; /* the plan helper parts use */
+    const uint32_t *wp, *xoff, *segend;
+    const int32_t *rqp;
+    const int8_t *wbase;
+} NearJob;
+/* Output rows [oh*part/parts, oh*(part+1)/parts) over every column chunk.
+ * Part 0 runs in the command's own near region (its plan p); parts 1.. in the
+ * helper slot par_near[part-1] (plan job->q). Parts write only output rows of
+ * their own range (distinct 256-byte block rows), and read the input and the
+ * shared tables, so they are independent. */
+static void near_rows(const NearJob *J, uint32_t part) {
+    G *g=J->g;const Nprg2ReferenceConv *c=g->conv;
+    const NearPlan *p=J->p;
+    const int sixteen=J->sixteen;
+    const int32_t kh=J->kh,kw=J->kw,ci=J->ci,co=J->co,ow=J->ow,xw=ow+kw-1,blocks=co/32;
+    const uint32_t nt=p->nt;
+    uint8_t *n,*out,*lo,*hi;int32_t *acc;int32_t cols;size_t rowb;
+    if(part==0) {
+        n=c->near;out=n+p->out;lo=n+p->lo;hi=sixteen?n+p->hi:NULL;acc=(int32_t *)(n+p->acc);cols=p->cols;rowb=p->rowbytes;
+    } else {
+        n=c->par_near[part-1u];out=n+J->q.out;lo=n+J->q.lo;hi=sixteen?n+J->q.hi:NULL;acc=(int32_t *)(n+J->q.acc);
+        cols=J->q.cols;rowb=J->q.rowbytes;
     }
-#endif
-    int32_t *acc=(int32_t *)(n+p->acc),*mult=(int32_t *)(n+p->mult),*bias=(int32_t *)(n+p->bias);
-    int32_t *M=(int32_t *)(n+p->M),*pre=(int32_t *)(n+p->pre),*post=(int32_t *)(n+p->post);
-    uint32_t *wp=(uint32_t *)(n+p->wp),*xoff=(uint32_t *)(n+p->xoff),*segend=(uint32_t *)(n+p->segend);
-    int64_t *wsum=(int64_t *)(n+p->wsum);
-    int32_t *rqp=(int32_t *)(n+p->rq);
-    int32_t xw=ow+kw-1,groups=ci/4,blocks=co/32;
-    uint32_t nt=p->nt;
-    size_t rowb=p->rowbytes;
-    const int8_t *wbase=(const int8_t *)g->pool[wt->pool]+wt->offset;
-    const uint8_t *rows=g->pool[ft->pool]+ft->offset;
-    for(int32_t k=0;k<co;k++){memcpy(mult+k,rows+(size_t)(k/32)*256+(k%32)*4,4);memcpy(bias+k,rows+(size_t)(k/32)*256+128+(k%32)*4,4);}
-    requant_params(mult,co,sixteen,M,pre,post);
-    build_taps(wt,s2,reverse,packed,kh,kw,groups,blocks,wbase,ci,p->lead,0,0,nt,wp,xoff,segend);
-    memset(wsum,0,(size_t)co*8);
-    if(xt->zp) tap_wsum(wsum,blocks,nt,wp,wbase);
-    int vec=RQ_HVX && rq_prepare(rqp,co,sixteen,(int64_t)kh*kw*ci*255*128,xt->zp,wsum,bias,M,pre,post);
-    (void)vec;
-    uint64_t (*clock)(void)=c->phase?c->clock:NULL,*ph=c->phase,t=clock?clock():0;
+    const uint32_t *wp=J->wp,*xoff=J->xoff,*segend=J->segend;
+    const int32_t *rqp=J->rqp;const int8_t *wbase=J->wbase;(void)rqp;
+    const T *xt=J->xt,*o=J->o;const uint8_t *x=J->x;
+    const int vec=J->vec;(void)vec;(void)nt;(void)xoff;(void)blocks;
+    const int32_t ys=(int32_t)((int64_t)J->oh*part/J->parts),ye=(int32_t)((int64_t)J->oh*(part+1u)/J->parts);
+    uint64_t (*clock)(void)=part==0&&c->phase?c->clock:NULL,*ph=c->phase,t=clock?clock():0;
+    const Fuse *fx=g->fx.kind?&g->fx:NULL;
 #define LAP(i) do { if(clock){uint64_t u_=clock();ph[i]+=u_-t;t=u_;} } while(0)
     size_t es=sixteen?2:1;
     int32_t *ahi=acc+2*PIXEL_BLOCK*32;
-    /* Blocked outputs are requantized straight into o's blocks, skipping the
-     * near output chunk and its xfer_copy. oa: the first column's slot. */
-    int direct=vec && (o->flags&F_BLOCKED) && o->esize==es;
-    int32_t RW=sixteen?4:8,oa=(int32_t)(o->p[2]%RW),L=(oa+PIXEL_BLOCK+RW-1)/RW;
-    if(sixteen && (oa&1)) direct=0;
-    int32_t rwsh=sixteen?2:3,onbw=(o->m[2]+RW-1)>>rwsh,onbd=(o->m[3]+31)>>5;
-    (void)L;(void)rwsh;(void)onbw;(void)onbd;
-    for(int32_t x0=0;x0<ow;x0+=p->cols) {
-        int32_t nc=ow-x0<p->cols?ow-x0:p->cols;
+    int direct=J->direct_out;
+    const int32_t oa=J->oa,RW=sixteen?4:8,L=J->L,rwsh=J->rwsh,onbw=J->onbw,onbd=J->onbd;
+    (void)RW;(void)L;(void)rwsh;(void)onbw;(void)onbd;(void)oa;
+    for(int32_t x0=0;x0<ow;x0+=cols) {
+        int32_t nc=ow-x0<cols?ow-x0:cols;
         int dchunk=direct && !(sixteen && (nc&1));
         int64_t W0=(int64_t)xt->p[2]+x0;
-        for(int32_t y=0;y<oh;y++) {
-            for(int32_t r=y?y+kh-1:0;r<=y+kh-1;r++) {
+        for(int32_t y=ys;y<ye;y++) {
+            for(int32_t r=y>ys?y+kh-1:ys;r<=y+kh-1;r++) {
                 size_t rs=(size_t)(r%kh)*rowb;
                 uint8_t *dl=lo+rs;
                 if(!x) stage_row8(g->pool,xt,(int64_t)xt->p[1]+r,W0,nc+kw-1,W0-p->lead,ci,dl);
@@ -2248,6 +2312,10 @@ static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o
                         continue;
                     }
 #endif
+                    {
+                    const int64_t *wsum=(const int64_t *)((uint8_t *)c->near+p->wsum);
+                    const int32_t *bias=(const int32_t *)((uint8_t *)c->near+p->bias),*M=(const int32_t *)((uint8_t *)c->near+p->M),
+                                  *pre=(const int32_t *)((uint8_t *)c->near+p->pre),*post=(const int32_t *)((uint8_t *)c->near+p->post);
                     tile_block(acc,np,xl,(uint32_t)kh,segend,(uint32_t)ci,wpp,nb==2,xoff,wbase,NULL,NULL);
                     if(sixteen) tile_block(ahi,np,xh,(uint32_t)kh,segend,(uint32_t)ci,wpp,nb==2,xoff,wbase,NULL,NULL);
                     LAP(1);
@@ -2259,6 +2327,7 @@ static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o
                         int64_t v=requant_value(a,bias[k],sixteen,M[k],pre[k],post[k]);
                         size_t idx=(size_t)(px+q)*co+k;
                         if(sixteen)((uint16_t *)out)[idx]=(uint16_t)v;else out[idx]=(uint8_t)v;
+                    }
                     }
                     LAP(2);
                 }
@@ -2272,6 +2341,76 @@ static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o
         }
     }
 #undef LAP
+}
+static void near_part(void *ctx, uint32_t part, uint32_t parts) {
+    (void)parts;
+    near_rows((const NearJob *)ctx,part);
+}
+/* fast_conv_compute over near memory, one column chunk at a time: the input
+ * rows live in a ring of kh staged rows (each input row is staged once per
+ * chunk, not kh times); a row is staged from the blocked input (x NULL) or
+ * from the workspace copy x. Each output row accumulates, requantizes and,
+ * for blocked outputs on the vector path, stores straight into o's blocks
+ * (u8 or u16, any column alignment; u16 needs even pixel pairs), else into a
+ * near output chunk written by xfer_copy.
+ *
+ * Threads (call->parallel): setup below fills the shared tables in near;
+ * then, if every chunk stores straight into o's blocks and the helper slots
+ * fit, the output rows are split over up to 3 parts (near_rows). */
+static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o, int s2, int reverse, int packed,
+                         int sixteen, int32_t kh, int32_t kw, int32_t ci, int32_t co, int32_t oh, int32_t ow,
+                         const uint8_t *x, const NearPlan *p) {
+    const Nprg2ReferenceConv *c=g->conv;
+    uint8_t *n=c->near;
+#ifdef NPRG2_FUSE_POISON
+    /* Host test: a dead conv output must not be observable, so scribble over it. */
+    if(g->fx.kind && g->fx.dead) {
+        uint64_t nblk=(uint64_t)(o->m[1]/8)*(uint64_t)(o->m[2]/8)*(uint64_t)(o->m[3]/32);
+        for(uint64_t i=0;i<nblk;i++) {
+            uint32_t e=o->blocks[o->slice+i];
+            if((e&127u)==1u) memset(g->pool[1]+(e&~127u),0xA5,2048);
+        }
+    }
+#endif
+    int32_t *mult=(int32_t *)(n+p->mult),*bias=(int32_t *)(n+p->bias);
+    int32_t *M=(int32_t *)(n+p->M),*pre=(int32_t *)(n+p->pre),*post=(int32_t *)(n+p->post);
+    uint32_t *wp=(uint32_t *)(n+p->wp),*xoff=(uint32_t *)(n+p->xoff),*segend=(uint32_t *)(n+p->segend);
+    int64_t *wsum=(int64_t *)(n+p->wsum);
+    int32_t *rqp=(int32_t *)(n+p->rq);
+    int32_t groups=ci/4,blocks=co/32;
+    uint32_t nt=p->nt;
+    const int8_t *wbase=(const int8_t *)g->pool[wt->pool]+wt->offset;
+    const uint8_t *rows=g->pool[ft->pool]+ft->offset;
+    for(int32_t k=0;k<co;k++){memcpy(mult+k,rows+(size_t)(k/32)*256+(k%32)*4,4);memcpy(bias+k,rows+(size_t)(k/32)*256+128+(k%32)*4,4);}
+    requant_params(mult,co,sixteen,M,pre,post);
+    build_taps(wt,s2,reverse,packed,kh,kw,groups,blocks,wbase,ci,p->lead,0,0,nt,wp,xoff,segend);
+    memset(wsum,0,(size_t)co*8);
+    if(xt->zp) tap_wsum(wsum,blocks,nt,wp,wbase);
+    int vec=RQ_HVX && rq_prepare(rqp,co,sixteen,(int64_t)kh*kw*ci*255*128,xt->zp,wsum,bias,M,pre,post);
+    (void)vec;
+    /* Blocked outputs are requantized straight into o's blocks, skipping the
+     * near output chunk and its xfer_copy. oa: the first column's slot. */
+    size_t es=sixteen?2:1;
+    int direct=vec && (o->flags&F_BLOCKED) && o->esize==es;
+    int32_t RW=sixteen?4:8,oa=(int32_t)(o->p[2]%RW),L=(oa+PIXEL_BLOCK+RW-1)/RW;
+    if(sixteen && (oa&1)) direct=0;
+    NearJob J={.g=g,.xt=xt,.o=o,.sixteen=sixteen,.vec=vec,.direct_out=direct,.kh=kh,.kw=kw,.ci=ci,.co=co,.oh=oh,.ow=ow,
+               .oa=oa,.rwsh=sixteen?2:3,.onbw=(o->m[2]+RW-1)>>(sixteen?2:3),.onbd=(o->m[3]+31)>>5,.L=L,.x=x,.p=p,.parts=1,
+               .wp=wp,.xoff=xoff,.segend=segend,.rqp=rqp,.wbase=wbase};
+    /* Parts: every chunk must store straight into o's blocks (u16 needs an
+     * even width for the last chunk too), rows must be enough, the helper
+     * slots must hold a plan, and the work must pay for the wake-up. */
+    uint32_t parts=1;
+    if(g->par_slots && (direct || !BLK_HVX) && !(direct && sixteen && (ow&1)) && oh>=2*(int32_t)(kh+1) &&
+       (uint64_t)oh*(uint64_t)ow*(uint64_t)co*(uint64_t)kh*(uint64_t)kw*(uint64_t)ci>=PAR_CONV_MIN_MACS &&
+       priv_plan_slot(c,&J.q,ow,kh,kw,ci,co,sixteen,p->direct,p->lead,!direct)) {
+        uint32_t want=1u+g->par_slots;
+        if((uint32_t)oh/(uint32_t)(kh+1)<want) want=(uint32_t)oh/(uint32_t)(kh+1);
+        parts=nprg2_parallel_parts(g->call->parallel,want);
+    }
+    J.parts=parts;
+    if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,near_part,&J);
+    else near_rows(&J,0);
 }
 
 /* ------------------------------------------------------- conv epilogue fusion */
@@ -2525,6 +2664,22 @@ static int setup(G *g, const Nprg2ExecCall *c, int dry, int measure, const Nprg2
              * advertised writable boundary and disjoint from workspace. */
             if(i==1 && n>=b+c->pool1_writable_bytes && ne<=b+c->pools[i].bytes)continue;
             FAIL(E_MEMORY);
+        }
+    }
+    /* Helper near slots: 128-byte aligned, disjoint from every pool, the
+     * workspace, the call scratch, near and each other, else unused. */
+    if(g->conv && g->conv->near && g->conv->par_near_bytes) {
+        for(unsigned s=0;s<2;s++) {
+            uintptr_t a=(uintptr_t)conv->par_near[s],e=a+conv->par_near_bytes;
+            int ok=a && !(a&127u) && e>a;
+            for(unsigned i=0;ok && i<7;i++)
+                if(c->pools[i].bytes && a<(uintptr_t)c->pools[i].base+c->pools[i].bytes && (uintptr_t)c->pools[i].base<e) ok=0;
+            if(ok && a<(uintptr_t)conv->workspace+conv->workspace_bytes && (uintptr_t)conv->workspace<e) ok=0;
+            if(ok && a<(uintptr_t)conv->near+conv->near_bytes && (uintptr_t)conv->near<e) ok=0;
+            if(ok && c->scratch && c->scratch_bytes && a<(uintptr_t)c->scratch+c->scratch_bytes && (uintptr_t)c->scratch<e) ok=0;
+            if(ok && s && a<(uintptr_t)conv->par_near[0]+conv->par_near_bytes && (uintptr_t)conv->par_near[0]<e) ok=0;
+            if(!ok) break;
+            g->par_slots++;
         }
     }
     for(unsigned i=0;i<7;i++) {

@@ -23,6 +23,7 @@ typedef struct {
     Nprg2ExecBuffer extra_scratch[NPRG2_EXEC_SCRATCH_REGIONS-1u];
     /* Optional profile and preflight reuse for every request (set after open). */
     Nprg2ExecProfile *profile;
+    Nprg2Parallel *parallel;
     uint8_t reuse_preflight;
     /* Conv epilogue fusion plan (NULL = off), see nprg2_runner_build_fuse. */
     Nprg2FusePlan fuse_plan;
@@ -89,6 +90,9 @@ int nprg2_runner_preflight(Nprg2PreparedRunner *runner,
  * against graph memory and the other regions on every request. */
 int nprg2_runner_set_scratch_region(Nprg2PreparedRunner *runner,uint8_t region,
                                     void *scratch,uint32_t scratch_bytes);
+
+/* Parallel hook for every later request (NULL = serial). */
+int nprg2_runner_set_parallel(Nprg2PreparedRunner *runner,Nprg2Parallel *parallel);
 
 void nprg2_runner_close(Nprg2PreparedRunner *runner);
 

@@ -466,6 +466,11 @@ static void follower(uint32_t tid) {
         uint32_t op=work->op;
         if(op==1){uint32_t e=qdrc_execute(&work->conv,(uint8_t *)work->arena,tid,work->prepared_a);if(e)work->error=e;}
         if(op==2)status(tid,work->sequence);
+        if(op==4 && tid<work->job_parts) {
+            work->job_started[tid]++;__asm__ volatile("barrier":::"memory");
+            work->job_fn(work->job_ctx,tid,work->job_parts);
+            __asm__ volatile("barrier":::"memory");work->job_finished[tid]++;
+        }
         __asm__ volatile("barrier":::"memory");work->done[tid]=seen;
         if(op==3)return;
     }
@@ -580,7 +585,11 @@ __attribute__((section(".text.resident_entry"))) void resident_entry(uint32_t ti
         }
         if(g){memcpy(SERVICE+QDS_PROFILE,g->stats.variant_ns,80*8);memcpy(SERVICE+QDS_PROFILE+80*8,g->stats.variant_count,80*8);}
 #if QDS_NATIVE_PREPARED && QDS_PREPARED_PROFILE
-        if(prepared)prepared_export_profile(prepared,SERVICE+QDS_PROFILE2);
+        if(prepared){prepared_export_profile(prepared,SERVICE+QDS_PROFILE2);
+#if QDS_PREPARED_THREADS>1
+            prepared_export_par(prepared,SERVICE+QDS_PROFILE2+4160u);
+#endif
+        }
 #endif
         send_work(2,seq);status(0,seq);
     }

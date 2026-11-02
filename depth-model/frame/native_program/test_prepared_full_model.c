@@ -25,6 +25,7 @@
 #include "prepared_fuse.h"
 #include "../qd_graph.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,6 +81,35 @@ typedef struct {
  * near slot for the fast convolution. */
 enum { CONV_WORKSPACE = 0x7e000, CONV_NEAR = 0x8000 };
 
+/* QD_PAR=0|1|2: the parallel hook with 3 parts and no worker, so every
+ * parallel job runs serially in ascending (0), descending (1) or shuffled (2)
+ * order; helper conv slots of QD_PAR_SLOT bytes (default 0x3e00, the Frame's).
+ * The pools must come out identical whatever the part order. */
+static Nprg2Parallel g_par;
+typedef struct { Nprg2ParallelFn fn; void *ctx; uint32_t part, parts; } PtJob;
+static void *pt_main(void *a) { PtJob *j = a; j->fn(j->ctx, j->part, j->parts); return NULL; }
+/* QD_PAR=3: real concurrent threads (parts 1.. on new pthreads). */
+static int pt_run(void *impl, uint32_t parts, Nprg2ParallelFn fn, void *ctx) {
+    (void)impl;
+    pthread_t th[8]; PtJob job[8];
+    for (uint32_t i = 1; i < parts; i++) {
+        job[i] = (PtJob){fn, ctx, i, parts};
+        CHECK(!pthread_create(&th[i], NULL, pt_main, &job[i]));
+    }
+    fn(ctx, 0, parts);
+    for (uint32_t i = 1; i < parts; i++) pthread_join(th[i], NULL);
+    return 1;
+}
+static Nprg2Parallel *par_hook(void) {
+    const char *e = getenv("QD_PAR");
+    if (!e) return NULL;
+    g_par.max_parts = 3;
+    g_par.order = (uint32_t)atoi(e);
+    if (g_par.order == 3) g_par.run = pt_run;
+    g_par.seed = 12345;
+    return &g_par;
+}
+
 static const char *const kInputNames[4] = {"x", "y", "hidden", "t"};
 
 static void pools_reset(Session *s) {
@@ -133,6 +163,11 @@ static void register_handlers(Session *s, int mixed, int fast) {
         s->conv.near = aligned_alloc(128, CONV_NEAR);
         s->conv.near_bytes = CONV_NEAR;
         CHECK(s->conv.workspace && s->conv.near);
+        if (getenv("QD_PAR")) {
+            const char *sb = getenv("QD_PAR_SLOT");
+            s->conv.par_near_bytes = sb ? (uint32_t)atoi(sb) : 0x3e00;
+            for (int k = 0; k < 2; k++) s->conv.par_near[k] = aligned_alloc(128, 0x10000);
+        }
         uint32_t added = 0;
         CHECK(nprg2_executor_register_reference_conv(e, &s->conv, &added) == NPRG2_EXEC_OK);
         printf("%s: %lu conv keys registered to the fast exact convolution\n", s->model, (unsigned long)added);
@@ -171,7 +206,7 @@ static Nprg2ExecRequest request(Session *s, Nprg2ExecBuffer *in, Nprg2ExecBuffer
     Nprg2ExecRequest r = {.fuse = s->fuse ? &s->plan : NULL, .program = &s->program, .bound = &s->bound, .pool1_writable_bytes = s->pools[1].bytes,
                           .inputs = in, .input_count = 4, .outputs = out, .output_count = 2,
                           .scratch = s->scratch, .scratch_bytes = s->scratch_bytes,
-                          .command_first = first, .command_count = count, .stats = stats};
+                          .command_first = first, .command_count = count, .stats = stats, .parallel = par_hook()};
     memcpy(r.pools, s->pools, sizeof s->pools);
     /* QD_NEAR=1: a 32 KiB near scratch region (the Frame's L2-TCM slot); commands whose scratch need fits use it. */
     if (getenv("QD_NEAR")) {
@@ -307,6 +342,11 @@ static void check_outputs(Session *s, uint8_t *const *out, const char *what) {
             exit(1);
         }
     }
+    if (g_par.max_parts)
+        printf("parallel hook order=%u: jobs parallel %lu/%lu/%lu serial conv/ew/dm %lu/%lu/%lu parts %lu/%lu/%lu\n", g_par.order,
+               (unsigned long)g_par.jobs_parallel[0], (unsigned long)g_par.jobs_parallel[1], (unsigned long)g_par.jobs_parallel[2],
+               (unsigned long)g_par.jobs_serial[0], (unsigned long)g_par.jobs_serial[1], (unsigned long)g_par.jobs_serial[2],
+               (unsigned long)g_par.parts_run[0], (unsigned long)g_par.parts_run[1], (unsigned long)g_par.parts_run[2]);
     printf("PASS %s %s: both graph outputs match the emulator smoke sha256\n", s->model, what);
 }
 

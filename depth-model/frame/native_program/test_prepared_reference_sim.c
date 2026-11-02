@@ -2,9 +2,9 @@
  *
  *   test_prepared_reference_sim [primary|alternate|both] [prefix|full]
  *   test_prepared_reference_sim <primary|alternate> split <segments> <dir>
+ *   test_prepared_reference_sim <primary|alternate> tail <first> <dir> [window]
  *   test_prepared_reference_sim segment <file.rseg> [log every N commands]
  *   test_prepared_reference_sim [primary|alternate|both] profile   (host)
- *   test_prepared_reference_sim <primary|alternate> tail <first> <dir> [count]   (host)
  *
  * Any mode also accepts "fast" (fast exact convolution in a VTCM-tail-sized
  * workspace), "ew" (Hexagon only: the HVX elementwise handlers, chained over the
@@ -61,6 +61,82 @@ static uint8_t ew_scratch[NPRG2_ELEMENTWISE_SCRATCH_BYTES + 8] __attribute__((al
 #endif
 static Nprg2ReferenceConv conv;
 static uint64_t conv_phase[4];
+/* "par" / "parrev" / "parshuf" / "thr": QDS_PREPARED_THREADS-style parallel hook
+ * with 3 parts and the Frame's two 0x3e00-byte helper conv slots. par runs the
+ * parts serially ascending, parrev descending, parshuf shuffled (any order
+ * must give the same pools); thr (Hexagon only) runs parts 1 and 2 on real
+ * hardware threads 1 and 2 of the simulator, the Frame's follower scheme. */
+#ifndef SJ_MODE
+#define SJ_MODE 0
+#endif
+static int use_par;
+static Nprg2Parallel par_hook;
+enum { PAR_SLOT = 0x3e00 };
+static uint8_t par_slot[2][PAR_SLOT] __attribute__((aligned(128)));
+#ifdef __hexagon__
+#include <hexagon_standalone.h>
+static volatile struct { uint32_t gen, op, parts; Nprg2ParallelFn fn; void *ctx; uint32_t done[3]; } sj;
+static uint8_t sj_stack[3][65536] __attribute__((aligned(16)));
+static volatile uint32_t sj_ran[3];
+static void sj_worker(void *p) {
+    uint32_t tid = (uint32_t)(uintptr_t)p, seen = 0;
+    /* The simulator shares HVX contexts between threads unless each thread acquires one. */
+    acquire_vector_unit(HEXAGON_VECTOR_WAIT);
+    for (;;) {
+        while (sj.gen == seen) __asm__ volatile("pause(#32)");
+        __asm__ volatile("barrier" ::: "memory");
+        seen = sj.gen;
+        if (sj.op == 3) { sj.done[tid] = seen; return; }
+#if SJ_MODE==2
+        if (tid==2) while (sj.done[1] != seen) __asm__ volatile("pause(#32)");
+#endif
+        if (tid < sj.parts) { sj.fn(sj.ctx, tid, sj.parts); sj_ran[tid]++; }
+        __asm__ volatile("barrier" ::: "memory");
+        sj.done[tid] = seen;
+    }
+}
+static int sj_run(void *impl, uint32_t parts, Nprg2ParallelFn fn, void *ctx) {
+    (void)impl;
+    if (parts < 2 || parts > 3) return 0;
+    sj.op = 4; sj.fn = fn; sj.ctx = ctx; sj.parts = parts;
+    uint32_t gen = sj.gen + 1;
+#if SJ_MODE>=1
+    fn(ctx, 0, parts);
+#endif
+    __asm__ volatile("barrier" ::: "memory");
+    sj.gen = gen;
+#if SJ_MODE==0
+    fn(ctx, 0, parts);
+#endif
+    while (sj.done[1] != gen || sj.done[2] != gen) __asm__ volatile("pause(#32)");
+    __asm__ volatile("barrier" ::: "memory");
+    return 1;
+}
+static void sj_stop(void);
+static void sj_start(void) {
+    memset(sj_stack, 0xa5, sizeof sj_stack);
+    acquire_vector_unit(HEXAGON_VECTOR_WAIT); /* every thread, the main one too */
+    for (int t = 1; t < 3; t++) thread_create(sj_worker, sj_stack[t] + sizeof sj_stack[t] - 64, t, (void *)(uintptr_t)t);
+    par_hook.run = sj_run;
+    atexit(sj_stop);
+}
+static void sj_stop(void) {
+    if (!par_hook.run) return;
+    uint32_t gen = sj.gen + 1;
+    sj.op = 3; __asm__ volatile("barrier" ::: "memory"); sj.gen = gen;
+    thread_join(0x6);
+    for (int t = 1; t < 3; t++) {
+        uint32_t i = 0;
+        while (i < sizeof sj_stack[t] && sj_stack[t][i] == 0xa5) i++;
+        printf("worker %d stack high-water %lu of %lu bytes\n", t, (unsigned long)(sizeof sj_stack[t] - i), (unsigned long)sizeof sj_stack[t]);
+    }
+    printf("worker parts run: %lu %lu\n", (unsigned long)sj_ran[1], (unsigned long)sj_ran[2]);
+    printf("parallel jobs conv/ew/dm %llu/%llu/%llu parts %llu/%llu/%llu declined %llu\n",
+           (unsigned long long)par_hook.jobs_parallel[0], (unsigned long long)par_hook.jobs_parallel[1], (unsigned long long)par_hook.jobs_parallel[2],
+           (unsigned long long)par_hook.parts_run[0], (unsigned long long)par_hook.parts_run[1], (unsigned long long)par_hook.parts_run[2],
+           (unsigned long long)par_hook.declined);
+}
+#endif
 
 /* Simulator pcycles on Hexagon (link -lhexagon), clock() ticks on the host. */
 static uint64_t ticks(void) {
@@ -183,6 +259,7 @@ static void env_open(Env *v, const char *model, uint8_t *const *inputs, const ui
             conv.near_bytes = CONV_NEAR;
             CHECK(conv.workspace && conv.near);
             if (use_cycles) { conv.clock = ticks; conv.phase = conv_phase; }
+            if (use_par) { conv.par_near[0] = par_slot[0]; conv.par_near[1] = par_slot[1]; conv.par_near_bytes = PAR_SLOT; }
         }
         CHECK(nprg2_executor_register_reference_conv(&v->e, &conv, &added) == NPRG2_EXEC_OK);
     }
@@ -280,6 +357,7 @@ static void env_run(Env *v, uint32_t first, uint32_t count, const uint8_t *const
                           .scratch = v->scratch, .scratch_bytes = v->scratch_bytes,
                           .command_first = first, .command_count = count, .stats = &st, .fuse = use_fuse ? &v->plan : NULL};
     memcpy(r.pools, v->pools, sizeof v->pools);
+    if (use_par) r.parallel = &par_hook;
 #ifdef __hexagon__
     if (use_ew) r.extra_scratch[0] = (Nprg2ExecBuffer){ew_scratch, NPRG2_ELEMENTWISE_SCRATCH_BYTES};
 #endif
@@ -398,6 +476,11 @@ static int env_pools_match(Env *v, const uint8_t *const *want) {
         } else while (v->pools[i].base[diff] == want[i][diff]) diff++;
         fprintf(stderr, "%s pool mismatch: pool=%d off=0x%lx prepared=%u want=%u\n", v->model, i, (unsigned long)diff,
                 v->pools[i].base[diff], want[i][diff]);
+        uint32_t n = 0, lines = 0, last = 0, prev_line = UINT32_MAX;
+        for (uint32_t k = diff; k < v->pools[i].bytes; k++)
+            if (v->pools[i].base[k] != want[i][k]) { n++; last = k; if (k / 128u != prev_line) { lines++; prev_line = k / 128u; } }
+        fprintf(stderr, "  %lu bytes differ in %lu 128-byte lines, first 0x%lx last 0x%lx\n", (unsigned long)n, (unsigned long)lines,
+                (unsigned long)diff, (unsigned long)last);
         return 0;
     }
     return 1;
@@ -560,7 +643,7 @@ static void split(const char *model, uint32_t segments, const char *dir) {
 /* One segment covering [first, end): the host runs the schedule once, keeping the state before
  * `first`, so a simulator run can start in the late part of a schedule without simulating
  * everything before it. */
-static void tail(const char *model, uint32_t first, const char *dir, uint32_t limit) {
+static void tail(const char *model, uint32_t first, const char *dir, uint32_t window) {
     uint8_t *inputs[4], *constants;
     uint32_t input_bytes[4], cn;
     read_smoke(model, inputs, input_bytes, &constants, &cn);
@@ -568,20 +651,23 @@ static void tail(const char *model, uint32_t first, const char *dir, uint32_t li
     env_open(&v, model, inputs, input_bytes);
     uint32_t n = v.p.command_count;
     CHECK(v.pools[5].bytes == cn && first < n);
+    /* window == 0: through the end of the schedule; else only [first, first+window), for a short
+     * focused simulator run (the outputs then need not be final). */
+    uint32_t count = window && window < n - first ? window : n - first;
     memcpy(v.pools[5].base, constants, cn);
     env_census(&v, 0, n);
     env_run(&v, 0, first, NULL);
-    uint32_t state_bytes, last = limit && limit < n - first ? first + limit : n;
+    uint32_t state_bytes;
     uint8_t *start = snapshot(&v, &state_bytes);
-    env_run(&v, first, last - first, NULL);
+    env_run(&v, first, count, NULL);
     uint8_t *end = snapshot(&v, &state_bytes);
-    write_segment(&v, dir, 0, first, last - first, input_bytes, start, end, state_bytes);
+    write_segment(&v, dir, 0, first, count, input_bytes, start, end, state_bytes);
     free(start);
     free(end);
-    /* The graph outputs are complete only for a segment that runs to the end. */
-    if (last == n && !outputs_match_emulator(model, v.out)) exit(1);
-    printf("PASS %s tail: commands %lu..%lu written%s\n", model, (unsigned long)first, (unsigned long)last - 1u,
-           last == n ? "; final outputs match the emulator smoke sha256" : "");
+    if (count == n - first && !outputs_match_emulator(model, v.out)) exit(1);
+    printf("PASS %s tail: commands %lu..%lu written%s\n", model,
+           (unsigned long)first, (unsigned long)(first + count - 1u),
+           count == n - first ? "; final outputs match the emulator smoke sha256" : " (window)");
     env_close(&v);
     free(constants);
     for (int j = 0; j < 4; j++) free(inputs[j]);
@@ -676,6 +762,17 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "cycles")) use_cycles = 1;
         else if (!strcmp(argv[i], "ew")) use_ew = 1;
         else if (!strcmp(argv[i], "fuse")) use_fuse = 1;
+        else if (!strcmp(argv[i], "par") || !strcmp(argv[i], "parrev") || !strcmp(argv[i], "parshuf") || !strcmp(argv[i], "thr")) {
+            use_par = 1;
+            par_hook.max_parts = 3;
+            par_hook.order = !strcmp(argv[i], "parrev") ? 1u : !strcmp(argv[i], "parshuf") ? 2u : 0u;
+            par_hook.seed = 99;
+#ifdef __hexagon__
+            if (!strcmp(argv[i], "thr")) sj_start();
+#else
+            if (!strcmp(argv[i], "thr")) { fprintf(stderr, "thr needs the simulator\n"); return 2; }
+#endif
+        }
         else argv[kept++] = argv[i];
     }
     argc = kept;

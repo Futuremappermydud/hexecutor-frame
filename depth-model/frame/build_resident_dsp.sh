@@ -26,6 +26,7 @@ docker run --rm --platform linux/amd64 -v "$task_sdk_root:/sdk:ro" -v "$PWD/fram
    -e QDS_PREPARED_PROFILE="${QDS_PREPARED_PROFILE:-1}" \
    -e QDS_PREPARED_FUSE="${QDS_PREPARED_FUSE:-0}" \
    -e QDS_L2_CACHE="${QDS_L2_CACHE:-0}" \
+   -e QDS_PREPARED_THREADS="${QDS_PREPARED_THREADS:-1}" \
    depth-model-hmx-tools:latest sh -eu -c '
 cc=/sdk/tools/HEXAGON_Tools/19.0.07/Tools/bin/hexagon-clang
 flags="-mv75 -mhvx -mhvx-length=128b -O2 -G0 -ffreestanding -fno-builtin -fno-vectorize -fno-slp-vectorize -ffp-contract=off -fno-strict-aliasing -Wall -Wextra -DQDO_SCALAR_CACHE=$QDS_SCALAR_CACHE"
@@ -136,6 +137,12 @@ if [ "$QDS_PREPARED_FUSE" = 1 ] && [ "$QDS_PREPARED_REFERENCE" != 1 ]; then
 fi
 engine_flags="$engine_flags -DQDS_PREPARED_FUSE=$QDS_PREPARED_FUSE"
 engine_flags="$engine_flags -DQDS_L2_CACHE=$QDS_L2_CACHE"
+case "$QDS_PREPARED_THREADS" in 1|3) ;; *) echo "QDS_PREPARED_THREADS must be 1 or 3" >&2; exit 1;; esac
+if [ "$QDS_PREPARED_THREADS" = 3 ] && [ "$QDS_PREPARED_REFERENCE" != 1 ]; then echo "QDS_PREPARED_THREADS=3 requires QDS_PREPARED_REFERENCE=1" >&2; exit 1; fi
+if [ "$QDS_PREPARED_THREADS" = 3 ] && [ "$QDS_L2_CACHE" != 0 ]; then
+  echo "QDS_PREPARED_THREADS=3 with QDS_L2_CACHE: helper slots and follower stacks are L2-TCM, unusable during the lease" >&2; exit 1
+fi
+engine_flags="$engine_flags -DQDS_PREPARED_THREADS=$QDS_PREPARED_THREADS"
 glue_src=
 native_src=
 if [ "$QDS_DYNAMIC_TCM" = 1 ]; then engine="${engine%.elf}-dynamic-tcm.elf"; fi

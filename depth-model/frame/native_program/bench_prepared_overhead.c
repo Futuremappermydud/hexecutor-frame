@@ -69,7 +69,7 @@ static void model(const char *qpath,const char *npath,uint32_t reps){
                 if(pass==2&&c.opcode==QDR_NOP)CHECK(nprg2_executor_mark_no_effect(&e,c.opcode,c.variant)==NPRG2_EXEC_OK);}
         }
         Nprg2ExecStats st;r.stats=&st;
-        uint64_t pre=~0ull,full=~0ull,reuse=~0ull,prof=~0ull,t;
+        uint64_t pre=~0ull,full=~0ull,reuse=~0ull,prof=~0ull,hit=~0ull,steady=~0ull,t;
         uint64_t hrc[NPRG2_EXEC_REGISTRY_CAPACITY],hrn[NPRG2_EXEC_REGISTRY_CAPACITY],hvc[NPRG2_EXEC_REGISTRY_CAPACITY];
         Nprg2ExecProfile pf;
         for(uint32_t k=0;k<reps;k++){
@@ -85,12 +85,21 @@ static void model(const char *qpath,const char *npath,uint32_t reps){
             t=ticks();CHECK(nprg2_executor_preflight(&e,&r)==NPRG2_EXEC_OK);r.reuse_preflight=1;
             CHECK(nprg2_executor_run(&e,&r)==NPRG2_EXEC_OK);t=ticks()-t;if(t<prof)prof=t;
             CHECK(pf.preflights_reused==1);
+            /* Steady state of an unchanged request across inferences: the preflight is a cache hit (signature and
+             * table digest only), then the run takes the verified preflight. Older executors preflight in full here. */
+            r.profile=NULL;r.reuse_preflight=1;
+            CHECK(nprg2_executor_preflight(&e,&r)==NPRG2_EXEC_OK); /* the first inference: full, records the digest */
+            t=ticks();CHECK(nprg2_executor_preflight(&e,&r)==NPRG2_EXEC_OK);uint64_t h=ticks()-t;if(h<hit)hit=h;
+            t=ticks();CHECK(nprg2_executor_run(&e,&r)==NPRG2_EXEC_OK);h+=ticks()-t;if(h<steady)steady=h;
+            CHECK(st.executed_commands==p.command_count);
         }
         r.profile=NULL;r.reuse_preflight=0;
         unsigned long long uc=p.command_count;
         printf("BENCH %s %-22s commands=%u nops=%u keys=%u %s: preflight=%llu run(preflight+dispatch)=%llu run(reused preflight)=%llu preflight+run(reuse)+profile=%llu | per cmd: preflight=%llu run_full=%llu run_reuse=%llu\n",
                npath,names[pass],(unsigned)p.command_count,(unsigned)nops,(unsigned)distinct,UNIT,(unsigned long long)pre,(unsigned long long)full,
                (unsigned long long)reuse,(unsigned long long)prof,(unsigned long long)pre/uc,(unsigned long long)full/uc,(unsigned long long)reuse/uc);
+        printf("BENCH %s %-22s %s: steady-state inference control = preflight(cached)=%llu + run=%llu -> %llu\n",npath,names[pass],UNIT,
+               (unsigned long long)hit,(unsigned long long)(steady-hit),(unsigned long long)steady);
     }
 #ifdef BENCH_REAL
     {   /* The real scalar reference validators (they dry-run each kernel, no

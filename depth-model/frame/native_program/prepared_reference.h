@@ -54,6 +54,12 @@ typedef struct {
     uint8_t *workspace; uint32_t workspace_bytes;
     uint8_t *near; uint32_t near_bytes;
     uint64_t (*clock)(void); uint64_t *phase;
+    /* Optional: two more near-style regions of par_near_bytes (128-byte
+     * aligned, disjoint from everything else) for helper threads. A command
+     * whose output rows can be split uses them with call->parallel (see
+     * nprg2_parallel_parts); without them, or when a slot is not usable or
+     * too small for the command, it runs on the calling thread. */
+    uint8_t *par_near[2]; uint32_t par_near_bytes;
 } Nprg2ReferenceConv;
 /* Fuse hook registered with the conv keys: the conv handler can run the
  * REQUANT_U8/70 or ADD_U8/13 command `epilogue` fused into its output step

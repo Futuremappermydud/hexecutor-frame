@@ -3,6 +3,13 @@
 #include "../blocked_glue/add_u8.h"
 #include "../blocked_glue/elementwise_u16.h"
 #include "../blocked_glue/linearclip_u8_u16.h"
+#include "../blocked_glue/linearclip_flat_u8.h"
+/* blocked_glue/linearclip_u16.h and sign_blocked.h declare their own QdBlockedU16, which
+ * elementwise_u16.h already typedefs (to the layout-identical QdBlockedU16Out);
+ * give the glue's the name QdBlockedU16Glue and convert by copy. */
+#define QdBlockedU16 QdBlockedU16Glue
+#include "../blocked_glue/sign_blocked.h"
+#undef QdBlockedU16
 #include <limits.h>
 #include <string.h>
 
@@ -222,20 +229,77 @@ static int linearclip_validate(const Nprg2ExecCall *c,void *ctx) {
     return alias_proof(c,&in,NULL,NULL,&out,1,c->pools[fi_view.pool].base+fi_view.offset,48);
 }
 
+
+/* ---- threads: the handlers split the rows (dims[1]) of the region. A part
+ * covers pixel rows [H*part/parts, H*(part+1)/parts) of every tensor; output
+ * pixel rows are distinct 256-byte rows of the blocks and the stores are
+ * byte-masked, so parts write disjoint bytes and read only inputs. */
+#ifndef PAR_EW_MIN_ELEMS
+#define PAR_EW_MIN_ELEMS 131072u
+#endif
+#define EW_SPLIT(T,t,h0,h1) do { (t).dims[1]=(h1)-(h0); (t).origin[1]+=(h0); } while(0)
+static int ew_range(int32_t H,uint32_t part,uint32_t parts,int32_t *h0,int32_t *h1) {
+    *h0=(int32_t)((int64_t)H*part/parts);*h1=(int32_t)((int64_t)H*(part+1u)/parts);
+    return *h1>*h0;
+}
+static uint32_t ew_parts(const Nprg2ExecCall *c,const int32_t *dims) {
+    uint64_t n=(uint64_t)dims[0]*(uint64_t)dims[1]*(uint64_t)dims[2]*(uint64_t)dims[3];
+    if (n<PAR_EW_MIN_ELEMS || dims[1]<2) return 1;
+    return nprg2_parallel_parts(c->parallel,(uint32_t)dims[1]);
+}
+typedef struct { QdBlockedU8 a,b,out; QdAddU8Params p; } AddJob;
+static void add_part(void *ctx,uint32_t part,uint32_t parts) {
+    AddJob j=*(const AddJob *)ctx;int32_t h0,h1;
+    if (!ew_range(j.a.dims[1],part,parts,&h0,&h1)) return;
+    EW_SPLIT(0,j.a,h0,h1);EW_SPLIT(0,j.b,h0,h1);EW_SPLIT(0,j.out,h0,h1);
+    QdBlockedAddU8 prepared;prepared.a=j.a;prepared.b=j.b;prepared.out=j.out;prepared.cookie=0x51444138u;
+    (void)qd_blocked_add_u8_apply(&prepared,&j.p);
+}
+static int add_apply_parts(const Nprg2ExecCall *c,const QdBlockedU8 *a,const QdBlockedU8 *b,const QdBlockedU8 *o,const QdAddU8Params *p) {
+    uint32_t parts=ew_parts(c,a->dims);
+    if (parts>1) {
+        AddJob j={*a,*b,*o,*p};
+        nprg2_parallel_for(c->parallel,NPRG2_PAR_EW,parts,add_part,&j);
+        return 1;
+    }
+    QdBlockedAddU8 prepared;prepared.a=*a;prepared.b=*b;prepared.out=*o;prepared.cookie=0x51444138u;
+    return qd_blocked_add_u8_apply(&prepared,p);
+}
+typedef struct { QdBlockedU8 in; QdBlockedU16Out out; QdLinearclipU8U16Params p; } LcJob;
+static void lc_part(void *ctx,uint32_t part,uint32_t parts) {
+    LcJob j=*(const LcJob *)ctx;int32_t h0,h1;
+    if (!ew_range(j.in.dims[1],part,parts,&h0,&h1)) return;
+    EW_SPLIT(0,j.in,h0,h1);EW_SPLIT(0,j.out,h0,h1);
+    QdBlockedLinearclipU8U16 prepared;prepared.in=j.in;prepared.out=j.out;prepared.cookie=0x51445538u;
+    (void)qd_blocked_linearclip_u8_u16_apply(&prepared,&j.p);
+}
+typedef struct { QdBlockedU16Out a,b,o; int has_b; QdEw16Params p; int32_t bs; } W16Job;
+static void w16_part(void *ctx,uint32_t part,uint32_t parts) {
+    W16Job j=*(const W16Job *)ctx;int32_t h0,h1;
+    if (!ew_range(j.a.dims[1],part,parts,&h0,&h1)) return;
+    EW_SPLIT(0,j.a,h0,h1);EW_SPLIT(0,j.b,h0,h1);EW_SPLIT(0,j.o,h0,h1);
+    (void)qd_blocked_ew16_apply(&j.a,j.has_b?&j.b:NULL,&j.o,&j.p,j.bs);
+}
+
 static int add_run(const Nprg2ExecCall *c,void *ctx) {
     (void)ctx;QdBlockedU8 a,b,o;QdAddU8Params p;
     if (!make_u8(c,0,0,&a)||!make_u8(c,1,0,&b)||!make_u8(c,0,1,&o)||!add_params(c,&p)) return 0;
     /* The audited helper's prepare() allocates alias lists. The equivalent
      * full proof already ran in executor preflight with caller scratch; this
      * cookie is the helper's apply guard, not a skip around validation. */
-    QdBlockedAddU8 prepared;prepared.a=a;prepared.b=b;prepared.out=o;prepared.cookie=0x51444138u;
-    return qd_blocked_add_u8_apply(&prepared,&p);
+    return add_apply_parts(c,&a,&b,&o,&p);
 }
 static int linearclip_run(const Nprg2ExecCall *c,void *ctx) {
     (void)ctx;QdBlockedU8 in;QdBlockedU16Out out;QdLinearclipU8U16Params p;
     if (!make_u8(c,0,0,&in)||!make_u16out(c,&out)||!linearclip_params(c,&p)) return 0;
     /* As for ADD_U8, executor preflight has already completed the alias proof
      * in caller scratch; use the audited helper's normal HVX apply routine. */
+    uint32_t parts=ew_parts(c,in.dims);
+    if (parts>1) {
+        LcJob j={in,out,p};
+        nprg2_parallel_for(c->parallel,NPRG2_PAR_EW,parts,lc_part,&j);
+        return 1;
+    }
     QdBlockedLinearclipU8U16 prepared;prepared.in=in;prepared.out=out;prepared.cookie=0x51445538u;
     return qd_blocked_linearclip_u8_u16_apply(&prepared,&p);
 }
@@ -287,8 +351,7 @@ static int requant_validate(const Nprg2ExecCall *c,void *ctx) {
 static int requant_run(const Nprg2ExecCall *c,void *ctx) {
     (void)ctx;QdBlockedU8 in,out;QdAddU8Params p;
     if (!make_u8(c,0,0,&in) || !make_u8(c,0,1,&out) || !requant_params(c,&p)) return 0;
-    QdBlockedAddU8 prepared;prepared.a=in;prepared.b=in;prepared.out=out;prepared.cookie=0x51444138u;
-    return qd_blocked_add_u8_apply(&prepared,&p);
+    return add_apply_parts(c,&in,&in,&out,&p);
 }
 
 
@@ -419,6 +482,13 @@ static int w16_run(const Nprg2ExecCall *c,int which) {
         if (!sa) return 0;
         bs=(int32_t)rd16e(sa);
     }
+    uint32_t parts=ew_parts(c,a.dims);
+    if (parts>1) {
+        W16Job j={a,b,o,sp->two_tensors,p,bs};
+        if (!sp->two_tensors) memset(&j.b,0,sizeof j.b);
+        nprg2_parallel_for(c->parallel,NPRG2_PAR_EW,parts,w16_part,&j);
+        return 1;
+    }
     return qd_blocked_ew16_apply(&a,sp->two_tensors?&b:NULL,&o,&p,bs);
 }
 #define W16_HANDLERS(N,W) \
@@ -431,6 +501,156 @@ W16_HANDLERS(add16,W16_ADD)
 W16_HANDLERS(addsub16,W16_ADDSUB)
 W16_HANDLERS(mul1111,W16_MUL1111)
 
+
+/* ------------------------------------------------------------------------
+ * SIGN/39 (CH u16 -> CH u16) and LINEARCLIP/67 (CH u16 -> CH u16), the
+ * blocked_glue/sign_blocked.c and linearclip_u16.c kernels, and LINEARCLIP/69
+ * (flat u8 -> flat u8). Shapes, alias proof and the derived constants are the
+ * ones the reference kernels use (k_sign, k_linearclip); anything outside them
+ * is rejected so the chained reference kernel runs it. Constants are derived
+ * in validation and again at run time from the same immutable sources (the
+ * geometry records, and the pool 5 `fi` tensor), so a run never relies on a
+ * stale validation.
+ * ------------------------------------------------------------------------ */
+_Static_assert(sizeof(QdBlockedU16Out)==sizeof(QdBlockedU16Glue),"glue descriptor layout");
+static void to_glue(const QdBlockedU16Out *s,QdBlockedU16Glue *d) { memcpy(d,s,sizeof *d); }
+
+/* Common shape/alias proof for one u16 CH input and one u16 CH output of equal
+ * logical shape (what w16_validate proves for a single-input op). */
+static int u16_pair_ok(const Nprg2ExecCall *c,QdBlockedU16Out *a,QdBlockedU16Out *o) {
+    if (!make_u16(c,0,0,a) || !make_u16(c,0,1,o)) return 0;
+    if (!qd_valid(a->meta,a->dims,a->origin,4) || !qd_valid(o->meta,o->dims,o->origin,4)) return 0;
+    for (int i=0;i<4;i++) if (a->dims[i]!=o->dims[i]) return 0;
+    if ((a->origin[3]&31)!=(o->origin[3]&31) || (a->origin[2]&3)!=(o->origin[2]&3)) return 0;
+    uint32_t oti;Nprg2TensorView ov;if (nprg2_exec_output(c,0,&oti,&ov)!=NPRG2_EXEC_OK) return 0;
+    if (ov.geometry_record[1]&GEOMETRY_CROUTON) {
+        int32_t depth=((o->dims[3]+o->origin[3]+31)/32)*32;
+        if (depth>o->meta[3]) depth=o->meta[3];
+        if (depth-o->origin[3]!=a->dims[3]) return 0;
+    }
+    return alias_proof16(c,a,NULL,o,NULL,0);
+}
+
+static int sign_levels_of(const Nprg2ExecCall *c,int32_t *input_zero,QdSignLevels *lv) {
+    uint32_t ti;Nprg2TensorView iv,ov;
+    if (nprg2_exec_input(c,0,&ti,&iv)!=NPRG2_EXEC_OK || nprg2_exec_output(c,0,&ti,&ov)!=NPRG2_EXEC_OK) return 0;
+    const uint8_t *ig=iv.geometry_record,*og=ov.geometry_record;
+    if (!ig || !og || !(ig[1]&32u) || !(og[1]&32u)) return 0;
+    *input_zero=(int32_t)rd32e(ig+30);
+    if (*input_zero<0 || *input_zero>65535) return 0;
+    double scale;memcpy(&scale,og+34,8);
+    return qd_sign_prepare_levels(scale,(int32_t)rd32e(og+30),lv);
+}
+static int sign_validate(const Nprg2ExecCall *c,void *ctx) {
+    (void)ctx;
+    if (!c || c->command.opcode!=QDR_SIGN || c->command.variant!=39 ||
+        c->command.input_count!=1 || c->command.output_count!=1) return 0;
+    QdBlockedU16Out a,o;int32_t iz;QdSignLevels lv;
+    return u16_pair_ok(c,&a,&o) && sign_levels_of(c,&iz,&lv);
+}
+static int sign_run(const Nprg2ExecCall *c,void *ctx) {
+    (void)ctx;
+    QdBlockedU16Out a,o;int32_t iz;QdSignLevels lv;
+    if (!make_u16(c,0,0,&a) || !make_u16(c,0,1,&o) || !sign_levels_of(c,&iz,&lv)) return 0;
+    /* The alias proof ran in preflight (see add_run); this is the audited
+     * helper's apply guard. */
+    QdBlockedSignU16 prepared;to_glue(&a,&prepared.in);to_glue(&o,&prepared.out);prepared.cookie=0x51445347u;
+    return qd_blocked_sign_u16_apply(&prepared,iz,&lv);
+}
+
+/* The 12-word `fi` operand of LinearClip: a direct constant (pool 5, immutable)
+ * 1x1x1x12 i32 tensor. */
+static const uint8_t *lc_fi(const Nprg2ExecCall *c) {
+    uint32_t id;Nprg2TensorView v;
+    if (c->command.input_count!=2 || nprg2_exec_input(c,1,&id,&v)!=NPRG2_EXEC_OK) return NULL;
+    if (v.storage_kind!=1 || v.pool!=5 || !c->pools[5].base || v.geometry_record[0]!=5 ||
+        memcmp(v.geometry_record+2,"fi",2)) return NULL;
+    int32_t d[4],m[4],o[4];if (!view_shape(&v,d,m,o)) return NULL;
+    static const int32_t want[4]={1,1,1,12};
+    for (int i=0;i<4;i++) if (d[i]!=want[i]||m[i]!=want[i]||o[i]) return NULL;
+    if (v.offset>c->pools[5].bytes || 48u>c->pools[5].bytes-v.offset) return NULL;
+    return c->pools[5].base+v.offset;
+}
+/* The reference's linearclip constants for a u16-input form:
+ * P=fi[10] (low half multiplier, high byte shift), zp=fi[11], negated
+ * multiplier when fi[6]<0. */
+static void lc_consts(const uint8_t *fi,int64_t *m,int64_t *sh,uint32_t *zp) {
+    uint32_t P=rd32e(fi+40);*zp=rd32e(fi+44);
+    *m=(int64_t)(P&0xffffu);*sh=15-(int64_t)(P>>24);
+    if ((int32_t)rd32e(fi+24)<0) *m=-*m;
+}
+/* linearclip_u16.c's affine_fits, on the parameters the kernel will see. */
+static int lc16_fits(const QdLinearclipParams *p) {
+    if (p->shift<1 || p->shift>31 || p->input_zero<0 || p->input_zero>65535 ||
+        p->output_zero<0 || p->output_zero>65535) return 0;
+    int64_t r=1ll<<(p->shift-1),a=-(int64_t)p->input_zero*p->multiplier+r;
+    int64_t b=(65535-(int64_t)p->input_zero)*p->multiplier+r;
+    if (a<INT32_MIN||a>INT32_MAX||b<INT32_MIN||b>INT32_MAX) return 0;
+    a=(a>>p->shift)+p->output_zero;b=(b>>p->shift)+p->output_zero;
+    return a>=INT32_MIN&&a<=INT32_MAX&&b>=INT32_MIN&&b<=INT32_MAX;
+}
+static int lc16_params(const Nprg2ExecCall *c,QdLinearclipParams *p) {
+    const uint8_t *fi=lc_fi(c);int64_t m,sh;uint32_t zp;
+    if (!fi) return 0;
+    lc_consts(fi,&m,&sh,&zp);
+    if (m<INT32_MIN||m>INT32_MAX||sh<1||sh>31) return 0;
+    p->multiplier=(int32_t)m;p->input_zero=(int32_t)(zp&0xffffu);p->output_zero=(int32_t)(zp>>16);
+    p->shift=(uint32_t)sh;p->reserved=0;
+    return lc16_fits(p);
+}
+static int lc16_validate(const Nprg2ExecCall *c,void *ctx) {
+    (void)ctx;
+    if (!c || c->command.opcode!=QDR_LINEARCLIP || c->command.variant!=67 ||
+        c->command.input_count!=2 || c->command.output_count!=1) return 0;
+    QdBlockedU16Out a,o;QdLinearclipParams p;
+    return lc16_params(c,&p) && u16_pair_ok(c,&a,&o);
+}
+static int lc16_run(const Nprg2ExecCall *c,void *ctx) {
+    (void)ctx;
+    QdBlockedU16Out a,o;QdLinearclipParams p;
+    if (!make_u16(c,0,0,&a) || !make_u16(c,0,1,&o) || !lc16_params(c,&p)) return 0;
+    QdBlockedU16Linearclip prepared;to_glue(&a,&prepared.in);to_glue(&o,&prepared.out);prepared.params=p;
+    prepared.cookie=0x51444c43u;
+    return qd_blocked_linearclip_u16_apply_params(&prepared,&p);
+}
+
+/* LINEARCLIP/69: flat u8 direct tensors, dense (dims == metadata, no origin). */
+typedef struct { uint8_t *src,*dst;uint32_t n,m; } LcFlatPlan;
+static int flat_u8(const Nprg2ExecCall *c,uint32_t slot,int output,uint8_t **ptr,uint32_t *n) {
+    uint32_t id;Nprg2TensorView v;
+    if ((output?nprg2_exec_output(c,slot,&id,&v):nprg2_exec_input(c,slot,&id,&v))!=NPRG2_EXEC_OK) return 0;
+    if (v.storage_kind!=1 || v.pool>=7 || !c->pools[v.pool].base || v.geometry_record[0]!=1) return 0;
+    if (output && v.pool==5) return 0;
+    int32_t d[4],m[4],o[4];if (!view_shape(&v,d,m,o)) return 0;
+    uint64_t count=1;
+    for (int i=0;i<4;i++) { if (d[i]!=m[i]||o[i]) return 0;count*=(uint32_t)d[i];if (count>UINT32_MAX) return 0; }
+    uint32_t limit=c->pools[v.pool].bytes;
+    if (output && v.pool==1 && limit>c->pool1_writable_bytes) limit=c->pool1_writable_bytes;
+    if (v.offset>limit || count>limit-v.offset) return 0;
+    *ptr=c->pools[v.pool].base+v.offset;*n=(uint32_t)count;return 1;
+}
+static int lcflat_plan(const Nprg2ExecCall *c,LcFlatPlan *p) {
+    if (!c || c->command.opcode!=QDR_LINEARCLIP || c->command.variant!=69 ||
+        c->command.input_count!=2 || c->command.output_count!=1) return 0;
+    uint32_t nin,nout;
+    if (!flat_u8(c,0,0,&p->src,&nin) || !flat_u8(c,0,1,&p->dst,&nout) || nin!=nout) return 0;
+    p->n=nin;
+    uintptr_t s=(uintptr_t)p->src,d=(uintptr_t)p->dst;
+    if (s!=d && s<d+nin && d<s+nin) return 0; /* only identical or disjoint */
+    const uint8_t *fi=lc_fi(c);int64_t m,sh;uint32_t zp;
+    if (!fi) return 0;
+    lc_consts(fi,&m,&sh,&zp);
+    /* k_linearclip's u8 input form requires exactly this. */
+    if (sh!=14 || zp!=0 || m<0) return 0;
+    p->m=(uint32_t)m;return 1;
+}
+static int lcflat_validate(const Nprg2ExecCall *c,void *ctx) { (void)ctx;LcFlatPlan p;return lcflat_plan(c,&p); }
+static int lcflat_run(const Nprg2ExecCall *c,void *ctx) {
+    (void)ctx;LcFlatPlan p;
+    if (!lcflat_plan(c,&p)) return 0;
+    qd_linearclip_flat_u8(p.src,p.dst,p.n,p.m);return 1;
+}
+
 int nprg2_executor_register_elementwise_region(Nprg2Executor *e, uint8_t region) {
     if (!e) return NPRG2_EXEC_ARGUMENT;
     int rc=nprg2_executor_register_scratch_region(e,QDR_ADD_U8,13,add_validate,add_run,NULL,
@@ -442,6 +662,15 @@ int nprg2_executor_register_elementwise_region(Nprg2Executor *e, uint8_t region)
     /* Variant 68 is the proven linearclip@CH.CB.fi (CB u8 -> CH u16) form.
      * U16->U16 and dense/FB variants remain unregistered and fail closed. */
     rc=nprg2_executor_register_scratch_region(e,QDR_LINEARCLIP,68,linearclip_validate,linearclip_run,NULL,
+            NPRG2_ELEMENTWISE_SCRATCH_BYTES,0,region);
+    if (rc) return rc;
+    rc=nprg2_executor_register_scratch_region(e,QDR_SIGN,39,sign_validate,sign_run,NULL,
+            NPRG2_ELEMENTWISE_SCRATCH_BYTES,0,region);
+    if (rc) return rc;
+    rc=nprg2_executor_register_scratch_region(e,QDR_LINEARCLIP,67,lc16_validate,lc16_run,NULL,
+            NPRG2_ELEMENTWISE_SCRATCH_BYTES,0,region);
+    if (rc) return rc;
+    rc=nprg2_executor_register_scratch_region(e,QDR_LINEARCLIP,69,lcflat_validate,lcflat_run,NULL,
             NPRG2_ELEMENTWISE_SCRATCH_BYTES,0,region);
     if (rc) return rc;
     /* u16 crouton elementwise (blocked_glue/elementwise_u16.h). */

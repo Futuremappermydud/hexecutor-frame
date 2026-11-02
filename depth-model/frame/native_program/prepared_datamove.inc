@@ -49,6 +49,31 @@ static inline void dv_dup32(DV v, DV *first, DV *second) {
 /* Word i = (u.half[2i] << 16) | v.half[2i], and the odd halves. */
 static inline DV dv_shuffe16(DV u, DV v) {return Q6_Vh_vshuffe_VhVh(u,v);}
 static inline DV dv_shuffo16(DV u, DV v) {return Q6_Vh_vshuffo_VhVh(u,v);}
+/* Elements of 1<<k bytes: lo:hi interleaves v and u (v0,u0,v1,u1,...). */
+static inline void dv_shuffk(DV u, DV v, uint32_t k, DV *lo, DV *hi) {
+    HVX_VectorPair p=Q6_W_vshuff_VVR(u,v,-(int32_t)(1u<<k));
+    *lo=Q6_V_lo_W(p);*hi=Q6_V_hi_W(p);
+}
+/* Inverse: lo and hi are the even and odd elements of v:u. */
+static inline void dv_dealk(DV u, DV v, uint32_t k, DV *lo, DV *hi) {
+    HVX_VectorPair p=Q6_W_vdeal_VVR(u,v,-(int32_t)(1u<<k));
+    *lo=Q6_V_lo_W(p);*hi=Q6_V_hi_W(p);
+}
+/* 128 bytes from / the first n bytes to an arbitrary address. */
+static inline DV dv_ldu(const uint8_t *p) {return load_part(p,128);}
+static inline void dv_stun(uint8_t *p, DV v, uint32_t n) {store_part(p,v,0,n);}
+/* The first n bytes (1..128) from any address; the rest of the vector is unspecified. */
+static inline DV dv_ldn(const uint8_t *p, uint32_t n) {return load_part(p,n);}
+/* v[src..src+n) to p. */
+static inline void dv_stup(uint8_t *p, DV v, uint32_t src, uint32_t n) {store_part(p,v,src,n);}
+static inline DV dv_or(DV a, DV b) {return Q6_V_vor_VV(a,b);}
+/* Bytes [0,n) of v, the rest zero (0<n<=128). */
+static inline DV dv_keep(DV v, uint32_t n) {return Q6_V_vand_QV(Q6_Q_vsetq_R((int32_t)n),v);}
+/* v rotated right (towards byte 0) by n bytes. */
+static inline DV dv_ror(DV v, uint32_t n) {return Q6_V_vror_VR(v,(int32_t)(n&127u));}
+/* Halfword plane split: [a0..a31,b0..b31] of [a0,b0,a1,b1,...] and back. */
+static inline DV dv_dealh(DV v) {return Q6_Vh_vdeal_Vh(v);}
+static inline DV dv_shuffh(DV v) {return Q6_Vh_vshuff_Vh(v);}
 #else
 typedef struct { uint8_t b[128]; } DV;
 static inline DV dv_ld(const uint8_t *p) {DV v;memcpy(v.b,p,128);return v;}
@@ -82,7 +107,79 @@ static inline DV dv_shuffo16(DV u, DV v) {
     for(uint32_t i=0;i<32;i++){memcpy(r.b+4*i,v.b+4*i+2,2);memcpy(r.b+4*i+2,u.b+4*i+2,2);}
     return r;
 }
+static inline void dv_shuffk(DV u, DV v, uint32_t k, DV *lo, DV *hi) {
+    const uint32_t e=1u<<k,n=128/e;
+    uint8_t t[256];
+    for(uint32_t i=0;i<n;i++){memcpy(t+2*i*e,v.b+i*e,e);memcpy(t+(2*i+1)*e,u.b+i*e,e);}
+    memcpy(lo->b,t,128);memcpy(hi->b,t+128,128);
+}
+static inline void dv_dealk(DV u, DV v, uint32_t k, DV *lo, DV *hi) {
+    const uint32_t e=1u<<k,n=128/e;
+    uint8_t t[256];
+    memcpy(t,v.b,128);memcpy(t+128,u.b,128);
+    for(uint32_t i=0;i<n;i++){memcpy(lo->b+i*e,t+2*i*e,e);memcpy(hi->b+i*e,t+(2*i+1)*e,e);}
+}
+static inline DV dv_ldu(const uint8_t *p) {DV v;memcpy(v.b,p,128);return v;}
+static inline void dv_stun(uint8_t *p, DV v, uint32_t n) {memcpy(p,v.b,n);}
+static inline DV dv_ldn(const uint8_t *p, uint32_t n) {DV v;memset(v.b,0,128);memcpy(v.b,p,n);return v;}
+static inline void dv_stup(uint8_t *p, DV v, uint32_t src, uint32_t n) {memcpy(p,v.b+src,n);}
+static inline DV dv_or(DV a, DV b) {DV r;for(uint32_t i=0;i<128;i++)r.b[i]=a.b[i]|b.b[i];return r;}
+static inline DV dv_keep(DV v, uint32_t n) {DV r;memset(r.b,0,128);memcpy(r.b,v.b,n);return r;}
+static inline DV dv_ror(DV v, uint32_t n) {DV r;for(uint32_t i=0;i<128;i++)r.b[i]=v.b[(i+n)&127u];return r;}
+static inline DV dv_dealh(DV v) {
+    DV r;
+    for(uint32_t i=0;i<32;i++){memcpy(r.b+2*i,v.b+4*i,2);memcpy(r.b+64+2*i,v.b+4*i+2,2);}
+    return r;
+}
+static inline DV dv_shuffh(DV v) {
+    DV r;
+    for(uint32_t i=0;i<32;i++){memcpy(r.b+4*i,v.b+2*i,2);memcpy(r.b+4*i+2,v.b+64+2*i,2);}
+    return r;
+}
 #endif
+
+/* Register-array bit permutations. r[0..n) are vectors; a stage (kind, j, k)
+ * pairs r[i], r[i | 1<<j] and replaces them with the interleave (kind 0) or
+ * de-interleave (kind 1) of their 1<<k byte elements, which exchanges address
+ * bit j of the register index with the top (kind 0) or the k-th (kind 1) bit of
+ * the byte offset. The stage lists below were found by a bit-permutation search
+ * and are proved by the sim test against the generic kernels. */
+static inline __attribute__((always_inline)) void dv_ladder(DV *r, uint32_t n, const uint8_t (*ops)[3], uint32_t nops) {
+    for(uint32_t s=0;s<nops;s++) {
+        const uint32_t kind=ops[s][0],bit=1u<<ops[s][1],k=ops[s][2];
+        for(uint32_t i=0;i<n;i++) {
+            if(i&bit) continue;
+            DV lo,hi;
+            if(kind)dv_dealk(r[i|bit],r[i],k,&lo,&hi);else dv_shuffk(r[i|bit],r[i],k,&lo,&hi);
+            r[i]=lo;r[i|bit]=hi;
+        }
+    }
+}
+/* u16 blocked 32 pixel x 32 channel tile, W<->C (16 pixel-pair vectors in, 16 channel-pair vectors out). */
+static const uint8_t dm_lad_wc16[6][3]={{0,0,2},{0,2,3},{0,1,3},{1,0,5},{0,3,5},{0,0,1}};
+/* u8 blocked 32 x 32 tile, W<->C (8 four-pixel vectors in and out). */
+static const uint8_t dm_lad_wc8[5][3]={{0,0,0},{0,0,0},{0,2,2},{0,1,2},{0,0,0}};
+/* 16 x 16 byte transpose: out[m][r+16u] = in[r][8m+u]. */
+static const uint8_t dm_lad_t16[4][3]={{0,3,0},{0,2,0},{0,1,0},{0,0,0}};
+/* im2col 4x4x2 u16: 4 rows x 8 groups (4 pixels) -> 4 pixel-pair vectors of 4 row segments. */
+static const uint8_t dm_lad_i25[4][3]={{0,0,4},{1,0,5},{0,1,5},{0,0,1}};
+/* 4 x 4 transpose of 32-byte units. */
+static const uint8_t dm_lad_u32[2][3]={{0,1,5},{0,0,5}};
+/* ------------------------------------------------------------- threads */
+/* The HVX fast paths below split their outermost (flattened) loop over
+ * g->call->parallel. Each iteration stores whole, distinct 128-byte vectors of
+ * the destination and only reads the source (the blocks are disjoint), so
+ * parts are independent. Small jobs stay on the caller. */
+#ifndef PAR_DM_MIN_ELEMS
+#define PAR_DM_MIN_ELEMS 262144u
+#endif
+static uint32_t dm_parts(const G *g, uint64_t elems, int64_t items) {
+    if(elems<PAR_DM_MIN_ELEMS || items<2) return 1;
+    return nprg2_parallel_parts(g->call->parallel,items<8?(uint32_t)items:8u);
+}
+static void dm_range(int64_t items, uint32_t part, uint32_t parts, int64_t *a, int64_t *b) {
+    *a=items*(int64_t)part/(int64_t)parts;*b=items*((int64_t)part+1)/(int64_t)parts;
+}
 
 /* ------------------------------------------------------- blocked addressing */
 /* Start of row H of block (B, H/8, col, z): the block's 8-row x cw-column x
@@ -106,6 +203,13 @@ static inline uint8_t *bk_at(const BK *k, int64_t B, int64_t H, int64_t col, int
     return pool?k->pool[pool]+(e&~127u)+(size_t)(H&7)*256:NULL;
 }
 static inline DV dv_ldz(const uint8_t *p) {return p?dv_ld(p):dv_zero();}
+/* Start of block (B, block row Hb, block column col, depth group z); NULL when absent. */
+static inline uint8_t *bk_blk(const BK *k, int64_t B, int64_t Hb, int64_t col, int64_t z) {
+    int64_t index=((B*k->nbh+Hb)*k->nbw+col)*k->nbd+k->slice+z;
+    if(index<0 || index>=k->count) return NULL;
+    uint32_t e=k->blocks[index],pool=e&127u;
+    return pool?k->pool[pool]+(e&~127u):NULL;
+}
 
 /* Vector accesses assume every pool base is 128-byte aligned (block offsets and
  * the in-block offsets used are). */
@@ -146,6 +250,72 @@ static int dm_disjoint(const uint32_t *a, uint32_t na, const uint32_t *b, uint32
     }
     return 1;
 }
+/* Present blocks of a blocked region, as raw table entries. */
+typedef void (*DMVisit)(void *ctx, uint32_t entry);
+static void dm_visit(const T *t, const int32_t *dims, const int32_t *origin, DMVisit f, void *ctx) {
+    if(!dims[0] || !dims[1] || !dims[2] || !dims[3]) return;
+    int64_t cw=t->esize==1?8:t->esize==2?4:2;
+    int64_t nbh=((int64_t)t->m[1]+7)/8,nbw=((int64_t)t->m[2]+cw-1)/cw,nbd=((int64_t)t->m[3]+31)/32;
+    for(int64_t b=origin[0];b<(int64_t)origin[0]+dims[0];b++)
+     for(int64_t h=origin[1]/8;h<=((int64_t)origin[1]+dims[1]-1)/8;h++)
+      for(int64_t w=origin[2]/cw;w<=((int64_t)origin[2]+dims[2]-1)/cw;w++)
+       for(int64_t z=origin[3]/32;z<=((int64_t)origin[3]+dims[3]-1)/32;z++) {
+        int64_t index=((b*nbh+h)*nbw+w)*nbd+t->slice+z;
+        if(index<0 || index>=(int64_t)t->nblocks) continue;
+        uint32_t e=t->blocks[index];
+        if(e&127u) f(ctx,e);
+       }
+}
+/* Per-pool byte extent [lo, hi] (block start offsets). */
+typedef struct { uint32_t lo[8], hi[8]; } DMExt;
+static void dm_v_ext(void *c, uint32_t e) {
+    DMExt *x=c;
+    uint32_t pool=e&127u,o=e&~127u;
+    if(pool>=8) return;
+    if(o<x->lo[pool])x->lo[pool]=o;
+    if(o>x->hi[pool])x->hi[pool]=o;
+}
+static void dm_extent(const T *t, const int32_t *dims, const int32_t *origin, DMExt *x) {
+    for(int i=0;i<8;i++){x->lo[i]=UINT32_MAX;x->hi[i]=0;}
+    dm_visit(t,dims,origin,dm_v_ext,x);
+}
+/* Exact test for 2048-aligned blocks of one pool inside [base, base + slots * 2048): one bit per slot. */
+enum { DM_SLOTS=8192 };
+typedef struct { uint32_t pool, base, mark, hit, odd; uint32_t bits[DM_SLOTS/32]; } DMBits;
+static void dm_v_bits(void *c, uint32_t e) {
+    DMBits *k=c;
+    if((e&127u)!=k->pool) return;
+    uint32_t o=e&~127u;
+    if(o&(BLOCK_BYTES-1)){k->odd=1;return;}
+    if(o<k->base || (o-k->base)/BLOCK_BYTES>=DM_SLOTS) return;
+    uint32_t i=(o-k->base)/BLOCK_BYTES;
+    if(k->mark)k->bits[i>>5]|=1u<<(i&31);
+    else if(k->bits[i>>5]&(1u<<(i&31)))k->hit=1;
+}
+/* 1 when no block of region a shares a byte with a block of region b: disjoint
+ * per-pool extents, else an exact slot-bitmap test of the overlapping pools
+ * (blocks on a 2048 grid), else the pairwise test when both fit dm_touch. */
+static int dm_clear(const T *a, const int32_t *da, const int32_t *oa, const T *b, const int32_t *db, const int32_t *ob) {
+    DMExt x,y;
+    dm_extent(a,da,oa,&x);dm_extent(b,db,ob,&y);
+    int exact=0;
+    for(uint32_t p=1;p<8;p++) {
+        if(!(x.lo[p]<=x.hi[p] && y.lo[p]<=y.hi[p] && x.hi[p]+BLOCK_BYTES>y.lo[p] && y.hi[p]+BLOCK_BYTES>x.lo[p])) continue;
+        uint32_t lo=x.lo[p]>y.lo[p]?x.lo[p]:y.lo[p],hi=x.hi[p]<y.hi[p]?x.hi[p]:y.hi[p];
+        if(lo>hi) continue;   /* extents touch without a shared start: aligned blocks differ */
+        DMBits k;
+        memset(&k,0,sizeof k);
+        k.pool=p;k.base=lo;k.mark=1;
+        dm_visit(a,da,oa,dm_v_bits,&k);
+        k.mark=0;
+        dm_visit(b,db,ob,dm_v_bits,&k);
+        if(k.hit && !k.odd) return 0;
+        if(k.odd || (hi-lo)/BLOCK_BYTES>=DM_SLOTS) {exact=1;break;}
+    }
+    if(!exact) return 1;
+    uint32_t ka[DM_TOUCH_CAP],kb[DM_TOUCH_CAP],na,nb;
+    return dm_touch(a,da,oa,ka,&na) && dm_touch(b,db,ob,kb,&nb) && dm_disjoint(ka,na,kb,nb);
+}
 /* dims the generic t_write uses for a same-shape value of d, or 0 when the
  * value would be padded or broadcast (n != dims). */
 static int dm_write_dims_match(const T *t, const int32_t *n) {
@@ -176,11 +346,18 @@ static int s2d_fast_ok(const G *g, const T *i, const T *o, int32_t ph, int32_t p
     return DM_ENABLED && dm_blocked_u8(i) && dm_blocked_u8(o) && ci>0 && !(ci&31) && oc==4*ci && ow>0 && !(ow&3) &&
            oh>0 && ph>=0 && pw>=7 && (pw&7)==7 && dm_pools_aligned(g);
 }
-static void s2d_fast_run(const G *g, const T *i, const T *o, int32_t ph, int32_t pw, int32_t oh, int32_t ow, int32_t ci) {
+typedef struct { const G *g; const T *i, *o; int32_t ph, pw, oh, ow, ci; int64_t items; } S2dJob;
+static void s2d_fast_part(void *ctx, uint32_t part, uint32_t parts) {
+    const S2dJob *J=ctx;
+    const G *g=J->g;const int32_t ph=J->ph,pw=J->pw,oh=J->oh,ow=J->ow,ci=J->ci;
     BK bi,bo;
-    bk_init(&bi,g,i);bk_init(&bo,g,o);
-    const int64_t s=(pw-7)/8,ncb=ci/32,nk=ow/4;
-    for(int64_t cb=0;cb<ncb;cb++)for(int32_t h=0;h<oh;h++)for(int dy=0;dy<2;dy++) {
+    bk_init(&bi,g,J->i);bk_init(&bo,g,J->o);
+    const int64_t s=(pw-7)/8,nk=ow/4;
+    int64_t i0,i1;
+    dm_range(J->items,part,parts,&i0,&i1);
+    for(int64_t it=i0;it<i1;it++) {
+     const int64_t cb=it/oh;const int32_t h=(int32_t)(it%oh);
+     for(int dy=0;dy<2;dy++) {
         const int64_t H=(int64_t)ph+2*h+dy,j0=cb*4+2*dy;
         const uint8_t *r=bk_at(&bi,0,H,s,cb);
         DV A=r?dv_ld(r+128):dv_zero();
@@ -199,7 +376,15 @@ static void s2d_fast_run(const G *g, const T *i, const T *o, int32_t ph, int32_t
             if(d0)dv_st(d0+128*(k&1),O);
             A=C;
         }
+     }
     }
+    (void)ci;
+}
+static void s2d_fast_run(const G *g, const T *i, const T *o, int32_t ph, int32_t pw, int32_t oh, int32_t ow, int32_t ci) {
+    S2dJob J={g,i,o,ph,pw,oh,ow,ci,(int64_t)(ci/32)*oh};
+    uint32_t parts=dm_parts(g,(uint64_t)oh*ow*4u*(uint64_t)ci,J.items);
+    if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_DM,parts,s2d_fast_part,&J);
+    else s2d_fast_part(&J,0,1);
 }
 /* Whole space-to-depth: -1 when not taken, else 0 or the error code the
  * generic path's checks would give. */
@@ -232,6 +417,32 @@ static int resize_fast_ok(const G *g, const T *xt, const T *wpt, const T *o) {
     if(xt->d[2]<n[2]/2 || (xt->p[2]&3) || (o->p[2]&7) || xt->d[1]<=0) return 0;
     return dm_write_dims_match(o,n);
 }
+typedef struct { const G *g; const T *xt, *o; const int32_t *hi; int32_t n[4]; } RsJob;
+static void resize_part(void *ctx, uint32_t part, uint32_t parts) {
+    const RsJob *J=ctx;const G *g=J->g;const T *xt=J->xt,*o=J->o;const int32_t *hi=J->hi,*n=J->n;
+    BK bx,bo;
+    bk_init(&bx,g,xt);bk_init(&bo,g,o);
+    const int64_t ng=n[3]/32,nq=n[2]/8,xw=xt->p[2]/4,ow=o->p[2]/8;
+    int64_t i0,i1;
+    dm_range((int64_t)n[0]*n[1]*ng,part,parts,&i0,&i1);
+    for(int64_t it=i0;it<i1;it++) {
+        const int64_t z=it%ng;const int32_t h=(int32_t)((it/ng)%n[1]),b=(int32_t)(it/ng/n[1]);
+        const int64_t H=(int64_t)hi[h]+xt->p[1],B=b+(int64_t)xt->p[0],OB=b+(int64_t)o->p[0],OH=h+(int64_t)o->p[1];
+        const uint8_t *s=bk_at(&bx,B,H,(xw)>>1,z+xt->p[3]/32);
+        DV cur=dv_ldz(s?s+128*(xw&1):NULL);
+        for(int64_t q=0;q<nq;q++) {
+            DV v=cur;
+            if(q+1<nq) {
+                s=bk_at(&bx,B,H,(xw+q+1)>>1,z+xt->p[3]/32);
+                cur=dv_ldz(s?s+128*((xw+q+1)&1):NULL);
+            }
+            DV lo,hi2;
+            dv_dup32(v,&lo,&hi2);
+            uint8_t *d=bk_at(&bo,OB,OH,ow+q,z+o->p[3]/32);
+            if(d){dv_st(d,lo);dv_st(d+128,hi2);}
+        }
+    }
+}
 static int resize_fast(G *g, const T *xt, const T *wpt, const T *o, const int32_t *hp) {
     if(!resize_fast_ok(g,xt,wpt,o)) return -1;
     int32_t n[4]={xt->d[0],o->d[1],o->d[2],xt->d[3]};
@@ -248,25 +459,10 @@ static int resize_fast(G *g, const T *xt, const T *wpt, const T *o, const int32_
         CHECK(v>=0 && v<xt->d[1],E_RANGE);hi[i]=(int32_t)v;
     }
     DM_COUNT(1,(uint64_t)n[0]*n[1]*n[2]*n[3]);
-    BK bx,bo;
-    bk_init(&bx,g,xt);bk_init(&bo,g,o);
-    const int64_t ng=n[3]/32,nq=n[2]/8,xw=xt->p[2]/4,ow=o->p[2]/8;
-    for(int32_t b=0;b<n[0];b++)for(int32_t h=0;h<n[1];h++)for(int64_t z=0;z<ng;z++) {
-        const int64_t H=(int64_t)hi[h]+xt->p[1],B=b+(int64_t)xt->p[0],OB=b+(int64_t)o->p[0],OH=h+(int64_t)o->p[1];
-        const uint8_t *s=bk_at(&bx,B,H,(xw)>>1,z+xt->p[3]/32);
-        DV cur=dv_ldz(s?s+128*(xw&1):NULL);
-        for(int64_t q=0;q<nq;q++) {
-            DV v=cur;
-            if(q+1<nq) {
-                s=bk_at(&bx,B,H,(xw+q+1)>>1,z+xt->p[3]/32);
-                cur=dv_ldz(s?s+128*((xw+q+1)&1):NULL);
-            }
-            DV lo,hi2;
-            dv_dup32(v,&lo,&hi2);
-            uint8_t *d=bk_at(&bo,OB,OH,ow+q,z+o->p[3]/32);
-            if(d){dv_st(d,lo);dv_st(d+128,hi2);}
-        }
-    }
+    RsJob J={g,xt,o,hi,{n[0],n[1],n[2],n[3]}};
+    uint32_t parts=dm_parts(g,(uint64_t)n[0]*n[1]*n[2]*n[3],(int64_t)n[0]*n[1]*(n[3]/32));
+    if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_DM,parts,resize_part,&J);
+    else resize_part(&J,0,1);
     return 0;
 }
 
@@ -283,30 +479,44 @@ static int tr_hw_fast_ok(const G *g, const T *xt, const T *o) {
     if((xt->p[1]&1) || (xt->p[2]&1) || (o->p[2]&1)) return 0;
     return dm_write_dims_match(o,n);
 }
+typedef struct { const G *g; const T *xt, *o; int32_t n[4]; } TrJob;
+static void tr_hw_part(void *ctx, uint32_t part, uint32_t parts) {
+    const TrJob *J=ctx;const G *g=J->g;const T *xt=J->xt,*o=J->o;const int32_t *n=J->n;
+    BK bx,bo;
+    bk_init(&bx,g,xt);bk_init(&bo,g,o);
+    const int32_t H=xt->d[1],W=xt->d[2];
+    const int64_t nz=n[3]/32,hp=H/2;
+    int64_t i0,i1;
+    dm_range((int64_t)n[0]*nz*hp,part,parts,&i0,&i1);
+    for(int64_t it=i0;it<i1;it++) {
+        const int32_t h=(int32_t)(it%hp)*2,b=(int32_t)(it/hp/nz);const int64_t z=(it/hp)%nz;
+        for(int32_t w=0;w<W;w+=2) {
+            const int64_t AH=(int64_t)h+xt->p[1],AW=(int64_t)w+xt->p[2];
+            const uint8_t *s=bk_at(&bx,b+(int64_t)xt->p[0],AH,AW>>2,z+xt->p[3]/32);
+            DV A=dv_zero(),B=A;
+            if(s){A=dv_ld(s+128*((AW>>1)&1));B=dv_ld(s+256+128*((AW>>1)&1));}
+            const int64_t OW=(int64_t)h+o->p[2],OB=b+(int64_t)o->p[0];
+            uint8_t *d0=bk_at(&bo,OB,(int64_t)w+o->p[1],OW>>2,z+o->p[3]/32);
+            uint8_t *d1=bk_at(&bo,OB,(int64_t)w+1+o->p[1],OW>>2,z+o->p[3]/32);
+            if(d0)dv_st(d0+128*((OW>>1)&1),dv_shuffe16(B,A));
+            if(d1)dv_st(d1+128*((OW>>1)&1),dv_shuffo16(B,A));
+        }
+    }
+}
 static int tr_hw_fast(G *g, const T *xt, const T *o) {
     if(!tr_hw_fast_ok(g,xt,o)) return -1;
     int32_t n[4]={xt->d[0],xt->d[2],xt->d[1],xt->d[3]};
     int e=xfer_check(g,xt,xt->d,xt->p,0);
     if(!e)e=xfer_check(g,o,n,o->p,1);
     if(e) return e;
-    uint32_t ka[DM_TOUCH_CAP],kb[DM_TOUCH_CAP],na,nb;
-    if(!dm_touch(xt,xt->d,xt->p,ka,&na) || !dm_touch(o,n,o->p,kb,&nb) || !dm_disjoint(ka,na,kb,nb)) return -1;
+    if(!dm_clear(xt,xt->d,xt->p,o,n,o->p)) return -1;
     if(g->dry) return 0;
     DM_COUNT(2,(uint64_t)n[0]*n[1]*n[2]*n[3]);
-    BK bx,bo;
-    bk_init(&bx,g,xt);bk_init(&bo,g,o);
-    const int32_t H=xt->d[1],W=xt->d[2];
-    for(int32_t b=0;b<n[0];b++)for(int64_t z=0;z<n[3]/32;z++)for(int32_t h=0;h<H;h+=2)for(int32_t w=0;w<W;w+=2) {
-        const int64_t AH=(int64_t)h+xt->p[1],AW=(int64_t)w+xt->p[2];
-        const uint8_t *s=bk_at(&bx,b+(int64_t)xt->p[0],AH,AW>>2,z+xt->p[3]/32);
-        DV A=dv_zero(),B=A;
-        if(s){A=dv_ld(s+128*((AW>>1)&1));B=dv_ld(s+256+128*((AW>>1)&1));}
-        const int64_t OW=(int64_t)h+o->p[2],OB=b+(int64_t)o->p[0];
-        uint8_t *d0=bk_at(&bo,OB,(int64_t)w+o->p[1],OW>>2,z+o->p[3]/32);
-        uint8_t *d1=bk_at(&bo,OB,(int64_t)w+1+o->p[1],OW>>2,z+o->p[3]/32);
-        if(d0)dv_st(d0+128*((OW>>1)&1),dv_shuffe16(B,A));
-        if(d1)dv_st(d1+128*((OW>>1)&1),dv_shuffo16(B,A));
-    }
+    TrJob J={g,xt,o,{n[0],n[1],n[2],n[3]}};
+    const int32_t H=xt->d[1];
+    uint32_t parts=dm_parts(g,(uint64_t)n[0]*n[1]*n[2]*n[3],(int64_t)n[0]*(n[3]/32)*(H/2));
+    if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_DM,parts,tr_hw_part,&J);
+    else tr_hw_part(&J,0,1);
     return 0;
 }
 
@@ -492,4 +702,373 @@ static int tr_flat_fast(G *g, const T *xt, const T *o, const int32_t *perm) {
     }
     DM_COUNT(6,count4(n));
     return 0;
+}
+
+/* ------------------------------------------------- blocked W<->C transposes */
+/* Permutation {0,2,1,3} of a blocked tensor swaps its width and depth axes.
+ * The unit is a tile of 32 pixels x 32 channels: input pixels are packed 2 (u16)
+ * or 4 (u8) to a vector with all 32 channels of the group, output pixels (the
+ * channels) are packed the same way with the 32 input pixels as lanes, so the
+ * tile is a register-array transpose (dv_ladder). Block pointers are resolved
+ * once per 8-row block row and tile, then reused for each of its rows. A group
+ * of fewer than 32 channels yields only the output pixels it has (a masked
+ * store when a vector is partial); lanes the tile does not own are not touched. */
+static int tr_wc_common_ok(const G *g, const T *xt, const T *o, uint32_t es, int32_t pixw, int32_t *n) {
+    if(!DM_ENABLED || !(xt->flags&F_BLOCKED) || !(xt->flags&F_SHAPE) || !(o->flags&F_BLOCKED) || !(o->flags&F_SHAPE) ||
+       xt->esize!=es || o->esize!=es || xt->dtype==DT_F32 || o->dtype==DT_F32 || !dm_pools_aligned(g)) return 0;
+    const int32_t W=xt->d[2],C=xt->d[3];
+    n[0]=xt->d[0];n[1]=xt->d[1];n[2]=C;n[3]=W;
+    if(n[0]<=0 || n[1]<=0 || W<=0 || C<=0 || (W&31)) return 0;
+    if((xt->p[2]%pixw) || (xt->p[3]&31) || (o->p[2]%pixw) || (o->p[3]&31)) return 0;
+    return dm_write_dims_match(o,n);
+}
+static int tr_wc_hook(G *g, const T *xt, const T *o, const int32_t *n, int id, int es) {
+    int e=xfer_check(g,xt,xt->d,xt->p,0);
+    if(!e)e=xfer_check(g,o,n,o->p,1);
+    if(e) return e;
+    if(!dm_clear(xt,xt->d,xt->p,o,n,o->p)) return -1;
+    if(g->dry) return 0;
+    (void)id;DM_COUNT(id,(uint64_t)n[0]*n[1]*n[2]*n[3]);
+    BK bx,bo;
+    bk_init(&bx,g,xt);bk_init(&bo,g,o);
+    const int32_t H=xt->d[1],W=xt->d[2],C=xt->d[3];
+    const int pb=es==2?2:4;      /* pixels per vector */
+    const int nin=16/(es==2?1:2); /* input vectors per tile: 32 pixels / pixels per vector */
+    const int64_t cw=es==2?4:8;  /* pixels per block column */
+    for(int32_t b=0;b<n[0];b++)for(int32_t h=0;h<H;) {
+        const int64_t Hi=(int64_t)h+xt->p[1],Ho=(int64_t)h+o->p[1],B=b+(int64_t)xt->p[0],OB=b+(int64_t)o->p[0];
+        int32_t run=8-(int32_t)(Hi&7);
+        if(8-(int32_t)(Ho&7)<run)run=8-(int32_t)(Ho&7);
+        if(H-h<run)run=H-h;
+        for(int32_t zc=0;zc*32<C;zc++) {
+            const int32_t cn=C-32*zc<32?C-32*zc:32,nout=(cn+pb-1)/pb;
+            for(int32_t w0=0;w0<W;w0+=32) {
+                const uint8_t *ip[16];
+                uint8_t *op[16];
+                for(int i=0;i<nin;i++) {
+                    const int64_t aw=(int64_t)xt->p[2]+w0+(int64_t)pb*i;
+                    uint8_t *blk=bk_blk(&bx,B,Hi>>3,aw/cw,zc+xt->p[3]/32);
+                    ip[i]=blk?blk+128*((aw/pb)&1):NULL;
+                }
+                for(int i=0;i<nout;i++) {
+                    const int64_t oc=(int64_t)o->p[2]+32*zc+(int64_t)pb*i;
+                    uint8_t *blk=bk_blk(&bo,OB,Ho>>3,oc/cw,(o->p[3]+w0)/32);
+                    op[i]=blk?blk+128*((oc/pb)&1):NULL;
+                }
+                for(int32_t r=0;r<run;r++) {
+                    DV v[16];
+                    for(int i=0;i<nin;i++)v[i]=ip[i]?dv_ld(ip[i]+256*((Hi&7)+r)):dv_zero();
+                    if(es==2)dv_ladder(v,16,dm_lad_wc16,6);else dv_ladder(v,8,dm_lad_wc8,5);
+                    for(int i=0;i<nout;i++) {
+                        if(!op[i]) continue;
+                        uint8_t *d=op[i]+256*((Ho&7)+r);
+                        const int32_t m=cn-pb*i<pb?cn-pb*i:pb;
+                        if(m==pb)dv_st(d,v[i]);else dv_stun(d,v[i],(uint32_t)m*(es==2?64u:32u));
+                    }
+                }
+            }
+        }
+        h+=run;
+    }
+    return 0;
+}
+static int tr_wc16_fast(G *g, const T *xt, const T *o) {
+    int32_t n[4];
+    /* every channel pair of the group must be whole */
+    if(!tr_wc_common_ok(g,xt,o,2,2,n) || (xt->d[3]&1)) return -1;
+    return tr_wc_hook(g,xt,o,n,7,2);
+}
+static int tr_wc8_fast(G *g, const T *xt, const T *o) {
+    int32_t n[4];
+    if(!tr_wc_common_ok(g,xt,o,1,4,n)) return -1;
+    return tr_wc_hook(g,xt,o,n,8,1);
+}
+
+/* u8 blocked {0,2,1,3}: pixel (h,w) of a depth group is 32 bytes, so the swap
+ * moves 32-byte units; 4 rows x 4 pixels of one group are four vectors whose
+ * units transpose. Pixels of the input quad beyond the width are loaded but
+ * their output rows are not stored. */
+static int tr_hw8_fast(G *g, const T *xt, const T *o) {
+    if(!DM_ENABLED || !(xt->flags&F_BLOCKED) || !(xt->flags&F_SHAPE) || !(o->flags&F_BLOCKED) || !(o->flags&F_SHAPE) ||
+       xt->esize!=1 || o->esize!=1 || xt->dtype==DT_F32 || o->dtype==DT_F32 || !dm_pools_aligned(g)) return -1;
+    const int32_t H=xt->d[1],W=xt->d[2],C=xt->d[3],n[4]={xt->d[0],W,H,C};
+    if(n[0]<=0 || H<=0 || W<=0 || C<=0 || (C&31) || (H&3) || (xt->p[1]&3) || (xt->p[2]&3) || (xt->p[3]&31) || (o->p[2]&3) || (o->p[3]&31)) return -1;
+    if(!dm_write_dims_match(o,n)) return -1;
+    int e=xfer_check(g,xt,xt->d,xt->p,0);
+    if(!e)e=xfer_check(g,o,n,o->p,1);
+    if(e) return e;
+    if(!dm_clear(xt,xt->d,xt->p,o,n,o->p)) return -1;
+    if(g->dry) return 0;
+    DM_COUNT(9,(uint64_t)n[0]*n[1]*n[2]*n[3]);
+    BK bx,bo;
+    bk_init(&bx,g,xt);bk_init(&bo,g,o);
+    for(int32_t b=0;b<n[0];b++)for(int64_t z=0;z<C/32;z++)for(int32_t h0=0;h0<H;h0+=4)for(int32_t w0=0;w0<W;w0+=4) {
+        const int64_t Hi=(int64_t)h0+xt->p[1],Wi=(int64_t)w0+xt->p[2],B=b+(int64_t)xt->p[0],OB=b+(int64_t)o->p[0];
+        uint8_t *blk=bk_blk(&bx,B,Hi>>3,Wi>>3,z+xt->p[3]/32);
+        DV v[4];
+        for(int i=0;i<4;i++)v[i]=blk?dv_ld(blk+256*((Hi&7)+i)+128*((Wi>>2)&1)):dv_zero();
+        dv_ladder(v,4,dm_lad_u32,2);
+        const int64_t Oc=(int64_t)h0+o->p[2];
+        for(int i=0;i<4 && w0+i<W;i++) {
+            const int64_t Orow=(int64_t)w0+i+o->p[1];
+            uint8_t *ob=bk_blk(&bo,OB,Orow>>3,Oc>>3,z+o->p[3]/32);
+            if(ob)dv_st(ob+256*(Orow&7)+128*((Oc>>2)&1),v[i]);
+        }
+    }
+    return 0;
+}
+
+/* ----------------------------------------------- flat <-> blocked data moves */
+typedef struct { uint32_t pool; uint64_t lo, hi; int hit; } DMFlat;
+static void dm_v_flat(void *c, uint32_t e) {
+    DMFlat *k=c;
+    if((e&127u)!=k->pool) return;
+    uint64_t o=e&~127u;
+    if(o<k->hi && o+BLOCK_BYTES>k->lo) k->hit=1;
+}
+/* 1 when the flat region f shares no byte with a block of the blocked region b. */
+static int dm_flat_apart_blocked(const T *f, const int32_t *fd, const int32_t *fo, const T *b, const int32_t *bd, const int32_t *bo) {
+    if(fl_empty(fd)) return 1;
+    DMFlat k;
+    k.pool=f->pool;k.hit=0;
+    fl_span(f,fd,fo,&k.lo,&k.hi);
+    dm_visit(b,bd,bo,dm_v_flat,&k);
+    return !k.hit;
+}
+/* A blocked u16 tensor written (or read) as pixels with 2 channels in lanes 0..1:
+ * the geometry the flow tensors use. */
+static int dm_blocked_c2(const T *t, int crouton) {
+    return (t->flags&F_BLOCKED) && (t->flags&F_SHAPE) && t->esize==2 && t->dtype!=DT_F32 && t->d[0]==1 && t->d[3]==2 && t->p[3]==0 &&
+           (!crouton || (t->crouton && t->m[3]>=32)) && !(t->p[2]&1) && t->d[1]>0 && t->d[2]>0 && !(t->d[2]&31);
+}
+
+/* ------------------------------------------------------------ COPY_VALUES */
+/* Flat flow (1,H,W,2) u16 -> padded blocked (1,H,W,2 of 32 lanes), and back.
+ * 32 pixels are one vector of flat words (c0, c1). dealh splits it into the c0
+ * and c1 planes, whose words (c0 of pixel 2p, 2p+1) are exactly the first word
+ * of the blocked pixel-pair vector p and (c1 ...) the second: Z = word
+ * interleave of the planes holds pair p's two words at bytes 8p. The crouton
+ * write zero fills the other 30 lanes, as the generic padded t_write does. */
+static int copy_c2_ok(const G *g, const T *f, const T *b, int to_blocked) {
+    if(!DM_ENABLED || !(f->flags&F_DIRECT) || !(f->flags&F_SHAPE) || f->esize!=2 || f->dtype==DT_F32 || !dm_pools_aligned(g)) return 0;
+    if(!dm_blocked_c2(b,to_blocked)) return 0;
+    if(memcmp(f->d,b->d,sizeof f->d) || f->p[3]!=0 || f->m[3]!=2 || f->d[0]!=1) return 0;
+    /* the flat value reshapes to the blocked tensor's d (equal here) and the dtypes must match as in k_copy_values */
+    return (to_blocked || !f->crouton) && b->dtype==f->dtype;
+}
+static int copy_c2_fast(G *g, const T *f, const T *b, int to_blocked) {
+    if(!copy_c2_ok(g,f,b,to_blocked)) return -1;
+    int32_t bd[4]={1,b->d[1],b->d[2],to_blocked?32:2};   /* region the generic path moves in the blocked tensor */
+    if(to_blocked && b->m[3]<32) return -1;
+    int e=to_blocked?xfer_check(g,f,f->d,f->p,0):xfer_check(g,b,b->d,b->p,0);
+    if(!e)e=to_blocked?xfer_check(g,b,bd,b->p,1):xfer_check(g,f,f->d,f->p,1);
+    if(e) return e;
+    if(!dm_flat_apart_blocked(f,f->d,f->p,b,to_blocked?bd:b->d,b->p)) return -1;
+    if(g->dry) return 0;
+    DM_COUNT(to_blocked?10:11,(uint64_t)b->d[1]*b->d[2]*2);
+    BK bk;
+    bk_init(&bk,g,b);
+    uint8_t *fb=g->pool[f->pool]+f->offset;
+    const int32_t H=b->d[1],W=b->d[2];
+    for(int32_t h=0;h<H;) {
+        const int64_t Hb=(int64_t)h+b->p[1];
+        int32_t run=8-(int32_t)(Hb&7);
+        if(H-h<run)run=H-h;
+        for(int32_t w0=0;w0<W;w0+=32) {
+            uint8_t *bp[16];
+            for(int p=0;p<16;p++) {
+                const int64_t aw=(int64_t)b->p[2]+w0+2*p;
+                uint8_t *blk=bk_blk(&bk,b->p[0],Hb>>3,aw>>2,b->p[3]/32);
+                bp[p]=blk?blk+128*((aw>>1)&1):NULL;
+            }
+            for(int32_t r=0;r<run;r++) {
+                uint8_t *fp=fb+fl_lin(f,(int32_t[4]){f->p[0],f->p[1]+h+r,f->p[2]+w0,f->p[3]})*2;
+                const uint32_t ro=256u*(uint32_t)((Hb&7)+r);
+                if(to_blocked) {
+                    DV m=dv_dealh(dv_ldu(fp)),z,zh;
+                    dv_shuffk(dv_ror(m,64),m,2,&z,&zh);
+                    for(int p=0;p<16;p++)
+                        if(bp[p])dv_st(bp[p]+ro,dv_keep(dv_ror(z,8u*(uint32_t)p),8));
+                } else {
+                    DV z=dv_zero();
+                    for(int p=0;p<16;p++)
+                        if(bp[p])z=dv_or(z,dv_ror(dv_keep(dv_ld(bp[p]+ro),8),(128u-8u*(uint32_t)p)&127u));
+                    DV lo,hi;
+                    dv_dealk(z,z,2,&lo,&hi);
+                    dv_stun(fp,dv_shuffh(dv_or(dv_keep(lo,64),dv_ror(dv_keep(hi,64),64))),128);
+                }
+            }
+        }
+        h+=run;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ IM2COL */
+/* 3x3 / stride 1 / depth 1 u8: output lane 3y+x of pixel w is input (h+y, w+x).
+ * For 128 pixels the 9 shifted row windows (and 7 zero vectors) are 16 vectors;
+ * a 16x16 byte transpose gives vectors of 8 pixels x 16 lanes, and interleaving
+ * each with zero 16-byte units yields the two 4-pixel x 32-lane vectors (lanes
+ * 9..31 zero, as the padded t_write leaves them) of one block row. */
+static int im2col_u8_fast(G *g, const T *i, const T *o, int32_t kh, int32_t kw, int32_t cin, int32_t sh, int32_t sw) {
+    if(!DM_ENABLED || kh!=3 || kw!=3 || cin!=1 || sh!=1 || sw!=1 || !dm_pools_aligned(g)) return -1;
+    if(!(i->flags&F_DIRECT) || !(i->flags&F_SHAPE) || i->esize!=1 || i->dtype==DT_F32 || i->d[0]!=1 || i->d[3]!=1 || i->m[3]!=1 || i->p[3]!=0) return -1;
+    if(!(o->flags&F_BLOCKED) || !(o->flags&F_SHAPE) || o->esize!=1 || o->dtype==DT_F32 || !o->crouton || o->d[0]!=1 || o->d[3]!=9 ||
+       o->p[3]!=0 || o->m[3]<32 || (o->p[2]&7)) return -1;
+    const int32_t oh=o->d[1],ow=o->d[2];
+    if(oh<=0 || ow<=0 || (ow&127) || 2+oh-1>=i->d[1] || 2+ow-1>=i->d[2]) return -1;
+    int32_t wd[4]={1,oh,ow,32};
+    int e=xfer_check(g,i,i->d,i->p,0);
+    if(!e)e=xfer_check(g,o,wd,o->p,1);
+    if(e) return e;
+    if(!dm_flat_apart_blocked(i,i->d,i->p,o,wd,o->p)) return -1;
+    if(g->dry) return 0;
+    DM_COUNT(12,(uint64_t)oh*ow*9);
+    BK bo;
+    bk_init(&bo,g,o);
+    const uint8_t *xb=g->pool[i->pool]+i->offset;
+    for(int32_t h=0;h<oh;) {
+        const int64_t Ho=(int64_t)h+o->p[1];
+        int32_t run=8-(int32_t)(Ho&7);
+        if(oh-h<run)run=oh-h;
+        for(int32_t w0=0;w0<ow;w0+=128) {
+            uint8_t *bp[16];
+            for(int m=0;m<16;m++)bp[m]=bk_blk(&bo,o->p[0],Ho>>3,((int64_t)o->p[2]+w0)/8+m,0);
+            for(int32_t r=0;r<run;r++) {
+                DV s[16];
+                for(int y=0;y<3;y++)for(int x=0;x<3;x++)
+                    s[3*y+x]=dv_ldu(xb+fl_lin(i,(int32_t[4]){i->p[0],i->p[1]+h+r+y,i->p[2]+w0+x,0}));
+                for(int l=9;l<16;l++)s[l]=dv_zero();
+                dv_ladder(s,16,dm_lad_t16,4);
+                const uint32_t ro=256u*(uint32_t)((Ho&7)+r);
+                for(int m=0;m<16;m++) {
+                    if(!bp[m]) continue;
+                    DV lo,hi;
+                    dv_shuffk(dv_zero(),s[m],4,&lo,&hi);
+                    dv_st(bp[m]+ro,lo);dv_st(bp[m]+ro+128,hi);
+                }
+            }
+        }
+        h+=run;
+    }
+    return 0;
+}
+/* 4x4 / stride 4 / depth 2 u16 (a 16-pixel patch is 32 lanes): pixel w's lane
+ * 8y+2x+c is input (4h+y, 4w+x) channel c. A row vector of 32 input pixels is 8
+ * patch rows (4 pixels = 8 halfwords each); four rows y become 4 output
+ * pixel-pair vectors whose 32-byte row segments interleave the halfwords of
+ * their two patch rows. */
+static int im2col_u16_fast(G *g, const T *i, const T *o, int32_t kh, int32_t kw, int32_t cin, int32_t sh, int32_t sw) {
+    if(!DM_ENABLED || kh!=4 || kw!=4 || cin!=2 || sh!=4 || sw!=4 || !dm_pools_aligned(g)) return -1;
+    if(!(i->flags&F_DIRECT) || !(i->flags&F_SHAPE) || i->esize!=2 || i->dtype==DT_F32 || i->d[0]!=1 || i->d[3]!=2 || i->m[3]!=2 || i->p[3]!=0) return -1;
+    if(!(o->flags&F_BLOCKED) || !(o->flags&F_SHAPE) || o->esize!=2 || o->dtype==DT_F32 || o->d[0]!=1 || o->d[3]!=32 ||
+       o->p[3]!=0 || o->m[3]<32 || (o->p[2]&1)) return -1;
+    const int32_t oh=o->d[1],ow=o->d[2];
+    if(oh<=0 || ow<=0 || (ow&7) || 3+4*(oh-1)>=i->d[1] || 3+4*(ow-1)>=i->d[2]) return -1;
+    int e=xfer_check(g,i,i->d,i->p,0);
+    if(!e)e=xfer_check(g,o,o->d,o->p,1);
+    if(e) return e;
+    if(!dm_flat_apart_blocked(i,i->d,i->p,o,o->d,o->p)) return -1;
+    if(g->dry) return 0;
+    DM_COUNT(13,(uint64_t)oh*ow*32);
+    BK bo;
+    bk_init(&bo,g,o);
+    const uint8_t *xb=g->pool[i->pool]+i->offset;
+    for(int32_t h=0;h<oh;) {
+        const int64_t Ho=(int64_t)h+o->p[1];
+        int32_t run=8-(int32_t)(Ho&7);
+        if(oh-h<run)run=oh-h;
+        for(int32_t w0=0;w0<ow;w0+=8) {
+            uint8_t *bp[4];
+            for(int q=0;q<4;q++) {
+                const int64_t W=(int64_t)o->p[2]+w0+2*q;
+                uint8_t *blk=bk_blk(&bo,o->p[0],Ho>>3,W>>2,0);
+                bp[q]=blk?blk+128*((W>>1)&1):NULL;
+            }
+            for(int32_t r=0;r<run;r++) {
+                DV v[4];
+                for(int y=0;y<4;y++)v[y]=dv_ldu(xb+fl_lin(i,(int32_t[4]){i->p[0],i->p[1]+4*(h+r)+y,i->p[2]+4*w0,0})*2);
+                dv_ladder(v,4,dm_lad_i25,4);
+                const uint32_t ro=256u*(uint32_t)((Ho&7)+r);
+                for(int q=0;q<4;q++)if(bp[q])dv_st(bp[q]+ro,v[q]);
+            }
+        }
+        h+=run;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------- flat 2-plane interleave */
+/* {0,2,3,1} of a flat (b,2,H,W) tensor to (b,H,W,2): the output stream is the
+ * element-wise interleave of the two planes, one vector shuffle per 128 bytes of
+ * each plane. Needs the planes and the output rows contiguous. */
+static int tr_flat_il(G *g, const T *xt, const T *o, const int32_t *perm) {
+    if(!DM_ENABLED || perm[0]!=0 || perm[1]!=2 || perm[2]!=3 || perm[3]!=1 || !dm_flat(xt) || !dm_flat(o) || xt->esize!=o->esize || xt->d[1]!=2) return -1;
+    const int32_t n[4]={xt->d[0],xt->d[2],xt->d[3],2};
+    if(!dm_write_dims_match(o,n) || fl_empty(n)) return -1;
+    const uint32_t es=xt->esize,k=es==1?0:es==2?1:2;
+    if(xt->p[2] || xt->p[3] || xt->m[2]!=xt->d[2] || xt->m[3]!=xt->d[3] || o->p[2] || o->p[3] || o->m[3]!=2 || o->m[2]!=n[2]) return -1;
+    int e=xfer_check(g,xt,xt->d,xt->p,0);
+    if(!e)e=xfer_check(g,o,n,o->p,1);
+    if(e) return e;
+    if(!fl_apart(xt,xt->d,xt->p,o,n,o->p)) return -1;
+    if(g->dry) return 0;
+    DM_COUNT(15,count4(n));
+    const size_t plane=(size_t)xt->d[2]*xt->d[3]*es;
+    for(int32_t b=0;b<n[0];b++) {
+        const uint8_t *s0=g->pool[xt->pool]+xt->offset+fl_lin(xt,(int32_t[4]){xt->p[0]+b,xt->p[1],0,0})*es;
+        const uint8_t *s1=g->pool[xt->pool]+xt->offset+fl_lin(xt,(int32_t[4]){xt->p[0]+b,xt->p[1]+1,0,0})*es;
+        uint8_t *d=g->pool[o->pool]+o->offset+fl_lin(o,(int32_t[4]){o->p[0]+b,o->p[1],0,0})*es;
+        for(size_t at=0;at<plane;at+=128) {
+            const uint32_t nb=plane-at<128?(uint32_t)(plane-at):128u;
+            DV lo,hi;
+            dv_shuffk(dv_ldn(s1+at,nb),dv_ldn(s0+at,nb),k,&lo,&hi);
+            dv_stun(d+2*at,lo,2*nb<128?2*nb:128u);
+            if(2*nb>128)dv_stun(d+2*at+128,hi,2*nb-128);
+        }
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------ flat u8 matrix transpose */
+/* {0,1,3,2} of a flat u8 tensor: per (a,b) a R x C byte matrix with R a multiple
+ * of 16. A tile is 16 rows x up to 128 columns: 16 row vectors, a 16x16 byte
+ * transpose (dm_lad_t16), and each output vector then holds 8 output rows of
+ * 16 bytes, stored as masked pieces. */
+static int tr_flat_t8(G *g, const T *xt, const T *o, const int32_t *perm) {
+    if(!DM_ENABLED || perm[0]!=0 || perm[1]!=1 || perm[2]!=3 || perm[3]!=2 || !dm_flat(xt) || !dm_flat(o) || xt->esize!=1 || o->esize!=1) return -1;
+    const int32_t n[4]={xt->d[0],xt->d[1],xt->d[3],xt->d[2]};
+    if(!dm_write_dims_match(o,n) || fl_empty(n) || (xt->d[2]&15)) return -1;
+    int e=xfer_check(g,xt,xt->d,xt->p,0);
+    if(!e)e=xfer_check(g,o,n,o->p,1);
+    if(e) return e;
+    if(!fl_apart(xt,xt->d,xt->p,o,n,o->p)) return -1;
+    if(g->dry) return 0;
+    DM_COUNT(14,count4(n));
+    const int32_t R=xt->d[2],Cn=xt->d[3];
+    for(int32_t a=0;a<n[0];a++)for(int32_t b=0;b<n[1];b++)for(int32_t r0=0;r0<R;r0+=16)for(int32_t c0=0;c0<Cn;c0+=128) {
+        const uint32_t nb=Cn-c0<128?(uint32_t)(Cn-c0):128u;
+        DV v[16];
+        for(int i=0;i<16;i++)
+            v[i]=dv_ldn(g->pool[xt->pool]+xt->offset+fl_lin(xt,(int32_t[4]){xt->p[0]+a,xt->p[1]+b,xt->p[2]+r0+i,xt->p[3]+c0}),nb);
+        dv_ladder(v,16,dm_lad_t16,4);
+        for(int32_t c=0;c<(int32_t)nb;c++)
+            dv_stup(g->pool[o->pool]+o->offset+fl_lin(o,(int32_t[4]){o->p[0]+a,o->p[1]+b,o->p[2]+c0+c,o->p[3]+r0}),v[c>>3],16u*(uint32_t)(c&7),16);
+    }
+    return 0;
+}
+
+/* The fast transposes in the order the kernel tries them; -1 when none applies. */
+static int tr_fast_dispatch(G *g, const T *xt, const T *o, const int32_t *pm) {
+    int fr=-1;
+    if(pm[0]==0 && pm[1]==2 && pm[2]==1 && pm[3]==3) {
+        fr=tr_hw_fast(g,xt,o);
+        if(fr<0)fr=tr_hw8_fast(g,xt,o);
+    } else if(pm[0]==0 && pm[1]==1 && pm[2]==3 && pm[3]==2) {
+        fr=tr_wc16_fast(g,xt,o);
+        if(fr<0)fr=tr_wc8_fast(g,xt,o);
+        if(fr<0)fr=tr_flat_t8(g,xt,o,pm);
+    } else if(pm[0]==0 && pm[1]==2 && pm[2]==3 && pm[3]==1) fr=tr_flat_il(g,xt,o,pm);
+    if(fr<0)fr=tr_flat_fast(g,xt,o,pm);
+    return fr;
 }

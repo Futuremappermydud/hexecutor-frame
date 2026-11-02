@@ -44,11 +44,19 @@ static uint32_t qds_config_valid(const QdsConfig *c) {
     }
     return 1;
 }
+typedef void (*QdsJobFn)(void *ctx,uint32_t part,uint32_t parts);
 typedef struct {
     volatile uint32_t generation,op,sequence,error,done[3];
     uint32_t arena,prepared_a;
     QdConv conv;
+    /* op 4 (prepared threads): followers with tid < job_parts run
+     * job_fn(job_ctx,tid,job_parts). job_started/finished count per follower
+     * (index tid) and let the host see a worker that never came back. */
+    QdsJobFn job_fn;void *job_ctx;volatile uint32_t job_parts,job_started[3],job_finished[3];
 } QdsWork;
+/* QdsWork owns 0x300f0000..0x300f0200; 0x300f0200.. is the prepared helper
+ * slots' (qd_graph_prepared.h). */
+_Static_assert(sizeof(QdsWork)<=0x200,"QdsWork overlaps the prepared helper near slots");
 uint32_t qdrc_execute(const QdConv *c,uint8_t *arena,uint32_t tid,uint32_t prepared_a);
 uint32_t qdrc_power(uint32_t on);
 #if QDS_NATIVE_1X1

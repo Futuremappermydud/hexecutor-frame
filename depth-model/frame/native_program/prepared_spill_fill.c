@@ -1,4 +1,5 @@
 #include "prepared_spill_fill.h"
+#include "prepared_vcopy.h"
 
 #include <limits.h>
 #include <string.h>
@@ -81,8 +82,8 @@ static int run_spill_fill(const Nprg2ExecCall *c, void *ctx) {
         uint32_t address = encoded & ~0x7ffu;
         uint8_t *pool_ptr = c->pools[pool].base + address;
         uint8_t *spill_ptr = c->pools[SPILL_POOL].base + (uint32_t)spill_offset;
-        if (plan.spill_to_pool) memmove(pool_ptr, spill_ptr, bytes);
-        else memmove(spill_ptr, pool_ptr, bytes);
+        if (plan.spill_to_pool) qd_vcopy(pool_ptr, spill_ptr, bytes);
+        else qd_vcopy(spill_ptr, pool_ptr, bytes);
         spill_offset += bytes;
     }
     return 1;

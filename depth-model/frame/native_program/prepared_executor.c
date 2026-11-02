@@ -80,7 +80,7 @@ static void fill_call(const Nprg2ExecRequest *r,uint32_t index,Nprg2ExecCall *ca
     call->user=r->user;call->scratch=r->scratch;call->scratch_bytes=r->scratch_bytes;
     call->scratch_region[0]=(Nprg2ExecBuffer){(uint8_t *)r->scratch,r->scratch_bytes};
     for(uint32_t k=1;k<NPRG2_EXEC_SCRATCH_REGIONS;k++)call->scratch_region[k]=r->extra_scratch[k-1u];
-    call->preflighted=0;call->epilogue=NULL;call->epilogue_dead=0;
+    call->preflighted=0;call->parallel=r->parallel;call->epilogue=NULL;call->epilogue_dead=0;
 }
 /* The plan pair this command is the conv of, for a request whose interval
  * contains both commands; NULL otherwise. */
@@ -156,6 +156,15 @@ static uint64_t sig_mix(uint64_t h,uint64_t v){h=(h^v)*0x9e3779b97f4a7c15ull;ret
 static uint64_t request_signature(const Nprg2Executor *e,const Nprg2ExecRequest *r){
     uint64_t h=0x243f6a8885a308d3ull;
     h=sig_mix(h,(uintptr_t)e);h=sig_mix(h,(uintptr_t)r->program);h=sig_mix(h,(uintptr_t)r->bound);
+    {
+        const Nprg2Program *p=r->program;const Nprg2Bound *b=r->bound;
+        h=sig_mix(h,(uintptr_t)p->raw);h=sig_mix(h,p->raw_bytes);h=sig_mix(h,p->command_count);
+        h=sig_mix(h,(uintptr_t)p->tensors);h=sig_mix(h,p->tensor_count);
+        h=sig_mix(h,(uintptr_t)p->expanded_blocks);h=sig_mix(h,p->expanded_block_count);
+        const Nprg2Section *sec[6]={&b->geometry,&b->tensor,&b->command,&b->refs,&b->vectors,&b->calls};
+        for(unsigned i=0;i<6;i++){h=sig_mix(h,(uintptr_t)sec[i]->data);h=sig_mix(h,sec[i]->bytes);}
+        h=sig_mix(h,b->hot_bytes);
+    }
     for(unsigned i=0;i<7;i++){h=sig_mix(h,(uintptr_t)r->pools[i].base);h=sig_mix(h,r->pools[i].bytes);}
     h=sig_mix(h,r->pool1_writable_bytes);h=sig_mix(h,(uintptr_t)r->user);
     h=sig_mix(h,(uintptr_t)r->scratch);h=sig_mix(h,r->scratch_bytes);
@@ -166,17 +175,59 @@ static uint64_t request_signature(const Nprg2Executor *e,const Nprg2ExecRequest 
     h=sig_mix(h,r->command_first);h=sig_mix(h,r->command_count);h=sig_mix(h,e->count);h=sig_mix(h,(uintptr_t)r->fuse);h=sig_mix(h,(uintptr_t)r->fuse);
     for(uint32_t i=0;i<NPRG2_EXEC_REGISTRY_CAPACITY;i++){
         const Nprg2ExecHandler *x=&e->handlers[i];if(!x->used)continue;
-        h=sig_mix(h,((uint64_t)x->opcode<<8|x->variant)<<8|x->scratch_region);
+        h=sig_mix(h,(((uint64_t)x->opcode<<8|x->variant)<<8|x->scratch_region)<<1|x->no_effect);
         h=sig_mix(h,(uintptr_t)x->validate);h=sig_mix(h,(uintptr_t)x->fuse);h=sig_mix(h,(uintptr_t)x->ctx);
         h=sig_mix(h,((uint64_t)x->scratch_bytes<<32)|x->concurrent_worker_scratch_bytes);
     }
     return h|1u;
 }
+/* Digest of the contents every validator reads through the program and the
+ * bound tables (geometry, tensor, command, refs, vectors, calls, and the
+ * expanded block tables). Four independent multiply-xor lanes over 32-bit
+ * words; like the signature it guards against accidental change. */
+static uint64_t hash_bytes(uint64_t h,const void *p,size_t n){
+    const uint8_t *b=p;uint32_t a0=0x811c9dc5u,a1=0x01000193u,a2=0x9e3779b1u,a3=0x85ebca6bu;size_t i=0;
+    if(!((uintptr_t)b&3u)){ /* the tables are 4-byte aligned in practice: plain word loads */
+        const uint32_t *w=(const uint32_t *)(const void *)b;
+        for(;i+16<=n;i+=16,w+=4){
+            a0=(a0^w[0])*0x9e3779b1u;a1=(a1^w[1])*0x85ebca6bu;a2=(a2^w[2])*0xc2b2ae35u;a3=(a3^w[3])*0x27d4eb2fu;
+        }
+    } else for(;i+16<=n;i+=16){
+        uint32_t w0,w1,w2,w3;memcpy(&w0,b+i,4);memcpy(&w1,b+i+4,4);memcpy(&w2,b+i+8,4);memcpy(&w3,b+i+12,4);
+        a0=(a0^w0)*0x9e3779b1u;a1=(a1^w1)*0x85ebca6bu;a2=(a2^w2)*0xc2b2ae35u;a3=(a3^w3)*0x27d4eb2fu;
+    }
+    for(;i<n;i++)a0=(a0^b[i])*0x01000193u;
+    h=sig_mix(h,n);h=sig_mix(h,(uint64_t)a0|(uint64_t)a1<<32);return sig_mix(h,(uint64_t)a2|(uint64_t)a3<<32);
+}
+static uint64_t content_digest(const Nprg2ExecRequest *r){
+    const Nprg2Bound *b=r->bound;const Nprg2Section *sec[6]={&b->geometry,&b->tensor,&b->command,&b->refs,&b->vectors,&b->calls};
+    uint64_t h=0x13198a2e03707344ull;
+    for(unsigned i=0;i<6;i++)h=hash_bytes(h,sec[i]->data,sec[i]->data?sec[i]->bytes:0);
+    h=hash_bytes(h,r->program->expanded_blocks,r->program->expanded_blocks?(size_t)r->program->expanded_block_count*sizeof(uint32_t):0);
+    return h|1u;
+}
+/* A stats object holding a successful preflight of this exact request (same
+ * signature, same table contents, full interval validated). */
+static int preflight_matches(const Nprg2Executor *e,const Nprg2ExecRequest *r,int fresh_ok){
+    const Nprg2ExecStats *s=r->stats;
+    if(!r->reuse_preflight||!s||!s->preflight_signature||s->validated_commands!=r->command_count||
+       s->preflight_signature!=request_signature(e,r))return 0;
+    /* digest 0: that preflight was made without reuse_preflight and recorded none; only the call that
+     * follows it directly (digest_fresh) may take it. */
+    return (fresh_ok&&s->digest_fresh)||(s->preflight_digest&&s->preflight_digest==content_digest(r));
+}
 int nprg2_executor_preflight(const Nprg2Executor *e,const Nprg2ExecRequest *r){
     if(!e||!request_valid(e,r))return NPRG2_EXEC_ARGUMENT;
-    Nprg2ExecStats local={0};Nprg2ExecStats *s=r->stats?r->stats:&local;memset(s,0,sizeof *s);s->failed_command=UINT32_MAX;
     Nprg2ExecProfile *pr=r->profile&&r->profile->clock?r->profile:NULL;
     uint64_t p0=pr?pr->clock():0;
+    if(preflight_matches(e,r,0)){
+        /* Reused across calls: nothing to validate, but this call's counters restart. */
+        Nprg2ExecStats *rs=r->stats;
+        rs->executed_commands=0;rs->failed_command=UINT32_MAX;rs->failed_opcode=rs->failed_variant=0;rs->digest_fresh=1;
+        if(pr)pr->preflight_cycles+=pr->clock()-p0;
+        return NPRG2_EXEC_OK;
+    }
+    Nprg2ExecStats local={0};Nprg2ExecStats *s=r->stats?r->stats:&local;memset(s,0,sizeof *s);s->failed_command=UINT32_MAX;
     /* Coverage, feature, bounds, alias, and scratch predicates are checked
      * without graph-pool writes. This public entry is also used before a
      * physical VTCM boundary copy by the DSP wrapper. */
@@ -205,8 +256,16 @@ int nprg2_executor_preflight(const Nprg2Executor *e,const Nprg2ExecRequest *r){
         if(pr){uint64_t d=pr->clock()-v0;pr->validate_cycles+=d;if(pr->handler_validate_cycles)pr->handler_validate_cycles[hi]+=d;}
         if(!valid){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_REJECTED;}
         s->validated_commands++;
+        if(ix<NPRG2_EXEC_STRIP_COMMANDS){
+            if(h->no_effect)s->stripped_by_slot[hi]++;else s->effect_bits[ix>>5]|=1u<<(ix&31u);
+        }
     }
-    if(r->stats)s->preflight_signature=request_signature(e,r);
+    if(r->stats){
+        s->preflight_signature=request_signature(e,r);s->digest_fresh=1;
+        /* Hashing the tables costs about a millisecond on the Frame: only for a request that asks to be reused. */
+        if(r->reuse_preflight)s->preflight_digest=content_digest(r);
+        s->strip_valid=r->command_first+r->command_count<=NPRG2_EXEC_STRIP_COMMANDS;
+    }
     if(pr){pr->preflight_cycles+=pr->clock()-p0;pr->preflight_calls++;}
     return NPRG2_EXEC_OK;
 }
@@ -215,16 +274,25 @@ int nprg2_executor_run(const Nprg2Executor *e,const Nprg2ExecRequest *r){
     /* The execution API repeats preflight after any caller-side boundary
      * operations, unless the caller proves the identical request was just
      * preflighted; then it executes strictly in prepared schedule order. */
-    if(r&&r->reuse_preflight&&e&&r->stats&&r->stats->preflight_signature&&request_valid(e,r)&&
-       r->stats->preflight_signature==request_signature(e,r)&&r->stats->validated_commands==r->command_count){
+    if(r&&e&&r->reuse_preflight&&r->stats&&request_valid(e,r)&&preflight_matches(e,r,1)){
+        /* A preflight call that has just verified the tables leaves digest_fresh
+         * (consumed here); otherwise preflight_matches hashed them again. A reused
+         * preflight is counted once per run (preflights_reused) whether it was made
+         * moments ago or by an earlier call; preflight_calls counts full preflights. */
+        Nprg2ExecStats *rs=r->stats;
         if(pr)pr->preflights_reused++;
+        rs->digest_fresh=0;rs->executed_commands=0;rs->failed_command=UINT32_MAX;rs->failed_opcode=rs->failed_variant=0;
     } else {
         int preflight=nprg2_executor_preflight(e,r);if(preflight!=NPRG2_EXEC_OK)return preflight;
+        if(r->stats)r->stats->digest_fresh=0;
     }
     Nprg2ExecStats local={0};Nprg2ExecStats *s=r->stats?r->stats:&local;
+    const int strip=r->stats&&s->strip_valid;
+    if(strip&&pr&&pr->handler_run_count)for(uint32_t k=0;k<NPRG2_EXEC_REGISTRY_CAPACITY;k++)pr->handler_run_count[k]+=s->stripped_by_slot[k];
     uint64_t prev=pr?pr->clock():0;
     for(uint32_t n=0;n<r->command_count;n++){
         uint32_t ix=r->command_first+n;Nprg2ExecCall call;
+        if(strip&&!(s->effect_bits[ix>>5]>>(ix&31u)&1u)){s->executed_commands++;continue;}
         if(nprg2_command_at(r->bound,ix,&call.command)!=NPRG2_OK)return NPRG2_EXEC_REJECTED;
         if(r->cancelled&&r->cancelled(r->cancel_ctx,ix)){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_CANCELLED;}
         int hi=handler_index(e,call.command.opcode,call.command.variant);if(hi<0)return NPRG2_EXEC_UNSUPPORTED;
@@ -297,4 +365,31 @@ int nprg2_executor_register_weights(Nprg2Executor *e){
     if(!e)return NPRG2_EXEC_ARGUMENT;
     for(uint8_t v=27;v<=30;v++){int x=nprg2_executor_register(e,QDR_WEIGHTS_TO_VTCM,v,nprg2_exec_weights_validate,nprg2_exec_weights_run,NULL);if(x)return x;}
     return NPRG2_EXEC_OK;
+}
+
+/* ---------------------------------------------------------------- parallel */
+uint32_t nprg2_parallel_parts(Nprg2Parallel *p, uint32_t want) {
+    if(!p || p->max_parts<2 || want<2) return 1;
+    if(p->ready && !p->ready(p->impl)) { p->not_ready++; return 1; }
+    return want<p->max_parts?want:p->max_parts;
+}
+void nprg2_parallel_for(Nprg2Parallel *p, uint32_t kind, uint32_t parts, Nprg2ParallelFn fn, void *ctx) {
+    if(kind>=NPRG2_PAR_KINDS) kind=0;
+    if(parts<2 || !p) { fn(ctx,0,parts<1?1:parts); return; }
+    if(p->run) {
+        if(p->run(p->impl,parts,fn,ctx)) { p->jobs_parallel[kind]++; p->parts_run[kind]+=parts; return; }
+        p->declined++;
+    }
+    /* Serial: all parts on the caller, in the requested order. */
+    uint32_t idx[8],n=parts<8?parts:8;
+    for(uint32_t i=0;i<n;i++) idx[i]=i;
+    if(p->order==1) for(uint32_t i=0;i<n;i++) idx[i]=n-1u-i;
+    else if(p->order==2) {
+        for(uint32_t i=n;i>1;i--) {
+            p->seed=p->seed*6364136223846793005ull+1442695040888963407ull;
+            uint32_t j=(uint32_t)(p->seed>>33)%i,t=idx[i-1u];idx[i-1u]=idx[j];idx[j]=t;
+        }
+    }
+    for(uint32_t i=0;i<n;i++) fn(ctx,idx[i],parts);
+    p->jobs_serial[kind]++;p->parts_run[kind]+=parts;
 }

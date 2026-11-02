@@ -51,7 +51,7 @@ def main():
                 row={'case':label,'run':run,'pools_zeroed':run==0,**dsp.last,'output_sha256':hashes,
                      'outputs_equal':hashes==expected,
                      'variant_profile':sorted(dsp.profile,key=lambda v:-v['ms']),
-                     'handler_profile':dsp.handler_profile,'executor_profile':dsp.executor_profile}
+                     'handler_profile':dsp.handler_profile,'executor_profile':dsp.executor_profile,'parallel_profile':getattr(dsp,'parallel_profile',{})}
                 # The prepared reference engine reuses the first four conv phase slots.
                 phases=list(dsp.last.get('conv_phases_ms',{}).values())[:4]
                 if len(phases)==4:

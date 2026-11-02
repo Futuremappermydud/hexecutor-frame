@@ -17,6 +17,46 @@ enum {
 };
 
 typedef struct Nprg2Executor Nprg2Executor;
+
+/* Optional data-parallel hook (QDS_PREPARED_THREADS). A handler that can split
+ * its work into independent parts asks nprg2_parallel_parts() how many parts
+ * it may use (1 when no hook, a one-part hook, or the workers are not ready
+ * right now) and then calls nprg2_parallel_for(), which runs fn(ctx, part,
+ * parts) for every part in [0,parts) exactly once and returns when all have
+ * finished. The parts must write disjoint bytes and may only read memory that
+ * no part writes; then any execution order, including the serial fallback
+ * below, gives identical results. Part 0 always runs on the calling thread.
+ *
+ *   max_parts   parts the hook can run concurrently including the caller
+ *               (0/1 = serial). Handlers never ask for more.
+ *   ready       optional; called by nprg2_parallel_parts, nonzero = workers
+ *               idle and leases valid. When it returns 0 the handler runs
+ *               serially (one part).
+ *   run         optional; runs the parts concurrently and returns 1, or
+ *               returns 0 without having run anything (not idle etc.), in
+ *               which case nprg2_parallel_for runs the parts on the caller.
+ *   order       serial execution order of the parts when there is no run hook
+ *               or it declined: 0 ascending, 1 descending, 2 pseudo-random
+ *               (seeded from seed). Host tests use 1 and 2 with max_parts 3 to
+ *               prove the parts are order independent.
+ * The counters accumulate until the owner clears them: per kind, parallel
+ * jobs, serial jobs of more than one part, and parts executed. */
+typedef void (*Nprg2ParallelFn)(void *ctx, uint32_t part, uint32_t parts);
+enum { NPRG2_PAR_CONV=0, NPRG2_PAR_EW=1, NPRG2_PAR_DM=2, NPRG2_PAR_KINDS=3 };
+typedef struct Nprg2Parallel {
+    uint32_t max_parts;
+    int (*ready)(void *impl);
+    int (*run)(void *impl, uint32_t parts, Nprg2ParallelFn fn, void *ctx);
+    void *impl;
+    uint32_t order;
+    uint64_t seed;
+    uint64_t jobs_parallel[NPRG2_PAR_KINDS], jobs_serial[NPRG2_PAR_KINDS], parts_run[NPRG2_PAR_KINDS];
+    uint64_t not_ready, declined;
+} Nprg2Parallel;
+/* Parts the caller may use for a job of `want` natural parts (>= 1). */
+uint32_t nprg2_parallel_parts(Nprg2Parallel *p, uint32_t want);
+void nprg2_parallel_for(Nprg2Parallel *p, uint32_t kind, uint32_t parts, Nprg2ParallelFn fn, void *ctx);
+
 typedef struct { uint8_t *data; uint32_t bytes; } Nprg2ExecBuffer;
 /* Scratch regions. Each handler names the region it receives as
  * call->scratch. Region 0 is the request's scratch/scratch_bytes; region k>0
@@ -38,6 +78,8 @@ struct Nprg2ExecCall {
     const Nprg2ExecBuffer *outputs;
     uint32_t output_count;
     void *user;
+    /* NULL = serial. Shared by every call of a request. */
+    Nprg2Parallel *parallel;
     /* The region the executor selected for this handler. */
     void *scratch;
     uint32_t scratch_bytes;
@@ -87,12 +129,27 @@ typedef struct {
     uint64_t preflight_cycles, validate_cycles, dispatch_cycles, run_cycles;
     uint32_t preflight_calls, preflights_reused;
 } Nprg2ExecProfile;
+/* Commands whose run is skipped without decoding (no_effect handlers, i.e. the
+ * NOPs) are recorded by a full preflight in a bitmap over command indices below
+ * this limit; larger indices are always decoded and dispatched. */
+#define NPRG2_EXEC_STRIP_COMMANDS 8192u
 typedef struct {
     uint32_t validated_commands, executed_commands, failed_command;
     uint8_t failed_opcode, failed_variant;
-    /* Signature of the request the last successful preflight covered; see
+    /* Signature of the request the last successful preflight covered, and the
+     * digest of the program and bound tables' contents at that time; see
      * Nprg2ExecRequest.reuse_preflight. */
-    uint64_t preflight_signature;
+    uint64_t preflight_signature, preflight_digest;
+    /* Set by a preflight (full or reused) that has just checked the digest;
+     * the run that follows consumes it instead of hashing the tables again. */
+    uint8_t digest_fresh;
+    /* Valid after a full preflight of an interval inside the bitmap range:
+     * bit set = the command has an effect and is dispatched; clear = a
+     * no_effect command, counted but not decoded. stripped_by_slot counts them
+     * per registry slot (for the handler profile). */
+    uint8_t strip_valid;
+    uint32_t effect_bits[NPRG2_EXEC_STRIP_COMMANDS/32u];
+    uint32_t stripped_by_slot[NPRG2_EXEC_REGISTRY_CAPACITY];
 } Nprg2ExecStats;
 
 typedef struct {
@@ -119,11 +176,17 @@ typedef struct {
      * their handler's fuse hook accepted them in the preflight of this
      * interval; the plan's `active` flags are written by preflight. */
     Nprg2FusePlan *fuse;
+    Nprg2Parallel *parallel;
     /* Run only. When set, stats is non-NULL and the same stats object holds
      * the signature of a successful preflight of this exact request (program,
      * bound tables, pools, ceiling, I/O and scratch buffers, interval,
-     * registry), run skips its own repeated preflight. Any difference, or no
-     * earlier preflight, runs the full preflight as usual. */
+     * registry, and a digest of the program/bound table contents), preflight
+     * and run skip the repeated preflight, across inferences too. Any
+     * difference, or no earlier preflight, runs the full preflight as usual.
+     * Valid only for handlers whose validators read nothing but the request
+     * and immutable data (pool 5): a validator that depends on other pool
+     * bytes must re-derive them in its run callback (the elementwise handlers
+     * and the reference chain do). */
     uint8_t reuse_preflight;
 } Nprg2ExecRequest;
 

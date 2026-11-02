@@ -125,6 +125,85 @@ static void run_all_u16(const char *qpath,const char *npath,uint8_t opcode,uint8
     printf("PASS ASan/UBSan %s: all %u commands in %s accepted by the HVX validator\n",name,n,qpath);
     free(scratch_raw);for(unsigned i=0;i<7;i++)free(pools[i].base);free(hot);nprg2_close(&p);free(q);free(raw);
 }
+
+/* SIGN/39, LINEARCLIP/67 (CH u16) and LINEARCLIP/69 (flat u8): every command of the real schedule, with the real
+ * constant pool (the fi operands live in pool 5), must be accepted by the HVX validator, and mutated metadata or
+ * constants must be rejected. */
+static void run_all_new(const char *model,uint8_t opcode,uint8_t variant,const char *name,uint32_t expect) {
+    char qpath[256],npath[256],cpath[256];
+    snprintf(qpath,sizeof qpath,"frame/build/resident-%s.qdrx",model);
+    snprintf(npath,sizeof npath,"frame/native_program/examples/%s-v2.nprg",model);
+    snprintf(cpath,sizeof cpath,"recovered/%s/constants/constant_pool_5.bin",model);
+    uint32_t qn,nn,cn;uint8_t *q=read_file(qpath,&qn),*raw=read_file(npath,&nn),*consts=read_file(cpath,&cn);
+    uint8_t qsha[32],nsha[32];nprg2_sha256(q,qn,qsha);nprg2_sha256(raw,nn,nsha);
+    Nprg2ExpectedHashes x={q+32,q+64,qsha,nsha};Nprg2Pool pools[7]={0};
+    for(unsigned i=0;i<7;i++){uint32_t z=rd32(raw+144+4*i);pools[i].bytes=z;pools[i].base=z?calloc(1,z):NULL;CHECK(!z||pools[i].base);}
+    CHECK(pools[5].bytes==cn);memcpy(pools[5].base,consts,cn);
+    Nprg2Program p;CHECK(nprg2_open(&p,raw,nn,&x,pools,(Nprg2Allocator){0})==NPRG2_OK);
+    uint8_t *hot=calloc(1,300000);CHECK(hot);Nprg2BindConfig bc={.hot_memory=hot,.hot_capacity=300000,.l2_available_bytes=786432,.pool1_is_verified_vtcm=1,.resolve=resolve_all};Nprg2Bound bound;
+    CHECK(nprg2_bind_mock(&p,pools,&bc,&bound)==NPRG2_OK);
+    Nprg2Executor e;nprg2_executor_init(&e);CHECK(nprg2_executor_register_elementwise(&e)==NPRG2_EXEC_OK);
+    void *scratch_raw=malloc(NPRG2_ELEMENTWISE_SCRATCH_BYTES+sizeof(uintptr_t));CHECK(scratch_raw);void *scratch=(void *)(((uintptr_t)scratch_raw+sizeof(uintptr_t)-1)&~(uintptr_t)(sizeof(uintptr_t)-1));
+    uint32_t n=0,first=UINT32_MAX;
+    Nprg2ExecRequest req={.program=&p,.bound=&bound,.pool1_writable_bytes=0x780000,.scratch=scratch,.scratch_bytes=NPRG2_ELEMENTWISE_SCRATCH_BYTES,.command_count=1};
+    memcpy(req.pools,pools,sizeof pools);
+    for(uint32_t i=0;i<p.command_count;i++){
+        Nprg2Command c;CHECK(nprg2_command_at(&bound,i,&c)==NPRG2_OK);
+        if(c.opcode!=opcode||c.variant!=variant)continue;
+        req.command_first=i;
+        int rc=nprg2_executor_preflight(&e,&req);
+        if(rc!=NPRG2_EXEC_OK){fprintf(stderr,"%s %s cmd %u rejected rc=%d\n",model,name,i,rc);exit(1);}
+        if(first==UINT32_MAX)first=i;
+        n++;
+    }
+    CHECK(n==expect);
+    req.command_first=first;
+    Nprg2Command c;CHECK(nprg2_command_at(&bound,first,&c)==NPRG2_OK);
+    uint32_t oti,iti;Nprg2TensorView ov,iv;Nprg2ExecCall call={.command_index=first,.command=c,.program=&p,.bound=&bound,.pools=pools,.pool1_writable_bytes=0x780000};
+    CHECK(!nprg2_exec_output(&call,0,&oti,&ov)&&!nprg2_exec_input(&call,0,&iti,&iv));
+    if(opcode==QDR_LINEARCLIP){
+        /* the fi operand: shift out of range, a negative-multiplier sign for the flat form, a non-zero zero point */
+        uint32_t fti;Nprg2TensorView fv;CHECK(!nprg2_exec_input(&call,1,&fti,&fv)&&fv.pool==5);
+        uint8_t *fi=pools[5].base+fv.offset,saved[48];memcpy(saved,fi,48);
+        fi[43]=0x7f;CHECK(nprg2_executor_preflight(&e,&req)==NPRG2_EXEC_REJECTED);memcpy(fi,saved,48);
+        if(variant==69){
+            fi[27]^=0x80;CHECK(nprg2_executor_preflight(&e,&req)==NPRG2_EXEC_REJECTED);memcpy(fi,saved,48);
+            fi[44]=1;CHECK(nprg2_executor_preflight(&e,&req)==NPRG2_EXEC_REJECTED);memcpy(fi,saved,48);
+        }
+        /* a fi operand outside pool 5 is not a constant */
+        uint8_t *ft=(uint8_t *)bound.tensor.data+(size_t)fti*NPRG2_TENSOR_BYTES+3u,pool=ft[0];ft[0]=1;
+        CHECK(nprg2_executor_preflight(&e,&req)==NPRG2_EXEC_REJECTED);ft[0]=pool;
+    }
+    if(opcode==QDR_SIGN){
+        uint8_t *g=(uint8_t *)ov.geometry_record+34,saved[8];memcpy(saved,g,8);memset(g,0,8);
+        CHECK(nprg2_executor_preflight(&e,&req)==NPRG2_EXEC_REJECTED);memcpy(g,saved,8);
+        uint8_t *ig=(uint8_t *)iv.geometry_record+30,isaved[4];memcpy(isaved,ig,4);ig[2]=1;ig[3]=0;
+        CHECK(nprg2_executor_preflight(&e,&req)==NPRG2_EXEC_REJECTED);memcpy(ig,isaved,4);
+    }
+    if(variant==69){
+        /* identical in place is fine, a shifted overlap or an output past the pool is not */
+        uint8_t *ot=(uint8_t *)bound.tensor.data+(size_t)oti*NPRG2_TENSOR_BYTES+4u;
+        uint32_t off=rd32(ot),ioff=rd32((uint8_t *)bound.tensor.data+(size_t)iti*NPRG2_TENSOR_BYTES+4u);
+        uint32_t t1[3]={ioff,ioff+64u,0x780000u-16u};
+        for(int k=0;k<3;k++){
+            memcpy(ot,&t1[k],4);
+            CHECK(nprg2_executor_preflight(&e,&req)==(k?NPRG2_EXEC_REJECTED:NPRG2_EXEC_OK));
+        }
+        memcpy(ot,&off,4);
+    } else {
+        int32_t od[4],om[4],oo[4],id[4],im[4],io[4];
+        CHECK(view_shape_t(&ov,od,om,oo)&&view_shape_t(&iv,id,im,io));
+        uint32_t oi0=(uint32_t)((((uint64_t)oo[0]*((om[1]+7)/8)+oo[1]/8)*((om[2]+3)/4)+oo[2]/4)*((om[3]+31)/32)+ov.slice_origin+oo[3]/32);
+        uint32_t ii0=(uint32_t)((((uint64_t)io[0]*((im[1]+7)/8)+io[1]/8)*((im[2]+3)/4)+io[2]/4)*((im[3]+31)/32)+iv.slice_origin+io[3]/32);
+        CHECK(oi0<ov.block_count&&ii0<iv.block_count);
+        uint32_t *ob=(uint32_t *)ov.blocks;uint32_t oldv=ob[oi0];
+        ob[oi0]=iv.blocks[ii0];CHECK(nprg2_executor_preflight(&e,&req)==NPRG2_EXEC_REJECTED);ob[oi0]=oldv;
+        ob[oi0]=0x780001u;CHECK(nprg2_executor_preflight(&e,&req)==NPRG2_EXEC_REJECTED);ob[oi0]=oldv;
+    }
+    CHECK(nprg2_executor_preflight(&e,&req)==NPRG2_EXEC_OK);
+    printf("PASS ASan/UBSan %s: all %u commands in %s accepted by the HVX validator; mutations rejected\n",name,n,qpath);
+    free(scratch_raw);for(unsigned i=0;i<7;i++)free(pools[i].base);free(hot);nprg2_close(&p);free(q);free(raw);free(consts);
+}
 int main(void) {
     run_model("frame/build/resident-primary.qdrx","frame/native_program/examples/primary-v2.nprg","frame/native_program/fixtures/primary-smoke-linearclip.epcpu",QDR_LINEARCLIP,68,"LinearClip");
     run_model("frame/build/resident-alternate.qdrx","frame/native_program/examples/alternate-v2.nprg","frame/native_program/fixtures/alternate-smoke-linearclip.epcpu",QDR_LINEARCLIP,68,"LinearClip");
@@ -138,5 +217,8 @@ int main(void) {
         run_all_u16("frame/build/resident-primary.qdrx","frame/native_program/examples/primary-v2.nprg",u16[i].op,u16[i].var,u16[i].name,u16[i].pn);
         run_all_u16("frame/build/resident-alternate.qdrx","frame/native_program/examples/alternate-v2.nprg",u16[i].op,u16[i].var,u16[i].name,u16[i].an);
     }
+    run_all_new("primary",QDR_SIGN,39,"sign",12);run_all_new("alternate",QDR_SIGN,39,"sign",12);
+    run_all_new("primary",QDR_LINEARCLIP,67,"linearclip u16",30);run_all_new("alternate",QDR_LINEARCLIP,67,"linearclip u16",30);
+    run_all_new("primary",QDR_LINEARCLIP,69,"linearclip flat u8",9);run_all_new("alternate",QDR_LINEARCLIP,69,"linearclip flat u8",9);
     return 0;
 }

@@ -194,6 +194,7 @@ class ResidentDSP:
         raw=np.frombuffer(bytes(t.arena[16384:16384+1280]),'<u8').reshape(2,80)
         self.profile=[{'variant':i,'ms':int(raw[0,i])/1843200,'count':int(raw[1,i])} for i in range(80) if raw[1,i]]
         self.handler_profile,self.executor_profile=self._read_handler_profile(t.arena)
+        self.parallel_profile=self._read_parallel_profile(t.arena)
         self.check_guards()
         downloaded=time.monotonic()
         outs=[np.frombuffer(self.mem,dt,int(np.prod(shape)),off).copy().reshape(shape)
@@ -201,6 +202,19 @@ class ResidentDSP:
         self.last['download_ms']=(time.monotonic()-downloaded)*1000
         self.last['total_seconds']=self.seconds+(upload_ms+self.last['download_ms'])/1000
         return outs
+
+    @staticmethod
+    def _read_parallel_profile(arena):
+        """Thread record of a QDS_PREPARED_THREADS=3 engine (arena 24640), else {}.
+        parts_run counts all executed parts; started/finished are per follower and
+        must be equal after a run (a worker that never left its part shows as started>finished)."""
+        r=struct.unpack_from('<16Q',arena,24640)
+        if r[0]!=0x100000000|0x54505451:return {}
+        k=('conv','ew','dm')
+        return {'max_parts':int(r[1]&0xffffffff),'fault':int(r[1]>>32),'not_ready':int(r[2]),'declined':int(r[3]),
+                'jobs_parallel':dict(zip(k,map(int,r[4:7]))),'jobs_serial':dict(zip(k,map(int,r[7:10]))),
+                'parts_run':dict(zip(k,map(int,r[10:13]))),
+                'started':[int(r[13]&0xffffffff),int(r[13]>>32)],'finished':[int(r[14]&0xffffffff),int(r[14]>>32)]}
 
     @staticmethod
     def _read_handler_profile(arena):

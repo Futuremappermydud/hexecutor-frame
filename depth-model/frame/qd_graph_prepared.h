@@ -52,6 +52,28 @@ static const volatile char qds_l2_engine_feature[] __attribute__((used))="QDL2EN
 static const volatile char prepared_reference_feature[]="QD_PREPARED_REF_1";
 #endif
 
+/* QDS_PREPARED_THREADS=3 (default 1): the reference build's conv rows and the
+ * large HVX elementwise / data-movement handlers run on the three HVX hardware
+ * threads (the master plus the two followers parked in follower()). 1 keeps the
+ * single-thread behaviour exactly (no hook, no helper memory is touched).
+ *
+ * Helper conv near slots, two of QDS_PAR_L2_BYTES each, in the work slot
+ * 0x300f0000..0x300f8000 whose only occupant is QdsWork (bytes 0..0x200, see
+ * the _Static_assert in qd_graph_dsp.h):
+ *   0x300f0200..0x300f4000   part 1
+ *   0x300f4000..0x300f7e00   part 2 (0x300f7e00..0x300f8000 unused)
+ * Nothing else is placed there during a prepared call: the expanded block
+ * table ends below 0x30078000, conv near is 0x30078000..0x30080000, the stacks
+ * are 0x30080000..0x300b0000, the hot program 0x300b0000..0x300ef000 and the
+ * elementwise region starts at 0x300f8000. The legacy dsp_* caches that used
+ * 0x300b0000.. are not used in prepared mode. */
+#ifndef QDS_PREPARED_THREADS
+#define QDS_PREPARED_THREADS 1
+#endif
+#define QDS_PAR_L2_0 0x300f0200u
+#define QDS_PAR_L2_1 0x300f4000u
+#define QDS_PAR_L2_BYTES 0x3e00u
+
 #if QDS_NATIVE_PADDED_1X1
 static const volatile char prepared_padded_feature[]="QD_PREPARED_W1_1";
 #endif
@@ -79,6 +101,7 @@ typedef struct {
     Nprg2NativeConfig native;
     Nprg2ExecBuffer inputs[4],outputs[2];
     Nprg2ExecStats stats;
+    Nprg2Parallel par;
 #if QDS_PREPARED_PROFILE
     Nprg2ExecProfile profile;
     uint64_t handler_run_cycles[NPRG2_EXEC_REGISTRY_CAPACITY],handler_run_count[NPRG2_EXEC_REGISTRY_CAPACITY],
@@ -160,8 +183,36 @@ static int prepared_submit(void *ctx,const Nprg2ExecCall *call,
     return okay;
 }
 
+#if QDS_PREPARED_THREADS>1
+/* Hook that runs parts on the parked followers (op 4 in follower()). A worker
+ * that does not come back within the join deadline is not recoverable (it may
+ * still be running our code): par_fault stops further jobs and cancels the
+ * run, and the arena record shows started != finished for that worker. */
+static volatile uint32_t prepared_par_fault;
+static int prepared_par_ready(void *impl) {
+    (void)impl;
+    return !prepared_par_fault && native_1x1_workers_idle() && native_1x1_lease_valid();
+}
+static int prepared_par_run(void *impl,uint32_t parts,Nprg2ParallelFn fn,void *ctx) {
+    if(parts<2 || parts>3 || !prepared_par_ready(impl))return 0;
+    work->op=4;work->job_fn=fn;work->job_ctx=ctx;work->job_parts=parts;work->error=0;
+    uint32_t gen=work->generation+1;
+    __asm__ volatile("barrier":::"memory");work->generation=gen;
+    fn(ctx,0,parts);
+    uint64_t end=now_ns()+400000000ull;
+    while(work->done[1]!=gen || work->done[2]!=gen)
+        if(now_ns()>end){prepared_par_fault=1;return 1;}
+    __asm__ volatile("barrier":::"memory");
+    return 1;
+}
+#endif
+
 static int prepared_cancel(void *ctx,uint32_t index) {
-    (void)ctx;(void)index;return resident_cancelled();
+    (void)ctx;(void)index;
+#if QDS_PREPARED_THREADS>1
+    if(prepared_par_fault)return 1;
+#endif
+    return resident_cancelled();
 }
 
 static QdPreparedState *prepared_open(QdgGraph *g,const QdsConfig *cfg,
@@ -210,7 +261,13 @@ static QdPreparedState *prepared_open(QdgGraph *g,const QdsConfig *cfg,
     s->conv=(Nprg2ReferenceConv){(uint8_t *)(QD_DIRECT_VTCM_BASE+QD_DIRECT_TAIL_OFFSET+0x2000u),
                                  QD_DIRECT_TAIL_BYTES-0x2000u,
                                  (uint8_t *)QDS_REFERENCE_NEAR,QDS_REFERENCE_NEAR_BYTES,
-                                 now_ns,g->dsp_conv_phase};
+                                 now_ns,g->dsp_conv_phase,{NULL,NULL},0};
+#if QDS_PREPARED_THREADS>1
+    s->conv.par_near[0]=(uint8_t *)QDS_PAR_L2_0;s->conv.par_near[1]=(uint8_t *)QDS_PAR_L2_1;
+    s->conv.par_near_bytes=QDS_PAR_L2_BYTES;
+    s->par=(Nprg2Parallel){.max_parts=3,.ready=prepared_par_ready,.run=prepared_par_run};
+    nprg2_runner_set_parallel(&s->runner,&s->par);
+#endif
     s->scratch=malloc(QDS_REFERENCE_SCRATCH_BYTES);
     if(!s->scratch || nprg2_executor_register_reference_conv(&s->executor,&s->conv,NULL) ||
        nprg2_executor_register_weights(&s->executor) ||
@@ -335,6 +392,10 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
 #else
     nprg2_runner_set_profile(&s->runner,NULL,1);
 #endif
+#if QDS_PREPARED_THREADS>1
+    memset(s->par.jobs_parallel,0,sizeof s->par.jobs_parallel);memset(s->par.jobs_serial,0,sizeof s->par.jobs_serial);
+    memset(s->par.parts_run,0,sizeof s->par.parts_run);s->par.not_ready=s->par.declined=0;
+#endif
     int e=nprg2_runner_preflight(&s->runner,&s->executor,first,last-first,QD_DIRECT_ACTIVE_BYTES,
         s->inputs,4,s->outputs,2,g,scratch,scratch_bytes,&s->stats);
     if(e)goto failed;
@@ -363,6 +424,25 @@ failed:
     return e==NPRG2_EXEC_UNSUPPORTED || e==NPRG2_EXEC_REJECTED?QDG_ERR_UNSUPPORTED:QDG_ERR_DSP;
 }
 
+#if QDS_PREPARED_PROFILE && QDS_PREPARED_THREADS>1
+/* Thread record, 128 bytes at QDS_PROFILE2+4160 (the profile record's end):
+ * u64 [0] magic 'QDPT' | 1<<32, [1] max_parts | par_fault<<32, [2] not_ready
+ * (workers busy or lease invalid when a handler asked), [3] declined (hook run
+ * refused), [4..6] parallel jobs conv/ew/dm, [7..9] jobs run serially in more
+ * than one part (never expected on hardware), [10..12] parts executed,
+ * [13] started[1] | started[2]<<32, [14] finished[1] | finished[2]<<32
+ * (cumulative since boot; started != finished = a worker that never left its
+ * part), [15] 0. Per-run counters are cleared by prepared_run. */
+static void prepared_export_par(const QdPreparedState *s,uint8_t *dst) {
+    uint64_t r[16]={0};
+    r[0]=0x54505451ull|1ull<<32;r[1]=(uint64_t)s->par.max_parts|(uint64_t)prepared_par_fault<<32;
+    r[2]=s->par.not_ready;r[3]=s->par.declined;
+    for(int k=0;k<3;k++){r[4+k]=s->par.jobs_parallel[k];r[7+k]=s->par.jobs_serial[k];r[10+k]=s->par.parts_run[k];}
+    r[13]=(uint64_t)work->job_started[1]|(uint64_t)work->job_started[2]<<32;
+    r[14]=(uint64_t)work->job_finished[1]|(uint64_t)work->job_finished[2]<<32;
+    memcpy(dst,r,sizeof r);
+}
+#endif
 #if QDS_PREPARED_PROFILE
 /* Writes the last run's executor profile to the service arena (4160 bytes at
  * QDS_PROFILE2): eight u64 [magic 'QDHP' | version 1<<32, preflight cycles,

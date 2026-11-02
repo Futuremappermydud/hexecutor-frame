@@ -79,6 +79,41 @@ static void profile_model(const char *qpath,const char *npath){
     CHECK(nprg2_executor_run(&e,&r)==NPRG2_EXEC_OK);
     CHECK(cs.runs==p.command_count-nops&&stats.executed_commands==p.command_count);
     rn=0;for(unsigned i=0;i<NPRG2_EXEC_REGISTRY_CAPACITY;i++)rn+=hrn[i];CHECK(rn==p.command_count);
+    CHECK(stats.strip_valid==1);
+    /* Reuse across calls: after a preflighted run, a preflight of the identical request validates nothing
+     * and the run after it neither validates nor hashes the tables again; counters restart each call. */
+    r.reuse_preflight=1;
+    CHECK(nprg2_executor_run(&e,&r)==NPRG2_EXEC_OK);
+    uint32_t v0=cs.validates;uint64_t calls0=prof.preflight_calls;
+    for(int k=0;k<3;k++){
+        memset(&cs,0,sizeof cs);cs.validates=v0;
+        CHECK(nprg2_executor_preflight(&e,&r)==NPRG2_EXEC_OK);
+        CHECK(cs.validates==v0&&prof.preflight_calls==calls0&&stats.executed_commands==0&&stats.validated_commands==p.command_count);
+        CHECK(nprg2_executor_run(&e,&r)==NPRG2_EXEC_OK);
+        CHECK(cs.validates==v0&&cs.runs==p.command_count-nops&&stats.executed_commands==p.command_count&&stats.failed_command==UINT32_MAX);
+    }
+    /* A run alone, with the digest not fresh, hashes the tables and still reuses. */
+    CHECK(nprg2_executor_run(&e,&r)==NPRG2_EXEC_OK);CHECK(cs.validates==v0&&prof.preflight_calls==calls0);
+    CHECK(nprg2_executor_run(&e,&r)==NPRG2_EXEC_OK);CHECK(cs.validates==v0&&prof.preflight_calls==calls0&&stats.executed_commands==p.command_count);
+    /* Anything the signature covers changes the result: table contents (a calls-table byte the mock handlers ignore),
+     * the request's user pointer, the registry's effect flags, the interval. Each preflights in full once. */
+    uint8_t *calls=(uint8_t *)r.bound->calls.data;CHECK(calls&&r.bound->calls.bytes>8);
+    calls[3]^=0x40;v0=cs.validates;
+    CHECK(nprg2_executor_preflight(&e,&r)==NPRG2_EXEC_OK);CHECK(cs.validates==v0+p.command_count&&prof.preflight_calls==calls0+1);
+    CHECK(nprg2_executor_preflight(&e,&r)==NPRG2_EXEC_OK);CHECK(cs.validates==v0+p.command_count);
+    calls[3]^=0x40;
+    CHECK(nprg2_executor_preflight(&e,&r)==NPRG2_EXEC_OK);CHECK(cs.validates==v0+2u*p.command_count);
+    r.user=&cs;CHECK(nprg2_executor_run(&e,&r)==NPRG2_EXEC_OK);CHECK(cs.validates==v0+3u*p.command_count);r.user=NULL;
+    CHECK(nprg2_executor_preflight(&e,&r)==NPRG2_EXEC_OK);CHECK(cs.validates==v0+4u*p.command_count);
+    for(uint32_t j=0;j<NPRG2_EXEC_REGISTRY_CAPACITY;j++)if(e.handlers[j].used&&e.handlers[j].opcode==QDR_NOP){e.handlers[j].no_effect=0;break;}
+    CHECK(nprg2_executor_preflight(&e,&r)==NPRG2_EXEC_OK);CHECK(cs.validates==v0+5u*p.command_count);
+    CHECK(nprg2_executor_run(&e,&r)==NPRG2_EXEC_OK);CHECK(cs.validates==v0+5u*p.command_count);
+    r.command_count=p.command_count-1u;CHECK(nprg2_executor_preflight(&e,&r)==NPRG2_EXEC_OK);CHECK(cs.validates==v0+6u*p.command_count-1u);
+    r.command_count=p.command_count;
+    /* A failed preflight forgets the old signature. */
+    r.command_first=p.command_count;r.command_count=1;CHECK(nprg2_executor_preflight(&e,&r)==NPRG2_EXEC_ARGUMENT);
+    r.command_first=0;r.command_count=p.command_count;
+    CHECK(nprg2_executor_preflight(&e,&r)==NPRG2_EXEC_OK);
     free(hot);nprg2_close(&p);pools_free(pools);free(q);free(raw);printf("PASS profile/reuse/no-effect %s (nops %u)\n",qpath,(unsigned)nops);
 }
 static void weights_model(const char *qpath,const char *npath){
