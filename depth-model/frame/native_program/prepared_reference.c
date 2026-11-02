@@ -2568,6 +2568,10 @@ static void fuse_scalar(G *g, const Fuse *fx, const uint8_t *q, int32_t nc, int3
 }
 static uint32_t conv_path;
 static uint64_t hmx_t_entry; /* HMX_PROF step 5: clock at k_hmx_conv entry */
+static uint64_t ref_t_entry; /* HMX_PROF step 9: clock at reference_run entry (conv handlers) */
+#ifndef HMX_PROF
+#define HMX_PROF 0
+#endif
 #include "prepared_hmx_conv.inc"
 /* Returns 1 when the command took the fast path (or would, in a dry pass),
  * 0 to use the reference convolution, or a negative error. */
@@ -3117,7 +3121,12 @@ static int fuse_cached(G *g, const T *xt, const T *wt, const T *ft, const T *o) 
     return 0;
 }
 static int k_hmx_conv(G *g) {
-    if(g->conv && g->conv->clock && g->conv->phase && !g->dry) hmx_t_entry=g->conv->clock();
+    if(g->conv && g->conv->clock && g->conv->phase && !g->dry) {
+        hmx_t_entry=g->conv->clock();
+#if HMX_PROF==9
+        if(ref_t_entry && ref_t_entry<=hmx_t_entry) g->conv->phase[3]+=hmx_t_entry-ref_t_entry;
+#endif
+    }
     CHECK(g->nin>=3 && g->nout==1,E_ARGS);
     const T *xt=in(g,0),*wt=in(g,1),*ft=in(g,2),*o=out0(g);
     int s2=g->variant==36;
@@ -3317,8 +3326,23 @@ int nprg2_exec_reference_validate(const Nprg2ExecCall *c, void *ctx) {
     if(setup(&g,c,1,0,ctx)) return 0;
     return run_kernel(&g)==0;
 }
+#if HMX_PROF==11
+static int nprg2_exec_reference_run_inner(const Nprg2ExecCall *c, void *ctx);
+#endif
 int nprg2_exec_reference_run(const Nprg2ExecCall *c, void *ctx) {
     G g;
+    const Nprg2ReferenceConv *pc=ctx;
+    uint64_t prof_t0=pc && pc->clock && pc->phase && c->command.opcode==QDR_HMX_CONV?pc->clock():0;
+    ref_t_entry=prof_t0;
+#if HMX_PROF==11
+    (void)g;
+    int rr=nprg2_exec_reference_run_inner(c,ctx);
+    if(prof_t0) pc->phase[3]+=pc->clock()-prof_t0;
+    return rr;
+}
+static int nprg2_exec_reference_run_inner(const Nprg2ExecCall *c, void *ctx) {
+    G g;
+#endif
     /* The dry pass measures the exact scratch need. A command that needs no
      * more than the near region (scratch region 1, L2-TCM on the Frame) runs
      * its temporaries there instead of in the DDR heap. Commands run one at

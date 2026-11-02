@@ -506,7 +506,7 @@ static int nat_mac(const NatJob *J, int32_t *fi, int32_t *zero, uint8_t *complet
  * its validated geometry, tables and parameters. */
 static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int32_t cbs, int32_t co, int32_t oh,
                       int32_t ow, const uint32_t *ktab, const int32_t *corr, const int32_t *pre, const int32_t *Mq,
-                      const int8_t *wbase, int s2, const uint32_t *s2off, uint32_t js, int32_t xrows, int32_t xwb0,
+                      const int8_t *wbase, int bcopy, int32_t kvec, const uint32_t *s2off, uint32_t js, int32_t xrows, int32_t xwb0,
                       int32_t xnwb, uint8_t **xtab, size_t at, int32_t *err) {
     const Nprg2ReferenceConv *c=g->conv;
     if(!xtab || (BLK_HVX && !c->hmx->native_n)) return 0;
@@ -534,7 +534,7 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
         }
     }
     const size_t fixed=((size_t)NB*256+256+2048*2+2047)&~(size_t)2047,
-                 bsz=s2?((size_t)KB*NB*1024+2047)&~(size_t)2047:0,per=(size_t)KB*2048+(staged?(size_t)NB*2048:0);
+                 bsz=bcopy?((size_t)KB*NB*1024+2047)&~(size_t)2047:0,per=(size_t)KB*2048+(staged?(size_t)NB*2048:0);
     if(c->workspace_bytes<fixed+bsz+2048+per+2048) return 0;
     int32_t mt=(int32_t)((c->workspace_bytes-fixed-bsz-2048-2048)/per);
     if(mt>total) mt=total;
@@ -547,15 +547,18 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
     conv_path=4;
     if(fused) g->fx_ok=1;
 #ifdef CONV_SHAPES
-    if(!g->dry) fprintf(stderr,"NATCONV var=%u KB=%d NB=%d oh=%d ow=%d tiles=%d mt=%d fused=%d staged=%d s2=%d\n",g->variant,KB,NB,oh,ow,total,mt,fused,staged,s2);
+    if(!g->dry) fprintf(stderr,"NATCONV var=%u KB=%d NB=%d oh=%d ow=%d tiles=%d mt=%d fused=%d staged=%d bcopy=%d\n",g->variant,KB,NB,oh,ow,total,mt,fused,staged,bcopy);
 #endif
     if(g->dry) return 1;
     uint8_t *base=(uint8_t *)(((uintptr_t)ws+2047)&~(uintptr_t)2047);
     int32_t *fi=(int32_t *)base,*zero=(int32_t *)(base+(size_t)NB*256);
     uint8_t *completion=base+fixed-2048,*Bc=base+fixed,*dummy=Bc+bsz,*A=dummy+2048,*C=A+(size_t)mt*KB*2048;
-    if(s2) {
-        for(int32_t j=0;j<NB;j++)for(int32_t k=0;k<KB;k++)
-            qd_vcopy(Bc+((size_t)j*KB+(size_t)k)*1024,wbase+s2off[k]+(size_t)j*js,1024);
+    if(bcopy) {
+        for(int32_t j=0;j<NB;j++)for(int32_t k=0;k<KB;k++) {
+            uint8_t *d=Bc+((size_t)j*KB+(size_t)k)*1024;
+            qd_vcopy(d,wbase+s2off[k]+(size_t)j*js,(size_t)kvec*128);
+            if(kvec<8) memset(d+(size_t)kvec*128,0,(size_t)(8-kvec)*128);
+        }
         wbase=(const int8_t *)Bc;
     }
     {
@@ -633,12 +636,20 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
      * present blocks, copied per command (s2off: raw offset of K block k for
      * output block 0; block j adds js). */
     uint32_t s2off[256],js=0;
+    /* bcopy: B copied per command into the workspace, K block k from
+     * s2off[k] (+ j*js for output block j), kvec valid 128-byte vectors per
+     * block, zeros after. Stride 2 (kvec 8), or packed 1x1 with I < 32
+     * (6/32: I = 12, 20): K padded to 32 with zero weights (the input
+     * crouton's lanes >= I then multiply zeros). */
+    int bcopy=s2;int32_t kvec=8,Ireal=I;
     if(s2) {
         if(H!=3 || W!=3 || I%32 || packed || reverse) return 0;
         js=(uint32_t)H*(uint32_t)W*(uint32_t)I*32u;
-        H=2;W=2;I*=4;
+        H=2;W=2;I*=4;Ireal=I;
+    } else if(packed && H==1 && W==1 && I>0 && I<32 && I%4==0) {
+        bcopy=1;kvec=I/4;js=(uint32_t)I*32u;I=32;
     }
-    if(I%32 || xt->m[3]<I || H>3 || W>3 || ow%4 || co%32) return 0;
+    if(I%32 || xt->m[3]<Ireal || H>3 || W>3 || ow%4 || co%32) return 0;
     if(!(xt->flags&F_BLOCKED) || xt->esize!=1 || !(o->flags&F_BLOCKED) || o->esize!=1) return 0;
     if(xt->p[0] || o->p[0] || xt->m[0]!=1 || o->m[0]!=1 || wt->pool!=1) return 0;
     const int32_t cbs=I/32,NB=co/32;
@@ -653,10 +664,11 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
             s2off[KB++]=t|(uint32_t)0; /* offset; the (ky,kx,cb) goes to ktab below */
         }
     }
+    if(bcopy && !s2) s2off[0]=0; /* KB == 1 */
     if(!KB || KB*32>HMX_TERMS_MAX || KB>255) return 0;
     const int8_t *wbase=(const int8_t *)g->pool[wt->pool]+wt->offset;
-    if(!s2 && ((uintptr_t)wbase&1023u)) return 0;
-    int32_t dims[4]={1,oh+H-1,ow+W-1,I},origin[4]={0,xt->p[1],xt->p[2],0};
+    if(!bcopy && ((uintptr_t)wbase&1023u)) return 0;
+    int32_t dims[4]={1,oh+H-1,ow+W-1,Ireal},origin[4]={0,xt->p[1],xt->p[2],0};
     int32_t on[4]={1,oh,ow,co},oorigin[4]={0,o->p[1],o->p[2],0};
     {
         /* bits 0..2: checks passed with epilogue kind 0..2 (bits 3..5 are fast_conv's) */
@@ -704,13 +716,13 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     }
     requant_params(mult,co,0,Mq,pre,post);
     memset(wsum,0,(size_t)co*8);
-    if(xt->zp && s2) for(int32_t j=0;j<NB;j++) {
+    if(xt->zp && bcopy) for(int32_t j=0;j<NB;j++) {
         /* the present raw blocks of output block j (NO_TILE blocks are zero) */
 #if BLK_HVX
         HVX_Vector ones=Q6_V_vsplat_R(0x01010101),a=Q6_V_vzero();
         for(int32_t k=0;k<KB;k++) {
             const int8_t *b=wbase+s2off[k]+(size_t)j*js;
-            for(int32_t r=0;r<8;r++) a=Q6_Vw_vrmpyacc_VwVbVb(a,*(const HVX_UVector *)(b+128*r),ones);
+            for(int32_t r=0;r<kvec;r++) a=Q6_Vw_vrmpyacc_VwVbVb(a,*(const HVX_UVector *)(b+128*r),ones);
         }
         int32_t tmp[32] __attribute__((aligned(128)));
         *(HVX_Vector *)tmp=a;
@@ -718,7 +730,7 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
 #else
         for(int32_t k=0;k<KB;k++) {
             const int8_t *b=wbase+s2off[k]+(size_t)j*js;
-            for(int q=0;q<1024;q++) wsum[32*j+(q/4)%32]+=b[q];
+            for(int q=0;q<kvec*128;q++) wsum[32*j+(q/4)%32]+=b[q];
         }
 #endif
     } else if(xt->zp) for(int32_t j=0;j<NB;j++) {
@@ -758,7 +770,7 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     uint8_t *nat_snap=NULL;int32_t nat_dims[4]={1,oh,ow,co},nat_org[4]={0,o->p[1],o->p[2],0};
 #endif
     {
-        int r=hmx_native(g,xt,o,KB,NB,cbs,co,oh,ow,ktab,corr,pre,Mq,wbase,s2,s2off,js,xrows,xwb0,xnwb,
+        int r=hmx_native(g,xt,o,KB,NB,cbs,co,oh,ow,ktab,corr,pre,Mq,wbase,bcopy,kvec,s2off,js,xrows,xwb0,xnwb,
                          use_tab?(uint8_t **)(n+o_xtab):NULL,at,err);
 #ifdef NAT_CHECK
         if(r==1 && !g->dry && !g->fx.kind) {
@@ -773,7 +785,7 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     /* Workspace: fi, finish record, completion, then A and C for mt tiles. */
     const int32_t total=(oh*ow+31)/32;
     const size_t fixed=((size_t)NB*256+256+2048*2+2047)&~(size_t)2047,per=(size_t)(KB+NB)*2048,
-                 bsz=s2?((size_t)KB*NB*1024+2047)&~(size_t)2047:0;
+                 bsz=bcopy?((size_t)KB*NB*1024+2047)&~(size_t)2047:0;
     if(c->workspace_bytes<fixed+bsz+per+2048) return 0;
     int32_t mt=(int32_t)((c->workspace_bytes-fixed-bsz-2048)/per);
     if(mt>total) mt=total;
@@ -792,9 +804,12 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     uint8_t *base=(uint8_t *)(((uintptr_t)ws+2047)&~(uintptr_t)2047);
     int32_t *fi=(int32_t *)base,*zero=(int32_t *)(base+(size_t)NB*256);
     uint8_t *completion=base+fixed-2048,*Bc=base+fixed,*A=Bc+bsz,*C=A+(size_t)mt*KB*2048;
-    if(s2) {
-        for(int32_t j=0;j<NB;j++)for(int32_t k=0;k<KB;k++)
-            qd_vcopy(Bc+((size_t)j*KB+(size_t)k)*1024,wbase+s2off[k]+(size_t)j*js,1024);
+    if(bcopy) {
+        for(int32_t j=0;j<NB;j++)for(int32_t k=0;k<KB;k++) {
+            uint8_t *d=Bc+((size_t)j*KB+(size_t)k)*1024;
+            qd_vcopy(d,wbase+s2off[k]+(size_t)j*js,(size_t)kvec*128);
+            if(kvec<8) memset(d+(size_t)kvec*128,0,(size_t)(8-kvec)*128);
+        }
         wbase=(const int8_t *)Bc;
     }
     {
