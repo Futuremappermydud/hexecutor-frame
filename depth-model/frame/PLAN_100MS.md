@@ -36,6 +36,37 @@ Facts that set the plan:
 - The VTCM pool-1 mirror takes 7.5 MiB. Only the 512 KiB tail is free for conv
   workspace, HMX A/W tiles and helper slots.
 
+## Progress (2026-11-01, late)
+
+Frame, thr3fuse (`QDS_PREPARED_THREADS=3 QDS_PREPARED_FUSE=1`), exact on both
+models, smoke + random, repeat 2, lease and guards clean. Run with
+`sh frame/bench/ab.sh -t TAG thr3fuse`; reports and table in `frame/build/ab/TAG/`.
+
+| Commit | Change | Steady ms |
+|---|---|---:|
+| c8b322b | Step 0: A/B harness, phase split u8/u16 over all parts (baseline thr3 946.7, l2fuse 1043.8) | 925.0 |
+| dbf25b8 | Step 1: u16 direct staging with HVX (`stage_row16`): u16 staging 360 → 3 ms, 6/35+6/34 390 → 33 ms | 565.3 |
+| (s2a) | Step 2: 3 parts for 8-row conv tiles (cap was oh/(kh+1) = 2) | 527.5 |
+| f9d473b | Step 4: HVX u16 blocked copies in the reference (`blocked_run4_16`): non-conv 220 → 157 ms | **468.4** |
+
+Findings that change the plan:
+- Step 1's cost was the u16 path only: u16 inputs were never staged direct and
+  went through `blocked_impl`'s scalar 2-byte-per-element VTCM copy. u8 staging
+  is only ~40 ms (CPU, all parts).
+- Step 2.1 (helper slots to VTCM) would be a regression: `tile_block` reads
+  activations with scalar loads (`vsplat_R(*(uint32_t *)x)`), so the row ring
+  must stay in L2-TCM. The 0x3e00 slots already fit every shape (census:
+  `-DCONV_SHAPES` host build prints PARTS lines).
+- Conv wall now (6/33 212 ms) ≈ setup 35 ms (serial, before the split:
+  `build_taps`, `tap_wsum`, `rq_prepare`, constant per command → cacheable at
+  preflight) + the 3/8 row imbalance of an 8-row tile over 3 parts.
+- Remaining non-conv (157 ms) is the scalar int64/double reference compute:
+  29/38 DEQUANTIZE 17, 41/72 MUL_INLINE 11, 28/48 QUANTIZE 10, 35/23 10,
+  40/11 ABS 10, 7/31 10, 23/37 9, 18/56 8 ms.
+
+Next, in order: Step 3 (HMX u8, ~200 ms of the remaining ~300 ms conv);
+cache per-command conv setup; typed/HVX kernels for the non-conv list above.
+
 ## Budget at the target
 
 | Bucket | Today | Target |
