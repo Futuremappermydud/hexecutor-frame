@@ -108,6 +108,28 @@ static void hmx_tile(const HmxJob *J, int32_t t, int32_t k) {
     int32_t P=32*(J->m0+t),y,x,total=J->oh*J->ow;
     y=J->tyx[2*t];x=J->tyx[2*t+1];
     uint8_t *dst=J->A+((size_t)t*J->KB+(size_t)k)*2048;
+#if BLK_HVX
+    /* Fast path: all 32 pixels in one output row, so the tile reads one input
+     * row's columns col0..col0+31: 4 or 5 blocks, 10 aligned vectors. Quad q
+     * starts at stream byte 32*(col0&7) + 128q: vector q + s/4, shift 32*(s%4). */
+    if(J->xtab && x+32<=J->ow && P+32<=total) {
+        int32_t col0=xt->p[2]+x+(int32_t)kx,s=col0&7;
+        uint8_t *const *row=J->xtab+(uint32_t)((((y+(int32_t)ky)*J->xnwb)+(col0>>3)-J->xwb0)*J->cbs+(int32_t)cb);
+        HVX_Vector V[10],zero=Q6_V_vzero();
+        for(int i=0;i<5;i++) {
+            const uint8_t *b=i<4 || s?row[i*J->cbs]:NULL;
+            V[2*i]=b?((const HVX_Vector *)b)[0]:zero;V[2*i+1]=b?((const HVX_Vector *)b)[1]:zero;
+        }
+        for(int q=0;q<8;q++) {
+            int i=q+(s>>2),sh=(s&3)*32;
+            HVX_Vector v=sh?Q6_V_valign_VVR(V[i+1],V[i],sh):V[i];
+            HVX_VectorPair w=Q6_W_vshuff_VVR(v,zero,-1);
+            ((HVX_Vector *)dst)[2*q]=Q6_Vh_vshuff_Vh(Q6_V_lo_W(w));
+            ((HVX_Vector *)dst)[2*q+1]=Q6_Vh_vshuff_Vh(Q6_V_hi_W(w));
+        }
+        return;
+    }
+#endif
     for(int q=0;q<8;q++,P+=4) {
         int valid=P<total;
         int64_t row=xt->p[1]+y+ky,col=xt->p[2]+x+kx;
