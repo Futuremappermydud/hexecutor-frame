@@ -384,8 +384,39 @@ typedef struct {
     const int32_t *tyx; /* per local tile: block row, block column */
     const int32_t *pre, *Mq, *corr; /* host model */
     const uint8_t *B;
+    int one; int32_t R0, C0; int64_t xnbw, xnbd; /* one: 1x1, origin block aligned: A tile = the input block */
 } NatJob;
+#ifndef NAT_SERIAL_BELOW
+#define NAT_SERIAL_BELOW 16 /* fewer 1x1 A tiles than this: staged serially, no thread dispatch */
+#endif
+#ifndef NAT_1X1
+#define NAT_1X1 1
+#endif
 static void nat_tile(const NatJob *J, int32_t t, int32_t k) {
+    if(J->one) {
+        /* A tile (by, bx, cb) of a 1x1 conv with block-aligned origin is the
+         * input block itself: one block lookup, whole-block copy (staged:
+         * reading the input in place hangs silicon). */
+        uint32_t e=J->ktab[k];
+        const uint8_t *p=hmx_row(J->g->pool,J->xt,(int64_t)(J->R0+J->tyx[2*t])*8,J->C0+J->tyx[2*t+1],J->xnbw,J->xnbd,(int64_t)(e>>16));
+        uint8_t *dst=J->A+((size_t)t*J->KB+(size_t)k)*2048;
+#if BLK_HVX
+        HVX_Vector *d=(HVX_Vector *)dst;
+        if(p) {
+            const HVX_Vector *sv=(const HVX_Vector *)p;
+            HVX_Vector v0=sv[0],v1=sv[1],v2=sv[2],v3=sv[3],v4=sv[4],v5=sv[5],v6=sv[6],v7=sv[7];
+            HVX_Vector v8=sv[8],v9=sv[9],v10=sv[10],v11=sv[11],v12=sv[12],v13=sv[13],v14=sv[14],v15=sv[15];
+            d[0]=v0;d[1]=v1;d[2]=v2;d[3]=v3;d[4]=v4;d[5]=v5;d[6]=v6;d[7]=v7;
+            d[8]=v8;d[9]=v9;d[10]=v10;d[11]=v11;d[12]=v12;d[13]=v13;d[14]=v14;d[15]=v15;
+        } else {
+            HVX_Vector z=Q6_V_vzero();
+            for(int i=0;i<16;i++) d[i]=z;
+        }
+#else
+        if(p) memcpy(dst,p,2048); else memset(dst,0,2048);
+#endif
+        return;
+    }
     uint32_t e=J->ktab[k];
     int32_t ky=(int32_t)(e&255),kx=(int32_t)((e>>8)&255),cb=(int32_t)(e>>16);
     int32_t by=J->tyx[2*t],bx=J->tyx[2*t+1];
@@ -732,7 +763,15 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
                       const int8_t *wbase, int bcopy, int32_t kvec, const uint32_t *s2off, uint32_t js, int32_t xrows, int32_t xwb0,
                       int32_t xnwb, uint8_t **xtab, const uint8_t *fipre, int hit, size_t at, int32_t *err) {
     const Nprg2ReferenceConv *c=g->conv;
-    if(!xtab || (BLK_HVX && !c->hmx->native_n)) return 0;
+    /* 1x1 conv (ktab k = (0,0,k)), input origin on a block corner: no row table */
+    int one=0;
+#if NAT_1X1
+    if(KB==cbs && (xt->p[1]&7)==0 && (xt->p[2]&7)==0) {
+        one=1;
+        for(int32_t k=0;k<KB;k++) if(ktab[k]!=((uint32_t)k<<16)) {one=0;break;}
+    }
+#endif
+    if((!xtab && !one) || (BLK_HVX && !c->hmx->native_n)) return 0;
     if(oh%8 || ow%8 || o->p[1]%8 || o->p[2]%8) return 0;
     if(g->fx.kind && (g->fx.oe.p[1]%8 || g->fx.oe.p[2]%8 || (g->fx.kind==2 && (g->fx.ob.p[1]%8 || g->fx.ob.p[2]%8)))) return 0;
     if(!hit) for(int32_t k=0;k<co;k++) if(pre[k]<0 || pre[k]>20) return 0;
@@ -792,7 +831,7 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
     }
     hmx_fi_put(base,NB,co,fipre,fipre?NULL:(int32_t *)(n+o_fi),corr,pre,Mq);
     HMX_MARK(6);
-    hmx_tab(xtab,g->pool,xt,xt->p[1],xrows,xwb0,xnwb,cbs);
+    if(!one) hmx_tab(xtab,g->pool,xt,xt->p[1],xrows,xwb0,xnwb,cbs);
     HMX_MARK(7);
     int32_t *tyx=(int32_t *)(n+o_tyx);
     uint8_t **outp=(uint8_t **)(n+o_out);
@@ -801,7 +840,8 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
     const uint32_t onbw=(uint32_t)(o->m[2]+7)/8u,onbd=(uint32_t)(o->m[3]+31)/32u,ocount=o->nblocks;
     const uint32_t *oblk=o->blocks;
     NatJob J={.g=g,.xt=xt,.o=o,.fx=fused?&g->fx:NULL,.KB=KB,.NB=NB,.cbs=cbs,.bw=bw,.xwb0=xwb0,.xnwb=xnwb,
-              .ktab=ktab,.xtab=xtab,.A=A,.C=staged?C:NULL,.tyx=tyx,.pre=pre,.Mq=Mq,.corr=corr,.B=(const uint8_t *)wbase};
+              .ktab=ktab,.xtab=xtab,.A=A,.C=staged?C:NULL,.tyx=tyx,.pre=pre,.Mq=Mq,.corr=corr,.B=(const uint8_t *)wbase,
+              .one=one,.R0=xt->p[1]>>3,.C0=xt->p[2]>>3,.xnbw=((int64_t)xt->m[2]+7)/8,.xnbd=((int64_t)xt->m[3]+31)/32};
     uint32_t parts=nprg2_parallel_parts(g->call->parallel,3);
     uint32_t saved=c->hmx->enter?c->hmx->enter():0;
     int e=0;
@@ -823,7 +863,7 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
             if(++bx==bw){bx=0;by++;}
         }
         HMX_MARK(8);
-        if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,nat_prep_part,&J);
+        if(parts>1 && !(one && (int64_t)J.mt*KB<NAT_SERIAL_BELOW)) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,nat_prep_part,&J);
         else nat_prep_part(&J,0,1);
         if(clock){t1=clock();c->phase[0]+=t1-t0;t0=t1;}
         e=nat_mac(&J,fi,zero,completion,outp);
