@@ -9,6 +9,15 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+/* The Frame engine builds with -fno-builtin: without these, every 4-byte
+ * memcpy(&x,p,4) is a call into qd_graph_dsp.c's range-checking memcpy.
+ * Constant small sizes now inline; other sizes still call memcpy/memset. */
+#ifdef __hexagon__
+#undef memcpy
+#undef memset
+#define memcpy(d,s,n) __builtin_memcpy((d),(s),(n))
+#define memset(d,c,n) __builtin_memset((d),(c),(n))
+#endif
 #if defined(__HVX__) && __HVX_LENGTH__==128
 #include <hexagon_types.h>
 #include <hexagon_protos.h>
@@ -2784,6 +2793,12 @@ static int fast_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, in
         int r=hmx_conv(g,xt,wt,ft,o,packed,reverse,s2,co,oh,ow,err);
         if(r) return r;
     }
+#if NPRG2_HW_ROUNDING && BLK_HVX && !defined(NPRG2_NO_HMX16)
+    else if(!s2) {
+        int r=hmx_native16(g,xt,wt,ft,o,packed,reverse,co,oh,ow,err);
+        if(r) return r;
+    }
+#endif
 
     int32_t xh=oh+kh-1,xw=ow+kw-1,groups=ci/4,blocks=co/32;
     uint32_t nt=count_taps(wt,s2,reverse,packed,kh,kw,groups);

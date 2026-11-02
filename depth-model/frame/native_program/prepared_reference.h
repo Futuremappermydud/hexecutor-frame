@@ -82,6 +82,9 @@ typedef struct Nprg2HmxOps {
     /* Optional qd_hmx_native_n (NPRG2_HW_ROUNDING builds): native int8, one N
      * block over mt 64-pixel crouton tiles, cvt.ub stored :cm at out[t]. */
     void (*native_n)(void *a, void *b, void *fi, void *const *out, uint32_t kb, uint32_t mt);
+    /* Optional qd_hmx_native16_n (NPRG2_HW_ROUNDING builds): u16 activations
+     * (32-pixel u16 crouton tiles, :2x1), cvt.uh stored at out[t]. */
+    void (*native16_n)(void *a, void *b, void *fi, void *const *out, uint32_t kb, uint32_t mt);
 } Nprg2HmxOps;
 /* Fuse hook registered with the conv keys: the conv handler can run the
  * REQUANT_U8/70 or ADD_U8/13 command `epilogue` fused into its output step

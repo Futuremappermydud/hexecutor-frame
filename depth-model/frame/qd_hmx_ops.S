@@ -96,3 +96,35 @@ qd_hmx_native_n:
     { p0 = cmp.gt(r5,#0) }
     { if (p0) jump 2b }
     { jumpr r31 }
+/* Native u16 x int8 (HW-rounding builds): as qd_hmx_native_n, but A tiles
+ * are u16 crouton blocks (8 rows x 4 px x 32 ch, the :2x1 layout, plain
+ * :deep), conversion cvt.uh:2x1 (silicon u16, HMX_NATIVE_ROUNDING.md) and a
+ * plain store of the [pixel pair][n][j] block at out[t].
+ * r0=first A tile, r1=B of this N block, r2=Fi of this N block, r3=table of
+ * mt output block addresses, r4=KB, r5=mt. */
+    .globl qd_hmx_native16_n
+qd_hmx_native16_n:
+    { r11 = asl(r4,#11); r7 = #0; r12 = #32 }
+    { mxclracc }
+    { bias = mxmem2(r2) }
+2:
+    { mxclracc }
+    { r8 = r4; r13 = r0; r14 = r1 }
+3:
+    { r9 = min(r8,r12) }
+    { r15 = asl(r9,#11); r28 = asl(r9,#10) }
+    { r15 = add(r15,#-1); r28 = add(r28,#-1) }
+    { activation.ub = mxmem(r13,r15):deep
+      weight.b = mxmem(r14,r28) }
+    { r15 = add(r15,#1); r28 = add(r28,#1) }
+    { r13 = add(r13,r15); r14 = add(r14,r28) }
+    { r8 = sub(r8,r9) }
+    { p0 = cmp.gt(r8,#0) }
+    { if (p0) jump 3b }
+    { r10 = memw(r3++#4) }
+    { cvt.uh = acc(r7):2x1 }
+    { mxmem(r10,r7) = cvt }
+    { r0 = add(r0,r11); r5 = add(r5,#-1) }
+    { p0 = cmp.gt(r5,#0) }
+    { if (p0) jump 2b }
+    { jumpr r31 }
