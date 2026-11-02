@@ -1686,6 +1686,35 @@ static int k_mean(G *g) {
 static int k_weight_scales(G *g) {
     NEED(1);
     const T *i=in(g,0),*o=out0(g);
+#if BLK_HVX
+    /* Dense direct [rows][64] u8 (the 80 dynamic-weight calls): column
+     * min/max with HVX, then the same per-channel arithmetic. u8 - zp is
+     * monotone, so min/max of the raw bytes give the same mn, mx. */
+    if((i->flags&F_DIRECT) && i->dtype==DT_U8 && o->dtype==DT_F32 && i->d[3]==64 &&
+       !i->p[0] && !i->p[1] && !i->p[2] && !i->p[3] && !memcmp(i->d,i->m,sizeof i->d) &&
+       count4(o->d)==64 && i->pool<7 && g->pool[i->pool]) {
+        const size_t bytes=count4(i->d),rows=bytes/64;
+        if(rows>0 && !(rows&1) && i->offset+(uint64_t)bytes<=g->pool_bytes[i->pool]) {
+            A r;TRY(anew(g,&r,o->d,DT_F32));
+            if(!g->dry) {
+                const HVX_UVector *v=(const HVX_UVector *)(const void *)(g->pool[i->pool]+i->offset);
+                HVX_Vector lo=Q6_V_vsplat_R(-1),hi=Q6_V_vzero();
+                for(size_t j=0;j<rows/2;j++){HVX_Vector x=v[j];lo=Q6_Vub_vmin_VubVub(lo,x);hi=Q6_Vub_vmax_VubVub(hi,x);}
+                lo=Q6_Vub_vmin_VubVub(lo,Q6_V_vror_VR(lo,64));hi=Q6_Vub_vmax_VubVub(hi,Q6_V_vror_VR(hi,64));
+                uint8_t mnb[128] __attribute__((aligned(128))),mxb[128] __attribute__((aligned(128)));
+                *(HVX_Vector *)mnb=lo;*(HVX_Vector *)mxb=hi;
+                for(int32_t k=0;k<64;k++) {
+                    int32_t mn=(int32_t)mnb[k]-i->zp,mx=(int32_t)mxb[k]-i->zp;
+                    int32_t a=-127*mn>128*mx?-127*mn:128*mx;
+                    float s=(float)a/(float)16256;
+                    if(!(s>=1.0f))s=s!=s?s:1.0f;
+                    ((float *)r.p)[k]=f32_from_bits((f32_bits(s)+0x800u)&0xfffff000u);
+                }
+            }
+            return t_write(g,o,&r);
+        }
+    }
+#endif
     A x;TRY(t_read(g,i,&x,0));
     CHECK(x.dt==DT_U8 && o->dtype==DT_F32,E_TENSOR);
     int32_t co=x.n[3];
