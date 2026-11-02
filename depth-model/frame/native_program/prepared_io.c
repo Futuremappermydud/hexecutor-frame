@@ -77,5 +77,7 @@ int nprg2_executor_register_core_safe_ops(Nprg2Executor *e){
     if(!e)return NPRG2_EXEC_ARGUMENT;int r;
     static const uint8_t nop_variants[]={2,6,7,10};
     for(uint32_t i=0;i<sizeof nop_variants;i++)if((r=nprg2_executor_register(e,QDR_NOP,nop_variants[i],valid_nop,run_nop,NULL)))return r;
+    /* NOP run only repeats valid_nop, which preflight already proved. */
+    for(uint32_t i=0;i<sizeof nop_variants;i++)if((r=nprg2_executor_mark_no_effect(e,QDR_NOP,nop_variants[i])))return r;
     return nprg2_executor_register(e,QDR_INPUT_SLICE_PAD,2,validate_slice_pad,run_slice_pad,NULL);
 }

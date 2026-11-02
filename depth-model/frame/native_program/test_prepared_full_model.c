@@ -169,6 +169,12 @@ static Nprg2ExecRequest request(Session *s, Nprg2ExecBuffer *in, Nprg2ExecBuffer
                           .scratch = s->scratch, .scratch_bytes = s->scratch_bytes,
                           .command_first = first, .command_count = count, .stats = stats};
     memcpy(r.pools, s->pools, sizeof s->pools);
+    /* QD_NEAR=1: a 32 KiB near scratch region (the Frame's L2-TCM slot); commands whose scratch need fits use it. */
+    if (getenv("QD_NEAR")) {
+        static uint8_t *near_region;
+        if (!near_region) near_region = aligned_alloc(4096, 0x8000);
+        r.extra_scratch[0] = (Nprg2ExecBuffer){near_region, 0x8000};
+    }
     return r;
 }
 

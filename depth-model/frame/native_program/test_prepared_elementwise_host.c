@@ -6,6 +6,7 @@
 #include <string.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL %s:%d: %s\n",__FILE__,__LINE__,#x); exit(1); } } while (0)
+static uint16_t rd16le(const uint8_t *p){return (uint16_t)(p[0]|p[1]<<8);}
 static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24; }
 static uint8_t *read_file(const char *path,uint32_t *n) {
     FILE *f=fopen(path,"rb");CHECK(f);CHECK(!fseek(f,0,SEEK_END));long z=ftell(f);CHECK(z>0&&z<64L*1024L*1024L);CHECK(!fseek(f,0,SEEK_SET));
@@ -63,10 +64,79 @@ static void run_model(const char *qpath,const char *npath,const char *fixture_pa
     printf("PASS ASan/UBSan %s actual-metadata preflight: %s command=%u\n",name,qpath,cmd);
     free(scratch_raw);for(unsigned i=0;i<7;i++){free(before[i]);free(pools[i].base);}free(hot);nprg2_close(&p);free(fx);free(q);free(raw);
 }
+
+/* Every command of the given opcode/variant in the real schedule must be
+ * accepted by its HVX validator (so none falls back to the reference kernel);
+ * then three mutations of the real metadata must be rejected. Pools are zero:
+ * validation reads metadata and the call table only. */
+static int view_shape_t(const Nprg2TensorView *v,int32_t d[4],int32_t m[4],int32_t o[4]){
+    for(int i=0;i<4;i++){d[i]=(int16_t)rd16le(v->geometry_record+6+2*i);m[i]=(int16_t)rd16le(v->geometry_record+14+2*i);o[i]=(int16_t)rd16le(v->geometry_record+22+2*i);}return 1;}
+static void run_all_u16(const char *qpath,const char *npath,uint8_t opcode,uint8_t variant,const char *name,uint32_t expect) {
+    uint32_t qn,nn;uint8_t *q=read_file(qpath,&qn),*raw=read_file(npath,&nn);
+    uint8_t qsha[32],nsha[32];nprg2_sha256(q,qn,qsha);nprg2_sha256(raw,nn,nsha);
+    Nprg2ExpectedHashes x={q+32,q+64,qsha,nsha};Nprg2Pool pools[7]={0};
+    for(unsigned i=0;i<7;i++){uint32_t z=rd32(raw+144+4*i);pools[i].bytes=z;pools[i].base=z?calloc(1,z):NULL;CHECK(!z||pools[i].base);}
+    Nprg2Program p;CHECK(nprg2_open(&p,raw,nn,&x,pools,(Nprg2Allocator){0})==NPRG2_OK);
+    uint8_t *hot=calloc(1,300000);CHECK(hot);Nprg2BindConfig bc={.hot_memory=hot,.hot_capacity=300000,.l2_available_bytes=786432,.pool1_is_verified_vtcm=1,.resolve=resolve_all};Nprg2Bound bound;
+    CHECK(nprg2_bind_mock(&p,pools,&bc,&bound)==NPRG2_OK);
+    Nprg2Executor e;nprg2_executor_init(&e);CHECK(nprg2_executor_register_elementwise(&e)==NPRG2_EXEC_OK);
+    void *scratch_raw=malloc(NPRG2_ELEMENTWISE_SCRATCH_BYTES+sizeof(uintptr_t));CHECK(scratch_raw);void *scratch=(void *)(((uintptr_t)scratch_raw+sizeof(uintptr_t)-1)&~(uintptr_t)(sizeof(uintptr_t)-1));
+    uint32_t n=0,first=UINT32_MAX;
+    for(uint32_t i=0;i<p.command_count;i++){
+        Nprg2Command c;CHECK(nprg2_command_at(&bound,i,&c)==NPRG2_OK);
+        if(c.opcode!=opcode||c.variant!=variant)continue;
+        Nprg2ExecRequest req={.program=&p,.bound=&bound,.pool1_writable_bytes=0x780000,.scratch=scratch,.scratch_bytes=NPRG2_ELEMENTWISE_SCRATCH_BYTES,.command_first=i,.command_count=1};
+        memcpy(req.pools,pools,sizeof pools);
+        int rc=nprg2_executor_preflight(&e,&req);
+        if(rc!=NPRG2_EXEC_OK){fprintf(stderr,"%s %s cmd %u rejected rc=%d\n",qpath,name,i,rc);exit(1);}
+        if(first==UINT32_MAX)first=i;
+        n++;
+    }
+    CHECK(n==expect);
+    /* mutations on the first command: a call-argument change outside the proven ranges, a
+     * wrong call table function id, and an output block overlapping an input block. */
+    Nprg2Command c;CHECK(nprg2_command_at(&bound,first,&c)==NPRG2_OK&&c.call_count==1);
+    uint8_t *rec=(uint8_t *)bound.calls.data+(size_t)c.call_first*88u;
+    Nprg2ExecRequest req={.program=&p,.bound=&bound,.pool1_writable_bytes=0x780000,.scratch=scratch,.scratch_bytes=NPRG2_ELEMENTWISE_SCRATCH_BYTES,.command_first=first,.command_count=1};
+    memcpy(req.pools,pools,sizeof pools);
+    /* a command rejected here is still accepted by the reference kernel registered behind it in real use;
+     * with only the HVX handler registered it is REJECTED. */
+    uint8_t saved[88];memcpy(saved,rec,88);
+    rec[0]^=0x40;CHECK(nprg2_executor_preflight(&e,&req)==NPRG2_EXEC_REJECTED);memcpy(rec,saved,88);
+    for(unsigned arg=3;arg<9;arg++){ /* make argument `arg` huge (>= 2^40) */
+        rec[8+8*arg+5]=0xff;
+        int rc=nprg2_executor_preflight(&e,&req);
+        CHECK(rc==NPRG2_EXEC_OK||rc==NPRG2_EXEC_REJECTED);
+        memcpy(rec,saved,88);
+    }
+    CHECK(nprg2_executor_preflight(&e,&req)==NPRG2_EXEC_OK);
+    uint32_t oti,iti;Nprg2TensorView ov,iv;Nprg2ExecCall call={.command_index=first,.command=c,.program=&p,.bound=&bound,.pools=pools,.pool1_writable_bytes=0x780000};
+    CHECK(!nprg2_exec_output(&call,0,&oti,&ov)&&!nprg2_exec_input(&call,0,&iti,&iv)&&ov.block_count&&iv.block_count);
+    /* first block each tensor touches (slice offset + crop origin), as in the CPU-prefix tests */
+    int32_t od[4],om[4],oo[4],id[4],im[4],io[4];
+    CHECK(view_shape_t(&ov,od,om,oo)&&view_shape_t(&iv,id,im,io));
+    uint32_t oi0=(uint32_t)((((uint64_t)oo[0]*((im[1]+7)/8)+oo[1]/8)*((om[2]+3)/4)+oo[2]/4)*((om[3]+31)/32)+ov.slice_origin+oo[3]/32);
+    uint32_t ii0=(uint32_t)((((uint64_t)io[0]*((im[1]+7)/8)+io[1]/8)*((im[2]+3)/4)+io[2]/4)*((im[3]+31)/32)+iv.slice_origin+io[3]/32);
+    CHECK(oi0<ov.block_count&&ii0<iv.block_count);
+    uint32_t *ob=(uint32_t *)ov.blocks;uint32_t oldv=ob[oi0];
+    ob[oi0]=iv.blocks[ii0];CHECK(nprg2_executor_preflight(&e,&req)==NPRG2_EXEC_REJECTED);ob[oi0]=oldv;
+    ob[oi0]=0x780001u;CHECK(nprg2_executor_preflight(&e,&req)==NPRG2_EXEC_REJECTED);ob[oi0]=oldv;
+    CHECK(nprg2_executor_preflight(&e,&req)==NPRG2_EXEC_OK);
+    printf("PASS ASan/UBSan %s: all %u commands in %s accepted by the HVX validator\n",name,n,qpath);
+    free(scratch_raw);for(unsigned i=0;i<7;i++)free(pools[i].base);free(hot);nprg2_close(&p);free(q);free(raw);
+}
 int main(void) {
     run_model("frame/build/resident-primary.qdrx","frame/native_program/examples/primary-v2.nprg","frame/native_program/fixtures/primary-smoke-linearclip.epcpu",QDR_LINEARCLIP,68,"LinearClip");
     run_model("frame/build/resident-alternate.qdrx","frame/native_program/examples/alternate-v2.nprg","frame/native_program/fixtures/alternate-smoke-linearclip.epcpu",QDR_LINEARCLIP,68,"LinearClip");
     run_model("frame/build/resident-primary.qdrx","frame/native_program/examples/primary-v2.nprg","frame/native_program/fixtures/primary-smoke-requant.epcpu",QDR_REQUANT_U8,70,"requant u8");
     run_model("frame/build/resident-alternate.qdrx","frame/native_program/examples/alternate-v2.nprg","frame/native_program/fixtures/alternate-smoke-requant.epcpu",QDR_REQUANT_U8,70,"requant u8");
+    static const struct { uint8_t op,var;const char *name;uint32_t pn,an; } u16[]={
+        {QDR_REQUANT_U16,71,"requant u16",54,64},{QDR_ADD1111_U16,59,"add1111 u16",60,60},
+        {QDR_MUL_U16,74,"mul u16",50,50},{QDR_ADD_U16,14,"add u16",20,20},
+        {QDR_ADDSUB_U16,60,"addsub u16",12,12},{QDR_MUL1111_U16,73,"mul1111 u16",10,10}};
+    for(unsigned i=0;i<sizeof u16/sizeof u16[0];i++){
+        run_all_u16("frame/build/resident-primary.qdrx","frame/native_program/examples/primary-v2.nprg",u16[i].op,u16[i].var,u16[i].name,u16[i].pn);
+        run_all_u16("frame/build/resident-alternate.qdrx","frame/native_program/examples/alternate-v2.nprg",u16[i].op,u16[i].var,u16[i].name,u16[i].an);
+    }
     return 0;
 }

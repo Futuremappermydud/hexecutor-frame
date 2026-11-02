@@ -4,9 +4,11 @@
  *   test_prepared_reference_sim <primary|alternate> split <segments> <dir>
  *   test_prepared_reference_sim segment <file.rseg> [log every N commands]
  *   test_prepared_reference_sim [primary|alternate|both] profile   (host)
+ *   test_prepared_reference_sim <primary|alternate> tail <first> <dir>   (host)
  *
  * Any mode also accepts "fast" (fast exact convolution in a VTCM-tail-sized
- * workspace) and "cycles" (per-command cost table; pcycles in the simulator).
+ * workspace), "ew" (Hexagon only: the HVX elementwise handlers, chained over the
+ * reference kernel as on the Frame) and "cycles" (per-command cost table; pcycles in the simulator).
  *
  * prefix starts from a captured NativeGraph CPU prefix (.mpfx from
  * capture_multi_prefix_cpu.py) and requires all seven pools to equal the
@@ -32,6 +34,7 @@
 #include <time.h>
 #ifdef __hexagon__
 #include <hexagon_sim_timer.h>
+#include "prepared_elementwise.h"
 #endif
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
@@ -44,6 +47,13 @@ enum { MPFX_HEADER = 64, RSEG_HEADER = 72, POOL1_CEILING = 0x780000, MAX_SEGMENT
  * times every command and prints the cost per (opcode, variant) and the fast
  * convolution's phases after each run. */
 static int use_fast, use_cycles;
+/* "ew" (Hexagon builds only): register the HVX elementwise handlers for scratch
+ * region 1, chained in front of the reference kernel as the Frame build does. */
+static int use_ew;
+#ifdef __hexagon__
+static Nprg2ReferenceChain ew_chains[32];
+static uint8_t ew_scratch[NPRG2_ELEMENTWISE_SCRATCH_BYTES + 8] __attribute__((aligned(128)));
+#endif
 static Nprg2ReferenceConv conv;
 static uint64_t conv_phase[4];
 
@@ -162,6 +172,20 @@ static void env_open(Env *v, const char *model, uint8_t *const *inputs, const ui
         }
         CHECK(nprg2_executor_register_reference_conv(&v->e, &conv, &added) == NPRG2_EXEC_OK);
     }
+#ifdef __hexagon__
+    if (use_ew) {
+        CHECK(nprg2_executor_register_elementwise_region(&v->e, NPRG2_EXEC_SCRATCH_NEAR) == NPRG2_EXEC_OK);
+        uint32_t chained = 0;
+        for (uint32_t i = 0; i < NPRG2_EXEC_REGISTRY_CAPACITY; i++) {
+            Nprg2ExecHandler *h = &v->e.handlers[i];
+            if (!h->used || h->opcode == QDR_NOP || h->validate == nprg2_exec_reference_validate) continue;
+            CHECK(chained < sizeof ew_chains / sizeof ew_chains[0]);
+            CHECK(nprg2_executor_chain_reference(&v->e, h->opcode, h->variant, &ew_chains[chained]) == NPRG2_EXEC_OK);
+            chained++;
+        }
+        printf("%s: %lu HVX elementwise keys chained over the reference kernel\n", model, (unsigned long)chained);
+    }
+#endif
     CHECK(nprg2_executor_register_reference_missing(&v->e, &added) == NPRG2_EXEC_OK);
     for (int j = 0; j < 2; j++) {
         v->out[j] = calloc(1, kOutputBytes[j]);
@@ -225,6 +249,9 @@ static void env_run(Env *v, uint32_t first, uint32_t count, const uint8_t *const
                           .scratch = v->scratch, .scratch_bytes = v->scratch_bytes,
                           .command_first = first, .command_count = count, .stats = &st};
     memcpy(r.pools, v->pools, sizeof v->pools);
+#ifdef __hexagon__
+    if (use_ew) r.extra_scratch[0] = (Nprg2ExecBuffer){ew_scratch, NPRG2_ELEMENTWISE_SCRATCH_BYTES};
+#endif
     uint64_t preflight_started = ticks();
     int rc = nprg2_executor_preflight(&v->e, &r);
     if (use_cycles)
@@ -464,6 +491,35 @@ static void split(const char *model, uint32_t segments, const char *dir) {
     for (int j = 0; j < 4; j++) free(inputs[j]);
 }
 
+/* One segment covering [first, end): the host runs the schedule once, keeping the state before
+ * `first`, so a simulator run can start in the late part of a schedule without simulating
+ * everything before it. */
+static void tail(const char *model, uint32_t first, const char *dir) {
+    uint8_t *inputs[4], *constants;
+    uint32_t input_bytes[4], cn;
+    read_smoke(model, inputs, input_bytes, &constants, &cn);
+    static Env v;
+    env_open(&v, model, inputs, input_bytes);
+    uint32_t n = v.p.command_count;
+    CHECK(v.pools[5].bytes == cn && first < n);
+    memcpy(v.pools[5].base, constants, cn);
+    env_census(&v, 0, n);
+    env_run(&v, 0, first, NULL);
+    uint32_t state_bytes;
+    uint8_t *start = snapshot(&v, &state_bytes);
+    env_run(&v, first, n - first, NULL);
+    uint8_t *end = snapshot(&v, &state_bytes);
+    write_segment(&v, dir, 0, first, n - first, input_bytes, start, end, state_bytes);
+    free(start);
+    free(end);
+    if (!outputs_match_emulator(model, v.out)) exit(1);
+    printf("PASS %s tail: commands %lu..%lu written; final outputs match the emulator smoke sha256\n", model,
+           (unsigned long)first, (unsigned long)n - 1u);
+    env_close(&v);
+    free(constants);
+    for (int j = 0; j < 4; j++) free(inputs[j]);
+}
+
 /* Host time per (opcode, variant) over the full schedule, slowest first. */
 static void profile(const char *model) {
     uint8_t *inputs[4], *constants;
@@ -551,6 +607,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "fast")) use_fast = 1;
         else if (!strcmp(argv[i], "cycles")) use_cycles = 1;
+        else if (!strcmp(argv[i], "ew")) use_ew = 1;
         else argv[kept++] = argv[i];
     }
     argc = kept;
@@ -561,7 +618,7 @@ int main(int argc, char **argv) {
     const char *which = argc > 1 ? argv[1] : "both";
     const char *mode = argc > 2 ? argv[2] : "prefix";
     CHECK(!strcmp(which, "both") || !strcmp(which, "primary") || !strcmp(which, "alternate"));
-    if (!strcmp(mode, "profile") || !strcmp(mode, "split")) use_cycles = 0;
+    if (!strcmp(mode, "profile") || !strcmp(mode, "split") || !strcmp(mode, "tail")) use_cycles = 0;
     if (!strcmp(mode, "profile")) {
         if (strcmp(which, "alternate")) profile("primary");
         if (strcmp(which, "primary")) profile("alternate");
@@ -570,6 +627,11 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "split")) {
         CHECK(argc > 4 && strcmp(which, "both"));
         split(which, (uint32_t)strtoul(argv[3], NULL, 10), argv[4]);
+        return 0;
+    }
+    if (!strcmp(mode, "tail")) {
+        CHECK(argc > 4 && strcmp(which, "both"));
+        tail(which, (uint32_t)strtoul(argv[3], NULL, 10), argv[4]);
         return 0;
     }
     CHECK(!strcmp(mode, "prefix") || !strcmp(mode, "full"));

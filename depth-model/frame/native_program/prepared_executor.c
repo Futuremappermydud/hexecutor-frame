@@ -1,4 +1,5 @@
 #include "prepared_executor.h"
+#include "prepared_vcopy.h"
 
 #include <limits.h>
 #include <string.h>
@@ -42,6 +43,11 @@ int nprg2_executor_register_scratch_region(Nprg2Executor *e,uint8_t op,uint8_t v
     return NPRG2_EXEC_REGISTRY_FULL;
 }
 
+int nprg2_executor_mark_no_effect(Nprg2Executor *e,uint8_t op,uint8_t variant){
+    if(!e)return NPRG2_EXEC_ARGUMENT;int hi=handler_index(e,op,variant);if(hi<0)return NPRG2_EXEC_UNSUPPORTED;
+    e->handlers[hi].no_effect=1;return NPRG2_EXEC_OK;
+}
+
 static int get_ref(const Nprg2ExecCall *c,uint32_t slot,int output,uint32_t *index,Nprg2TensorView *view){
     if(!c||!c->program||!c->bound||!index||!view)return NPRG2_EXEC_ARGUMENT;
     uint32_t count=output?c->command.output_count:c->command.input_count;
@@ -61,14 +67,16 @@ static int overlaps(const void *a,size_t an,const void *b,size_t bn){
     if(!an||!bn)return 0;if(!a||!b)return 1;uintptr_t x=(uintptr_t)a,y=(uintptr_t)b;
     if(x>UINTPTR_MAX-an||y>UINTPTR_MAX-bn)return 1;return x<y+bn&&y<x+an;
 }
-static int make_call(const Nprg2ExecRequest *r,uint32_t index,Nprg2ExecCall *call){
-    memset(call,0,sizeof *call);call->command_index=index;call->program=r->program;call->bound=r->bound;
+/* Fills every field but call->command, which the caller has already decoded
+ * in place (no memset or struct copy per command). */
+static void fill_call(const Nprg2ExecRequest *r,uint32_t index,Nprg2ExecCall *call){
+    call->command_index=index;call->program=r->program;call->bound=r->bound;
     call->pools=r->pools;call->pool1_writable_bytes=r->pool1_writable_bytes;
     call->inputs=r->inputs;call->input_count=r->input_count;call->outputs=r->outputs;call->output_count=r->output_count;
     call->user=r->user;call->scratch=r->scratch;call->scratch_bytes=r->scratch_bytes;
     call->scratch_region[0]=(Nprg2ExecBuffer){(uint8_t *)r->scratch,r->scratch_bytes};
     for(uint32_t k=1;k<NPRG2_EXEC_SCRATCH_REGIONS;k++)call->scratch_region[k]=r->extra_scratch[k-1u];
-    return nprg2_command_at(r->bound,index,&call->command)==NPRG2_OK;
+    call->preflighted=0;
 }
 /* Hands the handler the region it registered for. */
 static void select_scratch(Nprg2ExecCall *call,const Nprg2ExecHandler *h){
@@ -121,14 +129,41 @@ static int request_valid(const Nprg2Executor *e,const Nprg2ExecRequest *r){
        overlaps(r->stats,r->stats?sizeof *r->stats:0,r->outputs,(size_t)r->output_count*sizeof *r->outputs))return 0;
     return 1;
 }
+/* Identifies everything a preflight result depends on that the caller can
+ * change between calls (a multiplicative hash over pointers, sizes and the registry; it guards
+ * against accidental changes, not an adversary). */
+static uint64_t sig_mix(uint64_t h,uint64_t v){h=(h^v)*0x9e3779b97f4a7c15ull;return h^(h>>29);}
+static uint64_t request_signature(const Nprg2Executor *e,const Nprg2ExecRequest *r){
+    uint64_t h=0x243f6a8885a308d3ull;
+    h=sig_mix(h,(uintptr_t)e);h=sig_mix(h,(uintptr_t)r->program);h=sig_mix(h,(uintptr_t)r->bound);
+    for(unsigned i=0;i<7;i++){h=sig_mix(h,(uintptr_t)r->pools[i].base);h=sig_mix(h,r->pools[i].bytes);}
+    h=sig_mix(h,r->pool1_writable_bytes);h=sig_mix(h,(uintptr_t)r->user);
+    h=sig_mix(h,(uintptr_t)r->scratch);h=sig_mix(h,r->scratch_bytes);
+    for(unsigned k=0;k+1u<NPRG2_EXEC_SCRATCH_REGIONS;k++){h=sig_mix(h,(uintptr_t)r->extra_scratch[k].data);h=sig_mix(h,r->extra_scratch[k].bytes);}
+    h=sig_mix(h,(uintptr_t)r->inputs);h=sig_mix(h,r->input_count);h=sig_mix(h,(uintptr_t)r->outputs);h=sig_mix(h,r->output_count);
+    for(uint32_t i=0;i<r->input_count&&r->inputs;i++){h=sig_mix(h,(uintptr_t)r->inputs[i].data);h=sig_mix(h,r->inputs[i].bytes);}
+    for(uint32_t i=0;i<r->output_count&&r->outputs;i++){h=sig_mix(h,(uintptr_t)r->outputs[i].data);h=sig_mix(h,r->outputs[i].bytes);}
+    h=sig_mix(h,r->command_first);h=sig_mix(h,r->command_count);h=sig_mix(h,e->count);
+    for(uint32_t i=0;i<NPRG2_EXEC_REGISTRY_CAPACITY;i++){
+        const Nprg2ExecHandler *x=&e->handlers[i];if(!x->used)continue;
+        h=sig_mix(h,((uint64_t)x->opcode<<8|x->variant)<<8|x->scratch_region);
+        h=sig_mix(h,(uintptr_t)x->validate);h=sig_mix(h,(uintptr_t)x->ctx);
+        h=sig_mix(h,((uint64_t)x->scratch_bytes<<32)|x->concurrent_worker_scratch_bytes);
+    }
+    return h|1u;
+}
 int nprg2_executor_preflight(const Nprg2Executor *e,const Nprg2ExecRequest *r){
     if(!e||!request_valid(e,r))return NPRG2_EXEC_ARGUMENT;
     Nprg2ExecStats local={0};Nprg2ExecStats *s=r->stats?r->stats:&local;memset(s,0,sizeof *s);s->failed_command=UINT32_MAX;
+    Nprg2ExecProfile *pr=r->profile&&r->profile->clock?r->profile:NULL;
+    uint64_t p0=pr?pr->clock():0;
     /* Coverage, feature, bounds, alias, and scratch predicates are checked
      * without graph-pool writes. This public entry is also used before a
      * physical VTCM boundary copy by the DSP wrapper. */
     for(uint32_t n=0;n<r->command_count;n++){
-        uint32_t ix=r->command_first+n;Nprg2ExecCall call;if(!make_call(r,ix,&call))return NPRG2_EXEC_REJECTED;
+        uint32_t ix=r->command_first+n;Nprg2ExecCall call;
+        if(nprg2_command_at(r->bound,ix,&call.command)!=NPRG2_OK)return NPRG2_EXEC_REJECTED;
+        fill_call(r,ix,&call);
         int hi=handler_index(e,call.command.opcode,call.command.variant);
         if(hi<0){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_UNSUPPORTED;}
         const Nprg2ExecHandler *h=&e->handlers[hi];select_scratch(&call,h);
@@ -136,28 +171,54 @@ int nprg2_executor_preflight(const Nprg2Executor *e,const Nprg2ExecRequest *r){
            h->scratch_bytes+h->concurrent_worker_scratch_bytes>call.scratch_bytes){
             s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_REJECTED;
         }
-        if(!h->validate(&call,h->ctx)){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_REJECTED;}
+        uint64_t v0=pr?pr->clock():0;
+        int valid=h->validate(&call,h->ctx);
+        if(pr){uint64_t d=pr->clock()-v0;pr->validate_cycles+=d;if(pr->handler_validate_cycles)pr->handler_validate_cycles[hi]+=d;}
+        if(!valid){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_REJECTED;}
         s->validated_commands++;
     }
+    if(r->stats)s->preflight_signature=request_signature(e,r);
+    if(pr){pr->preflight_cycles+=pr->clock()-p0;pr->preflight_calls++;}
     return NPRG2_EXEC_OK;
 }
 int nprg2_executor_run(const Nprg2Executor *e,const Nprg2ExecRequest *r){
-    int preflight=nprg2_executor_preflight(e,r);if(preflight!=NPRG2_EXEC_OK)return preflight;
-    Nprg2ExecStats local={0};Nprg2ExecStats *s=r->stats?r->stats:&local;
+    Nprg2ExecProfile *pr=r&&r->profile&&r->profile->clock?r->profile:NULL;
     /* The execution API repeats preflight after any caller-side boundary
-     * operations; then it executes strictly in prepared schedule order. */
+     * operations, unless the caller proves the identical request was just
+     * preflighted; then it executes strictly in prepared schedule order. */
+    if(r&&r->reuse_preflight&&e&&r->stats&&r->stats->preflight_signature&&request_valid(e,r)&&
+       r->stats->preflight_signature==request_signature(e,r)&&r->stats->validated_commands==r->command_count){
+        if(pr)pr->preflights_reused++;
+    } else {
+        int preflight=nprg2_executor_preflight(e,r);if(preflight!=NPRG2_EXEC_OK)return preflight;
+    }
+    Nprg2ExecStats local={0};Nprg2ExecStats *s=r->stats?r->stats:&local;
+    uint64_t prev=pr?pr->clock():0;
     for(uint32_t n=0;n<r->command_count;n++){
-        uint32_t ix=r->command_first+n;Nprg2ExecCall call;if(!make_call(r,ix,&call))return NPRG2_EXEC_REJECTED;
+        uint32_t ix=r->command_first+n;Nprg2ExecCall call;
+        if(nprg2_command_at(r->bound,ix,&call.command)!=NPRG2_OK)return NPRG2_EXEC_REJECTED;
         if(r->cancelled&&r->cancelled(r->cancel_ctx,ix)){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_CANCELLED;}
         int hi=handler_index(e,call.command.opcode,call.command.variant);if(hi<0)return NPRG2_EXEC_UNSUPPORTED;
-        select_scratch(&call,&e->handlers[hi]);
+        const Nprg2ExecHandler *h=&e->handlers[hi];
+        if(h->no_effect){
+            if(pr&&pr->handler_run_count)pr->handler_run_count[hi]++;
+            s->executed_commands++;continue;
+        }
+        fill_call(r,ix,&call);call.preflighted=1;select_scratch(&call,h);
         uint32_t v=call.command.variant;
-        int timed=s->clock&&s->variant_cycles&&s->variant_count&&v<NPRG2_EXEC_PROFILE_VARIANTS;
-        uint64_t t0=timed?s->clock():0;
-        if(!e->handlers[hi].run(&call,e->handlers[hi].ctx)){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_HANDLER_ERROR;}
-        if(timed){s->variant_cycles[v]+=s->clock()-t0;s->variant_count[v]++;}
+        int timed=pr&&pr->variant_cycles&&pr->variant_count&&v<NPRG2_EXEC_PROFILE_VARIANTS;
+        uint64_t t0=pr?pr->clock():0;
+        if(pr)pr->dispatch_cycles+=t0-prev;
+        if(!h->run(&call,h->ctx)){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_HANDLER_ERROR;}
+        if(pr){
+            prev=pr->clock();uint64_t d=prev-t0;pr->run_cycles+=d;
+            if(timed){pr->variant_cycles[v]+=d;pr->variant_count[v]++;}
+            if(pr->handler_run_cycles)pr->handler_run_cycles[hi]+=d;
+            if(pr->handler_run_count)pr->handler_run_count[hi]++;
+        }
         s->executed_commands++;
     }
+    if(pr)pr->dispatch_cycles+=pr->clock()-prev;
     return NPRG2_EXEC_OK;
 }
 
@@ -187,7 +248,7 @@ int nprg2_exec_weights_run(const Nprg2ExecCall *c,void *ctx){
     (void)ctx;if(!nprg2_exec_weights_validate(c,NULL))return 0;uint32_t si,di;Nprg2TensorView s,d;
     if(nprg2_exec_input(c,0,&si,&s)||nprg2_exec_output(c,0,&di,&d))return 0;
     uint32_t sb=max_shape_bytes(s.geometry_record),db=max_shape_bytes(d.geometry_record),n=sb<db?sb:db;
-    memmove(c->pools[d.pool].base+d.offset,c->pools[s.pool].base+s.offset,n);return 1;
+    qd_vcopy(c->pools[d.pool].base+d.offset,c->pools[s.pool].base+s.offset,n);return 1;
 }
 int nprg2_executor_register_weights(Nprg2Executor *e){
     if(!e)return NPRG2_EXEC_ARGUMENT;

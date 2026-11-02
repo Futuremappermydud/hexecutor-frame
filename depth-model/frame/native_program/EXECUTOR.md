@@ -416,6 +416,52 @@ with `-Werror`):
 - To validate: `run_prepared_reference_sim.sh` in prefix mode, then fast full
   with `segments 6`, comparing pools and sha256 against the earlier results.
 
+Fused HVX requant in registers, single-multiply u8 (2026-11-01, **simulator
+unit tests and host only; not run in the full-model simulator or on
+hardware**):
+
+- `RQ_VECS` is 8. Per 32-channel block, `rq_prepare` stores u8 {off, pre, M,
+  post, r, c, 0, 0} and u16 {offh, off&255, M, post, r, c, sl, 0}, where
+  r=2^(post-1), u8 c=2^max(post-2,0), u16 c=min(2^(post+6),2^22) and
+  sl=16-post. `rq_emit` no longer recomputes them.
+- u8, every admitted post (1..22): clamp x to [0,c], then
+  q=vlsr(vmpyieacc(r,x,M),post). c*M>=2^(post+8), so q(c)>=256 saturates.
+  x*M+r<=2^(post-2)*2047+2^(post-1)<2^32, so the product taken mod 2^32
+  with a logical shift is exact. There is no per-command selection, and the
+  16-bit split path is now u16 only (sr dropped, since post<=16).
+- `rq_lane`/`rq_emit_k`/`rq_emit` are always_inline. nb and sixteen are
+  compile-time constants in every copy (so no `__hexagon_udivsi3`), and every
+  loop has a constant trip count with np only in guards, fully unrolled.
+  Each output vector's lanes are formed as it is packed. Full 8-pixel blocks
+  inline into `tile_block`. Partial blocks pass their sums through `acc`
+  (128-byte aligned, as `lo` already was) to the out-of-line `rq_emit_part`.
+  V75 -O2: `tile_block` frame 2304 -> 16 bytes, stack vector accesses
+  14 -> 0, and the `rq_emit` call (2688-byte frame, 27 stack vector accesses,
+  divide calls) is gone. Code grows about 19 KB (`tile_block` 1.2 -> 10 KB,
+  `rq_emit_part` 12 KB).
+- Parameter memory doubles (co*32 bytes). On the host, both models still put
+  all 1036 convs on near memory with a 169,216-byte workspace peak. Only the
+  80 u8 s2 convs with ci=128, co=64, ow=128 change near chunk width
+  (80 -> 72 columns, still 2 chunks per row).
+- Evidence: an exhaustive lane check (`rq32b.c` style: all M 1024..2047, u8
+  post 1..22, u16 post 1..16, dense sweeps at 0, the clip edge, both clamp
+  edges and a coarse int32 sweep; 3.5e9 cases) gives 0 mismatches. V75
+  simulator `.work/rqtest/test_rq.c` (800 random commands, now including
+  blocked output with absent blocks and misaligned destinations, and u8 post
+  19..22 with edge M across the clamp and clip edges) passes 240,512 outputs.
+  Mutants with a too-small clamp or a wrong blocked offset fail it. A
+  mutant that ignores a NULL (absent) `blk` still passes: only the
+  simulator's NULL-dereference warning shows it, so absent-block skipping is
+  weakly covered. Host
+  `test_prepared_full_model` fast/mixedfast and `test_refsim both full fast`
+  pass for both models. The engine builds with `-Werror`, with and without
+  `-DNPRG2_SCALAR_REQUANT`.
+- `.work/rqtest/bench_rq.c`, pcycles per 8-pixel x 64-channel block (fused
+  total, requant part), before -> after: u8 1x1 2200 -> 775 (1659 -> 225);
+  u8 3x3 ci=64 9136 -> 7711; u16 1x1 2983 -> 1630 (1914 -> 543); u16 3x3
+  9511 -> 8158. That is about 14 cycles per output vector for u8 and 34 for
+  u16.
+
 HVX elementwise handlers back on in the reference build, via per-handler
 scratch regions (2026-11-01, **change made, NOT run in the simulator or on
 hardware**):
@@ -472,6 +518,215 @@ hardware**):
   engine), and confirm that nothing on the Frame writes 0x300f8000..0x30100000
   during a prepared call.
 
+Direct data-movement fast paths, HVX weight copy, near scratch (2026-11-01,
+**host lockstep and V75 simulator unit tests only; the full-model simulator
+gate is recorded below; not run on hardware**):
+
+- `prepared_datamove.inc` (included by `prepared_reference.c`) adds exact
+  block-to-block / row-to-row paths that skip the dense int64-agnostic temps
+  (`t_read` -> permute -> `t_write`). The choice uses only geometry and
+  immutable pool-5 constants, so the dry and wet passes agree and a taken
+  path needs no call scratch. Each runs the same `xfer_check` bounds checks
+  first, checks all indices before its first graph write, and falls back to
+  the generic kernel for anything uncovered or when source and destination
+  blocks/byte ranges overlap (the generic path reads everything before it
+  writes). Vector moves use `DV` (HVX on Hexagon, a 128-byte array on the
+  host, so lockstep runs the same index logic). Vector paths need 128-byte
+  aligned pool bases. `-DDM_ENABLED=0` compiles them out (baseline).
+  - SpaceToDepth (variant 31): u8 blocked in and out, ci a multiple of 32,
+    oc=4*ci, pw%8==7, ow%4==0. A rolling window of three input vectors per
+    4 output pixels, `valign` + 32-byte `vdeal`, full aligned vector stores.
+  - ResizeNear (51): u8 blocked, column map w>>1 (parameters {0x80000000, v4 <
+    0x80000000, 0}, read from the constant), any row map, ow%8==0, C%32==0;
+    one load becomes two stores via 32-byte `vshuff`.
+  - Transpose (55-58): blocked u16 H<->W (perm 0213, even sizes) via
+    `vshuffe/vshuffo` halfword pairs; flat (direct) u8/u16/i32 any
+    permutation, 16x16 tiles. Blocked W<->C swaps (55 u8, 56 u16 0132) and
+    channel counts below 32 stay generic.
+  - Slice (54), SlicePad flat (53), Gather flat (46): direct pool-to-pool row
+    copies with contiguous-run merging (`qd_vcopy` for runs >= 512 bytes).
+    Blocked SlicePad (52, channel shift inside a 32-byte pixel) stays generic.
+- `prepared_vcopy.h`: `qd_vcopy`, a memmove-compatible HVX copy: eight vector
+  loads in flight, aligned destination stores, `valign` for a misaligned
+  source, scalar head, masked tail; a destination inside the source range
+  uses memmove. Used by `nprg2_exec_weights_run` (the built-in
+  WEIGHTS_TO_VTCM handler), `k_weights_to_vtcm`, and the flat copies.
+  `-DQD_NO_VCOPY` restores memmove.
+- Near scratch: `nprg2_exec_reference_run` already runs a dry pass, so it
+  knows the exact scratch need; if it is <= scratch region 1
+  (`NPRG2_EXEC_SCRATCH_NEAR`) the wet pass uses that region instead of the
+  DDR heap. On the Frame, region 1 is the existing `QDS_ELEMENTWISE_L2`
+  0x300f8000..0x30100000 (32 KiB, built with REFERENCE+ELEMENTWISE). It is
+  free during a reference command because commands run one at a time and the
+  elementwise handlers use it only inside their own commands. No new L2
+  range was added; `qd_graph_prepared.h` is unchanged.
+- Tests: `test_prepared_datamove_sim.c` (`run_prepared_datamove_sim.sh
+  [cycles]`; `SDK_MOUNT=<.work/hexagon-sdk path>` for a worktree) runs random
+  cases (absent blocks, slice offsets, shuffled placement, misaligned pool
+  bases, aliasing, declining shapes) against the generic kernels and compares
+  the whole pool, result codes and scratch need; also vcopy at all
+  alignments/overlaps. `test_prepared_full_model` takes `QD_NEAR=1` to supply
+  the near region. `run_prepared_reference_sim.sh` accepts `SDK_MOUNT` and
+  `CFLAGS_EXTRA`.
+
+HVX u16 elementwise handlers: REQUANT_U16/71, ADD1111/59, MUL_U16/74, ADD_U16/14,
+ADDSUB_U16/60, MUL1111/73 (2026-11-01, **simulator and host only, not on hardware**):
+
+- Files: `blocked_glue/elementwise_u16.{h,c}` (derivation, validator-side
+  parameter checks, HVX kernel), handlers in `prepared_elementwise.c`
+  (`w16_*`, registered with the others, same region and the same 30,748-byte
+  demand, so the 32 KiB region-1 fit is unchanged), `elementwise_host_glue_stubs.c`,
+  `build_resident_dsp.sh` (glue source list), `test_ew16_lanes_host.c`,
+  `blocked_glue/elementwise_u16_sim.c`, `run_prepared_reference_sim.sh`
+  (compiles the handlers), `test_prepared_reference_sim.c` (new `ew` option
+  registers and chains them; new host mode `tail <first> <dir>` writes one
+  segment covering the late schedule).
+- Elements taking the reference path per model (output dims product, after
+  the existing 13/70/68 and specialised handlers; both models have identical
+  op/variant tables apart from 71): S2D 7/31 10.0M, RESIZE 24/51 5.9M,
+  TRANSPOSE 18/56 2.9M, IM2COL 5/24 1.47M, REQUANT_U16 9/71 1.15M (alt 1.31M),
+  TRANSPOSE 18/55 0.98M, ADD1111 13/59 0.98M, MUL_U16 14/74 0.82M, 19/15 0.70M,
+  35/23 0.66M, 16/44 0.66M, 16/41 0.57M, 18/57 0.51M, SIGN 30/39 0.49M,
+  LINEARCLIP 39/67 0.49M, ADDSUB_U16 12/60 0.49M, ADD_U16 11/14 0.33M,
+  5/25 0.33M, 16/50 0.33M, MUL_INLINE 41/72 0.16M, MUL1111 15/73 0.16M; the
+  rest are smaller. Whole non-conv total about 61.6M per model, 20M of it
+  already HVX (10/13 7.8M, 8/70 9.6M, 39/68 2.6M). The doc's earlier "138M" is
+  both models together. Data movement (S2D, resize, transpose, im2col) is the
+  larger remaining share but is not elementwise and was not touched. Not
+  done: 41/72 (parameters in a pool tensor, scalar stored as a crouton),
+  39/67 and 39/69 (linearclip u16->u16, FB), SIGN 30/39.
+- Schedule geometry: every one of these commands is a full CH tile
+  1x8x{64,80}x{32,64}, origin 0, d == m, nothing absent in the output.
+  Observed parameters: REQUANT_U16 (m,s,zin,zout) = (16384,14,0,0),
+  (16384,14,32768,32768), (16548,14,0,0), (32765,15,0,0); ADD1111
+  (k0,k1,r6,r7) = (16384,16384,13,0xE0000000), (16384,8192,13,0xF0000000);
+  MUL (P1,P2) = (262127,262119), (262148,262140), (262156,262148),
+  (262281,262273), (284378,284369), K=0x80010000, zb=za=0; ADD (k0,k1,r6) =
+  (13699,26008,14), (16995,14224,13); ADDSUB (k0,k1,r6,zp) =
+  (14379,18491,14,36775), (17144,3455,13,10701), (30497,30497,14,61378).
+- All six ops are lane independent, so the CH interleave is irrelevant: a
+  128-byte half block is 64 u16 lanes, stored under a pixel/channel mask
+  (same masks as the u8->u16 LinearClip glue). The validator requires equal
+  dims, origin[2]%4 and origin[3]%32 equal across tensors, the unpadded depth
+  form of Memory.write, disjoint output/input blocks, and rejects everything
+  else (so it falls back to the reference kernel).
+- Exactness (32-bit lane forms of the int64 formulas; `make_*` return 0
+  unless no intermediate can overflow for any u16 input):
+  requant: p=(v-zin)*m+2^(s-1) checked in int32 at both extremes of v (m>=0 so
+  monotone), q=(p>>s)+zout checked in int32, saturating pack.
+  ADD1111: (x*k0+c)>>k2 with c=s*k1+k3 (runtime scalar), all four (x,s) corners
+  and c checked in int32. ADD: unsigned sum < 2^32 checked, logical shift
+  (k2+1<=31), so result < 2^31. ADDSUB: sum range [k3-65535*k1, k3+65535*k0]
+  fits int32 (arithmetic shift) or lies in [0,2^32) (logical shift, kind
+  ADDSUBU; (30497,30497,14,61378) needs this). MUL: D=a*b+K mod 2^32; with
+  D=65536*Dh+Dl, e=Dh*lo+((Dl*lo)>>16); q=2*hi*Dh+(e>>15)+(((e&0x7fff)+hi*Dl)>>15)
+  (no clip needed for |hi|<=16384); s=sat32(q+P2); out=pack_sat(((s>>2)+1)>>1)
+  since (s+4)>>3=floor((floor(s/4)+1)/2). Observed lo reaches 65519, so the
+  naive R=2*hi*Dl+2*Dh*lo overflows; the e>>15 split avoids it. zb/za must be 0.
+  `test_ew16_lanes_host` (portable C, lane forms copied op for op): every
+  observed parameter set over the complete input space (requant all 65536 v;
+  ADD1111/ADD/ADDSUB all 2^32 (a,b) pairs; MUL all 2^32 (a,b) and, separately,
+  all 2^32 values of D, including four P2 values at the int32 limits so the
+  saturating add engages), plus 92k random requant, 78k ADD, 45k ADDSUB (2.8k
+  unsigned) and 228 MUL parameter sets accepted by `make_*` (all inputs or
+  dense samples). 0 mismatches (138 s CPU, 15 s on 14 cores).
+- Simulator: `elementwise_u16_sim` checks the HVX against an independent
+  int64 oracle that also does the CH addressing element by element, with random
+  geometry (per-tensor meta/origin/slice, partial dims and pixel pairs,
+  batch 2, absent blocks in inputs and outputs, untouched bytes preserved),
+  schedule and random accepted parameters, special-value inputs: 268 trials
+  pass. Mutants (wrong shift, logical vs arithmetic, odd-pixel mask) fail it;
+  a non-saturating `q+P2` mutant only fails with the P2-near-limit entries.
+  Real data: `test_prepared_reference_sim segment` on the late schedule
+  (`tail 4500`, commands 4500..end, primary and alternate) with `fast cycles
+  ew`: all seven pools and both outputs identical to the host end state, with
+  all six ops on the HVX path.
+- Cost (V75 simulator pcycles per output element, primary tail segment;
+  reference -> HVX): MUL 112.3 -> 9.8, ADD1111 69.3 -> 6.4, REQUANT_U16 59.0
+  -> 6.1, ADDSUB 78.7 -> 7.5, ADD_U16 82.2 -> 8.7, MUL1111 96.3 -> 8.0.
+  Tail segment handler total 815.2M -> 535.3M pcycles (primary), alternate
+  481.6M with HVX; the six ops go from 307M to 28M. Per schedule that is about
+  280M pcycles saved of ~6.5e9. Host: `test_prepared_elementwise_host`
+  (sanitized) accepts every one of these commands in both schedules,
+  `test_prepared_full_model` mixed/mixedfast both models pass, the Frame engine
+  with QDS_PREPARED_REFERENCE=1 QDS_PREPARED_ELEMENTWISE=1 builds (scratch copy).
+
+Direct input staging, row ring, wider direct output, compact MAC tiles
+(2026-11-01, **host + V75 simulator only (prefix mode `fast`, unit tests); not
+run on hardware**):
+
+- Input staging (`stage_row8`): u8 blocked input is staged straight from the
+  blocked layout into near, one 8-pixel run (256 contiguous bytes per
+  32-channel group) at a time, zero for absent blocks. ci=32: two vector
+  copies per run; ci=64: `vshuff` of 32-byte units; ci%128==0: a 4x4
+  transpose of 32-byte units (two `vshuff` stages), stored per pixel; other ci
+  (12, 20, ...): 32-byte (or partial) `store_part` pieces. For ci%128 != 0 the
+  row keeps `lead` = (input column)%8 pixels in front so runs stay 128-byte
+  aligned; for ci%128==0 only the asked pixels are written. The workspace copy
+  of the input is gone for these commands (a token 128-byte workspace
+  allocation remains so the measured workspace stays nonzero).
+- That is only safe if output blocks cannot overwrite input a later row still
+  needs, so `blocked_overlap` compares the block sets (bitmap over 2048-byte
+  blocks of pool 1; anything else, or unaligned, counts as overlap). On overlap
+  and for u16 the old path runs: whole-input `xfer_copy` into the workspace,
+  then rows are copied/split (`near_copy`, `near_split16`) into near.
+  `near_copy`/`near_split16` now write exactly n bytes (they used to write up
+  to 127 past the end). On the host every u8 conv in both models is direct;
+  the u16 ones use the workspace copy.
+- Row ring: each chunk is processed column-chunk outer, output row inner. A
+  new input row is staged per output row (kh-1 in front), into slot r%kh, so
+  each input row is staged once per chunk, not kh times. The tap list has one
+  segment per kernel row and `tile_block` takes one base pointer per segment,
+  so there are no per-phase offset tables. Near layout: `wp` pair tables
+  replace `tiles`; `xoff` is nt entries, `segend` kh. The tightest conv (3x3
+  ci=128 co=128 ow=32..64) now uses exactly 32,768 of the 32,768 near bytes
+  (cols 32), 3x3 ci=256 30,080; all 1036 convs still fit near in both models.
+- Compact taps: `count_taps`/`build_taps` drop the stride-2 NO_TILE taps, so
+  `tile_block` has no per-tile check. Each tap carries both blocks' weight
+  addresses (`wp[2*i+b]`, absolute on 32-bit targets, offsets on the 64-bit
+  host); `WREF`/`WPTR`. Measured: an offset+add per operand costs as much as
+  the NO_TILE check did, absolute addresses in a pair table do not.
+  `tap_wsum` is HVX (vrmpy with ones) instead of 128 scalar adds per tap.
+- Direct blocked output now covers u16 (pixel pairs via `vsat` interleave,
+  one 128-byte store per pair) and any first-column alignment: `RqOut.a` is the
+  first pixel's slot, `blk[b][i]` the i-th block touched, partial stores are
+  masked `store_part`s; NULL (absent) blocks are skipped. Aligned full blocks
+  keep the old inline path (`aligned` is a compile-time constant); misaligned
+  ones go through the noinline `rq_emit_part`. u16 with an odd first slot or an
+  odd chunk width still uses the near chunk + `xfer_copy`. The accumulators
+  are written to `acc` before calling `rq_emit_part`: passing the local array
+  made V75 -O2 spill the tile again (frame 16 -> 2304 bytes).
+- Shared helpers changed: `near_copy`, `near_split16` (exact tails), `NearPlan`
+  and `tile_block`'s signature (conv path only). `blocked_impl`, `xfer_copy`,
+  `store_part`, `load_part` are unchanged.
+- Rejected by measurement (bench, 3x3 ci=64, cycles per 8x64 block): scalar
+  operand `vrmpy` (no vsplat; weights xor 0x80, needs the 128*sum(a)
+  correction) 4432 vs 5710 without correction but 5758 with it; sliding splat
+  window for kw=3 5149 (compiler does not pipeline it); one-tile lookahead and
+  unrolling made it worse. The simulator charges about 3 cycles per packet of
+  two vrmpy and about 1 per vsplat, so splats are what is left.
+- Tests: `.work/rqtest/test_rq.c` (tile_block with segments and pair tables vs
+  scalar sums + `requant_value`; blocked output u8/u16, every first slot,
+  absent blocks, canary pool: every unwritten byte must be intact;
+  `stage_row8` for ci 12/20/32/64/96/128/256 with random absent blocks and all
+  alignments; `near_copy`/`near_split16` exact length). A mutant without the
+  NULL guard makes the simulator report NULL dereferences (run.sh turns that
+  into FAIL; it also times out). `bench_rq.c`, pcycles per 8-pixel x 64-channel
+  block, before -> after (mac / fused): u8 1x1 550 -> 484 / 775 -> 706; u8 3x3
+  ci=64 7486 -> 5836 / 7711 -> 6058; u16 1x1 1087 -> 955 / 1630 -> 1495; u16 3x3
+  7615 -> 6043 / 8158 -> 6583.
+- Prefix simulator (`run_prepared_reference_sim.sh both prefix 6 fast cycles`,
+  set `DOCKER_EXTRA` for an extra docker mount; SDK mount in a worktree): primary 0..131: conv handler
+  9.55M -> 7.37M pcycles, staging 4.88M -> 2.37M, mac 3.78M -> 3.81M (flat: the
+  prefix convs are small-tap, overhead-bound), output 21K; alternate 0..99: conv
+  5.17M -> 3.83M, staging 2.54M -> 1.23M, mac 1.96M -> 1.98M. All seven pools
+  match in both models. The remaining ~1.2M per prefix is setup outside the
+  phase counters (taps, requant parameters, dry-pass checks).
+- Hardware should check: staging and MAC phases against the simulator ratios;
+  that no command takes the workspace path where it did not before
+  (`conv_path`); VTCM stores of the direct staging (aligned 128-byte vector
+  stores into L2-TCM, loads from VTCM at 128-byte alignment).
+
 Not established: anything on hardware. The Frame wiring (`QDS_PREPARED_REFERENCE=1`
 in `qd_graph_prepared.h`) is compiled offline only. The pure scalar reference conv
 has not completed a full-schedule simulator run.
@@ -489,3 +744,79 @@ real handlers' shape, alias, or live I/O predicates at cached run time.
 preflight skips handler validation. The header's approximate timing comment
 is not measured evidence. Use the ordinary executor preflight/run path for
 prepared execution.
+
+## Per-op hardware profile and executor overhead (2026-11-01)
+
+Why `variant_profile` / `top_variants_ms` were empty on Frame: the profile
+clock and arrays lived in `Nprg2ExecStats`, and `nprg2_executor_preflight`
+does `memset(stats,0)`. `prepared_run` set them before preflight, so run saw a
+NULL clock and timed nothing. (Variant-only keying also hid opcodes.) Python
+did read the right arena slot.
+
+Changes:
+
+- `Nprg2ExecProfile` (new, `Nprg2ExecRequest.profile`, set on the runner with
+  `nprg2_runner_set_profile`): clock plus caller-owned arrays, never cleared by
+  preflight. Per registry slot (so per opcode+variant): run cycles, run count,
+  validator cycles; totals for preflight, validators, dispatch (run loop outside
+  handler run: decode, lookup, cancel, scratch) and handler run. Zero cost when
+  no clock. On Frame (`qd_graph_prepared.h`, build flag `QDS_PREPARED_PROFILE`,
+  default 1, env var passed by `build_resident_dsp.sh`): about two pcycle reads
+  per command in preflight and in run, ~1.2M simulator pcycles per schedule
+  (~0.7 ms of ~3.5 s). `QDS_PREPARED_PROFILE=0` removes it.
+- Export: `prepared_export_profile` writes 64 header bytes plus 128 x 32-byte
+  slot records to arena offset `QDS_PROFILE2`=20480 (layout in the function's
+  comment). `resident_dsp.py` exposes `dsp.handler_profile` (opcode, variant,
+  count, run_ms, validate_ms, no_effect; sorted) and `dsp.executor_profile`
+  (preflight_ms, validate_ms, dispatch_ms, run_ms, preflight_calls,
+  preflights_reused, executed/validated commands). `verify_prepared_full_model.py`
+  stores both in each run row and prints `top_handlers_ms`
+  (`"op/var": [count, run_ms, validate_ms]`) and `executor_profile_ms`.
+  The old by-variant `variant_profile` now fills too.
+- Overhead reduction: (1) `Nprg2ExecRequest.reuse_preflight` (runner:
+  `nprg2_runner_set_profile(...,reuse=1)`): execute skips its repeated
+  preflight when the same stats object holds the signature (hash of program,
+  bound, pools, ceiling, I/O and scratch buffers, interval, registry) of a
+  successful preflight of the identical request; any difference runs the full
+  preflight. (2) Run calls set `Nprg2ExecCall.preflighted`; the reference
+  handler skips its repeated dry validation pass in run. (3) `no_effect`
+  handlers (the NOP variants 2/6/7/10, `nprg2_executor_mark_no_effect`) are
+  counted but not called in run. (4) Command decoded in place (no memset or
+  struct copy per command). Block-table lookups are already O(1)
+  (`nprg2_bound_tensor_at` is pointer arithmetic), so no cache was added.
+  Preflight still validates every command before the first write.
+
+Measurements (V75 simulator pcycles, `bench_prepared_overhead_sim.sh`, both
+models equal within 1%; primary shown, 5068 commands, 1299 NOPs):
+
+| | before | after |
+|---|---|---|
+| stub preflight | 1,154,697 | 1,161,552 |
+| stub run = preflight + dispatch | 2,397,519 | 2,373,999 (dispatch 1.21M) |
+| stub run with preflight reused | n/a | 1,222,380 |
+| tensor-decoding stubs, preflight | 4,040,748 | 4,047,603 |
+| tensor-decoding stubs, run reused | 5,283,570 (full) | 1,222,380 |
+| real scalar reference validators, whole preflight | 25.90M | 25.90M (unchanged) |
+
+Findings: the executor's own loop is ~230 pcycles/command preflight and ~240
+dispatch (about 1.2 ms per pass at 1.84 GHz), so executor overhead is not the
+non-conv bottleneck. The real cost is the handlers' validators, ~5,100
+pcycles/command (~26M pcycles, ~14 ms) per pass. Before, a Frame inference did
+this three times (prepared_run preflight, run's own preflight, reference_run's
+dry pass), ~78M pcycles (~42 ms, ~1.2%); now once, plus ~0.1M. Expected gain
+~50M pcycles (~28 ms, <1%) per inference, not seconds. The one-command-per-run
+cycles harness cannot show it (prefix totals 69.21M -> 69.49M primary,
+38.35M -> 38.66M alternate, within 1%, since each command is its own preflight).
+Plan-cache for the reference chain was not made real: the remaining overhead
+does not justify it; the dominant 2.5 s is handler compute.
+
+Evidence: host `test_prepared_executor` (new profile/reuse/no-effect test),
+`test_nprg2_plan_cache`, ASan `test_prepared_elementwise_host`,
+`test_prepared_full_model` primary/alternate fast and mixedfast (lockstep and
+whole, outputs equal emulator sha256) pass; V75 `run_prepared_reference_sim.sh
+both prefix 6 fast cycles` passes (all seven pools identical) for both models.
+The engine with the Frame flags + elementwise + profile builds from a scratch
+copy (`.work/engine-build`), and builds with `QDS_PREPARED_PROFILE=0`. Not run
+on hardware. Hardware must check: `executor_profile.preflights_reused==1`,
+`validated_commands==commands`, outputs still equal emulator sha256, and that
+arena bytes 20480..24640 are unused by anything else.

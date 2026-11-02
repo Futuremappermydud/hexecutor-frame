@@ -5,10 +5,14 @@
 # 6 segments per model, cut by host run time), then runs every segment in its
 # own simulator process in parallel; together they cover the whole schedule.
 # fast registers the fast exact convolution (HVX vrmpy in the simulator);
+# ew registers the HVX elementwise handlers (prepared_elementwise.c) for scratch
+# region 1 and chains the reference kernel behind them, as the Frame build does;
 # cycles prints simulator pcycles per (opcode, variant).
 # SEGDIR (default .work/full/segments) holds the segment files and logs; give a
 # concurrent run its own SEGDIR, since a segments run deletes the old logs.
 # SEGMENT_GLOB (default *) limits which segment files are simulated.
+# HEXAGON_SDK_HOST, when set, is a host directory mounted read-only at
+# /repo/.work/hexagon-sdk (for a worktree that has no SDK of its own).
 set -eu
 cd "$(dirname "$0")/../.."
 WHICH=${1:-both}
@@ -43,16 +47,25 @@ if [ "$MODE" = segments ]; then
     fi
   done
 fi
-docker run --rm --platform linux/amd64 \
-  -e WHICH="$WHICH" -e MODE="$MODE" -e SEGDIR="$SEGDIR" -e SEGMENT_GLOB="$SEGMENT_GLOB" -e EXTRA="$EXTRA" \
+# CFLAGS_EXTRA (optional): extra compiler flags, e.g. -DDM_ENABLED=0 -DQD_NO_VCOPY for the pre-fast-path baseline.
+# SDK_MOUNT or HEXAGON_SDK_HOST (optional): host path of .work/hexagon-sdk, for a worktree without one.
+SDK_MOUNT=${SDK_MOUNT:-${HEXAGON_SDK_HOST:-}}
+SDKARG=""
+if [ -n "$SDK_MOUNT" ]; then SDKARG="-v $SDK_MOUNT:/repo/.work/hexagon-sdk:ro"; fi
+docker run --rm --platform linux/amd64 $SDKARG ${DOCKER_EXTRA:-} \
+  -e CFX="${CFLAGS_EXTRA:-}" -e WHICH="$WHICH" -e MODE="$MODE" -e SEGDIR="$SEGDIR" -e SEGMENT_GLOB="$SEGMENT_GLOB" -e EXTRA="$EXTRA" \
   -v "$PWD:/repo" -w /repo depth-model-hmx-tools:latest sh -lc '
     SDK=/repo/.work/hexagon-sdk/6.6.0.0/tools/HEXAGON_Tools/19.0.07/Tools
     ELF=/tmp/nprg2-reference.elf
     "$SDK/bin/hexagon-clang" -mv75 -mhvx -mhvx-length=128b -O2 -G0 -ffp-contract=off -fno-fast-math -fno-strict-aliasing \
-      -Wall -Wextra -Werror -I"$SDK/target/hexagon/include" -Iframe/native_program \
+      -Wall -Wextra -Werror $CFX -I"$SDK/target/hexagon/include" -Iframe/native_program \
       frame/native_program/test_prepared_reference_sim.c \
       frame/native_program/prepared_reference.c \
       frame/native_program/prepared_executor.c \
+      frame/native_program/prepared_elementwise.c \
+      frame/blocked_glue/add_u8.c \
+      frame/blocked_glue/linearclip_u8_u16.c \
+      frame/blocked_glue/elementwise_u16.c \
       frame/native_program/nprg2_runtime.c -lhexagon -lm -o "$ELF"
     if [ "$MODE" != segments ]; then
       exec "$SDK/bin/hexagon-sim" -mv75 --quiet "$ELF" -- "$WHICH" "$MODE" $EXTRA

@@ -21,6 +21,9 @@ typedef struct {
     /* Executor scratch regions 1.. passed with every request (zero = absent).
      * Set with nprg2_runner_set_scratch_region after open. */
     Nprg2ExecBuffer extra_scratch[NPRG2_EXEC_SCRATCH_REGIONS-1u];
+    /* Optional profile and preflight reuse for every request (set after open). */
+    Nprg2ExecProfile *profile;
+    uint8_t reuse_preflight;
     uint8_t ready;
 } Nprg2PreparedRunner;
 
@@ -36,6 +39,13 @@ int nprg2_runner_open(Nprg2PreparedRunner *runner,
                       void *l2_hot,uint32_t l2_hot_capacity,
                       uint32_t l2_hot_available_bytes,
                       uint8_t pool1_is_verified_vtcm);
+
+/* Profile for every later preflight/execute (NULL = none). With reuse set,
+ * execute skips its repeated preflight when it can prove from the stats of the
+ * preceding nprg2_runner_preflight (same stats object, same request) that the
+ * interval was just validated; otherwise it preflights as usual. The caller
+ * must not change graph metadata between the two calls (pool bytes may change). */
+int nprg2_runner_set_profile(Nprg2PreparedRunner *runner,Nprg2ExecProfile *profile,int reuse_preflight);
 
 /* Executes exactly [command_first, command_first+command_count). The executor
  * preflights the complete requested interval before the first graph-pool

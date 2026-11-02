@@ -34,6 +34,53 @@ static void mock_model(const char *qpath,const char *npath){
     Nprg2ExecStats stats;r.stats=&stats;CHECK(nprg2_executor_run(&e,&r)==NPRG2_EXEC_OK);CHECK(stats.validated_commands==p.command_count&&stats.executed_commands==p.command_count&&state.writes==p.command_count);
     free(hot);nprg2_close(&p);pools_free(pools);free(q);free(raw);printf("PASS mock schedule %s\n",qpath);
 }
+static uint64_t fake_clock_now;
+static uint64_t fake_clock(void){return fake_clock_now+=10;}
+typedef struct {uint32_t validates,runs,preflighted_runs;} CountState;
+static int count_validate(const Nprg2ExecCall *c,void *ctx){(void)c;((CountState *)ctx)->validates++;return 1;}
+static int count_run(const Nprg2ExecCall *c,void *ctx){CountState *s=ctx;s->runs++;s->preflighted_runs+=c->preflighted;return 1;}
+/* Profile plumbing, preflight reuse and effect-free handlers on a real schedule. */
+static void profile_model(const char *qpath,const char *npath){
+    uint32_t qn,nn;uint8_t *q=read_file(qpath,&qn),*raw=read_file(npath,&nn),qsha[32],nsha[32];Nprg2ExpectedHashes h;hashes(q,qn,raw,nn,&h,qsha,nsha);
+    Nprg2Pool pools[7];pools_new(raw,pools);Nprg2Program p;CHECK(nprg2_open(&p,raw,nn,&h,pools,(Nprg2Allocator){0})==NPRG2_OK);
+    uint8_t *hot=calloc(1,300000);CHECK(hot);Nprg2BindConfig bc={.hot_memory=hot,.hot_capacity=300000,.l2_available_bytes=786432,.pool1_is_verified_vtcm=1,.resolve=bind_cover};Nprg2Bound bound;CHECK(nprg2_bind_mock(&p,pools,&bc,&bound)==NPRG2_OK);
+    Nprg2ExecRequest r={.program=&p,.bound=&bound,.pool1_writable_bytes=0x780000u,.command_count=p.command_count};memcpy(r.pools,pools,sizeof pools);
+    CountState cs={0};Nprg2Executor e;nprg2_executor_init(&e);uint32_t nops=0;
+    for(uint32_t i=0;i<p.command_count;i++){Nprg2Command c;CHECK(nprg2_command_at(&bound,i,&c)==NPRG2_OK);if(c.opcode==QDR_NOP)nops++;
+        int seen=0;for(uint32_t j=0;j<NPRG2_EXEC_REGISTRY_CAPACITY;j++)if(e.handlers[j].used&&e.handlers[j].opcode==c.opcode&&e.handlers[j].variant==c.variant)seen=1;
+        if(!seen)CHECK(nprg2_executor_register(&e,c.opcode,c.variant,count_validate,count_run,&cs)==NPRG2_EXEC_OK);}
+    CHECK(nprg2_executor_mark_no_effect(&e,255,1)==NPRG2_EXEC_UNSUPPORTED);
+    uint64_t vc[80]={0},vn[80]={0},hrc[NPRG2_EXEC_REGISTRY_CAPACITY]={0},hrn[NPRG2_EXEC_REGISTRY_CAPACITY]={0},hvc[NPRG2_EXEC_REGISTRY_CAPACITY]={0};
+    Nprg2ExecProfile prof={.clock=fake_clock,.variant_cycles=vc,.variant_count=vn,.handler_run_cycles=hrc,.handler_run_count=hrn,.handler_validate_cycles=hvc};
+    Nprg2ExecStats stats;memset(&stats,0xa5,sizeof stats);r.stats=&stats;r.profile=&prof;
+    /* Garbage in the stats must not matter: preflight clears them, the profile lives in the request. */
+    CHECK(nprg2_executor_preflight(&e,&r)==NPRG2_EXEC_OK);
+    CHECK(cs.validates==p.command_count&&stats.validated_commands==p.command_count&&prof.preflight_calls==1);
+    CHECK(prof.validate_cycles==10u*p.command_count&&prof.preflight_cycles>=prof.validate_cycles);
+    uint64_t hv=0;for(unsigned i=0;i<NPRG2_EXEC_REGISTRY_CAPACITY;i++)hv+=hvc[i];CHECK(hv==prof.validate_cycles);
+    /* reuse: identical request skips the second preflight, and calls are marked preflighted */
+    r.reuse_preflight=1;uint32_t before=cs.validates;
+    CHECK(nprg2_executor_run(&e,&r)==NPRG2_EXEC_OK);
+    CHECK(cs.validates==before&&prof.preflights_reused==1&&cs.runs==p.command_count&&cs.preflighted_runs==p.command_count);
+    CHECK(stats.validated_commands==p.command_count&&stats.executed_commands==p.command_count);
+    uint64_t rc=0,rn=0,vcs=0,vns=0;for(unsigned i=0;i<NPRG2_EXEC_REGISTRY_CAPACITY;i++){rc+=hrc[i];rn+=hrn[i];}for(unsigned i=0;i<80;i++){vcs+=vc[i];vns+=vn[i];}
+    CHECK(rn==p.command_count&&vns==p.command_count&&rc==prof.run_cycles&&vcs==prof.run_cycles&&rc==10u*p.command_count);
+    CHECK(prof.dispatch_cycles>0);
+    /* a changed request, or a different stats object, preflights again */
+    uint8_t scratch[64];before=cs.validates;r.scratch=scratch;r.scratch_bytes=sizeof scratch;
+    CHECK(nprg2_executor_run(&e,&r)==NPRG2_EXEC_OK);CHECK(cs.validates==before+p.command_count&&prof.preflights_reused==1);
+    r.scratch=NULL;r.scratch_bytes=0;Nprg2ExecStats other={0};r.stats=&other;before=cs.validates;
+    CHECK(nprg2_executor_run(&e,&r)==NPRG2_EXEC_OK);CHECK(cs.validates==before+p.command_count&&prof.preflights_reused==1);
+    r.stats=&stats;r.reuse_preflight=0;before=cs.validates;CHECK(nprg2_executor_preflight(&e,&r)==NPRG2_EXEC_OK);
+    CHECK(nprg2_executor_run(&e,&r)==NPRG2_EXEC_OK);CHECK(cs.validates==before+2u*p.command_count);
+    /* effect-free handlers are counted but their run is not called */
+    for(uint32_t j=0;j<NPRG2_EXEC_REGISTRY_CAPACITY;j++)if(e.handlers[j].used&&e.handlers[j].opcode==QDR_NOP)CHECK(nprg2_executor_mark_no_effect(&e,QDR_NOP,e.handlers[j].variant)==NPRG2_EXEC_OK);
+    memset(vc,0,sizeof vc);memset(vn,0,sizeof vn);memset(hrn,0,sizeof hrn);memset(hrc,0,sizeof hrc);memset(&cs,0,sizeof cs);
+    CHECK(nprg2_executor_run(&e,&r)==NPRG2_EXEC_OK);
+    CHECK(cs.runs==p.command_count-nops&&stats.executed_commands==p.command_count);
+    rn=0;for(unsigned i=0;i<NPRG2_EXEC_REGISTRY_CAPACITY;i++)rn+=hrn[i];CHECK(rn==p.command_count);
+    free(hot);nprg2_close(&p);pools_free(pools);free(q);free(raw);printf("PASS profile/reuse/no-effect %s (nops %u)\n",qpath,(unsigned)nops);
+}
 static void weights_model(const char *qpath,const char *npath){
     uint32_t qn,nn;uint8_t *q=read_file(qpath,&qn),*raw=read_file(npath,&nn),qsha[32],nsha[32];Nprg2ExpectedHashes h;hashes(q,qn,raw,nn,&h,qsha,nsha);
     Nprg2Pool pools[7];pools_new(raw,pools);Nprg2Program p;CHECK(nprg2_open(&p,raw,nn,&h,pools,(Nprg2Allocator){0})==NPRG2_OK);
@@ -55,4 +102,4 @@ static void weights_model(const char *qpath,const char *npath){
     CHECK(nprg2_executor_run(&e,&r)==NPRG2_EXEC_ARGUMENT);for(uint32_t i=0;i<last_bytes;i++)CHECK(pools[last_dest_pool].base[last_dest_offset+i]==0xa5);
     free(hot);nprg2_close(&p);pools_free(pools);free(q);free(raw);printf("PASS weights-to-VTCM variants 27-30 %s\n",qpath);
 }
-int main(int argc,char **argv){CHECK(argc==5);mock_model(argv[1],argv[2]);mock_model(argv[3],argv[4]);weights_model(argv[1],argv[2]);weights_model(argv[3],argv[4]);return 0;}
+int main(int argc,char **argv){CHECK(argc==5);mock_model(argv[1],argv[2]);mock_model(argv[3],argv[4]);weights_model(argv[1],argv[2]);weights_model(argv[3],argv[4]);profile_model(argv[1],argv[2]);profile_model(argv[3],argv[4]);return 0;}

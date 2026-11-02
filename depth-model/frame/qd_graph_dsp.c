@@ -565,6 +565,9 @@ __attribute__((section(".text.resident_entry"))) void resident_entry(uint32_t ti
 #endif
         }
         if(g){memcpy(SERVICE+QDS_PROFILE,g->stats.variant_ns,80*8);memcpy(SERVICE+QDS_PROFILE+80*8,g->stats.variant_count,80*8);}
+#if QDS_NATIVE_PREPARED && QDS_PREPARED_PROFILE
+        if(prepared)prepared_export_profile(prepared,SERVICE+QDS_PROFILE2);
+#endif
         send_work(2,seq);status(0,seq);
     }
 exit:

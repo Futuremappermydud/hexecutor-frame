@@ -3,6 +3,7 @@
  * dry pass, xfer only proves bounds, salloc only measures, and the arithmetic
  * blocks guarded by !g->dry are skipped. */
 #include "prepared_reference.h"
+#include "prepared_vcopy.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -419,6 +420,9 @@ static int small(const int64_t *r, uint32_t mask) {
     return 1;
 }
 
+/* Exact direct-copy fast paths for the data-movement kernels below. */
+#include "prepared_datamove.inc"
+
 /* ------------------------------------------------------------------ kernels */
 static int k_input_slice_pad(G *g) {
     CHECK(g->nin==7 && g->nout==1 && g->io<2 && g->io<g->call->input_count,E_ARGS);
@@ -467,7 +471,7 @@ static int k_weights_to_vtcm(G *g) {
     for(int i=0;i<4;i++)CHECK(s->m[i]>=0 && d->m[i]>=0,E_SHAPE);
     size_t ns=count4(s->m)*s->esize,nd=count4(d->m)*d->esize,n=ns<nd?ns:nd;
     CHECK(s->offset+(uint64_t)n<=g->pool_bytes[s->pool] && d->offset+(uint64_t)n<=g->write_limit[d->pool],E_RANGE);
-    if(!g->dry)memmove(g->pool[d->pool]+d->offset,g->pool[s->pool]+s->offset,n);
+    if(!g->dry)qd_vcopy(g->pool[d->pool]+d->offset,g->pool[s->pool]+s->offset,n);
     return 0;
 }
 static int k_im2col(G *g) {
@@ -506,6 +510,7 @@ static int k_space_to_depth(G *g) {
     int32_t ow=(i->m[2]-pw)/2;
     if(o->m[2]<ow)ow=o->m[2];
     CHECK(i->dtype==DT_U8 && i->m[0]>=1 && oh>0 && ow>0 && ph+2*(oh-1)+1<i->m[1] && pw+2*(ow-1)<i->m[2] && pw>=1,E_SHAPE);
+    {int fr=s2d_fast(g,i,o,ph,pw,oh,ow,ci,oc);if(fr>=0)return fr;}
     int32_t rd[4]={1,2*oh,2*ow,ci},ro[4]={0,ph,pw-1,0};
     A xf;TRY(t_read_region(g,i,&xf,rd,ro));
     ph=0;pw=1;
@@ -795,6 +800,19 @@ static int k_transpose(G *g) {
     int32_t *perm;size_t np;
     TRY(read_i32(g,&pt,&perm,&np));
     CHECK(np==4,E_ARGS);
+    {
+        int64_t pv[4];
+        if(const_value(g,&pt,0,&pv[0]) && const_value(g,&pt,1,&pv[1]) && const_value(g,&pt,2,&pv[2]) && const_value(g,&pt,3,&pv[3]) &&
+           pv[0]==0 && pv[1]==2 && pv[2]==1 && pv[3]==3) {
+            int fr=tr_hw_fast(g,in(g,0),out0(g));
+            if(fr>=0) return fr;
+        }
+        if(const_value(g,&pt,0,&pv[0]) && const_value(g,&pt,1,&pv[1]) && const_value(g,&pt,2,&pv[2]) && const_value(g,&pt,3,&pv[3])) {
+            int32_t pm[4]={(int32_t)pv[0],(int32_t)pv[1],(int32_t)pv[2],(int32_t)pv[3]};
+            int fr=tr_flat_fast(g,in(g,0),out0(g),pm);
+            if(fr>=0) return fr;
+        }
+    }
     A x;TRY(t_read(g,in(g,0),&x,0));
     int32_t known[4];
     if(g->dry) {
@@ -859,6 +877,7 @@ static int k_gather(G *g) {
     NEED(3);
     int64_t axis;TRY(read_scalar(g,in(g,1),&axis));
     int32_t *idx;size_t ni;TRY(read_i32(g,in(g,2),&idx,&ni));
+    {int fr=gather_fast(g,in(g,0),in(g,1),out0(g),idx,ni);if(fr>=0)return fr;}
     A x;TRY(t_read(g,in(g,0),&x,0));
     if(g->dry && !const_value(g,in(g,1),0,&axis)) {
         size_t worst=0;
@@ -893,6 +912,7 @@ static int k_slice(G *g) {
     const T *i=in(g,0);
     int32_t origin[4];
     for(int k=0;k<4;k++){CHECK(s->sv[k]>=0 && n->sv[k]>=0 && (int64_t)s->sv[k]+n->sv[k]<=i->d[k],E_RANGE);origin[k]=i->p[k]+s->sv[k];}
+    {int fr=slice_fast(g,i,out0(g),n->sv,origin);if(fr>=0)return fr;}
     A r;TRY(t_read_region(g,i,&r,n->sv,origin));
     return t_write(g,out0(g),&r);
 }
@@ -902,6 +922,7 @@ static int k_slice_pad(G *g) {
     const T *pad=in(g,1),*st=in(g,2),*sz=in(g,3);
     CHECK(pad->flags&st->flags&sz->flags&F_SV,E_ARGS);
     int64_t fill;TRY(read_scalar(g,in(g,4),&fill));
+    {int fr=slice_pad_fast(g,in(g,0),out0(g),pad,st,sz,fill);if(fr>=0)return fr;}
     A x;TRY(t_read(g,in(g,0),&x,0));
     CHECK(x.dt!=DT_F32,E_ARGS);
     A r;TRY(anew(g,&r,sz->sv,x.dt));
@@ -951,6 +972,7 @@ static int k_resize(G *g) {
     TRY(read_i32(g,in(g,1),&hp,&nh));
     TRY(read_i32(g,in(g,2),&wp,&nw));
     CHECK(nh>=6 && nw>=6,E_ARGS);
+    {int fr=resize_fast(g,in(g,0),in(g,2),out0(g),hp);if(fr>=0)return fr;}
     A x;TRY(t_read(g,in(g,0),&x,0));
     const T *o=out0(g);
     CHECK((o->flags&F_SHAPE) && o->d[1]>=0 && o->d[2]>=0,E_SHAPE);
@@ -1404,13 +1426,19 @@ static uint32_t weight_tile(const T *t, int s2, int reverse, int packed, int32_t
     return (uint32_t)off;
 }
 /* Vector requantization. Per 32-channel block, RQ_VECS lane vectors hold
- * u8: {bias-zp*wsum, pre, M, post}; u16: {(256*bias-zp*wsum)>>8, &255, M, post}.
- * Per lane x=floor(a/2^pre) is clamped to [0,c], c=2^(post-1) for u8 and
- * min(2^(post+6),2^22) for u16 (q is monotone and already saturated at c),
- * then q=(x*M+2^(post-1))>>post is formed from 16-bit halves of x so every
- * intermediate fits int32. Equal to requant_value for M 1024..2047 with post
- * 1..22 (u8) or 1..16 (u16), the ranges rq_prepare admits. */
-enum { RQ_VECS=4 };
+ * (lane l = channel 32*j+l, all precomputed by rq_prepare):
+ *   u8:  {bias-zp*wsum, pre, M, post, r, c, 0, 0}
+ *   u16: {(256*bias-zp*wsum)>>8, &255, M, post, r, c, sl, 0}
+ * with r=2^(post-1). Per lane x=floor(a/2^pre) is clamped to [0,c]; q is
+ * monotone and already saturated at c, so the packs clip it exactly.
+ * u8: c=2^max(post-2,0) (c*M>=2^(post+8), so q(c)>=256); x*M+r<=
+ * 2^(post-2)*2047+2^(post-1)<2^32 for post<=22, so one vmpyieacc (mod 2^32)
+ * and a logical shift by post give q exactly.
+ * u16: c=min(2^(post+6),2^22) and q=(x*M+r)>>post is formed from 16-bit
+ * halves of x, sl=16-post, so every intermediate fits int32.
+ * Equal to requant_value for M 1024..2047 with post 1..22 (u8) or 1..16
+ * (u16), the ranges rq_prepare admits. */
+enum { RQ_VECS=8 };
 #if defined(__HVX__) && __HVX_LENGTH__==128 && !defined(NPRG2_SCALAR_REQUANT)
 #define RQ_HVX 1
 #else
@@ -1429,55 +1457,82 @@ static int rq_prepare(int32_t *par, int32_t co, int sixteen, int64_t bound, int3
             if(pre[c]!=8 || post[c]<1 || post[c]>16) return 0;
             if(bound+255>INT32_MAX || (offh<0?-offh:offh)+bound+bound/256+1>INT32_MAX) return 0;
             v[0]=(int32_t)offh;v[32]=(int32_t)(off&255);
+            v[160]=post[c]+6<22?1<<(post[c]+6):1<<22;v[192]=16-post[c];
         } else {
             if(pre[c]<0 || pre[c]>31 || post[c]<1 || post[c]>22) return 0;
             if((off<0?-off:off)+bound>INT32_MAX) return 0;
             v[0]=(int32_t)off;v[32]=pre[c];
+            v[160]=post[c]>=2?1<<(post[c]-2):1;v[192]=0;
         }
-        v[64]=M[c];v[96]=post[c];
+        v[64]=M[c];v[96]=post[c];v[128]=1<<(post[c]-1);v[224]=0;
     }
     return 1;
 }
 #if defined(__HVX__) && __HVX_LENGTH__==128
 /* Where tile_block requantizes: block j's parameters, the output byte for
- * pixel 0 channel 32*j, and the byte stride between pixels. */
-/* With blocked set (u8 only), block b's pixels go to blk[b] instead, 32
- * bytes each and contiguous: the final blocked layout. A NULL blk[b] is an
- * absent block, which stores skip. */
-typedef struct { const HVX_Vector *par; uint8_t *out; uint32_t pstride; int sixteen, blocked; uint8_t *blk[2]; } RqOut;
-static inline HVX_Vector rq_lane(HVX_Vector a, HVX_Vector lo, const HVX_Vector *k, HVX_Vector c, HVX_Vector r,
-                                 HVX_Vector sl, HVX_Vector sr, int sixteen) {
-    HVX_Vector x,m16=Q6_V_vsplat_R(0xffff);
-    if(sixteen) x=Q6_Vw_vadd_VwVw(Q6_Vw_vadd_VwVw(a,k[0]),Q6_Vw_vasr_VwR(Q6_Vw_vadd_VwVw(lo,k[1]),8));
-    else x=Q6_Vw_vasr_VwVw(Q6_Vw_vadd_VwVw(a,k[0]),k[1]);
-    x=Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(x,Q6_V_vzero()),c);
-    HVX_Vector l=Q6_Vw_vmpyieacc_VwVwVuh(r,Q6_V_vand_VV(x,m16),k[2]);
-    HVX_Vector h=Q6_Vw_vmpyieacc_VwVwVuh(Q6_Vuw_vlsr_VuwR(l,16),Q6_Vw_vasr_VwR(x,16),k[2]);
-    return Q6_Vw_vadd_VwVw(Q6_Vw_vasr_VwVw(Q6_Vw_vasl_VwVw(h,sl),sr),Q6_Vw_vlsr_VwVw(Q6_V_vand_VV(l,m16),k[3]));
-}
-/* Requantizes acc[b*PIXEL_BLOCK+p] (u16: the high-byte accumulators, with the
- * low-byte ones in lo), b<nb, p<np, and stores them; saturating packs clip. */
-static inline void rq_emit(const RqOut *o, const HVX_Vector *acc, const HVX_Vector *lo, int32_t nb, int32_t np) {
-    HVX_Vector q[2*PIXEL_BLOCK],z=Q6_V_vzero(),one=Q6_V_vsplat_R(1),s16=Q6_V_vsplat_R(16);
-    int sixteen=o->sixteen;
-    for(int32_t b=0;b<nb;b++) {
-        const HVX_Vector *k=o->par+(size_t)b*RQ_VECS;
-        HVX_Vector post=k[3],r=Q6_Vw_vasl_VwVw(one,Q6_Vw_vsub_VwVw(post,one));
-        HVX_Vector sl=Q6_Vw_vmax_VwVw(Q6_Vw_vsub_VwVw(s16,post),z),sr=Q6_Vw_vmax_VwVw(Q6_Vw_vsub_VwVw(post,s16),z);
-        HVX_Vector c=sixteen?Q6_Vw_vmin_VwVw(Q6_Vw_vasl_VwVw(one,Q6_Vw_vadd_VwVw(post,Q6_V_vsplat_R(6))),
-                                             Q6_V_vsplat_R(1<<22)):r;
-        for(int32_t p=0;p<np;p++)
-            q[b*PIXEL_BLOCK+p]=rq_lane(acc[b*PIXEL_BLOCK+p],lo?lo[b*PIXEL_BLOCK+p]:z,k,c,r,sl,sr,sixteen);
+ * pixel 0 channel 32*j, and the byte stride between pixels.
+ * With blocked set, block b's pixels go to the final blocked layout instead:
+ * blk[b][i] is the start (row H%8 included) of the i-th block that the 8
+ * pixels touch, a is the first pixel's slot in its block (W%8 for u8, W%4 for
+ * u16, even for u16) and a NULL entry is an absent block, which stores skip. */
+typedef struct { const HVX_Vector *par; uint8_t *out; uint32_t pstride; int sixteen, blocked, a; uint8_t *blk[2][3]; } RqOut;
+#define RQ_INLINE static inline __attribute__((always_inline))
+/* Constant trip counts (np only guards), so every copy unrolls fully and the
+ * accumulator arrays below stay in registers. */
+#define RQ_UNROLL _Pragma("clang loop unroll(full)")
+RQ_INLINE HVX_Vector rq_lane(HVX_Vector a, const HVX_Vector *lo, const HVX_Vector *k, int sixteen) {
+    if(!sixteen) {
+        HVX_Vector x=Q6_Vw_vasr_VwVw(Q6_Vw_vadd_VwVw(a,k[0]),k[1]);
+        x=Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(x,Q6_V_vzero()),k[5]);
+        return Q6_Vw_vlsr_VwVw(Q6_Vw_vmpyieacc_VwVwVuh(k[4],x,k[2]),k[3]);
     }
+    HVX_Vector m16=Q6_V_vsplat_R(0xffff);
+    HVX_Vector x=Q6_Vw_vadd_VwVw(Q6_Vw_vadd_VwVw(a,k[0]),Q6_Vw_vasr_VwR(Q6_Vw_vadd_VwVw(*lo,k[1]),8));
+    x=Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(x,Q6_V_vzero()),k[5]);
+    HVX_Vector l=Q6_Vw_vmpyieacc_VwVwVuh(k[4],Q6_V_vand_VV(x,m16),k[2]);
+    HVX_Vector h=Q6_Vw_vmpyieacc_VwVwVuh(Q6_Vuw_vlsr_VuwR(l,16),Q6_Vw_vasr_VwR(x,16),k[2]);
+    return Q6_Vw_vadd_VwVw(Q6_Vw_vasl_VwVw(h,k[6]),Q6_Vw_vlsr_VwVw(Q6_V_vand_VV(l,m16),k[3]));
+}
+RQ_INLINE HVX_Vector rq_pack8(HVX_Vector q0, HVX_Vector q1, HVX_Vector q2, HVX_Vector q3) {
+    return Q6_Vub_vpack_VhVh_sat(Q6_Vh_vpack_VwVw_sat(q3,q2),Q6_Vh_vpack_VwVw_sat(q1,q0));
+}
+/* cnt (1..4) u8 pixels of 32 channels, v bytes 0..32*cnt, to slots a+p0.. of
+ * output block b. aligned: the caller guarantees a==0. */
+RQ_INLINE void rq_put8(const RqOut *o, int32_t b, HVX_Vector v, int32_t p0, int32_t cnt, int aligned) {
+    if(aligned) {
+        uint8_t *d=o->blk[b][0];
+        if(d) store_part(d+32*p0,v,0,(uint32_t)cnt*32);
+        return;
+    }
+    int32_t s=o->a+p0,idx=s>>3,slot=s&7,n1=8-slot<cnt?8-slot:cnt;
+    uint8_t *d=o->blk[b][idx];
+    if(d) store_part(d+32*slot,v,0,(uint32_t)n1*32);
+    if(cnt>n1 && (d=o->blk[b][idx+1])!=NULL) store_part(d,v,(uint32_t)n1*32,(uint32_t)(cnt-n1)*32);
+}
+/* The pixel pair p0,p0+1 (v halfword 2c+i is channel c of pixel p0+i), a
+ * whole 128-byte vector of u16 output block b. */
+RQ_INLINE void rq_put16(const RqOut *o, int32_t b, HVX_Vector v, int32_t p0, int aligned) {
+    int32_t s=aligned?p0:o->a+p0;
+    uint8_t *d=o->blk[b][s>>2];
+    if(d) store_part(d+128*((s>>1)&1),v,0,128);
+}
+/* Requantizes acc[b*PIXEL_BLOCK+p] (u16: with lo[b*PIXEL_BLOCK+p]), b<nb,
+ * p<np, and stores them; saturating packs clip. Each output vector's lanes
+ * are formed as it is packed, so no array of results is live. nb, sixteen
+ * and aligned are compile-time constants at every use. u16 blocked output
+ * needs np even. */
+RQ_INLINE void rq_emit_k(const RqOut *o, const HVX_Vector *acc, const HVX_Vector *lo, int32_t nb, int32_t np,
+                         int sixteen, int aligned) {
+    HVX_Vector z=Q6_V_vzero();
+#define RQ(b,p) ((p)<np?rq_lane(acc[(b)*PIXEL_BLOCK+(p)],sixteen?lo+(b)*PIXEL_BLOCK+(p):NULL, \
+                                o->par+(size_t)(b)*RQ_VECS,sixteen):z)
     if(o->blocked) {
-        for(int32_t b=0;b<nb;b++) {
-            const HVX_Vector *qb=q+b*PIXEL_BLOCK;
-            if(o->blk[b])for(int32_t p=0;p<np;p+=4) {
-#define QP(i) (p+(i)<np?qb[p+(i)]:z)
-                HVX_Vector v=Q6_Vub_vpack_VhVh_sat(Q6_Vh_vpack_VwVw_sat(QP(3),QP(2)),Q6_Vh_vpack_VwVw_sat(QP(1),QP(0)));
-#undef QP
-                store_part(o->blk[b]+32*p,v,0,(uint32_t)(np-p<4?np-p:4)*32);
-            }
+        if(!sixteen) {
+            RQ_UNROLL for(int32_t b=0;b<nb;b++) RQ_UNROLL for(int32_t p=0;p<PIXEL_BLOCK;p+=4) if(p<np)
+                rq_put8(o,b,rq_pack8(RQ(b,p),RQ(b,p+1),RQ(b,p+2),RQ(b,p+3)),p,np-p<4?np-p:4,aligned);
+        } else {
+            RQ_UNROLL for(int32_t b=0;b<nb;b++) RQ_UNROLL for(int32_t p=0;p<PIXEL_BLOCK;p+=2) if(p<np)
+                rq_put16(o,b,Q6_Vuh_vsat_VuwVuw(RQ(b,p+1),RQ(b,p)),p,aligned);
         }
         return;
     }
@@ -1485,154 +1540,359 @@ static inline void rq_emit(const RqOut *o, const HVX_Vector *acc, const HVX_Vect
      * packed vector holds g segments. */
     uint32_t seg=sixteen?64:32,g=sixteen?2:4,run=(uint32_t)nb*seg,n=(uint32_t)(nb*np);
     int contig=o->pstride==run;
-#define SQ(i) ((i)<n?q[((i)%nb)*PIXEL_BLOCK+(i)/nb]:z)
-    for(uint32_t s0=0;s0<n;s0+=g) {
-        HVX_Vector v=sixteen?Q6_Vuh_vpack_VwVw_sat(SQ(s0+1),SQ(s0)):
-            Q6_Vub_vpack_VhVh_sat(Q6_Vh_vpack_VwVw_sat(SQ(s0+3),SQ(s0+2)),Q6_Vh_vpack_VwVw_sat(SQ(s0+1),SQ(s0)));
+#define SQ(i) RQ((int32_t)((i)%(uint32_t)nb),(int32_t)((i)/(uint32_t)nb))
+    RQ_UNROLL for(uint32_t s0=0;s0<(uint32_t)nb*PIXEL_BLOCK;s0+=g) if(s0<n) {
+        HVX_Vector v=sixteen?Q6_Vuh_vpack_VwVw_sat(SQ(s0+1),SQ(s0)):rq_pack8(SQ(s0),SQ(s0+1),SQ(s0+2),SQ(s0+3));
         if(contig) store_part(o->out+(size_t)s0*seg,v,0,(n-s0<g?n-s0:g)*seg);
-        else for(uint32_t s=s0;s<s0+g && s<n;s+=(uint32_t)nb)
-            store_part(o->out+(size_t)(s/nb)*o->pstride,v,(s-s0)*seg,run);
+        else RQ_UNROLL for(uint32_t s=s0;s<s0+g;s+=(uint32_t)nb) if(s<n)
+            store_part(o->out+(size_t)(s/(uint32_t)nb)*o->pstride,v,(s-s0)*seg,run);
     }
 #undef SQ
+#undef RQ
+}
+RQ_INLINE void rq_emit(const RqOut *o, const HVX_Vector *acc, const HVX_Vector *lo, int32_t nb, int32_t np, int aligned) {
+    if(o->sixteen) {
+        if(nb==2) rq_emit_k(o,acc,lo,2,np,1,aligned);
+        else rq_emit_k(o,acc,lo,1,np,1,aligned);
+    } else if(nb==2) rq_emit_k(o,acc,lo,2,np,0,aligned);
+    else rq_emit_k(o,acc,lo,1,np,0,aligned);
+}
+/* Partial blocks (np<PIXEL_BLOCK) and misaligned blocked output are rare:
+ * keep their copy out of line. */
+static __attribute__((noinline)) void rq_emit_part(const RqOut *o, const HVX_Vector *acc, const HVX_Vector *lo,
+                                                   int32_t nb, int32_t np) {
+    rq_emit(o,acc,lo,nb,np,0);
 }
 #else
 typedef struct RqOut RqOut;
 typedef int32_t HVX_Vector;
 #endif
-/* For output block b (tiles tb: t0, and t1 when non-NULL) and pixel p < np:
- * acc[b][p][o] = sum over tiles k of the four u8 channels at xs+xoff[k]+p*stride
- * times tb[k]'s [o][0..3] weights. NO_TILE entries are the same in t0 and t1.
+/* Tile tables hold absolute weight addresses on 32-bit targets (one add less
+ * per vrmpy operand), byte offsets otherwise. */
+#if UINTPTR_MAX==0xffffffffu
+#define WREF(wb,off) ((uint32_t)(uintptr_t)((wb)+(off)))
+#define WPTR(wb,r) ((const int8_t *)(uintptr_t)(r))
+#else
+#define WREF(wb,off) ((uint32_t)(off))
+#define WPTR(wb,r) ((wb)+(r))
+#endif
+/* For output block b (b=0,1: wp[2*i+b] is tap i's weight tile) and pixel
+ * p < np: acc[b][p][o] = sum over taps i of the four u8 channels at
+ * xb[segment of i]+xoff[i]+p*stride times the tile's [o][0..3] weights. The
+ * taps are the compact list from build_taps (no NO_TILE entries); segend[s]
+ * is the end of segment s, which reads from xb[s] (one per kernel row in
+ * near memory, so a row ring needs no per-phase tables). two: both blocks.
  * With rq the sums are requantized and stored by rq_emit instead (lo: the
- * u16 low-byte sums from an earlier call's acc), and acc is not written. */
+ * u16 low-byte sums from an earlier call's acc). Full blocks then keep acc
+ * untouched; partial ones (np<PIXEL_BLOCK) pass their sums through acc,
+ * which must be 128-byte aligned, as lo already is. */
 #if defined(__HVX__) && __HVX_LENGTH__==128
-/* Activation words are 4-byte aligned: ci%4==0 and the dense input is
- * 128-byte aligned in the workspace. */
+/* Activation words are 4-byte aligned: ci%4==0 and the staged input is
+ * 128-byte aligned. */
 #define SPLAT(p) HVX_Vector s##p=Q6_V_vsplat_R(*(const uint32_t *)(x+(size_t)(p)*stride))
 #define MAC(a,p,w) a##p=Q6_Vw_vrmpyacc_VwVubVb(a##p,s##p,w)
 #define MAC8(a,w) MAC(a,0,w);MAC(a,1,w);MAC(a,2,w);MAC(a,3,w);MAC(a,4,w);MAC(a,5,w);MAC(a,6,w);MAC(a,7,w)
-static void tile_block(int32_t *acc, int32_t np, const uint8_t *xs, uint32_t stride, uint32_t ntiles,
-                       const uint32_t *t0, const uint32_t *t1, const uint32_t *xoff, const int8_t *wbase,
+#define WLOAD(i,b) (*(const HVX_UVector *)WPTR(wbase,wp[2*(i)+(b)]))
+static void tile_block(int32_t *acc, int32_t np, const uint8_t *const *xb, uint32_t nseg, const uint32_t *segend,
+                       uint32_t stride, const uint32_t *wp, int two, const uint32_t *xoff, const int8_t *wbase,
                        const RqOut *rq, const HVX_Vector *lo) {
     HVX_UVector *o=(HVX_UVector *)acc;
-    if(np==PIXEL_BLOCK && t1) {
+    (void)wbase;
+    if(np==PIXEL_BLOCK && two) {
         HVX_Vector a0=Q6_V_vzero(),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0;
         HVX_Vector b0=a0,b1=a0,b2=a0,b3=a0,b4=a0,b5=a0,b6=a0,b7=a0;
-        for(uint32_t k=0;k<ntiles;k++) {
-            if(t0[k]==NO_TILE) continue;
-            HVX_Vector w0=*(const HVX_UVector *)(wbase+t0[k]),w1=*(const HVX_UVector *)(wbase+t1[k]);
-            const uint8_t *x=xs+xoff[k];
-            SPLAT(0);SPLAT(1);SPLAT(2);SPLAT(3);SPLAT(4);SPLAT(5);SPLAT(6);SPLAT(7);
-            MAC8(a,w0);MAC8(b,w1);
+        uint32_t i=0;
+        for(uint32_t s=0;s<nseg;s++) {
+            const uint8_t *xs=xb[s];
+            for(uint32_t e=segend[s];i<e;i++) {
+                HVX_Vector w0=WLOAD(i,0),w1=WLOAD(i,1);
+                const uint8_t *x=xs+xoff[i];
+                SPLAT(0);SPLAT(1);SPLAT(2);SPLAT(3);SPLAT(4);SPLAT(5);SPLAT(6);SPLAT(7);
+                MAC8(a,w0);MAC8(b,w1);
+            }
         }
-        if(rq) {
+        if(rq && !rq->a) {
             HVX_Vector v[2*PIXEL_BLOCK]={a0,a1,a2,a3,a4,a5,a6,a7,b0,b1,b2,b3,b4,b5,b6,b7};
-            rq_emit(rq,v,lo,2,PIXEL_BLOCK);
+            rq_emit(rq,v,lo,2,PIXEL_BLOCK,1);
             return;
         }
         o[0]=a0;o[1]=a1;o[2]=a2;o[3]=a3;o[4]=a4;o[5]=a5;o[6]=a6;o[7]=a7;
         o[8]=b0;o[9]=b1;o[10]=b2;o[11]=b3;o[12]=b4;o[13]=b5;o[14]=b6;o[15]=b7;
+        if(rq) rq_emit_part(rq,(const HVX_Vector *)acc,lo,2,PIXEL_BLOCK);
         return;
     }
     if(np==PIXEL_BLOCK) {
         HVX_Vector a0=Q6_V_vzero(),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0;
-        for(uint32_t k=0;k<ntiles;k++) {
-            if(t0[k]==NO_TILE) continue;
-            HVX_Vector w0=*(const HVX_UVector *)(wbase+t0[k]);
-            const uint8_t *x=xs+xoff[k];
-            SPLAT(0);SPLAT(1);SPLAT(2);SPLAT(3);SPLAT(4);SPLAT(5);SPLAT(6);SPLAT(7);
-            MAC8(a,w0);
+        uint32_t i=0;
+        for(uint32_t s=0;s<nseg;s++) {
+            const uint8_t *xs=xb[s];
+            for(uint32_t e=segend[s];i<e;i++) {
+                HVX_Vector w0=WLOAD(i,0);
+                const uint8_t *x=xs+xoff[i];
+                SPLAT(0);SPLAT(1);SPLAT(2);SPLAT(3);SPLAT(4);SPLAT(5);SPLAT(6);SPLAT(7);
+                MAC8(a,w0);
+            }
         }
-        if(rq) {
+        if(rq && !rq->a) {
             HVX_Vector v[PIXEL_BLOCK]={a0,a1,a2,a3,a4,a5,a6,a7};
-            rq_emit(rq,v,lo,1,PIXEL_BLOCK);
+            rq_emit(rq,v,lo,1,PIXEL_BLOCK,1);
             return;
         }
         o[0]=a0;o[1]=a1;o[2]=a2;o[3]=a3;o[4]=a4;o[5]=a5;o[6]=a6;o[7]=a7;
+        if(rq) rq_emit_part(rq,(const HVX_Vector *)acc,lo,1,PIXEL_BLOCK);
         return;
     }
-    HVX_Vector v[2*PIXEL_BLOCK];
-    for(int32_t b=0;b<(t1?2:1);b++)for(int32_t p=0;p<np;p++) {
-        const uint32_t *t=b?t1:t0;
+    for(int32_t b=0;b<(two?2:1);b++)for(int32_t p=0;p<np;p++) {
         HVX_Vector a=Q6_V_vzero();
-        for(uint32_t k=0;k<ntiles;k++) {
-            if(t[k]==NO_TILE) continue;
-            const uint8_t *x=xs+xoff[k]+(size_t)p*stride;
-            a=Q6_Vw_vrmpyacc_VwVubVb(a,Q6_V_vsplat_R(*(const uint32_t *)x),*(const HVX_UVector *)(wbase+t[k]));
+        uint32_t i=0;
+        for(uint32_t s=0;s<nseg;s++) {
+            const uint8_t *xs=xb[s]+(size_t)p*stride;
+            for(uint32_t e=segend[s];i<e;i++)
+                a=Q6_Vw_vrmpyacc_VwVubVb(a,Q6_V_vsplat_R(*(const uint32_t *)(xs+xoff[i])),WLOAD(i,b));
         }
-        if(rq) v[b*PIXEL_BLOCK+p]=a;
-        else o[b*PIXEL_BLOCK+p]=a;
+        o[b*PIXEL_BLOCK+p]=a;
     }
-    if(rq) rq_emit(rq,v,lo,t1?2:1,np);
+    if(rq) rq_emit_part(rq,(const HVX_Vector *)acc,lo,two?2:1,np);
 }
+#undef WLOAD
 #undef MAC8
 #undef MAC
 #undef SPLAT
 #else
-static void tile_block(int32_t *acc, int32_t np, const uint8_t *xs, uint32_t stride, uint32_t ntiles,
-                       const uint32_t *t0, const uint32_t *t1, const uint32_t *xoff, const int8_t *wbase,
+static void tile_block(int32_t *acc, int32_t np, const uint8_t *const *xb, uint32_t nseg, const uint32_t *segend,
+                       uint32_t stride, const uint32_t *wp, int two, const uint32_t *xoff, const int8_t *wbase,
                        const RqOut *rq, const HVX_Vector *lo) {
-    (void)rq;(void)lo;
-    for(int32_t b=0;b<(t1?2:1);b++) {
-        const uint32_t *t=b?t1:t0;
+    (void)rq;(void)lo;(void)wbase;
+    for(int32_t b=0;b<(two?2:1);b++) {
         int32_t *ab=acc+(size_t)b*PIXEL_BLOCK*32;
         memset(ab,0,(size_t)np*32*4);
-        for(uint32_t k=0;k<ntiles;k++) {
-            if(t[k]==NO_TILE) continue;
-            const int8_t *w=wbase+t[k];
-            const uint8_t *x=xs+xoff[k];
+        uint32_t i=0;
+        for(uint32_t s=0;s<nseg;s++)for(uint32_t e=segend[s];i<e;i++) {
+            const int8_t *w=WPTR(wbase,wp[2*i+(uint32_t)b]);
+            const uint8_t *x=xb[s]+xoff[i];
             for(int32_t p=0;p<np;p++) {
                 const uint8_t *v=x+(size_t)p*stride;
                 int32_t v0=v[0],v1=v[1],v2=v[2],v3=v[3],*r=ab+32*p;
-                for(int32_t o=0;o<32;o++)r[o]+=v0*w[4*o]+v1*w[4*o+1]+v2*w[4*o+2]+v3*w[4*o+3];
+                for(int32_t q=0;q<32;q++)r[q]+=v0*w[4*q]+v1*w[4*q+1]+v2*w[4*q+2]+v3*w[4*q+3];
             }
         }
     }
 }
 #endif
-static void fast_conv_compute(G *g, const T *xt, const T *wt, const T *ft, int s2, int reverse, int packed, int sixteen,
-                              int32_t kh, int32_t kw, int32_t ci, int32_t co, int32_t oh, int32_t ow, uint8_t *x,
-                              uint8_t *xlo, uint8_t *xhi, uint8_t *r, uint32_t *tiles, uint32_t *xoff, int32_t *acc,
-                              int32_t *mult, int32_t *bias, int32_t *M, int32_t *pre, int32_t *post, int64_t *wsum,
-                              int32_t *rqp);
-
+/* The compact tap list: taps (ky,kx,group) whose tile exists (the stride-2
+ * regrouping leaves some zero; that depends on the tap only, not on the output
+ * block). */
+static uint32_t count_taps(const T *wt, int s2, int reverse, int packed, int32_t kh, int32_t kw, int32_t groups) {
+    uint32_t n=0;
+    for(int32_t ky=0;ky<kh;ky++)for(int32_t kx=0;kx<kw;kx++)for(int32_t q=0;q<groups;q++)
+        if(weight_tile(wt,s2,reverse,packed,ky,kx,q,0)!=NO_TILE) n++;
+    return n;
+}
+/* wp: (blocks+1)/2 pairs x nt taps x 2 weight addresses (an odd last block
+ * repeats its own). xoff[i]=(lead+kx)*ci+4*group, plus ky*kystride when merge
+ * (one segment), else segend has one end per kernel row. */
+static void build_taps(const T *wt, int s2, int reverse, int packed, int32_t kh, int32_t kw, int32_t groups,
+                       int32_t blocks, const int8_t *wbase, int32_t ci, int32_t lead, int merge, size_t kystride,
+                       uint32_t nt, uint32_t *wp, uint32_t *xoff, uint32_t *segend) {
+    uint32_t n=0;
+    (void)wbase;
+    for(int32_t ky=0;ky<kh;ky++) {
+        for(int32_t kx=0;kx<kw;kx++)for(int32_t q=0;q<groups;q++) {
+            if(weight_tile(wt,s2,reverse,packed,ky,kx,q,0)==NO_TILE) continue;
+            xoff[n]=(uint32_t)((merge?(size_t)ky*kystride:0)+(size_t)(lead+kx)*ci+4*(size_t)q);
+            for(int32_t pj=0;pj*2<blocks;pj++)for(int32_t b=0;b<2;b++) {
+                int32_t j=2*pj+b<blocks?2*pj+b:2*pj;
+                wp[((size_t)pj*nt+n)*2+(size_t)b]=WREF(wbase,weight_tile(wt,s2,reverse,packed,ky,kx,q,j));
+            }
+            n++;
+        }
+        if(!merge) segend[ky]=n;
+    }
+    if(merge) segend[0]=n;
+}
+/* wsum[c] = sum over taps of the tile's weights for output channel c. */
+static void tap_wsum(int64_t *wsum, int32_t blocks, uint32_t nt, const uint32_t *wp, const int8_t *wbase) {
+    (void)wbase;
+#if defined(__HVX__) && __HVX_LENGTH__==128
+    HVX_Vector ones=Q6_V_vsplat_R(0x01010101);
+    int32_t tmp[32] __attribute__((aligned(128)));
+    for(int32_t j=0;j<blocks;j++) {
+        HVX_Vector a=Q6_V_vzero();
+        for(uint32_t i=0;i<nt;i++)
+            a=Q6_Vw_vrmpyacc_VwVbVb(a,*(const HVX_UVector *)WPTR(wbase,wp[(((size_t)j/2)*nt+i)*2+(size_t)(j&1)]),ones);
+        *(HVX_Vector *)tmp=a;
+        for(int32_t c=0;c<32;c++)wsum[j*32+c]+=tmp[c];
+    }
+#else
+    for(int32_t j=0;j<blocks;j++)for(uint32_t i=0;i<nt;i++) {
+        const int8_t *w=WPTR(wbase,wp[(((size_t)j/2)*nt+i)*2+(size_t)(j&1)]);
+        for(int32_t c=0;c<128;c++)wsum[j*32+c/4]+=w[c];
+    }
+#endif
+}
+/* Does any block of the (blocked, batch 0) output region share bytes with a
+ * block of the input region? Conservative (1) unless both live in 2048-aligned
+ * blocks of pool 1. */
+static int blocked_overlap(const T *xt, const int32_t *xd, const int32_t *xo, const T *o, const int32_t *od,
+                           const int32_t *oo) {
+    uint32_t bits[128];
+    memset(bits,0,sizeof bits);
+    if(!(o->flags&F_BLOCKED) || !(xt->flags&F_BLOCKED)) return 1;
+    for(int pass=0;pass<2;pass++) {
+        const T *t=pass?xt:o;
+        const int32_t *d=pass?xd:od,*org=pass?xo:oo;
+        const int sh=t->esize==1?3:t->esize==2?2:1;
+        const int32_t nbw=(t->m[2]+(1<<sh)-1)>>sh,nbd=(t->m[3]+31)>>5,nbh=(t->m[1]+7)>>3;
+        for(int32_t h=org[1]>>3;h<=(org[1]+d[1]-1)>>3;h++)
+         for(int32_t w=org[2]>>sh;w<=(org[2]+d[2]-1)>>sh;w++)
+          for(int32_t z=org[3]>>5;z<=(org[3]+d[3]-1)>>5;z++) {
+            int64_t index=(int64_t)(((org[0]*nbh+h)*nbw+w)*nbd)+t->slice+z;
+            if(index<0 || index>=(int64_t)t->nblocks) continue;
+            uint32_t e=t->blocks[index],pool=e&127u,off=e&~127u;
+            if(!pool) continue;
+            if(pool!=1) { if(!pass) return 1; continue; }
+            if((off&2047u) || (off>>11)>=4096u) return 1;
+            uint32_t bit=off>>11;
+            if(pass) { if(bits[bit>>5]&(1u<<(bit&31))) return 1; }
+            else bits[bit>>5]|=1u<<(bit&31);
+        }
+    }
+    return 0;
+}
+#if RQ_HVX
+/* Where pixels of channel group z in block column wblk (of nbw, nbd channel
+ * groups) of row h start (row h%8 included) in a u8 or u16 blocked tensor (batch 0), or NULL
+ * for an absent block, as blocked_impl finds them. */
+static inline uint8_t *blocked_rowptr(uint8_t *const *pools, const T *t, int32_t h, int32_t wblk, int32_t nbw,
+                                      int32_t nbd, int32_t z) {
+    int64_t index=(int64_t)(((h>>3)*nbw+wblk)*nbd)+t->slice+z;
+    uint32_t e=(index>=0 && index<(int64_t)t->nblocks)?t->blocks[index]:0,pool=e&127;
+    return pool && pools[pool]?pools[pool]+(e&~127u)+(size_t)(h&7)*256:NULL;
+}
+#endif
+/* Input pixels W0..W0+npix-1 of row h of the u8 blocked tensor t, channels
+ * [0,ci), staged by 8-pixel runs (256 contiguous bytes per 32-channel group)
+ * to dst, pixel W at dst+(W-Wbase)*ci. Absent blocks stage zeros, as
+ * blocked_impl. ci%128==0 stores exactly the pixels asked for; otherwise Wbase
+ * is 8-aligned and whole runs are written (the pixels before W0 and after the
+ * end are other columns of the same blocks). dst is 128-byte aligned. */
+static void stage_row8(uint8_t *const *pools, const T *t, int64_t h, int64_t W0, int32_t npix, int64_t Wbase,
+                       int32_t ci, uint8_t *dst) {
+    const int64_t nbw=((int64_t)t->m[2]+7)/8,nbd=((int64_t)t->m[3]+31)/32,count=t->nblocks;
+    const int64_t hrow=(h/8)*nbw;
+    const size_t hin=(size_t)(h%8)*256;
+    const int ng=(ci+31)/32,compact=ci%128==0;
+    for(int64_t Wa=W0&~(int64_t)7;Wa<W0+npix;Wa+=8) {
+        int lo=0,hi=8;
+        if(compact) {
+            if(Wa<W0)lo=(int)(W0-Wa);
+            if(Wa+8>W0+npix)hi=(int)(W0+npix-Wa);
+        }
+        const int64_t wrow=(hrow+Wa/8)*nbd+t->slice,pix0=Wa-Wbase;
+#if BLK_HVX
+        HVX_Vector G[4][2];
+#define LDG(gi,B) do { int64_t ix_=wrow+(gi); uint32_t e_=(ix_>=0 && ix_<count)?t->blocks[ix_]:0,pl_=e_&127; \
+            if(pl_ && pools[pl_]) { const uint8_t *bk_=pools[pl_]+(e_&~127u)+hin; (B)[0]=load_part(bk_,128); \
+                (B)[1]=load_part(bk_+128,128); } else (B)[0]=(B)[1]=Q6_V_vzero(); } while(0)
+        if(ci==32) {
+            LDG(0,G[0]);
+            uint8_t *d=dst+(size_t)(pix0*32);
+            *(HVX_Vector *)d=G[0][0];*(HVX_Vector *)(d+128)=G[0][1];
+        } else if(ci==64) {
+            LDG(0,G[0]);LDG(1,G[1]);
+            uint8_t *d=dst+(size_t)(pix0*64);
+            for(int h2=0;h2<2;h2++) {
+                HVX_VectorPair a=Q6_W_vshuff_VVR(G[1][h2],G[0][h2],-32);
+                *(HVX_Vector *)(d+256*h2)=Q6_V_lo_W(a);*(HVX_Vector *)(d+256*h2+128)=Q6_V_hi_W(a);
+            }
+        } else if(compact) {
+            for(int sg=0;sg<ci/128;sg++) {
+                HVX_Vector H[4][2];
+                for(int gg=0;gg<4;gg++)LDG(4*sg+gg,H[gg]);
+                for(int h2=0;h2<2;h2++) {
+                    HVX_VectorPair a=Q6_W_vshuff_VVR(H[1][h2],H[0][h2],-32),b=Q6_W_vshuff_VVR(H[3][h2],H[2][h2],-32);
+                    HVX_VectorPair c=Q6_W_vshuff_VVR(Q6_V_lo_W(b),Q6_V_lo_W(a),-64),
+                                   d2=Q6_W_vshuff_VVR(Q6_V_hi_W(b),Q6_V_hi_W(a),-64);
+                    HVX_Vector P[4]={Q6_V_lo_W(c),Q6_V_hi_W(c),Q6_V_lo_W(d2),Q6_V_hi_W(d2)};
+                    for(int k=0;k<4;k++) {
+                        int px=4*h2+k;
+                        if(px>=lo && px<hi) *(HVX_Vector *)(dst+(size_t)((pix0+px)*ci)+128*(size_t)sg)=P[k];
+                    }
+                }
+            }
+        } else {
+            for(int gi=0;gi<ng;gi++) {
+                uint32_t n=(uint32_t)(ci-32*gi<32?ci-32*gi:32);
+                LDG(gi,G[0]);
+                for(int k=lo;k<hi;k++)
+                    store_part(dst+(size_t)((pix0+k)*ci)+32*(size_t)gi,G[0][k>>2],(uint32_t)(k&3)*32,n);
+            }
+        }
+#undef LDG
+#else
+        for(int k=lo;k<hi;k++)for(int gi=0;gi<ng;gi++) {
+            int64_t ix=wrow+gi;
+            uint32_t e=(ix>=0 && ix<count)?t->blocks[ix]:0,pl=e&127;
+            size_t n=(size_t)(ci-32*gi<32?ci-32*gi:32);
+            uint8_t *d=dst+(size_t)((pix0+k)*ci)+32*(size_t)gi;
+            if(pl && pools[pl]) memcpy(d,pools[pl]+(e&~127u)+hin+32*(size_t)k,n);
+            else memset(d,0,n);
+        }
+#endif
+    }
+}
 /* Near-memory layout for one command: output columns per chunk, the staged
- * chunk's row stride in pixels, and 128-aligned offsets into near. */
-typedef struct { int32_t cols, sw; size_t acc, tiles, xoff, mult, bias, M, pre, post, wsum, rq, out, lo, hi; } NearPlan;
+ * row ring (kh rows of rowbytes), and 128-aligned offsets into near. direct:
+ * rows are staged straight from the blocked input (lead pixels before the
+ * chunk's first column keep the 8-pixel runs aligned). */
+typedef struct { int32_t cols, lead, direct; uint32_t nt; size_t rowbytes, acc, wp, xoff, segend, mult, bias, M, pre, post, wsum, rq, out, lo, hi; } NearPlan;
 static size_t nbump(size_t *at, size_t bytes) {size_t a=(*at+127)&~(size_t)127;*at=a+bytes;return a;}
-static size_t near_layout(NearPlan *p, int32_t cols, int32_t kh, int32_t kw, int32_t ci, int32_t co, uint32_t ntiles,
-                          int sixteen) {
-    /* Each staged plane has 128 bytes of slack for whole-vector copies. */
-    size_t at=0,plane=(size_t)kh*(cols+kw-1)*ci+128;
-    p->cols=cols;p->sw=cols+kw-1;
+static size_t near_layout(NearPlan *p, int32_t cols, int32_t kh, int32_t kw, int32_t ci, int32_t co, uint32_t nt,
+                          int sixteen, int direct, int32_t head0) {
+    size_t at=0;
+    p->cols=cols;p->direct=direct;p->nt=nt;
+    p->lead=direct && ci%128?head0:0;
+    size_t npix=(size_t)p->lead+(size_t)cols+(size_t)kw-1;
+    if(direct && ci%128) npix=(npix+7)&~(size_t)7;
+    p->rowbytes=(npix*(size_t)ci+127)&~(size_t)127;
     p->acc=nbump(&at,(size_t)2*PIXEL_BLOCK*32*4*(sixteen?2:1));
-    p->tiles=nbump(&at,(size_t)ntiles*(co/32)*4);p->xoff=nbump(&at,(size_t)ntiles*4);
+    p->wp=nbump(&at,(size_t)((co/32+1)/2)*nt*8);p->xoff=nbump(&at,(size_t)nt*4);p->segend=nbump(&at,(size_t)kh*4);
     p->mult=nbump(&at,(size_t)co*4);p->bias=nbump(&at,(size_t)co*4);p->M=nbump(&at,(size_t)co*4);
     p->pre=nbump(&at,(size_t)co*4);p->post=nbump(&at,(size_t)co*4);p->wsum=nbump(&at,(size_t)co*8);
     p->rq=nbump(&at,(size_t)co*RQ_VECS*4);
     p->out=nbump(&at,(size_t)cols*co*(sixteen?2:1));
-    p->lo=nbump(&at,plane);p->hi=sixteen?nbump(&at,plane):0;
+    p->lo=nbump(&at,(size_t)kh*p->rowbytes);p->hi=sixteen?nbump(&at,(size_t)kh*p->rowbytes):0;
     return at;
 }
 /* The widest whole-block chunk that fits, or 0. Depends on shapes only. */
 static int near_plan(const G *g, NearPlan *p, int32_t ow, int32_t kh, int32_t kw, int32_t ci, int32_t co,
-                     uint32_t ntiles, int sixteen) {
+                     uint32_t nt, int sixteen, int direct, int32_t head0) {
     const Nprg2ReferenceConv *c=g->conv;
     if(!c->near || ((uintptr_t)c->near&127u)) return 0;
     for(int32_t cols=(ow+PIXEL_BLOCK-1)/PIXEL_BLOCK*PIXEL_BLOCK;cols>0;cols-=PIXEL_BLOCK)
-        if(near_layout(p,cols,kh,kw,ci,co,ntiles,sixteen)<=c->near_bytes) return 1;
+        if(near_layout(p,cols,kh,kw,ci,co,nt,sixteen,direct,head0)<=c->near_bytes) return 1;
     return 0;
 }
-/* Whole-vector copies: they read up to 127 bytes past src+n (255 past 2n for
- * the u16 split) and write up to 127 past each destination's n. */
-#if defined(__HVX__) && __HVX_LENGTH__==128
+/* Exact copies: they read up to 127 bytes past src+n (255 past 2n for the
+ * u16 split) but write exactly n bytes at each destination. */
+#if BLK_HVX
 static void near_copy(uint8_t *d, const uint8_t *s, size_t n) {
-    for(size_t i=0;i<n;i+=128) *(HVX_UVector *)(d+i)=*(const HVX_UVector *)(s+i);
+    size_t i=0;
+    for(;i+128<=n;i+=128) *(HVX_UVector *)(d+i)=*(const HVX_UVector *)(s+i);
+    if(i<n) store_part(d+i,load_part(s+i,(uint32_t)(n-i)),0,(uint32_t)(n-i));
 }
 static void near_split16(uint8_t *lo, uint8_t *hi, const uint8_t *s, size_t n) {
-    for(size_t i=0;i<n;i+=128) {
+    size_t i=0;
+    for(;i+128<=n;i+=128) {
         HVX_Vector a=*(const HVX_UVector *)(s+2*i),b=*(const HVX_UVector *)(s+2*i+128);
         *(HVX_UVector *)(lo+i)=Q6_Vb_vpacke_VhVh(b,a);
         *(HVX_UVector *)(hi+i)=Q6_Vb_vpacko_VhVh(b,a);
+    }
+    if(i<n) {
+        uint32_t r=(uint32_t)(n-i);
+        HVX_Vector a=load_part(s+2*i,2*r<128?2*r:128),b=2*r>128?load_part(s+2*i+128,2*r-128):Q6_V_vzero();
+        store_part(lo+i,Q6_Vb_vpacke_VhVh(b,a),0,r);
+        store_part(hi+i,Q6_Vb_vpacko_VhVh(b,a),0,r);
     }
 }
 #else
@@ -1641,6 +1901,11 @@ static void near_split16(uint8_t *lo, uint8_t *hi, const uint8_t *s, size_t n) {
     for(size_t i=0;i<n;i++){uint16_t v;memcpy(&v,s+2*i,2);lo[i]=(uint8_t)v;hi[i]=(uint8_t)(v>>8);}
 }
 #endif
+static void fast_conv_compute(G *g, const T *xt, const T *wt, const T *ft, int s2, int reverse, int packed, int sixteen,
+                              int32_t kh, int32_t kw, int32_t ci, int32_t co, int32_t oh, int32_t ow, uint8_t *x,
+                              uint8_t *xlo, uint8_t *xhi, uint8_t *r, uint32_t nt, uint32_t *wp, uint32_t *xoff,
+                              uint32_t *segend, int32_t *acc, int32_t *mult, int32_t *bias, int32_t *M, int32_t *pre,
+                              int32_t *post, int64_t *wsum, int32_t *rqp);
 static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o, int s2, int reverse, int packed,
                          int sixteen, int32_t kh, int32_t kw, int32_t ci, int32_t co, int32_t oh, int32_t ow,
                          const uint8_t *x, const NearPlan *p);
@@ -1657,7 +1922,7 @@ static int fast_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, in
     if(H<=0 || W<=0 || I<=0 || O<=0 || I%4 || O%32 || (!packed && I%32) || co%32 || co>O) return 0;
     if(s2 && (H!=3 || W!=3 || I%32)) return 0;
     int32_t kh=s2?2:H,kw=s2?2:W,ci=s2?4*I:I;
-    if(ci>xt->m[3]) return 0;
+    if(ci>xt->m[3] || kh>4) return 0;
     if((int64_t)kh*kw*ci*255*128>INT32_MAX) return 0;
     int32_t xH=xt->m[1]-xt->p[1],xW=xt->m[2]-xt->p[2],cw=sixteen?4:8;
     oh=(oh+7)/8*8;if(oh>o->m[1])oh=o->m[1];if(oh>xH-kh+1)oh=xH-kh+1;
@@ -1666,73 +1931,81 @@ static int fast_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, in
     if(wt->offset+(uint64_t)H*W*I*O>g->pool_bytes[wt->pool]){*err=E_RANGE;return -1;}
 
     int32_t xh=oh+kh-1,xw=ow+kw-1,groups=ci/4,blocks=co/32;
-    uint32_t ntiles=(uint32_t)(kh*kw*groups);
+    uint32_t nt=count_taps(wt,s2,reverse,packed,kh,kw,groups);
     size_t es=sixteen?2:1,pixels=(size_t)oh*ow;
     NearPlan plan;
-    if(near_plan(g,&plan,ow,kh,kw,ci,co,ntiles,sixteen)) {
+    int32_t dims[4]={1,xh,xw,ci},origin[4]={0,xt->p[1],xt->p[2],0};
+    int32_t on[4]={1,oh,ow,co},oorigin[4]={0,o->p[1],o->p[2],0};
+    /* u8 blocked input is staged straight into near unless the output blocks
+     * could overwrite input that later rows still need. */
+    int direct=0,use_near=0,checked=0;
+    if(g->conv->near) {
+        if(!sixteen && (xt->flags&F_BLOCKED) && xt->esize==1 && o->esize==es &&
+           !xfer_check(g,xt,dims,origin,0) && !xfer_check(g,o,on,oorigin,1)) {
+            checked=1;
+            direct=!blocked_overlap(xt,dims,origin,o,on,oorigin);
+        }
+        int32_t head0=(int32_t)(xt->p[2]&7);
+        use_near=direct && near_plan(g,&plan,ow,kh,kw,ci,co,nt,sixteen,1,head0);
+        if(!use_near){direct=0;use_near=near_plan(g,&plan,ow,kh,kw,ci,co,nt,sixteen,0,head0);}
+    }
+    if(use_near) {
         g->wused=0;
-        uint8_t *x=walloc(g,(size_t)xh*xw*ci*es+256);
+        /* Direct staging needs no copy of the input; a token allocation keeps
+         * the measured workspace nonzero for fast commands. */
+        uint8_t *x=walloc(g,direct?128:(size_t)xh*xw*ci*es+256);
         if(g->wused>g->conv->workspace_bytes) return 0;
         if(!x){*err=E_MEMORY;return -1;}
-        int32_t dims[4]={1,xh,xw,ci},origin[4]={0,xt->p[1],xt->p[2],0};
-        int32_t on[4]={1,oh,ow,co},oorigin[4]={0,o->p[1],o->p[2],0};
         if(o->esize!=es){*err=E_TENSOR;return -1;}
-        if((*err=xfer_check(g,xt,dims,origin,0)) || (*err=xfer_check(g,o,on,oorigin,1))) return -1;
+        if(!checked && ((*err=xfer_check(g,xt,dims,origin,0)) || (*err=xfer_check(g,o,on,oorigin,1)))) return -1;
         conv_path=2;
         if(g->dry) return 1;
         const Nprg2ReferenceConv *c=g->conv;
-        uint64_t t=c->clock && c->phase?c->clock():0;
-        xfer_copy(g,xt,x,dims,origin,0);
-        if(c->clock && c->phase) c->phase[0]+=c->clock()-t;
-        near_compute(g,xt,wt,ft,o,s2,reverse,packed,sixteen,kh,kw,ci,co,oh,ow,x,&plan);
+        if(!direct) {
+            uint64_t t=c->clock && c->phase?c->clock():0;
+            xfer_copy(g,xt,x,dims,origin,0);
+            if(c->clock && c->phase) c->phase[0]+=c->clock()-t;
+        }
+        near_compute(g,xt,wt,ft,o,s2,reverse,packed,sixteen,kh,kw,ci,co,oh,ow,direct?NULL:x,&plan);
         return 1;
     }
     g->wused=0;
     uint8_t *x=walloc(g,(size_t)xh*xw*ci*es+128),*xlo=sixteen?walloc(g,(size_t)xh*xw*ci+128):NULL,
             *xhi=sixteen?walloc(g,(size_t)xh*xw*ci+128):NULL,*r=walloc(g,pixels*co*es);
-    uint32_t *tiles=walloc(g,(size_t)ntiles*blocks*4),*xoff=walloc(g,(size_t)ntiles*4);
+    uint32_t *wp=walloc(g,(size_t)((blocks+1)/2)*nt*8),*xoff=walloc(g,(size_t)nt*4),*segend=walloc(g,16);
     int32_t *acc=walloc(g,(size_t)2*PIXEL_BLOCK*32*4*(sixteen?2:1)),*mult=walloc(g,(size_t)co*4),
             *bias=walloc(g,(size_t)co*4),*M=walloc(g,(size_t)co*4),*pre=walloc(g,(size_t)co*4),*post=walloc(g,(size_t)co*4);
     int64_t *wsum=walloc(g,(size_t)co*8);
     int32_t *rqp=walloc(g,(size_t)co*RQ_VECS*4);
     if(g->wused>g->conv->workspace_bytes) return 0;
-    if(!x || (sixteen && (!xlo || !xhi)) || !r || !tiles || !xoff || !acc || !mult || !bias || !M || !pre || !post || !wsum ||
-       !rqp){
+    if(!x || (sixteen && (!xlo || !xhi)) || !r || !wp || !xoff || !segend || !acc || !mult || !bias || !M || !pre || !post ||
+       !wsum || !rqp){
         *err=E_MEMORY;return -1;
     }
-    int32_t dims[4]={1,xh,xw,ci},origin[4]={0,xt->p[1],xt->p[2],0};
     if((*err=xfer(g,xt,x,dims,origin,0))) return -1;
-    if(!g->dry) fast_conv_compute(g,xt,wt,ft,s2,reverse,packed,sixteen,kh,kw,ci,co,oh,ow,x,xlo,xhi,r,tiles,xoff,acc,
+    if(!g->dry) fast_conv_compute(g,xt,wt,ft,s2,reverse,packed,sixteen,kh,kw,ci,co,oh,ow,x,xlo,xhi,r,nt,wp,xoff,segend,acc,
                                   mult,bias,M,pre,post,wsum,rqp);
     A out={.n={1,oh,ow,co},.dt=sixteen?DT_U16:DT_U8,.p=r};
-    int32_t oorigin[4]={0,o->p[1],o->p[2],0};
     if((*err=t_write_region(g,o,&out,oorigin))) return -1;
     conv_path=1;
     return 1;
 }
 static void fast_conv_compute(G *g, const T *xt, const T *wt, const T *ft, int s2, int reverse, int packed, int sixteen,
                               int32_t kh, int32_t kw, int32_t ci, int32_t co, int32_t oh, int32_t ow, uint8_t *x,
-                              uint8_t *xlo, uint8_t *xhi, uint8_t *r, uint32_t *tiles, uint32_t *xoff, int32_t *acc,
-                              int32_t *mult, int32_t *bias, int32_t *M, int32_t *pre, int32_t *post, int64_t *wsum,
-                              int32_t *rqp) {
-    int32_t xh=oh+kh-1,xw=ow+kw-1,groups=ci/4,blocks=co/32;
-    uint32_t ntiles=(uint32_t)(kh*kw*groups);
+                              uint8_t *xlo, uint8_t *xhi, uint8_t *r, uint32_t nt, uint32_t *wp, uint32_t *xoff,
+                              uint32_t *segend, int32_t *acc, int32_t *mult, int32_t *bias, int32_t *M, int32_t *pre,
+                              int32_t *post, int64_t *wsum, int32_t *rqp) {
+    int32_t xw=ow+kw-1,groups=ci/4,blocks=co/32;
     const int8_t *wbase=(const int8_t *)g->pool[wt->pool]+wt->offset;
     const uint8_t *rows=g->pool[ft->pool]+ft->offset;
     for(int32_t c=0;c<co;c++){memcpy(mult+c,rows+(size_t)(c/32)*256+(c%32)*4,4);memcpy(bias+c,rows+(size_t)(c/32)*256+128+(c%32)*4,4);}
     requant_params(mult,co,sixteen,M,pre,post);
-    for(int32_t j=0;j<blocks;j++)for(int32_t ky=0;ky<kh;ky++)for(int32_t kx=0;kx<kw;kx++)for(int32_t q=0;q<groups;q++)
-        tiles[(size_t)j*ntiles+((size_t)ky*kw+kx)*groups+q]=weight_tile(wt,s2,reverse,packed,ky,kx,q,j);
-    for(int32_t ky=0;ky<kh;ky++)for(int32_t kx=0;kx<kw;kx++)for(int32_t q=0;q<groups;q++)
-        xoff[((size_t)ky*kw+kx)*groups+q]=(uint32_t)((((size_t)ky*xw+kx)*ci+4*q));
+    build_taps(wt,s2,reverse,packed,kh,kw,groups,blocks,wbase,ci,0,1,(size_t)xw*ci,nt,wp,xoff,segend);
     memset(wsum,0,(size_t)co*8);
-    if(xt->zp) for(int32_t j=0;j<blocks;j++)for(uint32_t k=0;k<ntiles;k++) {
-        uint32_t tile=tiles[(size_t)j*ntiles+k];
-        if(tile!=NO_TILE)for(int32_t c=0;c<128;c++)wsum[j*32+c/4]+=wbase[tile+c];
-    }
+    if(xt->zp) tap_wsum(wsum,blocks,nt,wp,wbase);
     if(sixteen) {
         const uint16_t *s=(const uint16_t *)x;
-        for(size_t i=0;i<(size_t)xh*xw*ci;i++){xlo[i]=(uint8_t)s[i];xhi[i]=(uint8_t)(s[i]>>8);}
+        for(size_t i=0;i<(size_t)(oh+kh-1)*xw*ci;i++){xlo[i]=(uint8_t)s[i];xhi[i]=(uint8_t)(s[i]>>8);}
     }
     uint32_t stride=(uint32_t)ci;
     int vec=RQ_HVX && rq_prepare(rqp,co,sixteen,(int64_t)kh*kw*ci*255*128,xt->zp,wsum,bias,M,pre,post);
@@ -1742,24 +2015,25 @@ static void fast_conv_compute(G *g, const T *xt, const T *wt, const T *ft, int s
         size_t at=((size_t)y*xw+x0)*ci;
         for(int32_t j=0;j<blocks;j+=2) {
             int32_t nb=blocks-j<2?blocks-j:2;
-            const uint32_t *t0=tiles+(size_t)j*ntiles,*t1=nb==2?t0+ntiles:NULL;
+            const uint32_t *wpp=wp+(size_t)(j/2)*nt*2;
             int32_t *hi=acc+2*PIXEL_BLOCK*32;
+            const uint8_t *xb=x+at,*xbl=xlo+at,*xbh=xhi+at;
 #if RQ_HVX
             if(vec) {
                 size_t es=sixteen?2:1;
                 RqOut ro={(const HVX_Vector *)rqp+(size_t)j*RQ_VECS,r+(((size_t)y*ow+x0)*co+(size_t)j*32)*es,
-                          (uint32_t)(co*es),sixteen,0,{NULL,NULL}};
+                          (uint32_t)(co*es),sixteen,0,0,{{NULL}}};
                 if(sixteen) {
-                    tile_block(acc,np,xlo+at,stride,ntiles,t0,t1,xoff,wbase,NULL,NULL);
-                    tile_block(hi,np,xhi+at,stride,ntiles,t0,t1,xoff,wbase,&ro,(const HVX_Vector *)acc);
-                } else tile_block(acc,np,x+at,stride,ntiles,t0,t1,xoff,wbase,&ro,NULL);
+                    tile_block(acc,np,&xbl,1,segend,stride,wpp,nb==2,xoff,wbase,NULL,NULL);
+                    tile_block(hi,np,&xbh,1,segend,stride,wpp,nb==2,xoff,wbase,&ro,(const HVX_Vector *)acc);
+                } else tile_block(acc,np,&xb,1,segend,stride,wpp,nb==2,xoff,wbase,&ro,NULL);
                 continue;
             }
 #endif
             if(sixteen) {
-                tile_block(acc,np,xlo+at,stride,ntiles,t0,t1,xoff,wbase,NULL,NULL);
-                tile_block(hi,np,xhi+at,stride,ntiles,t0,t1,xoff,wbase,NULL,NULL);
-            } else tile_block(acc,np,x+at,stride,ntiles,t0,t1,xoff,wbase,NULL,NULL);
+                tile_block(acc,np,&xbl,1,segend,stride,wpp,nb==2,xoff,wbase,NULL,NULL);
+                tile_block(hi,np,&xbh,1,segend,stride,wpp,nb==2,xoff,wbase,NULL,NULL);
+            } else tile_block(acc,np,&xb,1,segend,stride,wpp,nb==2,xoff,wbase,NULL,NULL);
             for(int32_t b=0;b<nb;b++)for(int32_t p=0;p<np;p++)for(int32_t c=0;c<32;c++) {
                 int32_t k=(j+b)*32+c;
                 size_t a_at=((size_t)b*PIXEL_BLOCK+p)*32+c;
@@ -1772,20 +2046,13 @@ static void fast_conv_compute(G *g, const T *xt, const T *wt, const T *ft, int s
         }
     }
 }
-#if RQ_HVX
-/* Where pixels (h, w..w+7), w%8==0, of channel group z start in a u8 blocked
- * tensor (batch 0), or NULL for an absent block, as blocked_impl finds them. */
-static uint8_t *blocked_row8(uint8_t *const *pools, const T *t, int64_t h, int64_t w, int64_t z) {
-    int64_t nbw=((int64_t)t->m[2]+7)/8,nbd=((int64_t)t->m[3]+31)/32;
-    int64_t index=((h/8)*nbw+w/8)*nbd+t->slice+z;
-    uint32_t e=(index>=0 && index<(int64_t)t->nblocks)?t->blocks[index]:0,pool=e&127;
-    return pool && pools[pool]?pools[pool]+(e&~127u)+(size_t)(h%8)*256:NULL;
-}
-#endif
-/* fast_conv_compute over near memory, one output row chunk at a time: stage
- * the chunk's kh input rows from x, accumulate, requantize into a near output
- * chunk and write it to o. x holds the whole input, so in-place outputs are
- * safe. */
+/* fast_conv_compute over near memory, one column chunk at a time: the input
+ * rows live in a ring of kh staged rows (each input row is staged once per
+ * chunk, not kh times); a row is staged from the blocked input (x NULL) or
+ * from the workspace copy x. Each output row accumulates, requantizes and,
+ * for blocked outputs on the vector path, stores straight into o's blocks
+ * (u8 or u16, any column alignment; u16 needs even pixel pairs), else into a
+ * near output chunk written by xfer_copy. */
 static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o, int s2, int reverse, int packed,
                          int sixteen, int32_t kh, int32_t kw, int32_t ci, int32_t co, int32_t oh, int32_t ow,
                          const uint8_t *x, const NearPlan *p) {
@@ -1793,87 +2060,101 @@ static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o
     uint8_t *n=c->near,*out=n+p->out,*lo=n+p->lo,*hi=sixteen?n+p->hi:NULL;
     int32_t *acc=(int32_t *)(n+p->acc),*mult=(int32_t *)(n+p->mult),*bias=(int32_t *)(n+p->bias);
     int32_t *M=(int32_t *)(n+p->M),*pre=(int32_t *)(n+p->pre),*post=(int32_t *)(n+p->post);
-    uint32_t *tiles=(uint32_t *)(n+p->tiles),*xoff=(uint32_t *)(n+p->xoff);
+    uint32_t *wp=(uint32_t *)(n+p->wp),*xoff=(uint32_t *)(n+p->xoff),*segend=(uint32_t *)(n+p->segend);
     int64_t *wsum=(int64_t *)(n+p->wsum);
     int32_t *rqp=(int32_t *)(n+p->rq);
-    int32_t xw=ow+kw-1,groups=ci/4,blocks=co/32,sw=p->sw;
-    uint32_t ntiles=(uint32_t)(kh*kw*groups);
+    int32_t xw=ow+kw-1,groups=ci/4,blocks=co/32;
+    uint32_t nt=p->nt;
+    size_t rowb=p->rowbytes;
     const int8_t *wbase=(const int8_t *)g->pool[wt->pool]+wt->offset;
     const uint8_t *rows=g->pool[ft->pool]+ft->offset;
     for(int32_t k=0;k<co;k++){memcpy(mult+k,rows+(size_t)(k/32)*256+(k%32)*4,4);memcpy(bias+k,rows+(size_t)(k/32)*256+128+(k%32)*4,4);}
     requant_params(mult,co,sixteen,M,pre,post);
-    for(int32_t j=0;j<blocks;j++)for(int32_t ky=0;ky<kh;ky++)for(int32_t kx=0;kx<kw;kx++)for(int32_t q=0;q<groups;q++)
-        tiles[(size_t)j*ntiles+((size_t)ky*kw+kx)*groups+q]=weight_tile(wt,s2,reverse,packed,ky,kx,q,j);
-    for(int32_t ky=0;ky<kh;ky++)for(int32_t kx=0;kx<kw;kx++)for(int32_t q=0;q<groups;q++)
-        xoff[((size_t)ky*kw+kx)*groups+q]=(uint32_t)((((size_t)ky*sw+kx)*ci+4*q));
+    build_taps(wt,s2,reverse,packed,kh,kw,groups,blocks,wbase,ci,p->lead,0,0,nt,wp,xoff,segend);
     memset(wsum,0,(size_t)co*8);
-    if(xt->zp) for(int32_t j=0;j<blocks;j++)for(uint32_t k=0;k<ntiles;k++) {
-        uint32_t tile=tiles[(size_t)j*ntiles+k];
-        if(tile!=NO_TILE)for(int32_t q=0;q<128;q++)wsum[j*32+q/4]+=wbase[tile+q];
-    }
+    if(xt->zp) tap_wsum(wsum,blocks,nt,wp,wbase);
     int vec=RQ_HVX && rq_prepare(rqp,co,sixteen,(int64_t)kh*kw*ci*255*128,xt->zp,wsum,bias,M,pre,post);
     (void)vec;
     uint64_t (*clock)(void)=c->phase?c->clock:NULL,*ph=c->phase,t=clock?clock():0;
 #define LAP(i) do { if(clock){uint64_t u_=clock();ph[i]+=u_-t;t=u_;} } while(0)
-    size_t es=sixteen?2:1,plane=(size_t)sw*ci;
+    size_t es=sixteen?2:1;
     int32_t *ahi=acc+2*PIXEL_BLOCK*32;
-    /* u8 blocked outputs aligned to whole blocks are requantized straight into
-     * o, skipping the near output chunk and its xfer_copy. */
-    int direct=vec && !sixteen && (o->flags&F_BLOCKED) && o->esize==1;
-    for(int32_t y=0;y<oh;y++)for(int32_t x0=0;x0<ow;x0+=p->cols) {
+    /* Blocked outputs are requantized straight into o's blocks, skipping the
+     * near output chunk and its xfer_copy. oa: the first column's slot. */
+    int direct=vec && (o->flags&F_BLOCKED) && o->esize==es;
+    int32_t RW=sixteen?4:8,oa=(int32_t)(o->p[2]%RW),L=(oa+PIXEL_BLOCK+RW-1)/RW;
+    if(sixteen && (oa&1)) direct=0;
+    int32_t rwsh=sixteen?2:3,onbw=(o->m[2]+RW-1)>>rwsh,onbd=(o->m[3]+31)>>5;
+    (void)L;(void)rwsh;(void)onbw;(void)onbd;
+    for(int32_t x0=0;x0<ow;x0+=p->cols) {
         int32_t nc=ow-x0<p->cols?ow-x0:p->cols;
-        int dchunk=direct && (o->p[2]+x0)%8==0;
-        size_t span=(size_t)(nc+kw-1)*ci;
-        for(int32_t ky=0;ky<kh;ky++) {
-            const uint8_t *src=x+(((size_t)(y+ky)*xw+x0)*ci)*es;
-            if(sixteen) near_split16(lo+(size_t)ky*plane,hi+(size_t)ky*plane,src,span);
-            else near_copy(lo+(size_t)ky*plane,src,span);
-        }
-        LAP(0);
-        for(int32_t px=0;px<nc;px+=PIXEL_BLOCK) {
-            int32_t np=nc-px<PIXEL_BLOCK?nc-px:PIXEL_BLOCK;
-            size_t at=(size_t)px*ci;
-            for(int32_t j=0;j<blocks;j+=2) {
-                int32_t nb=blocks-j<2?blocks-j:2;
-                const uint32_t *t0=tiles+(size_t)j*ntiles,*t1=nb==2?t0+ntiles:NULL;
-#if RQ_HVX
-                /* Fused: requant time lands in the mac phase. */
-                if(vec) {
-                    RqOut ro={(const HVX_Vector *)rqp+(size_t)j*RQ_VECS,out+((size_t)px*co+(size_t)j*32)*es,
-                              (uint32_t)(co*es),sixteen,0,{NULL,NULL}};
-                    if(dchunk) {
-                        ro.blocked=1;
-                        for(int32_t b=0;b<nb;b++)
-                            ro.blk[b]=blocked_row8(g->pool,o,(int64_t)o->p[1]+y,(int64_t)o->p[2]+x0+px,j+b);
-                    }
-                    if(sixteen) {
-                        tile_block(acc,np,lo+at,(uint32_t)ci,ntiles,t0,t1,xoff,wbase,NULL,NULL);
-                        tile_block(ahi,np,hi+at,(uint32_t)ci,ntiles,t0,t1,xoff,wbase,&ro,(const HVX_Vector *)acc);
-                    } else tile_block(acc,np,lo+at,(uint32_t)ci,ntiles,t0,t1,xoff,wbase,&ro,NULL);
-                    LAP(1);
-                    continue;
+        int dchunk=direct && !(sixteen && (nc&1));
+        int64_t W0=(int64_t)xt->p[2]+x0;
+        for(int32_t y=0;y<oh;y++) {
+            for(int32_t r=y?y+kh-1:0;r<=y+kh-1;r++) {
+                size_t rs=(size_t)(r%kh)*rowb;
+                uint8_t *dl=lo+rs;
+                if(!x) stage_row8(g->pool,xt,(int64_t)xt->p[1]+r,W0,nc+kw-1,W0-p->lead,ci,dl);
+                else {
+                    const uint8_t *src=x+(((size_t)r*xw+x0)*ci)*es;
+                    size_t span=(size_t)(nc+kw-1)*ci;
+                    if(sixteen) near_split16(dl,hi+rs,src,span);
+                    else near_copy(dl,src,span);
                 }
-#endif
-                tile_block(acc,np,lo+at,(uint32_t)ci,ntiles,t0,t1,xoff,wbase,NULL,NULL);
-                if(sixteen) tile_block(ahi,np,hi+at,(uint32_t)ci,ntiles,t0,t1,xoff,wbase,NULL,NULL);
-                LAP(1);
-                for(int32_t b=0;b<nb;b++)for(int32_t q=0;q<np;q++)for(int32_t l=0;l<32;l++) {
-                    int32_t k=(j+b)*32+l;
-                    size_t a_at=((size_t)b*PIXEL_BLOCK+q)*32+l;
-                    int64_t a=sixteen?(int64_t)ahi[a_at]*256+acc[a_at]:(int64_t)acc[a_at];
-                    a-=(int64_t)xt->zp*wsum[k];
-                    int64_t v=requant_value(a,bias[k],sixteen,M[k],pre[k],post[k]);
-                    size_t idx=(size_t)(px+q)*co+k;
-                    if(sixteen)((uint16_t *)out)[idx]=(uint16_t)v;else out[idx]=(uint8_t)v;
-                }
-                LAP(2);
             }
+            LAP(0);
+            size_t slot[4];
+            for(int32_t s=0,r=y%kh;s<kh;s++,r=r+1==kh?0:r+1) slot[s]=(size_t)r*rowb;
+            for(int32_t px=0;px<nc;px+=PIXEL_BLOCK) {
+                int32_t np=nc-px<PIXEL_BLOCK?nc-px:PIXEL_BLOCK;
+                const uint8_t *xl[4],*xh[4];
+                for(int32_t s=0;s<kh;s++) {
+                    size_t at=slot[s]+(size_t)px*ci;
+                    xl[s]=lo+at;xh[s]=hi?hi+at:NULL;
+                }
+                for(int32_t j=0;j<blocks;j+=2) {
+                    int32_t nb=blocks-j<2?blocks-j:2;
+                    const uint32_t *wpp=wp+(size_t)(j/2)*nt*2;
+#if RQ_HVX
+                    /* Fused: requant time lands in the mac phase. */
+                    if(vec) {
+                        RqOut ro={(const HVX_Vector *)rqp+(size_t)j*RQ_VECS,out+((size_t)px*co+(size_t)j*32)*es,
+                                  (uint32_t)(co*es),sixteen,0,0,{{NULL}}};
+                        if(dchunk) {
+                            int32_t wb=(o->p[2]+x0+px-oa)>>rwsh;
+                            ro.blocked=1;ro.a=oa;
+                            for(int32_t b=0;b<nb;b++)for(int32_t i=0;i<L;i++)
+                                ro.blk[b][i]=blocked_rowptr(g->pool,o,o->p[1]+y,wb+i,onbw,onbd,j+b);
+                        }
+                        if(sixteen) {
+                            tile_block(acc,np,xl,(uint32_t)kh,segend,(uint32_t)ci,wpp,nb==2,xoff,wbase,NULL,NULL);
+                            tile_block(ahi,np,xh,(uint32_t)kh,segend,(uint32_t)ci,wpp,nb==2,xoff,wbase,&ro,(const HVX_Vector *)acc);
+                        } else tile_block(acc,np,xl,(uint32_t)kh,segend,(uint32_t)ci,wpp,nb==2,xoff,wbase,&ro,NULL);
+                        LAP(1);
+                        continue;
+                    }
+#endif
+                    tile_block(acc,np,xl,(uint32_t)kh,segend,(uint32_t)ci,wpp,nb==2,xoff,wbase,NULL,NULL);
+                    if(sixteen) tile_block(ahi,np,xh,(uint32_t)kh,segend,(uint32_t)ci,wpp,nb==2,xoff,wbase,NULL,NULL);
+                    LAP(1);
+                    for(int32_t b=0;b<nb;b++)for(int32_t q=0;q<np;q++)for(int32_t l=0;l<32;l++) {
+                        int32_t k=(j+b)*32+l;
+                        size_t a_at=((size_t)b*PIXEL_BLOCK+q)*32+l;
+                        int64_t a=sixteen?(int64_t)ahi[a_at]*256+acc[a_at]:(int64_t)acc[a_at];
+                        a-=(int64_t)xt->zp*wsum[k];
+                        int64_t v=requant_value(a,bias[k],sixteen,M[k],pre[k],post[k]);
+                        size_t idx=(size_t)(px+q)*co+k;
+                        if(sixteen)((uint16_t *)out)[idx]=(uint16_t)v;else out[idx]=(uint8_t)v;
+                    }
+                    LAP(2);
+                }
+            }
+            if(!dchunk) {
+                int32_t dims[4]={1,1,nc,co},origin[4]={0,o->p[1]+y,o->p[2]+x0,0};
+                xfer_copy(g,o,out,dims,origin,1);
+            }
+            LAP(3);
         }
-        if(!dchunk) {
-            int32_t dims[4]={1,1,nc,co},origin[4]={0,o->p[1]+y,o->p[2]+x0,0};
-            xfer_copy(g,o,out,dims,origin,1);
-        }
-        LAP(3);
     }
 #undef LAP
 }
@@ -2047,7 +2328,26 @@ int nprg2_exec_reference_validate(const Nprg2ExecCall *c, void *ctx) {
 }
 int nprg2_exec_reference_run(const Nprg2ExecCall *c, void *ctx) {
     G g;
+    /* The dry pass measures the exact scratch need. A command that needs no
+     * more than the near region (scratch region 1, L2-TCM on the Frame) runs
+     * its temporaries there instead of in the DDR heap. Commands run one at
+     * a time, so the region (also used by the elementwise handlers inside
+     * their own commands) is free. Results do not depend on where scratch is.
+     * Without a near region, a call the executor already preflighted skips
+     * the repeated dry pass (same pass as nprg2_exec_reference_validate). */
+    const Nprg2ExecBuffer *nr=&c->scratch_region[NPRG2_EXEC_SCRATCH_NEAR];
+    int has_near=nr->data && nr->bytes;
+    if(!has_near && c->preflighted) {
+        if(setup(&g,c,0,0,ctx)) return 0;
+        return run_kernel(&g)==0;
+    }
     if(setup(&g,c,1,0,ctx) || run_kernel(&g)) return 0;
+    if(has_near && g.used && !((uintptr_t)nr->data&63u) && g.used+64u<=nr->bytes) {
+        Nprg2ExecCall w=*c;
+        w.scratch=nr->data;w.scratch_bytes=nr->bytes;
+        if(setup(&g,&w,0,0,ctx)) return 0;
+        return run_kernel(&g)==0;
+    }
     if(setup(&g,c,0,0,ctx)) return 0;
     return run_kernel(&g)==0;
 }

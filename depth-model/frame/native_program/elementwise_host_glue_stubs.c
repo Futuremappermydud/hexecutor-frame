@@ -8,3 +8,8 @@ int qd_blocked_linearclip_u8_u16_apply(const QdBlockedLinearclipU8U16 *p,
         const QdLinearclipU8U16Params *q) {
     (void)p;(void)q;return 1;
 }
+#include "../blocked_glue/elementwise_u16.h"
+int qd_blocked_ew16_apply(const QdBlockedU16 *a,const QdBlockedU16 *b,const QdBlockedU16 *out,
+                          const QdEw16Params *p,int32_t bscalar) {
+    (void)a;(void)b;(void)out;(void)p;(void)bscalar;return 1;
+}

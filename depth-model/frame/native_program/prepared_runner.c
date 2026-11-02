@@ -62,13 +62,17 @@ static int runner_request(Nprg2PreparedRunner *r,uint32_t first,uint32_t count,u
     memset(q,0,sizeof *q);*q=(Nprg2ExecRequest){.program=&r->program,.bound=&r->bound,.pool1_writable_bytes=pool1_writable,
         .inputs=inputs,.input_count=input_count,.outputs=outputs,.output_count=output_count,
         .user=user,.scratch=scratch,.scratch_bytes=scratch_bytes,.command_first=first,
-        .command_count=count,.cancelled=cancelled,.cancel_ctx=cancel_ctx,.stats=stats};
+        .command_count=count,.cancelled=cancelled,.cancel_ctx=cancel_ctx,.stats=stats,
+        .profile=r->profile,.reuse_preflight=r->reuse_preflight};
     memcpy(q->pools,r->pools,sizeof q->pools);
     memcpy(q->extra_scratch,r->extra_scratch,sizeof q->extra_scratch);return NPRG2_EXEC_OK;
 }
 int nprg2_runner_set_scratch_region(Nprg2PreparedRunner *r,uint8_t region,void *scratch,uint32_t bytes){
     if(!r||!r->ready||!region||region>=NPRG2_EXEC_SCRATCH_REGIONS||(bytes&&!scratch))return NPRG2_RUNNER_ARGUMENT;
     r->extra_scratch[region-1u]=(Nprg2ExecBuffer){bytes?(uint8_t *)scratch:NULL,bytes};return NPRG2_RUNNER_OK;
+}
+int nprg2_runner_set_profile(Nprg2PreparedRunner *r,Nprg2ExecProfile *profile,int reuse_preflight){
+    if(!r||!r->ready)return NPRG2_RUNNER_ARGUMENT;r->profile=profile;r->reuse_preflight=reuse_preflight?1u:0u;return NPRG2_RUNNER_OK;
 }
 int nprg2_runner_preflight(Nprg2PreparedRunner *r,const Nprg2Executor *e,
                            uint32_t first,uint32_t count,uint32_t pool1_writable,

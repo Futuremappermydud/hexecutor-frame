@@ -8,6 +8,8 @@
 #define QDS_WORK_L2 0x300f0000u
 #define QDS_RESULT 2048u
 #define QDS_PROFILE 16384u
+/* Prepared per-handler profile, see prepared_export_profile (qd_graph_prepared.h). */
+#define QDS_PROFILE2 20480u
 #define QDS_OP_RUN 3u
 typedef struct {
     uint32_t magic,version,image,image_bytes,pool[7],pool_bytes[7];

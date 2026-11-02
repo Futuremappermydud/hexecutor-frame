@@ -46,12 +46,23 @@ static const volatile char prepared_padded_feature[]="QD_PREPARED_W1_1";
 static const volatile char prepared_compact3_feature[]="QD_PREPARED_A3_1";
 #endif
 
+/* Per-handler hardware profile (QDS_PREPARED_PROFILE, default on): the cost
+ * is two pcycle reads per command in preflight and in run. */
+#ifndef QDS_PREPARED_PROFILE
+#define QDS_PREPARED_PROFILE 1
+#endif
+
 typedef struct {
     Nprg2PreparedRunner runner;
     Nprg2Executor executor;
     Nprg2NativeConfig native;
     Nprg2ExecBuffer inputs[4],outputs[2];
     Nprg2ExecStats stats;
+#if QDS_PREPARED_PROFILE
+    Nprg2ExecProfile profile;
+    uint64_t handler_run_cycles[NPRG2_EXEC_REGISTRY_CAPACITY],handler_run_count[NPRG2_EXEC_REGISTRY_CAPACITY],
+             handler_validate_cycles[NPRG2_EXEC_REGISTRY_CAPACITY];
+#endif
 #if QDS_PREPARED_REFERENCE
     Nprg2ReferenceConv conv;
     Nprg2ReferenceChain chains[QDS_REFERENCE_CHAINS];
@@ -233,7 +244,19 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
     scratch=s->scratch;scratch_bytes=QDS_REFERENCE_SCRATCH_BYTES;
     trace[15]=(uint32_t)prepared_reference_feature[0];
 #endif
-    s->stats.clock=now_ns;s->stats.variant_cycles=g->stats.variant_ns;s->stats.variant_count=g->stats.variant_count;
+#if QDS_PREPARED_PROFILE
+    /* Per run: cleared here, exported by the caller after the run. The
+     * identical-request preflight is proved, not repeated, in execute. */
+    memset(s->handler_run_cycles,0,sizeof s->handler_run_cycles);
+    memset(s->handler_run_count,0,sizeof s->handler_run_count);
+    memset(s->handler_validate_cycles,0,sizeof s->handler_validate_cycles);
+    s->profile=(Nprg2ExecProfile){.clock=now_ns,.variant_cycles=g->stats.variant_ns,.variant_count=g->stats.variant_count,
+        .handler_run_cycles=s->handler_run_cycles,.handler_run_count=s->handler_run_count,
+        .handler_validate_cycles=s->handler_validate_cycles};
+    nprg2_runner_set_profile(&s->runner,&s->profile,1);
+#else
+    nprg2_runner_set_profile(&s->runner,NULL,1);
+#endif
     int e=nprg2_runner_preflight(&s->runner,&s->executor,first,last-first,QD_DIRECT_ACTIVE_BYTES,
         s->inputs,4,s->outputs,2,g,scratch,scratch_bytes,&s->stats);
     if(e)goto failed;
@@ -256,4 +279,29 @@ failed:
     g->error_detail=0x4e505200u|(uint32_t)e;trace[14]=(uint32_t)e;
     return e==NPRG2_EXEC_UNSUPPORTED || e==NPRG2_EXEC_REJECTED?QDG_ERR_UNSUPPORTED:QDG_ERR_DSP;
 }
+
+#if QDS_PREPARED_PROFILE
+/* Writes the last run's executor profile to the service arena (4160 bytes at
+ * QDS_PROFILE2): eight u64 [magic 'QDHP' | version 1<<32, preflight cycles,
+ * validator cycles, dispatch cycles, handler run cycles, preflight calls |
+ * reused<<32, executed | validated<<32, registry slots], then one 32-byte
+ * record per registry slot: u32 key (opcode | variant<<8 | used<<16 |
+ * no_effect<<24), u32 0, u64 run count, u64 run cycles, u64 validator cycles.
+ * Cycles are pcycles. Dispatch is the run loop outside handler run callbacks
+ * (decode, lookup, cancel, scratch selection); preflight includes validators. */
+static void prepared_export_profile(const QdPreparedState *s,uint8_t *dst) {
+    uint64_t head[8]={0,s->profile.preflight_cycles,s->profile.validate_cycles,
+        s->profile.dispatch_cycles,s->profile.run_cycles,
+        (uint64_t)s->profile.preflight_calls|(uint64_t)s->profile.preflights_reused<<32,
+        (uint64_t)s->stats.executed_commands|(uint64_t)s->stats.validated_commands<<32,NPRG2_EXEC_REGISTRY_CAPACITY};
+    head[0]=0x51444850ull|1ull<<32;
+    memcpy(dst,head,sizeof head);
+    for(uint32_t i=0;i<NPRG2_EXEC_REGISTRY_CAPACITY;i++) {
+        const Nprg2ExecHandler *h=&s->executor.handlers[i];
+        uint64_t rec[4]={0,s->handler_run_count[i],s->handler_run_cycles[i],s->handler_validate_cycles[i]};
+        if(h->used)rec[0]=(uint64_t)h->opcode|(uint64_t)h->variant<<8|1ull<<16|(uint64_t)h->no_effect<<24;
+        memcpy(dst+sizeof head+(size_t)i*32u,rec,32);
+    }
+}
+#endif
 #endif

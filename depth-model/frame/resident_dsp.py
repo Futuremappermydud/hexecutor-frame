@@ -184,6 +184,7 @@ class ResidentDSP:
         if result[0]!=MAGIC or result[1]:raise RuntimeError(f'resident graph failed: {self.last}')
         raw=np.frombuffer(bytes(t.arena[16384:16384+1280]),'<u8').reshape(2,80)
         self.profile=[{'variant':i,'ms':int(raw[0,i])/1843200,'count':int(raw[1,i])} for i in range(80) if raw[1,i]]
+        self.handler_profile,self.executor_profile=self._read_handler_profile(t.arena)
         self.check_guards()
         downloaded=time.monotonic()
         outs=[np.frombuffer(self.mem,dt,int(np.prod(shape)),off).copy().reshape(shape)
@@ -191,6 +192,26 @@ class ResidentDSP:
         self.last['download_ms']=(time.monotonic()-downloaded)*1000
         self.last['total_seconds']=self.seconds+(upload_ms+self.last['download_ms'])/1000
         return outs
+
+    @staticmethod
+    def _read_handler_profile(arena):
+        """Prepared executor profile written by the engine (QDS_PREPARED_PROFILE=1):
+        per-(opcode,variant) run ms/count/validator ms and the executor overhead
+        buckets, all in ms (pcycles / 1843200). Empty when the engine has none."""
+        head=struct.unpack_from('<8Q',arena,20480)
+        if head[0]!=0x100000000|0x51444850:return [],{}
+        ms=lambda v:v/1843200
+        slots=int(head[7])
+        rows=[]
+        for i in range(slots):
+            key,_,count,run,val=struct.unpack_from('<IIQQQ',arena,20480+64+i*32)
+            if not key&0x10000:continue
+            rows.append({'opcode':key&255,'variant':(key>>8)&255,'no_effect':bool(key>>24),
+                         'count':int(count),'run_ms':ms(run),'validate_ms':ms(val)})
+        rows.sort(key=lambda r:-(r['run_ms']+r['validate_ms']))
+        return rows,{'preflight_ms':ms(head[1]),'validate_ms':ms(head[2]),'dispatch_ms':ms(head[3]),
+                     'run_ms':ms(head[4]),'preflight_calls':int(head[5]&0xffffffff),'preflights_reused':int(head[5]>>32),
+                     'executed_commands':int(head[6]&0xffffffff),'validated_commands':int(head[6]>>32)}
 
     def cancel(self):
         """Request cancellation at the next graph-command boundary."""

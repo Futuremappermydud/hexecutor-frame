@@ -42,19 +42,43 @@ typedef struct {
     /* Every request region, index 0 = default, so a wrapping handler (the
      * reference chain) can hand the wrapped handler its own region. */
     Nprg2ExecBuffer scratch_region[NPRG2_EXEC_SCRATCH_REGIONS];
+    /* Set only on run calls: the executor has just validated this command's
+     * exact request (in this run or an identical preflight), so a handler
+     * may skip a purely repeated dry-run of its own validator. Always 0 in
+     * validation calls. */
+    uint8_t preflighted;
 } Nprg2ExecCall;
 
 typedef int (*Nprg2ExecValidate)(const Nprg2ExecCall *call, void *handler_ctx);
 typedef int (*Nprg2ExecRun)(const Nprg2ExecCall *call, void *handler_ctx);
 typedef int (*Nprg2ExecCancel)(void *ctx, uint32_t next_command);
-/* With clock and both arrays set, run adds each executed command's clock
- * delta and count at its variant (variants below NPRG2_EXEC_PROFILE_VARIANTS). */
+/* Optional hardware profile, passed in the request (never in the stats, which
+ * preflight clears). All arrays are caller-owned and accumulate until the
+ * caller clears them. With no clock nothing is timed. Cycle values are in
+ * clock() units (the DSP's pcycle counter on Frame).
+ *   variant_*          run time and count per variant (< NPRG2_EXEC_PROFILE_VARIANTS)
+ *   handler_*          per registry slot (NPRG2_EXEC_REGISTRY_CAPACITY entries):
+ *                      run cycles, run count (also counts effect-free
+ *                      commands, which are not timed) and validator cycles
+ *   preflight_cycles   whole preflight calls, including the validators
+ *   validate_cycles    the validator callbacks alone
+ *   dispatch_cycles    run loop time outside handler run callbacks: command
+ *                      decode, registry lookup, scratch selection, cancel
+ *   run_cycles         the handler run callbacks alone */
 #define NPRG2_EXEC_PROFILE_VARIANTS 80u
+typedef struct {
+    uint64_t (*clock)(void);
+    uint64_t *variant_cycles, *variant_count;
+    uint64_t *handler_run_cycles, *handler_run_count, *handler_validate_cycles;
+    uint64_t preflight_cycles, validate_cycles, dispatch_cycles, run_cycles;
+    uint32_t preflight_calls, preflights_reused;
+} Nprg2ExecProfile;
 typedef struct {
     uint32_t validated_commands, executed_commands, failed_command;
     uint8_t failed_opcode, failed_variant;
-    uint64_t (*clock)(void);
-    uint64_t *variant_cycles, *variant_count;
+    /* Signature of the request the last successful preflight covered; see
+     * Nprg2ExecRequest.reuse_preflight. */
+    uint64_t preflight_signature;
 } Nprg2ExecStats;
 
 typedef struct {
@@ -76,10 +100,20 @@ typedef struct {
     Nprg2ExecCancel cancelled;
     void *cancel_ctx;
     Nprg2ExecStats *stats;
+    Nprg2ExecProfile *profile;
+    /* Run only. When set, stats is non-NULL and the same stats object holds
+     * the signature of a successful preflight of this exact request (program,
+     * bound tables, pools, ceiling, I/O and scratch buffers, interval,
+     * registry), run skips its own repeated preflight. Any difference, or no
+     * earlier preflight, runs the full preflight as usual. */
+    uint8_t reuse_preflight;
 } Nprg2ExecRequest;
 
 typedef struct {
     uint8_t opcode, variant, used, scratch_region;
+    /* Run does nothing beyond what validation proved (a NOP): the run loop
+     * counts the command without calling run. */
+    uint8_t no_effect;
     Nprg2ExecValidate validate;
     Nprg2ExecRun run;
     void *ctx;
@@ -102,6 +136,9 @@ int nprg2_executor_register_scratch_region(Nprg2Executor *executor, uint8_t opco
                                            uint32_t scratch_bytes,
                                            uint32_t concurrent_worker_scratch_bytes,
                                            uint8_t scratch_region);
+/* Declares a registered handler's run callback effect-free given a passed
+ * validation, so run may skip calling it. UNSUPPORTED if not registered. */
+int nprg2_executor_mark_no_effect(Nprg2Executor *executor, uint8_t opcode, uint8_t variant);
 int nprg2_exec_input(const Nprg2ExecCall *call, uint32_t slot,
                      uint32_t *tensor_index, Nprg2TensorView *view);
 int nprg2_exec_output(const Nprg2ExecCall *call, uint32_t slot,

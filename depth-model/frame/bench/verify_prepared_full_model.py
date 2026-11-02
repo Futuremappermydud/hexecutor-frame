@@ -50,7 +50,8 @@ def main():
                 trace=dsp.last.get('native_direct_trace',[])
                 row={'case':label,'run':run,'pools_zeroed':run==0,**dsp.last,'output_sha256':hashes,
                      'outputs_equal':hashes==expected,
-                     'variant_profile':sorted(dsp.profile,key=lambda v:-v['ms'])}
+                     'variant_profile':sorted(dsp.profile,key=lambda v:-v['ms']),
+                     'handler_profile':dsp.handler_profile,'executor_profile':dsp.executor_profile}
                 # The prepared reference engine reuses the first four conv phase slots.
                 phases=list(dsp.last.get('conv_phases_ms',{}).values())[:4]
                 if len(phases)==4:
@@ -63,7 +64,10 @@ def main():
                 print(json.dumps({'case':label,'run':run,'passed':row['passed'],'outputs_equal':row['outputs_equal'],
                                   'dsp_ms':row.get('dsp_ms'),'total_seconds':row.get('total_seconds'),
                                   'near_conv_phases_ms':row.get('near_conv_phases_ms'),
-                                  'top_variants_ms':{v['variant']:round(v['ms'],1) for v in row['variant_profile'][:6]}}),
+                                  'top_variants_ms':{v['variant']:round(v['ms'],1) for v in row['variant_profile'][:6]},
+                                  'top_handlers_ms':{f"{h['opcode']}/{h['variant']}":[h['count'],round(h['run_ms'],1),round(h['validate_ms'],1)]
+                                                     for h in row['handler_profile'][:8]},
+                                  'executor_profile_ms':{k:(round(v,2) if isinstance(v,float) else v) for k,v in row['executor_profile'].items()}}),
                       flush=True)
     report['exit_errors']=dsp.exit_errors;report['vtcm_lease']=dsp.vtcm_lease
     report['passed']=(bool(report['runs']) and all(r['passed'] for r in report['runs'])

@@ -1,6 +1,7 @@
 #include "prepared_elementwise.h"
 
 #include "../blocked_glue/add_u8.h"
+#include "../blocked_glue/elementwise_u16.h"
 #include "../blocked_glue/linearclip_u8_u16.h"
 #include <limits.h>
 #include <string.h>
@@ -290,6 +291,146 @@ static int requant_run(const Nprg2ExecCall *c,void *ctx) {
     return qd_blocked_add_u8_apply(&prepared,&p);
 }
 
+
+/* ------------------------------------------------------------------------
+ * u16 crouton ("CH") elementwise: REQUANT_U16/71, ADD1111_U16/59,
+ * MUL_U16/74, ADD_U16/14, ADDSUB_U16/60, MUL1111_U16/73. Exact 32-bit lane
+ * forms are derived and checked in blocked_glue/elementwise_u16.h; this
+ * section only maps the reference kernels' arguments onto them and rejects
+ * (-> reference kernel) everything outside the proven ranges. Same scratch as
+ * the u8 handlers (alias proof), so the region demand is unchanged.
+ * ------------------------------------------------------------------------ */
+enum { W16_REQ, W16_ADD1111, W16_MUL, W16_ADD, W16_ADDSUB, W16_MUL1111, W16_COUNT };
+typedef struct { uint8_t opcode,variant,nin; uint32_t fn,used; int two_tensors,scalar; } W16Spec;
+static const W16Spec w16_spec[W16_COUNT]={
+    {QDR_REQUANT_U16,71,2,QDR_CALL_REQUANTIZE_CROUTON_U16,0x18,0,0},
+    {QDR_ADD1111_U16,59,3,QDR_CALL_ELEMENTWISE_ADD1111_CROUTON_U16,0xf0,0,1},
+    {QDR_MUL_U16,74,3,QDR_CALL_ELEMENTWISE_MUL_CROUTON_U16,0x1f0,1,0},
+    {QDR_ADD_U16,14,2,QDR_CALL_ELEMENTWISE_ADD_CROUTON_U16,0x1f0,1,0},
+    {QDR_ADDSUB_U16,60,3,QDR_CALL_ELEMENTWISE_ADDSUB_CROUTON_U16,0x70,1,0},
+    {QDR_MUL1111_U16,73,3,QDR_CALL_ELEMENTWISE_MUL1111_CROUTON_U16,0x1f0,0,1},
+};
+
+static int make_u16(const Nprg2ExecCall *c,uint32_t slot,int output,QdBlockedU16Out *out) {
+    uint32_t ti;Nprg2TensorView v;
+    if ((output?nprg2_exec_output(c,slot,&ti,&v):nprg2_exec_input(c,slot,&ti,&v))!=NPRG2_EXEC_OK) return 0;
+    (void)ti;
+    if (v.storage_kind!=2 || v.block_count>MAX_BLOCKS || !v.blocks || !(v.geometry_record[1]&GEOMETRY_CROUTON) ||
+        v.geometry_record[0]!=3 || memcmp(v.geometry_record+2,"CH",2)) return 0;
+    if (!fill_pool_pointer_table(c)) return 0;
+    memset(out,0,sizeof *out); out->pools=pool_pointer_table(c);
+    out->blocks=v.blocks; out->block_count=v.block_count; out->slice=v.slice_origin;
+    return view_shape(&v,out->dims,out->meta,out->origin);
+}
+
+/* The 1x1x1x1 direct u16 scalar operand of ADD1111/MUL1111: address of its
+ * two bytes, or NULL. The value is read at run time (it may be a pool 3
+ * activation written by an earlier command). */
+static const uint8_t *w16_scalar_addr(const Nprg2ExecCall *c,uint32_t slot) {
+    uint32_t id;Nprg2TensorView v;
+    if (nprg2_exec_input(c,slot,&id,&v)!=NPRG2_EXEC_OK) return NULL;
+    (void)id;
+    if (v.storage_kind!=1 || v.pool>=7 || !c->pools[v.pool].base || v.geometry_record[0]!=3) return NULL;
+    int32_t d[4],m[4],o[4];if (!view_shape(&v,d,m,o)) return NULL;
+    for (int i=0;i<4;i++) if (d[i]!=1||m[i]!=1||o[i]) return NULL;
+    uint32_t limit=c->pools[v.pool].bytes;
+    if (v.pool==1 && limit>c->pool1_writable_bytes) limit=c->pool1_writable_bytes;
+    if (v.offset>limit || 2u>limit-v.offset) return NULL;
+    return c->pools[v.pool].base+v.offset;
+}
+
+/* The reference's call_args: exactly one matching call record, the "used"
+ * arguments unmasked. Fills r[10]. */
+static int w16_call(const Nprg2ExecCall *c,const W16Spec *sp,int64_t r[10]) {
+    if (c->command.call_count!=1 || c->command.call_first>c->bound->calls.bytes/88u ||
+        c->command.call_count>c->bound->calls.bytes/88u-c->command.call_first) return 0;
+    const uint8_t *rec=c->bound->calls.data+(size_t)c->command.call_first*88u;
+    if (rd32e(rec)!=sp->fn) return 0;
+    uint32_t mask=rd32e(rec+4);
+    if (sp->used&mask) return 0;
+    for (unsigned i=0;i<10;i++) r[i]=(int64_t)rd64e(rec+8u+i*8u);
+    return 1;
+}
+static int w16_params(const Nprg2ExecCall *c,int which,QdEw16Params *p) {
+    const W16Spec *sp=&w16_spec[which];int64_t r[10];
+    if (!w16_call(c,sp,r)) return 0;
+    switch (which) {
+    case W16_REQ: return qd_ew16_make_requant(r[3],r[4],p);
+    case W16_ADD1111: return qd_ew16_make_add1111(r[4],r[5],r[6],r[7],p);
+    case W16_MUL: case W16_MUL1111: return qd_ew16_make_mul(r[4],r[5],r[6],r[7],r[8],p);
+    case W16_ADD: return r[7]==0 && qd_ew16_make_add(r[4],r[5],r[6],p);
+    default: {
+        uint32_t oti;Nprg2TensorView ov;
+        if (nprg2_exec_output(c,0,&oti,&ov)!=NPRG2_EXEC_OK) return 0;
+        return qd_ew16_make_addsub(r[4],r[5],r[6],(int32_t)rd32e(ov.geometry_record+30),p);
+    }
+    }
+}
+
+static int alias_proof16(const Nprg2ExecCall *c,const QdBlockedU16Out *a,const QdBlockedU16Out *b,
+                         const QdBlockedU16Out *o,const void *extra_read,size_t extra_read_bytes) {
+    if (!fill_pool_pointer_table(c)) return 0;
+    uintptr_t *s=(uintptr_t *)c->scratch;
+    uintptr_t *sa=s,*sb=s+MAX_BLOCKS,*so=s+2u*MAX_BLOCKS;
+    size_t na=0,nb=0,no=0;
+    if (!collect(c,a->blocks,a->block_count,a->slice,a->meta,a->dims,a->origin,4,sa,MAX_BLOCKS,&na)) return 0;
+    if (b && !collect(c,b->blocks,b->block_count,b->slice,b->meta,b->dims,b->origin,4,sb,MAX_BLOCKS,&nb)) return 0;
+    if (!collect(c,o->blocks,o->block_count,o->slice,o->meta,o->dims,o->origin,4,so,MAX_BLOCKS,&no)) return 0;
+    for (size_t i=1;i<no;i++) if (so[i]<so[i-1]+BLOCK_BYTES) return 0;
+    if (extra_read_bytes) {
+        uintptr_t x=(uintptr_t)extra_read;
+        if (!extra_read || add_overflow(x,extra_read_bytes)) return 0;
+        for (size_t i=0;i<no;i++) if (so[i]<x+extra_read_bytes && x<so[i]+BLOCK_BYTES) return 0;
+    }
+    return sets_disjoint(so,no,sa,na) && sets_disjoint(so,no,sb,nb);
+}
+
+static int w16_validate(const Nprg2ExecCall *c,int which) {
+    const W16Spec *sp=&w16_spec[which];
+    if (!c || c->command.opcode!=sp->opcode || c->command.variant!=sp->variant ||
+        c->command.input_count!=sp->nin || c->command.output_count!=1) return 0;
+    QdEw16Params p;QdBlockedU16Out a,b,o;
+    if (!w16_params(c,which,&p) || !make_u16(c,0,0,&a) || !make_u16(c,0,1,&o)) return 0;
+    if (sp->two_tensors && !make_u16(c,1,0,&b)) return 0;
+    const uint8_t *scalar=NULL;
+    if (sp->scalar && !(scalar=w16_scalar_addr(c,1))) return 0;
+    if (!qd_valid(a.meta,a.dims,a.origin,4) || !qd_valid(o.meta,o.dims,o.origin,4)) return 0;
+    if (sp->two_tensors && !qd_valid(b.meta,b.dims,b.origin,4)) return 0;
+    for (int i=0;i<4;i++) if (a.dims[i]!=o.dims[i] || (sp->two_tensors && a.dims[i]!=b.dims[i])) return 0;
+    if ((a.origin[3]&31)!=(o.origin[3]&31) || (a.origin[2]&3)!=(o.origin[2]&3)) return 0;
+    if (sp->two_tensors && ((a.origin[3]&31)!=(b.origin[3]&31) || (a.origin[2]&3)!=(b.origin[2]&3))) return 0;
+    uint32_t oti;Nprg2TensorView ov;if (nprg2_exec_output(c,0,&oti,&ov)!=NPRG2_EXEC_OK) return 0;
+    if (ov.geometry_record[1]&GEOMETRY_CROUTON) {
+        /* Memory.write pads a narrower value to the 32-lane boundary with zeros;
+         * only the unpadded form is the elementwise result. */
+        int32_t depth=((o.dims[3]+o.origin[3]+31)/32)*32;
+        if (depth>o.meta[3]) depth=o.meta[3];
+        if (depth-o.origin[3]!=a.dims[3]) return 0;
+    }
+    return alias_proof16(c,&a,sp->two_tensors?&b:NULL,&o,scalar,scalar?2u:0u);
+}
+static int w16_run(const Nprg2ExecCall *c,int which) {
+    const W16Spec *sp=&w16_spec[which];
+    QdEw16Params p;QdBlockedU16Out a,b,o;int32_t bs=-1;
+    if (!w16_params(c,which,&p) || !make_u16(c,0,0,&a) || !make_u16(c,0,1,&o)) return 0;
+    if (sp->two_tensors && !make_u16(c,1,0,&b)) return 0;
+    if (sp->scalar) {
+        const uint8_t *sa=w16_scalar_addr(c,1);
+        if (!sa) return 0;
+        bs=(int32_t)rd16e(sa);
+    }
+    return qd_blocked_ew16_apply(&a,sp->two_tensors?&b:NULL,&o,&p,bs);
+}
+#define W16_HANDLERS(N,W) \
+    static int N##_validate(const Nprg2ExecCall *c,void *ctx){(void)ctx;return w16_validate(c,W);} \
+    static int N##_run(const Nprg2ExecCall *c,void *ctx){(void)ctx;return w16_run(c,W);}
+W16_HANDLERS(req16,W16_REQ)
+W16_HANDLERS(add1111,W16_ADD1111)
+W16_HANDLERS(mul16,W16_MUL)
+W16_HANDLERS(add16,W16_ADD)
+W16_HANDLERS(addsub16,W16_ADDSUB)
+W16_HANDLERS(mul1111,W16_MUL1111)
+
 int nprg2_executor_register_elementwise_region(Nprg2Executor *e, uint8_t region) {
     if (!e) return NPRG2_EXEC_ARGUMENT;
     int rc=nprg2_executor_register_scratch_region(e,QDR_ADD_U8,13,add_validate,add_run,NULL,
@@ -300,8 +441,20 @@ int nprg2_executor_register_elementwise_region(Nprg2Executor *e, uint8_t region)
     if (rc) return rc;
     /* Variant 68 is the proven linearclip@CH.CB.fi (CB u8 -> CH u16) form.
      * U16->U16 and dense/FB variants remain unregistered and fail closed. */
-    return nprg2_executor_register_scratch_region(e,QDR_LINEARCLIP,68,linearclip_validate,linearclip_run,NULL,
+    rc=nprg2_executor_register_scratch_region(e,QDR_LINEARCLIP,68,linearclip_validate,linearclip_run,NULL,
             NPRG2_ELEMENTWISE_SCRATCH_BYTES,0,region);
+    if (rc) return rc;
+    /* u16 crouton elementwise (blocked_glue/elementwise_u16.h). */
+    static const struct { int w; Nprg2ExecValidate v; Nprg2ExecRun r; } h16[W16_COUNT]={
+        {W16_REQ,req16_validate,req16_run},{W16_ADD1111,add1111_validate,add1111_run},
+        {W16_MUL,mul16_validate,mul16_run},{W16_ADD,add16_validate,add16_run},
+        {W16_ADDSUB,addsub16_validate,addsub16_run},{W16_MUL1111,mul1111_validate,mul1111_run}};
+    for (unsigned i=0;i<W16_COUNT;i++) {
+        rc=nprg2_executor_register_scratch_region(e,w16_spec[h16[i].w].opcode,w16_spec[h16[i].w].variant,
+                h16[i].v,h16[i].r,NULL,NPRG2_ELEMENTWISE_SCRATCH_BYTES,0,region);
+        if (rc) return rc;
+    }
+    return NPRG2_EXEC_OK;
 }
 int nprg2_executor_register_elementwise(Nprg2Executor *e) {
     return nprg2_executor_register_elementwise_region(e,NPRG2_EXEC_SCRATCH_DEFAULT);

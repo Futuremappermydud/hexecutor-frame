@@ -23,6 +23,7 @@ docker run --rm --platform linux/amd64 -v "$task_sdk_root:/sdk:ro" -v "$PWD/fram
    -e QDS_PREPARED_QUANTIZE="${QDS_PREPARED_QUANTIZE:-0}" \
    -e QDS_PREPARED_ELEMENTWISE="${QDS_PREPARED_ELEMENTWISE:-0}" \
    -e QDS_PREPARED_REFERENCE="${QDS_PREPARED_REFERENCE:-0}" \
+   -e QDS_PREPARED_PROFILE="${QDS_PREPARED_PROFILE:-1}" \
    depth-model-hmx-tools:latest sh -eu -c '
 cc=/sdk/tools/HEXAGON_Tools/19.0.07/Tools/bin/hexagon-clang
 flags="-mv75 -mhvx -mhvx-length=128b -O2 -G0 -ffreestanding -fno-builtin -fno-vectorize -fno-slp-vectorize -ffp-contract=off -fno-strict-aliasing -Wall -Wextra -DQDO_SCALAR_CACHE=$QDS_SCALAR_CACHE"
@@ -121,6 +122,8 @@ engine_flags="$engine_flags -DQDS_PREPARED_QUANTIZE=$QDS_PREPARED_QUANTIZE"
 engine_flags="$engine_flags -DQDS_PREPARED_ELEMENTWISE=$QDS_PREPARED_ELEMENTWISE"
 engine_flags="$engine_flags -DQDS_PRESERVE_VTCM=$QDS_PRESERVE_VTCM"
 engine_flags="$engine_flags -DQDS_PREPARED_REFERENCE=$QDS_PREPARED_REFERENCE"
+case "$QDS_PREPARED_PROFILE" in 0|1) ;; *) echo "QDS_PREPARED_PROFILE must be 0 or 1" >&2; exit 1;; esac
+engine_flags="$engine_flags -DQDS_PREPARED_PROFILE=$QDS_PREPARED_PROFILE"
 glue_src=
 native_src=
 if [ "$QDS_DYNAMIC_TCM" = 1 ]; then engine="${engine%.elf}-dynamic-tcm.elf"; fi
@@ -128,7 +131,7 @@ if [ "$QDS_FALLBACK_TCM" = 1 ]; then engine="${engine%.elf}-fallback-tcm.elf"; f
 if [ "$QDS_FALLBACK_TCM" = 2 ]; then engine="${engine%.elf}-fallback-l2.elf"; fi
 if [ "$QDS_BLOCKED_GLUE" = 1 ]; then
   engine="${engine%.elf}-blocked-glue.elf"
-  glue_src="blocked_glue/linearclip_u16.c blocked_glue/linearclip_u8_u16.c blocked_glue/sign_levels.c blocked_glue/sign_blocked.c blocked_glue/add_u8.c"
+  glue_src="blocked_glue/linearclip_u16.c blocked_glue/linearclip_u8_u16.c blocked_glue/sign_levels.c blocked_glue/sign_blocked.c blocked_glue/add_u8.c blocked_glue/elementwise_u16.c"
 fi
 if [ "$QDS_FAST_SPILL" = 1 ]; then engine="${engine%.elf}-fast-spill.elf"; fi
 if [ "$QDS_BLOCKED_S2D" = 1 ]; then engine="${engine%.elf}-blocked-s2d.elf"; fi
