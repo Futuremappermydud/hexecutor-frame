@@ -1144,7 +1144,59 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
 typedef struct {
     G *g; const T *xt, *o; int32_t KB, NB, bw, m0, mt; const uint32_t *ktab; uint8_t *A, *C;
     int64_t xnbw, xnbd, onbw, onbd;
+    int32_t H, W, cbs; uint8_t kinv[256]; /* (cb*3+ky)*3+kx -> k */
 } N16Job;
+#ifndef N16_FUSED
+#define N16_FUSED 1
+#endif
+/* All H*W taps of tile t, channel block cb, in one pass: each input row
+ * (8+H-1 of them) is loaded once as up to 4 pixel pairs, the W column
+ * shifts are built from them and stored into every tap tile using that row.
+ * Same bytes as n16_tile for every (t, k). */
+static void n16_tile_all(const N16Job *J, int32_t t, int32_t cb) {
+    const T *xt=J->xt;
+    int32_t tt=J->m0+t,by=tt/J->bw,bx=tt-by*J->bw;
+    const HVX_Vector z=Q6_V_vzero();
+    const int32_t X0=xt->p[2]+bx*4,a0=X0>>1,wbA=a0>>1;
+    int32_t ra[3],od[3];
+    for(int32_t kx=0;kx<J->W;kx++){ra[kx]=((X0+kx)>>1)-a0;od[kx]=(X0+kx)&1;}
+    HVX_Vector *tile[3][3];
+    for(int32_t ky=0;ky<J->H;ky++)for(int32_t kx=0;kx<J->W;kx++)
+        tile[ky][kx]=(HVX_Vector *)(J->A+((size_t)t*J->KB+J->kinv[(cb*3+ky)*3+kx])*2048);
+    const int32_t Ybase=xt->p[1]+by*8,nrows=8+J->H-1;
+    int32_t brow=INT32_MIN;const uint8_t *blk[3]={NULL,NULL,NULL};
+    for(int32_t i=0;i<nrows;i++) {
+        const int32_t Y=Ybase+i;
+        if((Y>>3)!=brow) {
+            brow=Y>>3;
+            for(int q=0;q<3;q++){const uint8_t *r=hmx_row(J->g->pool,xt,(int64_t)brow*8,wbA+q,J->xnbw,J->xnbd,cb);blk[q]=r;}
+        }
+        const size_t ro=(size_t)(Y&7)*256;
+        HVX_Vector P[5];
+        for(int q=0;q<5;q++) {
+            const int32_t a=a0+q,b=(a>>1)-wbA;
+            P[q]=(q<4 && blk[b])?((const HVX_Vector *)(blk[b]+ro))[a&1]:z;
+        }
+        for(int32_t kx=0;kx<J->W;kx++) {
+            const int32_t r0=ra[kx];HVX_Vector v0,v1;
+            if(!od[kx]){v0=P[r0];v1=P[r0+1];}
+            else {
+                v0=Q6_V_vor_VV(Q6_Vuw_vlsr_VuwR(P[r0],16),Q6_Vw_vasl_VwR(P[r0+1],16));
+                v1=Q6_V_vor_VV(Q6_Vuw_vlsr_VuwR(P[r0+1],16),Q6_Vw_vasl_VwR(P[r0+2],16));
+            }
+            for(int32_t ky=0;ky<J->H;ky++) {
+                const int32_t r=i-ky;
+                if(r<0 || r>7) continue;
+                HVX_Vector *d=tile[ky][kx]+2*r;d[0]=v0;d[1]=v1;
+            }
+        }
+    }
+}
+static void n16_prep_all_part(void *ctx, uint32_t part, uint32_t parts) {
+    const N16Job *J=(const N16Job *)ctx;
+    const uint32_t units=(uint32_t)J->mt*(uint32_t)J->cbs;
+    for(uint32_t u=part;u<units;u+=parts) n16_tile_all(J,(int32_t)(u/(uint32_t)J->cbs),(int32_t)(u%(uint32_t)J->cbs));
+}
 static void n16_tile(const N16Job *J, int32_t t, int32_t k) {
     const T *xt=J->xt;
     uint32_t e=J->ktab[k];
@@ -1262,6 +1314,20 @@ static int hmx_native16(G *g, const T *xt, const T *wt, const T *ft, const T *o,
               .xnbw=((int64_t)xt->m[2]+3)/4,.xnbd=((int64_t)xt->m[3]+31)/32,
               .onbw=((int64_t)o->m[2]+3)/4,.onbd=((int64_t)o->m[3]+31)/32};
     const Nprg2HmxOps *h=c->hmx;
+#if N16_FUSED
+    /* the fused staging needs every (cb, ky, kx) tap exactly once */
+    J.H=H;J.W=W;J.cbs=0;
+    if(H*W*cbs==KB) {
+        memset(J.kinv,255,sizeof J.kinv);int ok=cbs*9<=256;
+        for(int32_t k=0;k<KB && ok;k++) {
+            uint32_t e=ktab[k];uint32_t ky=e&255u,kx=(e>>8)&255u,cb=e>>16;
+            uint32_t ix=(cb*3u+ky)*3u+kx;
+            if(ky>=(uint32_t)H || kx>=(uint32_t)W || cb>=(uint32_t)cbs || J.kinv[ix]!=255) ok=0;
+            else J.kinv[ix]=(uint8_t)k;
+        }
+        if(ok) J.cbs=cbs;
+    }
+#endif
     uint64_t (*clock)(void)=c->phase?c->clock:NULL,t0=clock?clock():0,t1;
     uint32_t parts=nprg2_parallel_parts(g->call->parallel,3);
     uint32_t saved=h->enter?h->enter():0;
@@ -1270,8 +1336,16 @@ static int hmx_native16(G *g, const T *xt, const T *wt, const T *ft, const T *o,
         J.m0=m0;J.mt=total-m0<mt?total-m0:mt;
         for(int32_t j=0;j<NB;j++)for(int32_t t=0;t<J.mt;t++) outp[(size_t)j*J.mt+(size_t)t]=C+((size_t)t*NB+(size_t)j)*2048;
         if(clock){t1=clock();c->phase[6]+=t1-t0;t0=t1;}
-        if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,n16_prep_part,&J);
-        else n16_prep_part(&J,0,1);
+#if N16_FUSED
+        if(J.cbs) {
+            if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,n16_prep_all_part,&J);
+            else n16_prep_all_part(&J,0,1);
+        } else
+#endif
+        {
+            if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,n16_prep_part,&J);
+            else n16_prep_part(&J,0,1);
+        }
         if(clock){t1=clock();c->phase[4]+=t1-t0;t0=t1;}
         HVX_Vector sentinel=Q6_V_vsplat_R(-1);
         for(uint32_t i=0;i<2048;i+=128)*(HVX_Vector *)(completion+i)=sentinel;

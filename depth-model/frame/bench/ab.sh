@@ -1,7 +1,7 @@
 #!/bin/sh
 # One-command A/B of prepared-reference engine variants on the Frame.
 #
-#   sh frame/bench/ab.sh [-q] [-n] [-r REPEAT] [-t TAG] VARIANT...
+#   sh frame/bench/ab.sh [-q|-p] [-n] [-r REPEAT] [-t TAG] VARIANT...
 #
 # VARIANT is a name below or NAME:KEY=VAL[,KEY=VAL...] (extra QDS_ flags over
 # the base set, e.g. try:QDS_PREPARED_THREADS=3,QDS_PREPARED_FUSE=1).
@@ -11,14 +11,15 @@
 # for both models (smoke + random, --repeat REPEAT). Reports land in
 # frame/build/ab/TAG/ (fetched back) and the table is printed by ab_table.py.
 #   -q  primary smoke only (no alternate, no random): a fast timing pass
+#   -p  primary only, smoke + random (no alternate): the primary gate
 #   -n  no build: reuse frame/build/ab/TAG/eng-NAME.elf
 # Gate (PLAN_100MS.md): every report "passed": exact on both models, lease
 # and guards clean. A failing variant stops the run.
 set -eu
 cd "$(dirname "$0")/../.."
 QUICK=0 BUILD=1 REPEAT=2 TAG=$(date +%Y%m%d-%H%M)
-while getopts qnr:t: o; do
-  case $o in q) QUICK=1;; n) BUILD=0;; r) REPEAT=$OPTARG;; t) TAG=$OPTARG;; *) exit 2;; esac
+while getopts qpnr:t: o; do
+  case $o in q) QUICK=1;; p) QUICK=2;; n) BUILD=0;; r) REPEAT=$OPTARG;; t) TAG=$OPTARG;; *) exit 2;; esac
 done
 shift $((OPTIND-1))
 [ $# -ge 1 ] || { sed -n 2,17p "$0"; exit 2; }
@@ -83,7 +84,7 @@ for n in $names; do
   echo "== $n: short (primary 0..1)"
   ssh "$REMOTE" "cd $RDIR && $PY frame/bench/verify_l2_short.py --model primary --first 0 --last 1 --case smoke $common \
       --prepared-program frame/native_program/examples/primary-v2.nprg --report $R/${n}_short.json" | tail -3
-  if [ $QUICK = 1 ]; then models=primary; cases="--case smoke"; else models="primary alternate"; cases=""; fi
+  if [ $QUICK = 1 ]; then models=primary; cases="--case smoke"; elif [ $QUICK = 2 ]; then models=primary; cases=""; else models="primary alternate"; cases=""; fi
   for m in $models; do
     echo "== $n: full $m"
     ssh "$REMOTE" "cd $RDIR && $PY frame/bench/verify_prepared_full_model.py --model $m $cases --repeat $REPEAT $common \
