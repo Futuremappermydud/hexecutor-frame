@@ -33,6 +33,12 @@ int qd_blocked_linearclip_u8_u16_prepare(const QdBlockedU8 *in,
 /* Exact recovered rule: clip_u16((x*multiplier + 2^(shift-1)) >> shift). */
 int qd_blocked_linearclip_u8_u16_apply(const QdBlockedLinearclipU8U16 *prepared,
         const QdLinearclipU8U16Params *params);
+/* Whole-block fast form (every region is whole blocks): 1 if eligible. The
+ * apply processes blocks part, part+parts, ... of the region; distinct parts
+ * write distinct output blocks, so parts may run concurrently. */
+int qd_blocked_linearclip_u8_u16_whole(const QdBlockedLinearclipU8U16 *prepared);
+int qd_blocked_linearclip_u8_u16_apply_whole(const QdBlockedLinearclipU8U16 *prepared,
+        const QdLinearclipU8U16Params *params,uint32_t part,uint32_t parts);
 uint32_t qd_linearclip_u8_u16_oracle(uint8_t x,
         const QdLinearclipU8U16Params *params);
 #endif

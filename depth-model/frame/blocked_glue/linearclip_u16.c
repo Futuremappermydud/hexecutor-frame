@@ -101,6 +101,68 @@ static int affine_fits(const QdLinearclipParams *p) {
     return a>=INT32_MIN&&a<=INT32_MAX&&b>=INT32_MIN&&b<=INT32_MAX;
 }
 
+
+/* ---- Whole-block form: every region is whole 8x4x32 blocks, so one table
+ * lookup serves 16 vectors and no store masks are needed. Absent input blocks
+ * read as zeros, absent output blocks discard their stores. Blocks are
+ * visited in (B,H,W,D) order; in-place (same blocks) is safe because each
+ * vector is read before it is written.
+ *
+ * Fast forms (exact; verified exhaustively over all u16 by linearclip_u16_sim):
+ *   multiplier == -(1<<shift): v = (oz+iz) - x          (floor(-(x-iz)+1/2) = iz-x)
+ *   multiplier ==  (1<<shift): v = x + (oz-iz)
+ * both clipped to [0,65535] by saturating u16 add/sub. Everything else uses
+ * the generic 32-bit affine. */
+static int whole_region(const QdBlockedU16 *t) {
+    return !(t->origin[1]&7)&&!(t->origin[2]&3)&&!(t->origin[3]&31)&&
+           !(t->dims[1]&7)&&!(t->dims[2]&3)&&!(t->dims[3]&31);
+}
+static uint8_t *block_ptr_u16(const QdBlockedU16 *t,int64_t ix) {
+    if(ix<0||(uint64_t)ix>=t->block_count)return 0;
+    uint32_t e=t->blocks[ix],pool=e&127u;
+    return pool&&t->pools[pool]?t->pools[pool]+(e&~127u):0;
+}
+enum { LC_GENERIC, LC_NEG, LC_POS };
+static int apply_whole(const QdBlockedU16 *in,const QdBlockedU16 *out,const QdLinearclipParams *p) {
+    const int nB=in->dims[0],nH=in->dims[1]/8,nW=in->dims[2]/4,nD=in->dims[3]/32;
+    const int iH=(in->meta[1]+7)/8,iW=(in->meta[2]+3)/4,iD=(in->meta[3]+31)/32;
+    const int oH=(out->meta[1]+7)/8,oW=(out->meta[2]+3)/4,oD=(out->meta[3]+31)/32;
+    int mode=LC_GENERIC;
+    if(p->multiplier==-(int64_t)(1ll<<p->shift)&&p->shift<=31)mode=LC_NEG;
+    else if(p->multiplier>0&&(int64_t)p->multiplier==(1ll<<p->shift))mode=LC_POS;
+    const int c=p->output_zero+p->input_zero,d=p->output_zero-p->input_zero;
+    HVX_Vector vc=Q6_Vh_vsplat_R(c&65535),vd=Q6_Vh_vsplat_R((d<0?-d:d)&65535),vx=Q6_Vh_vsplat_R(c>65535?c-65535:0);
+    HVX_Vector all1=Q6_Vh_vsplat_R(65535);
+    for(int B=0;B<nB;B++)for(int H=0;H<nH;H++)for(int W=0;W<nW;W++)for(int D=0;D<nD;D++) {
+        int64_t ix=((((int64_t)(B+in->origin[0])*iH+H+in->origin[1]/8)*iW+W+in->origin[2]/4)*iD)+in->slice+D+in->origin[3]/32;
+        int64_t ox=((((int64_t)(B+out->origin[0])*oH+H+out->origin[1]/8)*oW+W+out->origin[2]/4)*oD)+out->slice+D+out->origin[3]/32;
+        HVX_Vector *po=(HVX_Vector *)block_ptr_u16(out,ox);
+        if(!po)continue;
+        const HVX_Vector *pi=(const HVX_Vector *)block_ptr_u16(in,ix);
+        if(mode==LC_NEG) {
+            if(c<=65535) {
+                #pragma unroll
+                for(int v=0;v<16;v++)po[v]=Q6_Vuh_vsub_VuhVuh_sat(vc,pi?pi[v]:Q6_V_vzero());
+            } else {
+                #pragma unroll
+                for(int v=0;v<16;v++)po[v]=Q6_Vuh_vadd_VuhVuh_sat(Q6_Vh_vsub_VhVh(all1,pi?pi[v]:Q6_V_vzero()),vx);
+            }
+        } else if(mode==LC_POS) {
+            if(d>=0) {
+                #pragma unroll
+                for(int v=0;v<16;v++)po[v]=Q6_Vuh_vadd_VuhVuh_sat(pi?pi[v]:Q6_V_vzero(),vd);
+            } else {
+                #pragma unroll
+                for(int v=0;v<16;v++)po[v]=Q6_Vuh_vsub_VuhVuh_sat(pi?pi[v]:Q6_V_vzero(),vd);
+            }
+        } else {
+            #pragma unroll
+            for(int v=0;v<16;v++)po[v]=affine_vec(pi?pi[v]:Q6_V_vzero(),p);
+        }
+    }
+    return 1;
+}
+
 int qd_blocked_linearclip_u16_prepare(const QdBlockedU16 *in,const QdBlockedU16 *out,
         const QdLinearclipParams *p,QdBlockedU16Linearclip *prepared) {
     if(!prepared||!valid(in)||!valid(out)||!p||p->reserved||p->shift<1||p->shift>31||!affine_fits(p)||
@@ -120,6 +182,7 @@ int qd_blocked_linearclip_u16_apply_params(const QdBlockedU16Linearclip *prepare
        p->shift<1||p->shift>31||!affine_fits(p))return 0;
     const QdBlockedU16 *in=&prepared->in,*out=&prepared->out;
     for(int i=0;i<4;i++)if(!in->dims[i])return 1;
+    if(whole_region(in)&&whole_region(out))return apply_whole(in,out,p);
     /* One 128-byte vector is 32 depth positions x two interleaved W parity
      * lanes. Compute the affine over physical lanes, but store only the crop. */
     int32_t w0=in->origin[2]&~1,w1=in->origin[2]+in->dims[2];

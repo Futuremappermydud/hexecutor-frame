@@ -285,6 +285,11 @@ static int add_apply_parts(const Nprg2ExecCall *c,const QdBlockedU8 *a,const QdB
     QdBlockedAddU8 prepared;prepared.a=*a;prepared.b=*b;prepared.out=*o;prepared.cookie=0x51444138u;
     return qd_blocked_add_u8_apply(&prepared,p);
 }
+typedef struct { QdBlockedLinearclipU8U16 pr; QdLinearclipU8U16Params p; } LcWholeJob;
+static void lc_whole_part(void *ctx,uint32_t part,uint32_t parts) {
+    const LcWholeJob *j=(const LcWholeJob *)ctx;
+    (void)qd_blocked_linearclip_u8_u16_apply_whole(&j->pr,&j->p,part,parts);
+}
 typedef struct { QdBlockedU8 in; QdBlockedU16Out out; QdLinearclipU8U16Params p; } LcJob;
 static void lc_part(void *ctx,uint32_t part,uint32_t parts) {
     LcJob j=*(const LcJob *)ctx;int32_t h0,h1;
@@ -314,6 +319,14 @@ static int linearclip_run(const Nprg2ExecCall *c,void *ctx) {
     if (!make_u8(c,0,0,&in)||!make_u16out(c,&out)||!linearclip_params(c,&p)) return 0;
     /* As for ADD_U8, executor preflight has already completed the alias proof
      * in caller scratch; use the audited helper's normal HVX apply routine. */
+    {
+        LcWholeJob j;j.pr.in=in;j.pr.out=out;j.pr.cookie=0x51445538u;j.p=p;
+        if (qd_blocked_linearclip_u8_u16_whole(&j.pr)) {
+            uint32_t wparts=ew_parts(c,in.dims);
+            if (wparts>1) { nprg2_parallel_for(c->parallel,NPRG2_PAR_EW,wparts,lc_whole_part,&j);return 1; }
+            return qd_blocked_linearclip_u8_u16_apply_whole(&j.pr,&j.p,0,1);
+        }
+    }
     uint32_t parts=ew_parts(c,in.dims);
     if (parts>1) {
         LcJob j={in,out,p};

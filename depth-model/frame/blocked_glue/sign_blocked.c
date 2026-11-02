@@ -63,6 +63,40 @@ static HVX_Vector splat(int64_t value) {
     uint32_t x=(uint16_t)value;return Q6_V_vsplat_R(x|(x<<16));
 }
 static HVX_VectorPred prefix(unsigned n) {return n>=128?Q6_Q_not_Q(Q6_Q_vsetq_R(0)):Q6_Q_vsetq_R(n);}
+/* Whole-block form: every region is whole 8x4x32 blocks, so a single table
+ * lookup serves 16 vectors and no store masks are needed. Absent input blocks
+ * read as zeros (the selector then sees x=0), absent output blocks discard
+ * their stores. In-place is safe: each vector is read before it is written. */
+static int whole_region(const QdBlockedU16 *t) {
+    return !(t->origin[1]&7)&&!(t->origin[2]&3)&&!(t->origin[3]&31)&&
+           !(t->dims[1]&7)&&!(t->dims[2]&3)&&!(t->dims[3]&31);
+}
+static uint8_t *block_ptr(const QdBlockedU16 *t,int64_t ix) {
+    if(ix<0||(uint64_t)ix>=t->block_count)return 0;
+    uint32_t e=t->blocks[ix],pool=e&127u;
+    return pool&&t->pools[pool]?t->pools[pool]+(e&~127u):0;
+}
+static int apply_whole(const QdBlockedU16 *in,const QdBlockedU16 *out,int32_t input_zero,
+        const QdSignLevels *levels) {
+    const int nB=in->dims[0],nH=in->dims[1]/8,nW=in->dims[2]/4,nD=in->dims[3]/32;
+    const int iH=(in->meta[1]+7)/8,iW=(in->meta[2]+3)/4,iD=(in->meta[3]+31)/32;
+    const int oH=(out->meta[1]+7)/8,oW=(out->meta[2]+3)/4,oD=(out->meta[3]+31)/32;
+    HVX_Vector zp=splat(input_zero),neg=splat(levels->neg),zero=splat(levels->zero),pos=splat(levels->pos);
+    for(int B=0;B<nB;B++)for(int H=0;H<nH;H++)for(int W=0;W<nW;W++)for(int D=0;D<nD;D++) {
+        int64_t ix=((((int64_t)(B+in->origin[0])*iH+H+in->origin[1]/8)*iW+W+in->origin[2]/4)*iD)+in->slice+D+in->origin[3]/32;
+        int64_t ox=((((int64_t)(B+out->origin[0])*oH+H+out->origin[1]/8)*oW+W+out->origin[2]/4)*oD)+out->slice+D+out->origin[3]/32;
+        HVX_Vector *po=(HVX_Vector *)block_ptr(out,ox);
+        if(!po)continue;
+        const HVX_Vector *pi=(const HVX_Vector *)block_ptr(in,ix);
+        #pragma unroll
+        for(int v=0;v<16;v++) {
+            HVX_Vector x=pi?pi[v]:Q6_V_vzero();
+            HVX_Vector y=Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VuhVuh(x,zp),pos,neg);
+            po[v]=Q6_V_vmux_QVV(Q6_Q_vcmp_eq_VhVh(x,zp),zero,y);
+        }
+    }
+    return 1;
+}
 int qd_blocked_sign_u16_prepare(const QdBlockedU16 *in,const QdBlockedU16 *out,
         QdBlockedSignU16 *prepared) {
     if(!prepared||!valid(in)||!valid(out))return 0;
@@ -79,6 +113,7 @@ int qd_blocked_sign_u16_apply(const QdBlockedSignU16 *prepared,int32_t input_zer
        levels->pos<0||levels->pos>65535)return 0;
     const QdBlockedU16 *in=&prepared->in,*out=&prepared->out;
     for(int i=0;i<4;i++)if(!in->dims[i])return 1;
+    if(whole_region(in)&&whole_region(out))return apply_whole(in,out,input_zero,levels);
     int w0=in->origin[2]&~1,w1=in->origin[2]+in->dims[2],
         d0=in->origin[3]/32,d1=(in->origin[3]+in->dims[3]+31)/32;
     uint32_t z=(uint16_t)input_zero;HVX_Vector zp=Q6_V_vsplat_R(z|(z<<16));

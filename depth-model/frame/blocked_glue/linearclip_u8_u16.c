@@ -136,3 +136,83 @@ int qd_blocked_linearclip_u8_u16_apply(const QdBlockedLinearclipU8U16 *prepared,
       }
     return 1;
 }
+
+/* ---- Whole-block form --------------------------------------------------
+ * Every region is whole blocks (input 8x8x32 u8, output 8x4x32 u16: origins
+ * and extents multiples of 8/8/32 for the input and 8/4/32 for the output),
+ * so one table lookup per block serves 16 vectors and no store masks are
+ * needed: each input block (rows x 8 W x 32 c) feeds two output blocks (W
+ * 0..3 and 4..7). Absent input blocks read as zeros; absent output blocks
+ * discard their stores. Blocks i = part, part+parts, ... of the region in
+ * (B, H, W8, D) order.
+ *
+ * Fast arithmetic (multiplier < 2^16 and 1 <= shift <= 15): vmpy uh x uh -> uw
+ * is exact (x*m < 2^24), and vasr uw -> uh :rnd:sat adds 2^(shift-1), shifts
+ * and clips to u16, re-interleaving the even/odd product lanes. The vasr
+ * shift is taken mod 16, so shift 16..31 uses the generic 32-bit path. */
+static int whole_in(const QdBlockedU8 *t) {
+    return !(t->origin[1]&7)&&!(t->origin[2]&7)&&!(t->origin[3]&31)&&
+           !(t->dims[1]&7)&&!(t->dims[2]&7)&&!(t->dims[3]&31);
+}
+static int whole_out(const QdBlockedU16Out *t) {
+    return !(t->origin[1]&7)&&!(t->origin[2]&3)&&!(t->origin[3]&31)&&
+           !(t->dims[1]&7)&&!(t->dims[2]&7)&&!(t->dims[3]&31);
+}
+int qd_blocked_linearclip_u8_u16_whole(const QdBlockedLinearclipU8U16 *prepared) {
+    if(!prepared||prepared->cookie!=0x51445538u)return 0;
+    return whole_in(&prepared->in)&&whole_out(&prepared->out);
+}
+static uint8_t *block_ptr(const uint8_t *const *pools,const uint32_t *blocks,uint32_t count,int64_t ix) {
+    if(ix<0||(uint64_t)ix>=count)return 0;
+    uint32_t e=blocks[ix],pool=e&127u;
+    return pool&&pools[pool]?(uint8_t *)pools[pool]+(e&~127u):0;
+}
+static HVX_Vector aff16(HVX_Vector h,uint32_t m2,uint32_t sh) {
+    HVX_VectorPair w=Q6_Wuw_vmpy_VuhRuh(h,m2);
+    return Q6_Vuh_vasr_VuwVuwR_rnd_sat(Q6_V_hi_W(w),Q6_V_lo_W(w),sh);
+}
+static void block16(const HVX_Vector *pi,HVX_Vector *pa,HVX_Vector *pb,uint32_t m2,uint32_t sh) {
+    #pragma unroll
+    for(int v=0;v<16;v++) {
+        HVX_Vector x=pi?pi[v]:Q6_V_vzero();
+        HVX_VectorPair h=Q6_Wuh_vunpack_Vub(x);
+        HVX_Vector y0=Q6_Vh_vshuff_Vh(aff16(Q6_V_lo_W(h),m2,sh));
+        HVX_Vector y1=Q6_Vh_vshuff_Vh(aff16(Q6_V_hi_W(h),m2,sh));
+        HVX_Vector *po=(v&1)?pb:pa;
+        if(po){po[(v>>1)*2]=y0;po[(v>>1)*2+1]=y1;}
+    }
+}
+static void block32(const HVX_Vector *pi,HVX_Vector *pa,HVX_Vector *pb,const QdLinearclipU8U16Params *p) {
+    #pragma unroll
+    for(int v=0;v<16;v++) {
+        HVX_Vector x=pi?pi[v]:Q6_V_vzero();
+        HVX_VectorPair half=Q6_Wuh_vunpack_Vub(x);
+        HVX_Vector y0=Q6_Vh_vshuff_Vh(affine(Q6_V_lo_W(half),p));
+        HVX_Vector y1=Q6_Vh_vshuff_Vh(affine(Q6_V_hi_W(half),p));
+        HVX_Vector *po=(v&1)?pb:pa;
+        if(po){po[(v>>1)*2]=y0;po[(v>>1)*2+1]=y1;}
+    }
+}
+int qd_blocked_linearclip_u8_u16_apply_whole(const QdBlockedLinearclipU8U16 *prepared,
+        const QdLinearclipU8U16Params *p,uint32_t part,uint32_t parts) {
+    if(!qd_blocked_linearclip_u8_u16_whole(prepared)||!p||p->multiplier>65535||p->shift<1||p->shift>31||!parts)return 0;
+    const QdBlockedU8 *in=&prepared->in;const QdBlockedU16Out *out=&prepared->out;
+    for(int i=0;i<4;i++)if(!in->dims[i])return 1;
+    const int nB=in->dims[0],nH=in->dims[1]/8,nW=in->dims[2]/8,nD=in->dims[3]/32;
+    const int inH=(in->meta[1]+7)/8,inW=(in->meta[2]+7)/8,inD=(in->meta[3]+31)/32;
+    const int oH=(out->meta[1]+7)/8,oW=(out->meta[2]+3)/4,oD=(out->meta[3]+31)/32;
+    const int f16=p->shift<=15;
+    const uint32_t m2=p->multiplier|p->multiplier<<16;
+    uint32_t i=0;
+    for(int B=0;B<nB;B++)for(int H=0;H<nH;H++)for(int W=0;W<nW;W++)for(int D=0;D<nD;D++,i++) {
+        if(i%parts!=part)continue;
+        int64_t ix=((((int64_t)(B+in->origin[0])*inH+H+in->origin[1]/8)*inW+W+in->origin[2]/8)*inD)+in->slice+D+in->origin[3]/32;
+        int64_t ox=((((int64_t)(B+out->origin[0])*oH+H+out->origin[1]/8)*oW+2*W+out->origin[2]/4)*oD)+out->slice+D+out->origin[3]/32;
+        const HVX_Vector *pi=(const HVX_Vector *)block_ptr((const uint8_t *const *)in->pools,in->blocks,in->block_count,ix);
+        HVX_Vector *pa=(HVX_Vector *)block_ptr((const uint8_t *const *)out->pools,out->blocks,out->block_count,ox);
+        HVX_Vector *pb=(HVX_Vector *)block_ptr((const uint8_t *const *)out->pools,out->blocks,out->block_count,ox+oD);
+        if(!pa&&!pb)continue;
+        if(f16)block16(pi,pa,pb,m2,p->shift);else block32(pi,pa,pb,p);
+    }
+    return 1;
+}
