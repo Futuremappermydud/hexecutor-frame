@@ -34,7 +34,9 @@ def ensure_image(model):
     return image
 
 
-def cases(model, only=None):
+def cases(model, only=None, expect='emulator'):
+    """expect='hw': the silicon-rounding oracle (recovered/<model>/hw_*.json,
+    tools/make_hw_oracle.py) instead of the emulator hashes; smoke and random only."""
     from stereo_probes import make
     probes = ROOT / 'frame/build/native-probes'
     if not (probes / 'same' / 'x.raw').exists():
@@ -47,12 +49,13 @@ def cases(model, only=None):
         import subprocess
         subprocess.run([sys.executable, str(ROOT / 'tools/prepare_inputs.py'), str(smoke), '--smoke'],
                        check=True, stdout=subprocess.DEVNULL)
-    smoke_ref = json.loads((recovered / 'emulator_smoke.json').read_text())
+    smoke_ref = json.loads((recovered / f'{expect}_smoke.json').read_text())
     result = [('smoke', smoke, {n.removesuffix('.raw') + '.raw': v['sha256'] for n, v in smoke_ref.items()})]
-    result += [(case, probes / case, expected) for case, expected in refs.items()]
+    if expect == 'emulator':
+        result += [(case, probes / case, expected) for case, expected in refs.items()]
     random = ROOT / 'frame/build/depth-inputs/random'
     if random.exists():
-        expected = json.loads((recovered / 'emulator_random.json').read_text())
+        expected = json.loads((recovered / f'{expect}_random.json').read_text())
         result.append(('random', random, {n + '.raw': expected[n]['sha256'] for n in names}))
     if only:
         result = [c for c in result if c[0] in only]

@@ -180,11 +180,23 @@ static const char *tick_unit(void) {
 }
 
 static const uint32_t kOutputBytes[2] = {163840, 655360};
+#ifndef NPRG2_HW_ROUNDING
+#define NPRG2_HW_ROUNDING 0
+#endif
+#if NPRG2_HW_ROUNDING
+/* Silicon-rounding oracle (recovered/<model>/hw_smoke.json, tools/make_hw_oracle.py). */
+static const char *const kExpect[2][2] = {
+    {"1e8ea71c160e22ab8f9ee06110598b471cddc02d3e8ae9b9c6276759c73ef178",
+     "97b0d8066a3a89ef14f1e45376b9b70ab6000b645287d1b7e5617097914bb16c"},
+    {"1e8ea71c160e22ab8f9ee06110598b471cddc02d3e8ae9b9c6276759c73ef178",
+     "655381a40e758f03e6f12ad79480114acc147b56a2140c6fddc25a88a6eaa916"}};
+#else
 static const char *const kExpect[2][2] = {
     {"dfacee192b7a534ef79634993d03a1c870e1550e5ba1c485af5ab17466616ad3",
      "a978ee8291ea05c0b482b72cdc54f09c1ad8294a366f3ba215bb32653cb3f32b"},
     {"dfacee192b7a534ef79634993d03a1c870e1550e5ba1c485af5ab17466616ad3",
      "98d28b66c3489d1424569aad3e1c2b9bfa12fac3aba5b11e67b0fde10d8bc36a"}};
+#endif
 
 static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
 static void wr32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }

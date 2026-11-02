@@ -1853,9 +1853,33 @@ static void requant_params(const int32_t *mult, int32_t co, int sixteen, int32_t
         M[c]=1024+(h&1023);pre[c]=sixteen?8:(int32_t)shift-14;post[c]=(int32_t)shift-pre[c];
     }
 }
+/* Conv output rounding. NPRG2_HW_ROUNDING=0: the emulator's HMX model
+ * (mxconvert_to_u8/u16: round q*M). 1: V75 silicon, which rounds the midpoint
+ * of the floor interval, (2q+1)*M (HMX_NATIVE_ROUNDING.md); with q, M integers
+ * that is q*M + rq_round >> post with the extra floor(M/2^s) below (u8: s=1,
+ * post=14; u16: s=19-post, post<=18). */
+#ifndef NPRG2_HW_ROUNDING
+#define NPRG2_HW_ROUNDING 0
+#endif
+static inline int64_t rq_round(int sixteen, int32_t M, int32_t post) {
+    int64_t r=(int64_t)1<<(post-1);
+#if NPRG2_HW_ROUNDING
+    if(!sixteen) r+=M>>1;
+    else if(post<=18) r+=M>>(19-post);
+#else
+    (void)sixteen;(void)M;
+#endif
+    return r;
+}
 static inline int64_t requant_value(int64_t acc, int32_t bias, int sixteen, int32_t M, int32_t pre, int32_t post) {
     int64_t a=acc+(int64_t)bias*(sixteen?256:1);
-    int64_t q=(((a>>pre)*M)+((int64_t)1<<(post-1)))>>post;
+#if NPRG2_HW_ROUNDING
+    if(sixteen && post>18) { /* q = floor(x*2^(e-8)) is a right shift here */
+        int64_t q=(a>>pre)>>(post-18);
+        return clip64(((2*q+1)*M+((int64_t)1<<18))>>19,0,65535);
+    }
+#endif
+    int64_t q=(((a>>pre)*M)+rq_round(sixteen,M,post))>>post;
     return clip64(q,0,sixteen?65535:255);
 }
 static void requant(uint8_t *o, const int64_t *acc, const int32_t *mult, const int32_t *bias, size_t pixels,
@@ -1939,7 +1963,7 @@ static int rq_prepare(int32_t *par, int32_t co, int sixteen, int64_t bound, int3
             v[0]=(int32_t)off;v[32]=pre[c];
             v[160]=post[c]>=2?1<<(post[c]-2):1;v[192]=0;
         }
-        v[64]=M[c];v[96]=post[c];v[128]=1<<(post[c]-1);v[224]=0;
+        v[64]=M[c];v[96]=post[c];v[128]=(int32_t)rq_round(sixteen,M[c],post[c]);v[224]=0;
     }
     return 1;
 }

@@ -41,6 +41,7 @@ flags() {
     fuse) echo "$(base) QDS_PREPARED_FUSE=1";;
     thr3fuse) echo "$(base) QDS_PREPARED_THREADS=3 QDS_PREPARED_FUSE=1";;
     hmx) echo "$(base) QDS_PREPARED_THREADS=3 QDS_PREPARED_FUSE=1 QDS_PREPARED_HMX=1";;
+    hw) echo "$(base) QDS_PREPARED_THREADS=3 QDS_PREPARED_FUSE=1 QDS_PREPARED_HMX=1 QDS_EXTRA_CFLAGS=-DNPRG2_HW_ROUNDING=1";;
     l2) echo "$(base) QDS_L2_CACHE=5";;
     l2fuse) echo "$(base) QDS_L2_CACHE=5 QDS_PREPARED_FUSE=1";;
     *) echo "unknown variant $1" >&2; exit 2;;
@@ -70,9 +71,11 @@ ssh "$REMOTE" "mkdir -p $RDIR/$OUT $RDIR/results/ab/$TAG"
 rsync -c frame/*.py "$REMOTE:$RDIR/frame/"
 rsync -c frame/bench/*.py "$REMOTE:$RDIR/frame/bench/"
 rsync -c "$OUT"/*.elf "$REMOTE:$RDIR/$OUT/"
+for m in primary alternate; do rsync -c recovered/$m/hw_*.json "$REMOTE:$RDIR/recovered/$m/" 2>/dev/null || true; done
 
 for n in $names; do
   common="--engine $OUT/eng-$n.elf --bootstrap $OUT/boot-$n.elf"
+  expect=""; if grep -q "NPRG2_HW_ROUNDING=1" "$OUT/flags-$n.txt" 2>/dev/null; then expect="--expect hw"; fi
   R=results/ab/$TAG
   echo "== $n: short (primary 0..1)"
   ssh "$REMOTE" "cd $RDIR && $PY frame/bench/verify_l2_short.py --model primary --first 0 --last 1 --case smoke $common \
@@ -81,7 +84,7 @@ for n in $names; do
   for m in $models; do
     echo "== $n: full $m"
     ssh "$REMOTE" "cd $RDIR && $PY frame/bench/verify_prepared_full_model.py --model $m $cases --repeat $REPEAT $common \
-        --prepared-program frame/native_program/examples/$m-v2.nprg --report $R/${n}_$m.json" \
+        --prepared-program frame/native_program/examples/$m-v2.nprg --report $R/${n}_$m.json $expect" \
       | python3 -c 'import sys,json
 for l in sys.stdin:
   try: d=json.loads(l)

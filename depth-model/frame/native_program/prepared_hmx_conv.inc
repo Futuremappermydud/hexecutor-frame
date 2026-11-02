@@ -44,6 +44,7 @@ typedef struct {
     const uint32_t *ktab; /* ky | kx<<8 | cb<<16 per k */
     const int32_t *corr, *pre, *Mq;
     const uint8_t *multv; /* NB vectors: M of channel n in halfwords 2n, 2n+1 */
+    const uint8_t *rndv;  /* NB vectors: rounding word of channel n in word n */
     uint8_t *const *xtab; /* input row pointers [r][wb-wb0][cb], or NULL: hmx_row per quad */
     int32_t xwb0, xnwb, cbs;
     /* Output row pointers [y][wb-owb0][j] of o, and of the epilogue's output
@@ -203,11 +204,13 @@ static inline void hmx_put(const HmxJob *J, const T *o, uint8_t *const *tab, int
     if(d) store_part(d+32*s,v,0,n1);
     if(n1<128 && (d=row?row[J->NB]:hmx_row(J->g->pool,o,oy,(ox>>3)+1,J->onbw,J->onbd,j))!=NULL) store_part(d,v,n1,128-n1);
 }
-static HVX_Vector hmx_quant_pair(HVX_Vector pre, HVX_Vector mult) {
+/* rnd: per-channel rounding word (lane n = channel n; both halves of a
+ * product pair are the same channel), rq_round(0, M, 14). */
+static HVX_Vector hmx_quant_pair(HVX_Vector pre, HVX_Vector mult, HVX_Vector rnd) {
     pre=Q6_Vuh_vmin_VuhVuh(pre,Q6_V_vsplat_R(4096|(4096<<16)));
     HVX_VectorPair product=Q6_Ww_vmpy_VhVh(pre,mult);
-    HVX_Vector a=Q6_Vw_vasr_VwR(Q6_Vw_vadd_VwVw(Q6_V_lo_W(product),Q6_V_vsplat_R(8192)),14);
-    HVX_Vector b=Q6_Vw_vasr_VwR(Q6_Vw_vadd_VwVw(Q6_V_hi_W(product),Q6_V_vsplat_R(8192)),14);
+    HVX_Vector a=Q6_Vw_vasr_VwR(Q6_Vw_vadd_VwVw(Q6_V_lo_W(product),rnd),14);
+    HVX_Vector b=Q6_Vw_vasr_VwR(Q6_Vw_vadd_VwVw(Q6_V_hi_W(product),rnd),14);
     return Q6_Vh_vpack_VwVw_sat(b,a);
 }
 #endif
@@ -216,9 +219,9 @@ static void hmx_quant_tile(const HmxJob *J, int32_t t, int32_t j) {
     y=J->tyx[2*t];x=J->tyx[2*t+1];
     const uint8_t *src=J->C+((size_t)t*J->NB+(size_t)j)*2048;
 #if BLK_HVX
-    HVX_Vector mult=((const HVX_Vector *)J->multv)[j];
+    HVX_Vector mult=((const HVX_Vector *)J->multv)[j],rnd=((const HVX_Vector *)J->rndv)[j];
     for(int i=0;i<8 && P<total;i++,P+=4) {
-        HVX_Vector a=hmx_quant_pair(((const HVX_Vector *)src)[2*i],mult),b=hmx_quant_pair(((const HVX_Vector *)src)[2*i+1],mult);
+        HVX_Vector a=hmx_quant_pair(((const HVX_Vector *)src)[2*i],mult,rnd),b=hmx_quant_pair(((const HVX_Vector *)src)[2*i+1],mult,rnd);
         HVX_Vector v=Q6_Vub_vpack_VhVh_sat(b,a);
         const Fuse *f=J->fx;
         if(!f) hmx_put(J,J->o,J->otab,y,x,j,v);
@@ -260,7 +263,7 @@ static void hmx_quant_tile(const HmxJob *J, int32_t t, int32_t j) {
                               hmx_row(J->g->pool,&f->ob,(int64_t)f->ob.p[1]+y,((int64_t)f->ob.p[2]+x+r)>>3,J->onbw,J->onbd,j);
             for(int n=0;n<32;n++) {
                 uint16_t pre;memcpy(&pre,src+((size_t)(4*i+r)*32+(size_t)n)*2,2);
-                uint32_t v=((uint32_t)(pre<4096?pre:4096)*(uint32_t)J->Mq[32*j+n]+8192u)>>14;
+                uint32_t v=((uint32_t)(pre<4096?pre:4096)*(uint32_t)J->Mq[32*j+n]+(uint32_t)rq_round(0,J->Mq[32*j+n],14))>>14;
                 v=v>255?255:v;
                 if(d) d[32*(ox&7)+n]=(uint8_t)v;
                 if(de) {
@@ -329,6 +332,7 @@ static int hmx_mac(const HmxJob *J, int32_t *fi, int32_t *zero, uint8_t *complet
 }
 /* 1: the command ran (or would, dry) on HMX; 0: not eligible (use the HVX
  * path); -1: error in *err. */
+
 static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int packed, int reverse, int s2, int32_t co,
                     int32_t oh, int32_t ow, int32_t *err) {
     const Nprg2ReferenceConv *c=g->conv;
@@ -383,7 +387,7 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     size_t at=0;
     size_t o_ktab=nbump(&at,(size_t)KB*4),o_corr=nbump(&at,(size_t)co*4),o_pre=nbump(&at,(size_t)co*4),
            o_M=nbump(&at,(size_t)co*4),o_mult=nbump(&at,(size_t)co*4),o_bias=nbump(&at,(size_t)co*4),
-           o_post=nbump(&at,(size_t)co*4),o_wsum=nbump(&at,(size_t)co*8),o_multv=nbump(&at,(size_t)NB*128),
+           o_post=nbump(&at,(size_t)co*4),o_wsum=nbump(&at,(size_t)co*8),o_multv=nbump(&at,(size_t)NB*128),o_rndv=nbump(&at,(size_t)NB*128),
            o_rows=nbump(&at,(size_t)NB*256),o_fi=nbump(&at,(size_t)NB*256+256);
     /* Input row pointers for every (row, block column, channel block) the
      * quads read: rows p1..p1+oh+H-2, columns p2..p2+ow+W-2 (a straddling quad
@@ -502,6 +506,8 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     }
     uint16_t *mv=(uint16_t *)(n+o_multv);
     for(int32_t k=0;k<co;k++) mv[(k>>5)*64+2*(k&31)]=mv[(k>>5)*64+2*(k&31)+1]=(uint16_t)Mq[k];
+    int32_t *rv=(int32_t *)(n+o_rndv);
+    for(int32_t k=0;k<co;k++) rv[k]=(int32_t)rq_round(0,Mq[k],14);
     HMX_MARK(3);
     uint8_t **xtab=use_tab?(uint8_t **)(n+o_xtab):NULL;
     if(xtab) hmx_tab(xtab,g->pool,xt,xt->p[1],xrows,xwb0,xnwb,cbs);
@@ -517,7 +523,7 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
 #endif
     HMX_MARK(4);
     HmxJob J={.g=g,.xtab=xtab,.xwb0=xwb0,.xnwb=xnwb,.cbs=cbs,.otab=otab,.etab=etab,.btab=btab,.owb0=owb0,.onwb=onwb,.xt=xt,.o=o,.oh=oh,.ow=ow,.KB=KB,.NB=NB,.total=total,.A=A,.C=C,.B=(const uint8_t *)wbase,
-              .ktab=ktab,.corr=corr,.pre=pre,.Mq=Mq,.multv=(const uint8_t *)mv,.fx=g->fx.kind?&g->fx:NULL,
+              .ktab=ktab,.corr=corr,.pre=pre,.Mq=Mq,.multv=(const uint8_t *)mv,.rndv=(const uint8_t *)rv,.fx=g->fx.kind?&g->fx:NULL,
               .xnbw=((int64_t)xt->m[2]+7)/8,.xnbd=((int64_t)xt->m[3]+31)/32,
               .onbw=((int64_t)o->m[2]+7)/8,.onbd=((int64_t)o->m[3]+31)/32};
     uint32_t parts=nprg2_parallel_parts(g->call->parallel,3);

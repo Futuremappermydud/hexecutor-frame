@@ -38,7 +38,7 @@ if [ "$MODE" = segments ]; then
   mkdir -p "$SEGDIR"
   rm -f "$SEGDIR"/*.rseg "$SEGDIR"/*.log
   host="$SEGDIR/test_refsim_split"
-  cc -O2 -std=c11 -ffp-contract=off -fno-fast-math -fno-strict-aliasing -Wall -Wextra -Werror -I$N \
+  cc -O2 -std=c11 -ffp-contract=off -fno-fast-math -fno-strict-aliasing -Wall -Wextra -Werror ${CFLAGS_EXTRA:-} -I$N \
     $N/test_prepared_reference_sim.c $N/prepared_reference.c $N/prepared_executor.c $N/prepared_fuse.c $N/nprg2_runtime.c \
     -lm -o "$host"
   for model in primary alternate; do

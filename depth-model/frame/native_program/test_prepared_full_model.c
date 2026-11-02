@@ -127,7 +127,9 @@ static void open_session(Session *s, const char *model) {
     snprintf(path, sizeof path, "recovered/%s/constants/constant_pool_5.bin", model);
     s->constants = read_file(path, &s->constants_bytes);
     for (int i = 0; i < 4; i++) {
-        snprintf(path, sizeof path, "frame/build/native-smoke/%s.raw", kInputNames[i]);
+        /* QD_INPUTS=dir: another input case (x/y/hidden/t.raw), e.g. the random case. */
+        snprintf(path, sizeof path, "%s/%s.raw", getenv("QD_INPUTS") ? getenv("QD_INPUTS") : "frame/build/native-smoke",
+                 kInputNames[i]);
         s->inputs[i] = read_file(path, &s->input_bytes[i]);
     }
     CHECK(s->input_bytes[0] == 81920 && s->input_bytes[1] == 81920 && s->input_bytes[2] == 655360 && s->input_bytes[3] == 128);
@@ -335,13 +337,24 @@ static void check_outputs(Session *s, uint8_t *const *out, const char *what) {
          "98d28b66c3489d1424569aad3e1c2b9bfa12fac3aba5b11e67b0fde10d8bc36a"}};
     static const uint32_t bytes[2] = {163840, 655360};
     int alt = !strcmp(s->model, "alternate");
+    /* QD_EXPECT="hex0,hex1" overrides the emulator hashes (the silicon-rounding
+     * oracle from a reference-mode run); QD_EXPECT=print prints them instead. */
+    const char *env = getenv("QD_EXPECT");
+    char ov[2][65] = {{0}};
+    int print = env && !strcmp(env, "print");
+    if (env && !print) {
+        CHECK(strlen(env) == 129 && env[64] == ',');
+        memcpy(ov[0], env, 64); memcpy(ov[1], env + 65, 64);
+    }
     for (int k = 0; k < 2; k++) {
         uint8_t sha[32];
         char hex[65];
         nprg2_sha256(out[k], bytes[k], sha);
         for (int j = 0; j < 32; j++) snprintf(hex + 2 * j, 3, "%02x", sha[j]);
-        if (strcmp(hex, expect[alt][k])) {
-            fprintf(stderr, "%s %s output %d sha256 %s, emulator %s\n", s->model, what, k, hex, expect[alt][k]);
+        const char *want = env && !print ? ov[k] : expect[alt][k];
+        if (print) { printf("%s %s output %d sha256 %s\n", s->model, what, k, hex); continue; }
+        if (strcmp(hex, want)) {
+            fprintf(stderr, "%s %s output %d sha256 %s, expected %s\n", s->model, what, k, hex, want);
             exit(1);
         }
     }
@@ -350,7 +363,7 @@ static void check_outputs(Session *s, uint8_t *const *out, const char *what) {
                (unsigned long)g_par.jobs_parallel[0], (unsigned long)g_par.jobs_parallel[1], (unsigned long)g_par.jobs_parallel[2],
                (unsigned long)g_par.jobs_serial[0], (unsigned long)g_par.jobs_serial[1], (unsigned long)g_par.jobs_serial[2],
                (unsigned long)g_par.parts_run[0], (unsigned long)g_par.parts_run[1], (unsigned long)g_par.parts_run[2]);
-    printf("PASS %s %s: both graph outputs match the emulator smoke sha256\n", s->model, what);
+    printf("PASS %s %s: both graph outputs match the %s smoke sha256\n", s->model, what, env ? "expected" : "emulator");
 }
 
 static void lockstep(Session *s) {

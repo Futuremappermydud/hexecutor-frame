@@ -26,12 +26,14 @@ def main():
     ap.add_argument('--bootstrap',type=Path,required=True)
     ap.add_argument('--prepared-program',type=Path,required=True)
     ap.add_argument('--report',type=Path,required=True)
+    ap.add_argument('--expect',choices=('emulator','hw'),default='emulator',
+                    help='hw: an NPRG2_HW_ROUNDING=1 engine, checked against the silicon-rounding oracle')
     a=ap.parse_args()
     image=ensure_image(a.model)
     commands=len(resident_image.unpack(image.read_bytes())['commands'])
     constants=FRAME.parent/'recovered'/a.model/'constants/constant_pool_5.bin'
-    names,todo=cases(a.model,a.case or ['smoke','random'])
-    report={'purpose':__doc__,'model':a.model,'commands':commands,'runs':[],'passed':False,
+    names,todo=cases(a.model,a.case or ['smoke','random'],a.expect)
+    report={'purpose':__doc__,'model':a.model,'expect':a.expect,'commands':commands,'runs':[],'passed':False,
             'engine_sha256':hashlib.sha256(a.engine.read_bytes()).hexdigest(),
             'bootstrap_sha256':hashlib.sha256(a.bootstrap.read_bytes()).hexdigest(),
             'prepared_sha256':hashlib.sha256(a.prepared_program.read_bytes()).hexdigest()}
