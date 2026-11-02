@@ -33,6 +33,9 @@ class ResidentDSP:
         self.bootstrap=Path(bootstrap) if bootstrap else FRAME/'build/qd_graph_boot.elf'
         features=self.bootstrap.read_bytes().find(b'QDBOOT01\x01\x00\x00\x00')
         self.preserve_vtcm=features>=0
+        self.l2_cache=b'QDL2BOOT01' in self.bootstrap.read_bytes()
+        if self.l2_cache != (b'QDL2ENGN01' in self.engine.read_bytes()):
+            raise ValueError('L2 cache bootstrap and engine features differ')
         self.direct_hmx=bool(direct_hmx)
         self.prepared_program=Path(prepared_program).read_bytes() if prepared_program else None
         self.transport=None;self.mem=None;self.cursor=1<<20;self.guards=[]
@@ -81,6 +84,7 @@ class ResidentDSP:
             self.guards.extend((((80<<20)-4096,4096),((88<<20),4096),((64<<20)-4096,4096)))
             self.guards.append((SIZE-4096,4096))
             if self.preserve_vtcm:self.guards.extend((((96<<20)-128,128),(104<<20,128)))
+            if self.l2_cache:self.guards.extend(((112<<20,128),((112<<20)+0x20000,128)))
             for off,n in self.guards:self.mem[off:off+n]=b'\xa5'*n
             t=self.transport;t.arena[:32768]=bytes(32768)
             config=[MAGIC,1,image,len(self.image),*self.pools,*self.sizes,*self.inputs,*self.input_bytes,

@@ -25,6 +25,7 @@ docker run --rm --platform linux/amd64 -v "$task_sdk_root:/sdk:ro" -v "$PWD/fram
    -e QDS_PREPARED_REFERENCE="${QDS_PREPARED_REFERENCE:-0}" \
    -e QDS_PREPARED_PROFILE="${QDS_PREPARED_PROFILE:-1}" \
    -e QDS_PREPARED_FUSE="${QDS_PREPARED_FUSE:-0}" \
+   -e QDS_L2_CACHE="${QDS_L2_CACHE:-0}" \
    depth-model-hmx-tools:latest sh -eu -c '
 cc=/sdk/tools/HEXAGON_Tools/19.0.07/Tools/bin/hexagon-clang
 flags="-mv75 -mhvx -mhvx-length=128b -O2 -G0 -ffreestanding -fno-builtin -fno-vectorize -fno-slp-vectorize -ffp-contract=off -fno-strict-aliasing -Wall -Wextra -DQDO_SCALAR_CACHE=$QDS_SCALAR_CACHE"
@@ -64,6 +65,14 @@ if [ "$QDS_PREPARED_ELEMENTWISE" = 1 ] && { [ "$QDS_NATIVE_PREPARED" != 1 ] || [
   echo "QDS_PREPARED_ELEMENTWISE requires prepared and blocked glue" >&2; exit 1
 fi
 case "$QDS_PREPARED_REFERENCE" in 0|1) ;; *) echo "QDS_PREPARED_REFERENCE must be 0 or 1" >&2; exit 1;; esac
+case "$QDS_L2_CACHE" in 0|1) ;; *) echo "QDS_L2_CACHE must be 0 or 1" >&2; exit 1;; esac
+if [ "$QDS_L2_CACHE" = 1 ] && { [ "$QDS_NATIVE_PREPARED" != 1 ] || [ "$QDS_PRESERVE_VTCM" != 1 ]; }; then
+  echo "QDS_L2_CACHE requires prepared dispatch and preserving bootstrap" >&2; exit 1
+fi
+if [ "$QDS_L2_CACHE" = 1 ]; then
+  echo "QDS_L2_CACHE executor mode is disabled: field 1 displaces 512 KiB of TCM under load; see L2_HANDOFF.md and use the restored bench/l2sweep_probe.py" >&2
+  exit 1
+fi
 # Reference scratch is L1-cached heap: no HVX may touch it, so no
 # autovectorized engine. Elementwise handlers are allowed: with the reference
 # build they get their own L2-TCM scratch region (qd_graph_prepared.h,
@@ -130,6 +139,7 @@ if [ "$QDS_PREPARED_FUSE" = 1 ] && [ "$QDS_PREPARED_REFERENCE" != 1 ]; then
   echo "QDS_PREPARED_FUSE requires QDS_PREPARED_REFERENCE (the fast conv runs the fused epilogue)" >&2; exit 1
 fi
 engine_flags="$engine_flags -DQDS_PREPARED_FUSE=$QDS_PREPARED_FUSE"
+engine_flags="$engine_flags -DQDS_L2_CACHE=$QDS_L2_CACHE"
 glue_src=
 native_src=
 if [ "$QDS_DYNAMIC_TCM" = 1 ]; then engine="${engine%.elf}-dynamic-tcm.elf"; fi
@@ -185,13 +195,17 @@ if [ "$QDS_PRESERVE_VTCM" = 1 ]; then
   engine="${engine%.elf}-vtcm-lease.elf"
   bootstrap="${bootstrap%.elf}-preserve-vtcm-guarded-entry.elf"
 fi
+if [ "$QDS_L2_CACHE" = 1 ]; then
+  engine="${engine%.elf}-l2cache.elf"
+  bootstrap="${bootstrap%.elf}-l2cache.elf"
+fi
 $cc $engine_flags -ffunction-sections -fdata-sections -nostdlib -Wl,--gc-sections,-T,qd_graph_dsp.ld \
   qd_graph_dsp.c qd_resident.c qd_resident_conv.c qd_hmx_ops_encoded.S $glue_src $native_src \
   -Wl,--start-group -lhexagon -lgcc -lc -lm -Wl,--end-group -o "$engine"
 # Experiments only write a separate engine. Use the existing mode-specific
 # bootstrap; never replace the normal bootstrap/probe during these builds.
 if [ "$QDS_PRESERVE_VTCM" = 1 ]; then
-  $cc $flags -DQDS_PRESERVE_VTCM=1 -DQDS_ENTRY_GUARD=1 -nostdlib -Wl,-T,qd_payload.ld qd_graph_boot.c qd_graph_stack.S -o "$bootstrap"
+  $cc $flags -DQDS_PRESERVE_VTCM=1 -DQDS_ENTRY_GUARD=1 -DQDS_L2_CACHE=$QDS_L2_CACHE -nostdlib -Wl,-T,qd_payload.ld qd_graph_boot.c qd_graph_stack.S -o "$bootstrap"
   echo "Experimental engine: $engine; preserving bootstrap: $bootstrap"
   exit 0
 fi

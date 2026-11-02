@@ -4,6 +4,13 @@
 #include "native_program/prepared_runner.h"
 #include "native_program/prepared_native.h"
 #include "native_program/prepared_io.h"
+#ifndef QDS_L2_CACHE
+#define QDS_L2_CACHE 0
+#endif
+#if QDS_L2_CACHE
+#include "qd_l2_cache.h"
+static const volatile char qds_l2_engine_feature[] __attribute__((used))="QDL2ENGN01";
+#endif
 #if QDS_PREPARED_PREPROCESS
 #include "native_program/prepared_preprocess.h"
 #endif
@@ -242,6 +249,9 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
     volatile uint32_t *trace=(volatile uint32_t *)(SERVICE+1024u);
     for(uint32_t q=0;q<16;q++)trace[q]=0;
     trace[0]=0x31525051u;trace[2]=((volatile uint32_t *)SERVICE)[2];g->error_detail=0;
+#if QDS_L2_CACHE
+    trace[12]=(uint32_t)qds_l2_engine_feature[0];
+#endif
     if(!s || first>=last || last>g->ncommands || !native_1x1_lease_valid() ||
        !native_1x1_hmx_owned() || !native_1x1_workers_idle())return QDG_ERR_UNSUPPORTED;
     trace[6]=s->runner.l2_hot_bytes;trace[7]=s->runner.l2_expanded_bytes;
@@ -274,6 +284,11 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
         s->inputs,4,s->outputs,2,g,scratch,scratch_bytes,&s->stats);
     if(e)goto failed;
     trace[1]=1;
+#if QDS_L2_CACHE
+    QdsL2Cache l2;
+    e=qds_l2_begin(&l2);
+    if(e){qds_l2_end(&l2);goto failed;}
+#endif
     uint64_t t=now_ns();
     dsp_clean_range(g->pool[1],QD_DIRECT_ACTIVE_BYTES);
     dsp_packet_copy((void *)QD_DIRECT_VTCM_BASE,g->pool[1],QD_DIRECT_ACTIVE_BYTES);
@@ -282,10 +297,17 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
     e=nprg2_runner_execute(&s->runner,&s->executor,first,last-first,QD_DIRECT_ACTIVE_BYTES,
         s->inputs,4,s->outputs,2,g,scratch,scratch_bytes,prepared_cancel,NULL,&s->stats);
     qdrc_invalidate_native();g->resident_key=0;
-    if(e)goto failed;
+    if(e)goto failed_active;
     t=now_ns();dsp_packet_copy(g->pool[1],(void *)QD_DIRECT_VTCM_BASE,QD_DIRECT_ACTIVE_BYTES);
     g->dsp_write_cycles+=now_ns()-t;trace[1]=7;
+#if QDS_L2_CACHE
+    if(qds_l2_end(&l2)){e=NPRG2_EXEC_ARGUMENT;goto failed;}
+#endif
     trace[8]=s->stats.executed_commands;trace[9]=s->stats.validated_commands;return 0;
+failed_active:
+#if QDS_L2_CACHE
+    if(qds_l2_end(&l2))e=NPRG2_EXEC_ARGUMENT;
+#endif
 failed:
     trace[8]=s->stats.executed_commands;trace[9]=s->stats.validated_commands;
     g->stats.error_command=s->stats.failed_command;
