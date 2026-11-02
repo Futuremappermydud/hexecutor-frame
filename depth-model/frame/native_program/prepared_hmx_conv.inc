@@ -40,6 +40,7 @@ typedef struct {
      * and other operand (same geometry), or NULL: hmx_row per quad. */
     uint8_t *const *otab, *const *etab, *const *btab;
     int32_t owb0, onwb;
+    int32_t *tyx; /* per local tile t: first pixel's y, x (no divide per tile) */
     const Fuse *fx; /* fused epilogue (same geometry as o, proved by fuse_decode), or NULL */
     int64_t xnbw, xnbd, onbw, onbd;
 } HmxJob;
@@ -72,8 +73,6 @@ static void hmx_tab(uint8_t **tab, uint8_t *const *pools, const T *t, int32_t ro
         }
     }
 }
-/* Output pixel P0 -> (y, x), without a hardware divide per quad. */
-static inline void hmx_pix(int32_t P0, int32_t ow, int32_t *y, int32_t *x) {*y=P0/ow;*x=P0-*y*ow;}
 #if BLK_HVX
 /* Pixels col..col+3 of row, channels 32cb..32cb+31: 128 bytes, pixel-major. */
 static inline HVX_Vector hmx_quad(uint8_t *const *pools, const T *t, int64_t row, int64_t col, int64_t cb,
@@ -89,10 +88,10 @@ static inline HVX_Vector hmx_quad(uint8_t *const *pools, const T *t, int64_t row
 #endif
 #if BLK_HVX
 /* hmx_quad over a row pointer table (hmx_tab; r relative to its first row). */
-static inline HVX_Vector hmx_quad_tab(uint8_t *const *tab, int32_t wb0, int32_t nwb, int32_t nz, int64_t r, int64_t col,
-                                      int64_t z) {
-    int64_t wb=(col>>3)-wb0;int s=(int)(col&7);
-    uint8_t *const *row=tab+((size_t)r*(size_t)nwb+(size_t)wb)*(size_t)nz+(size_t)z;
+static inline HVX_Vector hmx_quad_tab(uint8_t *const *tab, int32_t wb0, int32_t nwb, int32_t nz, int32_t r, int32_t col,
+                                      int32_t z) {
+    int32_t wb=(col>>3)-wb0;int s=col&7;
+    uint8_t *const *row=tab+(uint32_t)((r*nwb+wb)*nz+z);
     const uint8_t *p0=row[0];
     if(s<=4) return p0?load_part(p0+32*s,128):Q6_V_vzero();
     uint32_t n1=(uint32_t)(8-s)*32;
@@ -107,13 +106,13 @@ static void hmx_tile(const HmxJob *J, int32_t t, int32_t k) {
     uint32_t e=J->ktab[k];
     int64_t ky=e&255,kx=(e>>8)&255,cb=e>>16;
     int32_t P=32*(J->m0+t),y,x,total=J->oh*J->ow;
-    hmx_pix(P,J->ow,&y,&x);
+    y=J->tyx[2*t];x=J->tyx[2*t+1];
     uint8_t *dst=J->A+((size_t)t*J->KB+(size_t)k)*2048;
     for(int q=0;q<8;q++,P+=4) {
         int valid=P<total;
         int64_t row=xt->p[1]+y+ky,col=xt->p[2]+x+kx;
 #if BLK_HVX
-        HVX_Vector v=!valid?Q6_V_vzero():J->xtab?hmx_quad_tab(J->xtab,J->xwb0,J->xnwb,J->cbs,y+ky,col,cb):hmx_quad(g->pool,xt,row,col,cb,J->xnbw,J->xnbd);
+        HVX_Vector v=!valid?Q6_V_vzero():J->xtab?hmx_quad_tab(J->xtab,J->xwb0,J->xnwb,J->cbs,y+(int32_t)ky,(int32_t)col,(int32_t)cb):hmx_quad(g->pool,xt,row,col,cb,J->xnbw,J->xnbd);
         HVX_VectorPair w=Q6_W_vshuff_VVR(v,Q6_V_vzero(),-1);
         ((HVX_Vector *)dst)[2*q]=Q6_Vh_vshuff_Vh(Q6_V_lo_W(w));
         ((HVX_Vector *)dst)[2*q+1]=Q6_Vh_vshuff_Vh(Q6_V_hi_W(w));
@@ -129,12 +128,16 @@ static void hmx_tile(const HmxJob *J, int32_t t, int32_t k) {
         if(valid && (x+=4)==J->ow){x=0;y++;}
     }
 }
+/* Tiles i = t*KB + k with i % parts == part, stepped without a divide
+ * (Hexagon has none: a % per tile was a library call per tile per part). */
 static void hmx_prep_part(void *ctx, uint32_t part, uint32_t parts) {
     const HmxJob *J=(const HmxJob *)ctx;
-    uint32_t n=(uint32_t)J->mt*(uint32_t)J->KB,t=0,k=0;
-    for(uint32_t i=0;i<n;i++) {
-        if(i%parts==part) hmx_tile(J,(int32_t)t,(int32_t)k);
-        if(++k==(uint32_t)J->KB){k=0;t++;}
+    uint32_t KB=(uint32_t)J->KB,t=0,k=part;
+    while(k>=KB){k-=KB;t++;}
+    while(t<(uint32_t)J->mt) {
+        hmx_tile(J,(int32_t)t,(int32_t)k);
+        k+=parts;
+        while(k>=KB){k-=KB;t++;}
     }
 }
 /* Quad (4 pixels x 32 channels of output block j, 128 bytes v) to pixels
@@ -159,7 +162,7 @@ static HVX_Vector hmx_quant_pair(HVX_Vector pre, HVX_Vector mult) {
 #endif
 static void hmx_quant_tile(const HmxJob *J, int32_t t, int32_t j) {
     int32_t P=32*(J->m0+t),y,x,total=J->oh*J->ow;
-    hmx_pix(P,J->ow,&y,&x);
+    y=J->tyx[2*t];x=J->tyx[2*t+1];
     const uint8_t *src=J->C+((size_t)t*J->NB+(size_t)j)*2048;
 #if BLK_HVX
     HVX_Vector mult=((const HVX_Vector *)J->multv)[j];
@@ -177,7 +180,7 @@ static void hmx_quant_tile(const HmxJob *J, int32_t t, int32_t j) {
             HVX_VectorPair w0=Q6_Wuw_vunpack_Vuh(Q6_V_lo_W(w)),w1=Q6_Wuw_vunpack_Vuh(Q6_V_hi_W(w));
             HVX_Vector q[4]={Q6_V_lo_W(w0),Q6_V_hi_W(w0),Q6_V_lo_W(w1),Q6_V_hi_W(w1)},u[4],r[4];
             if(f->kind==2) {
-                HVX_Vector bv=J->btab?hmx_quad_tab(J->btab,J->owb0,J->onwb,J->NB,y,(int64_t)f->ob.p[2]+x,j):
+                HVX_Vector bv=J->btab?hmx_quad_tab(J->btab,J->owb0,J->onwb,J->NB,y,f->ob.p[2]+x,j):
                               hmx_quad(J->g->pool,&f->ob,(int64_t)f->ob.p[1]+y,(int64_t)f->ob.p[2]+x,j,J->onbw,J->onbd);
                 HVX_VectorPair z=Q6_Wuh_vunpack_Vub(bv);
                 HVX_VectorPair z0=Q6_Wuw_vunpack_Vuh(Q6_V_lo_W(z)),z1=Q6_Wuw_vunpack_Vuh(Q6_V_hi_W(z));
@@ -223,10 +226,12 @@ static void hmx_quant_tile(const HmxJob *J, int32_t t, int32_t j) {
 }
 static void hmx_quant_part(void *ctx, uint32_t part, uint32_t parts) {
     const HmxJob *J=(const HmxJob *)ctx;
-    uint32_t n=(uint32_t)J->mt*(uint32_t)J->NB,t=0,j=0;
-    for(uint32_t i=0;i<n;i++) {
-        if(i%parts==part) hmx_quant_tile(J,(int32_t)t,(int32_t)j);
-        if(++j==(uint32_t)J->NB){j=0;t++;}
+    uint32_t NB=(uint32_t)J->NB,t=0,j=part;
+    while(j>=NB){j-=NB;t++;}
+    while(t<(uint32_t)J->mt) {
+        hmx_quant_tile(J,(int32_t)t,(int32_t)j);
+        j+=parts;
+        while(j>=NB){j-=NB;t++;}
     }
 }
 /* C = conversion(A x B) for the batch. fi/zero/completion: VTCM records as
@@ -357,6 +362,8 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     if(c->workspace_bytes<fixed+per+2048) return 0;
     int32_t mt=(int32_t)((c->workspace_bytes-fixed-2048)/per);
     if(mt>total) mt=total;
+    size_t o_tyx=nbump(&at,(size_t)mt*8);
+    if(at>c->near_bytes) return 0;
     g->wused=0;
     uint8_t *ws=walloc(g,fixed+(size_t)mt*per+2048);
     if(!ws){*err=E_MEMORY;return -1;}
@@ -393,8 +400,16 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     uint32_t parts=nprg2_parallel_parts(g->call->parallel,3);
     uint32_t saved=c->hmx->enter?c->hmx->enter():0;
     int e=0;
+    J.tyx=(int32_t *)(n+o_tyx);
     for(int32_t m0=0;m0<total && !e;m0+=mt) {
         J.m0=m0;J.mt=total-m0<mt?total-m0:mt;
+        {
+            int32_t P=32*m0,y=P/ow,x=P-y*ow;
+            for(int32_t t=0;t<J.mt;t++) {
+                J.tyx[2*t]=y;J.tyx[2*t+1]=x;
+                for(x+=32;x>=ow;x-=ow) y++;
+            }
+        }
         if(clock){t1=clock();c->phase[2]+=t1-t0;t0=t1;}
         if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,hmx_prep_part,&J);
         else hmx_prep_part(&J,0,1);
