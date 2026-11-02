@@ -667,11 +667,66 @@ static int ew_strips(G *g, const T *it, const T *ot, uint32_t ies, uint32_t oes,
     return 0;
 }
 typedef struct { int32_t zp; uint32_t m24; int32_t e, fast; double sc; uint32_t in_es; } DqCtx;
+#if BLK_HVX
+/* dq_exact on 32 int32 lanes x (input values): the float bits, and in *bad
+ * the lanes dq_exact would reject or that the split below cannot hold
+ * (|x-zp| >= 2^17). P = a*m24 with m24 = mh*2^12 + ml (12-bit halves), so
+ * both partial products are < 2^29; P < 2^41 as (hi,lo) words. X = P
+ * shifted so its top bit is bit 31 of the high word; the 24-bit mantissa is
+ * X>>8 rounded half up on bit 7, which is dq_exact's (P>>sh)+(remainder>=half). */
+static inline HVX_Vector dq_hvx32(HVX_Vector x, HVX_Vector vzp, uint32_t mh2, uint32_t ml2, HVX_Vector vex0,
+                                  HVX_VectorPred *bad) {
+    const HVX_Vector zero=Q6_V_vzero(),one=Q6_V_vsplat_R(1);
+    HVX_Vector dd=Q6_Vw_vsub_VwVw(x,vzp);
+    HVX_VectorPred neg=Q6_Q_vcmp_gt_VwVw(zero,dd);
+    HVX_Vector a=Q6_Vw_vabs_Vw(dd);
+    HVX_VectorPred z=Q6_Q_vcmp_eq_VwVw(a,zero);
+    HVX_VectorPred big=Q6_Q_vcmp_gt_VwVw(a,Q6_V_vsplat_R(0x1ffff));
+    HVX_Vector p1=Q6_Vw_vmpyi_VwRh(a,(int32_t)mh2),p0=Q6_Vw_vmpyi_VwRh(a,(int32_t)ml2);
+    HVX_Vector lo=Q6_Vw_vadd_VwVw(Q6_Vw_vasl_VwR(p1,12),p0);
+    HVX_Vector hi=Q6_Vuw_vlsr_VuwR(p1,20);
+    hi=Q6_Vw_condacc_QVwVw(Q6_Q_vcmp_gt_VuwVuw(p0,lo),hi,one);
+    HVX_Vector L=Q6_Vuw_vcl0_Vuw(hi),Ll=Q6_Vuw_vcl0_Vuw(lo);
+    HVX_VectorPred hz=Q6_Q_vcmp_eq_VwVw(hi,zero);
+    HVX_Vector Xa=Q6_V_vor_VV(Q6_Vw_vasl_VwVw(hi,L),Q6_Vw_vlsr_VwVw(lo,Q6_Vw_vsub_VwVw(Q6_V_vsplat_R(32),L)));
+    HVX_Vector X=Q6_V_vmux_QVV(hz,Q6_Vw_vasl_VwVw(lo,Ll),Xa);
+    HVX_Vector nb=Q6_V_vmux_QVV(hz,Q6_Vw_vsub_VwVw(Q6_V_vsplat_R(32),Ll),Q6_Vw_vsub_VwVw(Q6_V_vsplat_R(64),L));
+    HVX_Vector mant=Q6_Vw_vadd_VwVw(Q6_Vuw_vlsr_VuwR(X,8),Q6_V_vand_VV(Q6_Vuw_vlsr_VuwR(X,7),one));
+    HVX_VectorPred ovf=Q6_Q_vcmp_eq_VwVw(mant,Q6_V_vsplat_R(1<<24));
+    nb=Q6_Vw_condacc_QVwVw(ovf,nb,one);
+    HVX_Vector ex=Q6_Vw_vadd_VwVw(nb,vex0);
+    HVX_VectorPred exbad=Q6_Q_or_QQ(Q6_Q_vcmp_gt_VwVw(one,ex),Q6_Q_vcmp_gt_VwVw(ex,Q6_V_vsplat_R(254)));
+    *bad=Q6_Q_or_QQ(big,Q6_Q_and_QQn(exbad,z));
+    HVX_Vector bits=Q6_V_vor_VV(Q6_Vw_vasl_VwR(ex,23),Q6_V_vand_VV(mant,Q6_V_vsplat_R(0x7fffff)));
+    bits=Q6_V_vor_VV(bits,Q6_V_vand_QR(neg,0x80000000u));
+    return Q6_V_vmux_QVV(z,zero,bits);
+}
+#endif
 static void dq_strip(const void *c_, const uint8_t *src, uint8_t *dst, size_t n, const int32_t *io) {
     (void)io;
     const DqCtx *c=c_;
     float *d=(float *)dst;
-    for(size_t j=0;j<n;j++) {
+    size_t j0=0;
+#if BLK_HVX
+    if(c->fast && c->in_es==2 && !((uintptr_t)src&127u) && !((uintptr_t)dst&127u)) {
+        uint32_t mh=c->m24>>12,ml=c->m24&4095u;
+        HVX_Vector vzp=Q6_V_vsplat_R(c->zp),vex0=Q6_V_vsplat_R(c->e+126),acc=Q6_V_vzero();
+        for(;j0+64<=n;j0+=64) {
+            HVX_VectorPair w=Q6_Wuw_vunpack_Vuh(*(const HVX_Vector *)(src+2*j0));
+            HVX_VectorPred b0,b1;
+            HVX_Vector r0=dq_hvx32(Q6_V_lo_W(w),vzp,mh|mh<<16,ml|ml<<16,vex0,&b0);
+            HVX_Vector r1=dq_hvx32(Q6_V_hi_W(w),vzp,mh|mh<<16,ml|ml<<16,vex0,&b1);
+            acc=Q6_V_vor_VV(acc,Q6_V_vand_QR(Q6_Q_or_QQ(b0,b1),0x01010101u));
+            ((HVX_Vector *)(d+j0))[0]=r0;((HVX_Vector *)(d+j0))[1]=r1; /* vunpack keeps element order */
+        }
+        /* A rejected lane anywhere: the whole strip again in scalar (never seen in the models). */
+        HVX_Vector flag __attribute__((aligned(128)))=acc;
+        const uint32_t *fw=(const uint32_t *)&flag;uint32_t any=0;
+        for(int k=0;k<32;k++) any|=fw[k];
+        if(any) j0=0;
+    }
+#endif
+    for(size_t j=j0;j<n;j++) {
         int32_t v=c->in_es==2?(int32_t)((const uint16_t *)src)[j]:(int32_t)src[j];
         uint32_t bits;
         if(c->fast && dq_exact(v-c->zp,c->m24,c->e,&bits)){memcpy(d+j,&bits,4);continue;}

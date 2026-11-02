@@ -246,11 +246,12 @@ static int prepared_par_run(void *impl,uint32_t parts,Nprg2ParallelFn fn,void *c
 #endif
 
 static int prepared_cancel(void *ctx,uint32_t index) {
-    (void)ctx;(void)index;
+    (void)ctx;
 #if QDS_PREPARED_THREADS>1
     if(prepared_par_fault)return 1;
 #endif
-    return resident_cancelled();
+    /* The host's cancel words are two uncached arena loads: every 32nd command. */
+    return !(index&31u) && resident_cancelled();
 }
 
 static QdPreparedState *prepared_open(QdgGraph *g,const QdsConfig *cfg,
