@@ -69,7 +69,12 @@ static uint8_t *hmx_vtcm;
 #ifdef __hexagon__
 extern void qd_hmx_wide(void *, void *, void *, void *, uint32_t);
 extern void qd_hmx_finish(void *, void *);
-static const Nprg2HmxOps sim_hmx = {.wide = qd_hmx_wide, .finish = qd_hmx_finish};
+extern void qd_hmx_wide_n(void *, void *, void *, void *, uint32_t, uint32_t);
+/* SIM_HMX_N=0 keeps the per-tile qd_hmx_wide (the v6 call). */
+#ifndef SIM_HMX_N
+#define SIM_HMX_N 1
+#endif
+static const Nprg2HmxOps sim_hmx = {.wide = qd_hmx_wide, .finish = qd_hmx_finish, .wide_n = SIM_HMX_N ? qd_hmx_wide_n : NULL};
 static void hmx_map_vtcm(void) {
     uint32_t base = __rdcfg(__vtcm_base) << 16, pn = base >> 12, index = 120;
     uint64_t entry = ((uint64_t)(0xc0000000u | pn) << 32) | (0xf6000000u | (pn << 1) | 0x40u);

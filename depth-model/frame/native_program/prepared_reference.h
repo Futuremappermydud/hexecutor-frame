@@ -76,6 +76,9 @@ typedef struct Nprg2HmxOps {
     void (*wide)(void *a, void *b, void *fi, void *c, uint32_t kb);
     void (*finish)(void *zero, void *completion);
     uint64_t (*clock)(void);
+    /* Optional qd_hmx_wide_n: one N block over mt M tiles with one bias load
+     * and clear (kbnb = KB | NB<<16); used instead of wide when present. */
+    void (*wide_n)(void *a, void *b, void *fi, void *c, uint32_t kbnb, uint32_t mt);
 } Nprg2HmxOps;
 /* Fuse hook registered with the conv keys: the conv handler can run the
  * REQUANT_U8/70 or ADD_U8/13 command `epilogue` fused into its output step

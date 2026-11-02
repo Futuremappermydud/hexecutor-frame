@@ -36,6 +36,10 @@ typedef struct {
     const uint8_t *multv; /* NB vectors: M of channel n in halfwords 2n, 2n+1 */
     uint8_t *const *xtab; /* input row pointers [r][wb-wb0][cb], or NULL: hmx_row per quad */
     int32_t xwb0, xnwb, cbs;
+    /* Output row pointers [y][wb-owb0][j] of o, and of the epilogue's output
+     * and other operand (same geometry), or NULL: hmx_row per quad. */
+    uint8_t *const *otab, *const *etab, *const *btab;
+    int32_t owb0, onwb;
     const Fuse *fx; /* fused epilogue (same geometry as o, proved by fuse_decode), or NULL */
     int64_t xnbw, xnbd, onbw, onbd;
 } HmxJob;
@@ -47,6 +51,26 @@ static inline uint8_t *hmx_row(uint8_t *const *pools, const T *t, int64_t h, int
     int64_t index=((h>>3)*nbw+wb)*nbd+t->slice+z;
     uint32_t e=(index>=0 && index<(int64_t)t->nblocks)?t->blocks[index]:0,pool=e&127;
     return pool && pools[pool]?pools[pool]+(e&~127u)+(size_t)(h&7)*256:NULL;
+}
+/* Row pointers tab[(r*nwb + w)*nz + z] = hmx_row(t, row0+r, wb0+w, z) for
+ * r < nrows, w < nwb, z < nz, in 32-bit arithmetic (the tables are small). */
+static void hmx_tab(uint8_t **tab, uint8_t *const *pools, const T *t, int32_t row0, int32_t nrows, int32_t wb0,
+                    int32_t nwb, int32_t nz) {
+    const int32_t nbw=(t->m[2]+7)/8,nbd=(t->m[3]+31)/32;
+    const uint32_t nb=t->nblocks;
+    for(int32_t r=0;r<nrows;r++) {
+        int32_t h=row0+r;
+        uint8_t **row=tab+(size_t)r*(size_t)nwb*(size_t)nz;
+        for(int32_t w=0;w<nwb;w++) {
+            int32_t wb=wb0+w;
+            int ok=h>=0 && wb>=0 && wb<nbw;
+            uint32_t idx=ok?(uint32_t)(((h>>3)*nbw+wb)*nbd)+t->slice:0;
+            for(int32_t z=0;z<nz;z++) {
+                uint32_t e=ok && idx+(uint32_t)z<nb?t->blocks[idx+(uint32_t)z]:0,pool=e&127;
+                row[w*nz+z]=pool && pools[pool]?pools[pool]+(e&~127u)+(size_t)(h&7)*256:NULL;
+            }
+        }
+    }
 }
 /* Output pixel P0 -> (y, x), without a hardware divide per quad. */
 static inline void hmx_pix(int32_t P0, int32_t ow, int32_t *y, int32_t *x) {*y=P0/ow;*x=P0-*y*ow;}
@@ -64,14 +88,15 @@ static inline HVX_Vector hmx_quad(uint8_t *const *pools, const T *t, int64_t row
 }
 #endif
 #if BLK_HVX
-/* hmx_quad over the row pointer table: input row r (relative to xt->p[1]). */
-static inline HVX_Vector hmx_quad_tab(const HmxJob *J, int64_t r, int64_t col, int64_t cb) {
-    int64_t wb=(col>>3)-J->xwb0;int s=(int)(col&7);
-    uint8_t *const *row=J->xtab+((size_t)r*(size_t)J->xnwb+(size_t)wb)*(size_t)J->cbs+(size_t)cb;
+/* hmx_quad over a row pointer table (hmx_tab; r relative to its first row). */
+static inline HVX_Vector hmx_quad_tab(uint8_t *const *tab, int32_t wb0, int32_t nwb, int32_t nz, int64_t r, int64_t col,
+                                      int64_t z) {
+    int64_t wb=(col>>3)-wb0;int s=(int)(col&7);
+    uint8_t *const *row=tab+((size_t)r*(size_t)nwb+(size_t)wb)*(size_t)nz+(size_t)z;
     const uint8_t *p0=row[0];
     if(s<=4) return p0?load_part(p0+32*s,128):Q6_V_vzero();
     uint32_t n1=(uint32_t)(8-s)*32;
-    const uint8_t *p1=row[J->cbs];
+    const uint8_t *p1=row[nz];
     HVX_Vector v1=p0?load_part(p0+32*s,n1):Q6_V_vzero(),v2=p1?load_part(p1,128-n1):Q6_V_vzero();
     return Q6_V_vmux_QVV(Q6_Q_vsetq_R((int32_t)n1),v1,Q6_V_vror_VR(v2,(int32_t)(128-n1)));
 }
@@ -88,14 +113,16 @@ static void hmx_tile(const HmxJob *J, int32_t t, int32_t k) {
         int valid=P<total;
         int64_t row=xt->p[1]+y+ky,col=xt->p[2]+x+kx;
 #if BLK_HVX
-        HVX_Vector v=!valid?Q6_V_vzero():J->xtab?hmx_quad_tab(J,y+ky,col,cb):hmx_quad(g->pool,xt,row,col,cb,J->xnbw,J->xnbd);
+        HVX_Vector v=!valid?Q6_V_vzero():J->xtab?hmx_quad_tab(J->xtab,J->xwb0,J->xnwb,J->cbs,y+ky,col,cb):hmx_quad(g->pool,xt,row,col,cb,J->xnbw,J->xnbd);
         HVX_VectorPair w=Q6_W_vshuff_VVR(v,Q6_V_vzero(),-1);
         ((HVX_Vector *)dst)[2*q]=Q6_Vh_vshuff_Vh(Q6_V_lo_W(w));
         ((HVX_Vector *)dst)[2*q+1]=Q6_Vh_vshuff_Vh(Q6_V_hi_W(w));
 #else
         uint8_t *d=dst+128*q;
         for(int r=0;r<4;r++) {
-            const uint8_t *s=valid?hmx_row(g->pool,xt,row,(col+r)>>3,J->xnbw,J->xnbd,cb):NULL;
+            const uint8_t *s=!valid?NULL:J->xtab?J->xtab[((size_t)(y+ky)*(size_t)J->xnwb+(size_t)(((col+r)>>3)-J->xwb0))*
+                                                         (size_t)J->cbs+(size_t)cb]:
+                             hmx_row(g->pool,xt,row,(col+r)>>3,J->xnbw,J->xnbd,cb);
             if(s) memcpy(d+32*r,s+32*((col+r)&7),32); else memset(d+32*r,0,32);
         }
 #endif
@@ -113,12 +140,14 @@ static void hmx_prep_part(void *ctx, uint32_t part, uint32_t parts) {
 /* Quad (4 pixels x 32 channels of output block j, 128 bytes v) to pixels
  * (y, x..x+3) of the output blocks. */
 #if BLK_HVX
-static inline void hmx_put(const HmxJob *J, const T *o, int32_t y, int32_t x, int32_t j, HVX_Vector v) {
+static inline void hmx_put(const HmxJob *J, const T *o, uint8_t *const *tab, int32_t y, int32_t x, int32_t j,
+                           HVX_Vector v) {
     int64_t oy=o->p[1]+y,ox=o->p[2]+x;int s=(int)(ox&7);
     uint32_t n1=(uint32_t)(s<=4?4:8-s)*32;
-    uint8_t *d=hmx_row(J->g->pool,o,oy,ox>>3,J->onbw,J->onbd,j);
+    uint8_t *const *row=tab?tab+((size_t)y*(size_t)J->onwb+(size_t)((ox>>3)-J->owb0))*(size_t)J->NB+(size_t)j:NULL;
+    uint8_t *d=row?row[0]:hmx_row(J->g->pool,o,oy,ox>>3,J->onbw,J->onbd,j);
     if(d) store_part(d+32*s,v,0,n1);
-    if(n1<128 && (d=hmx_row(J->g->pool,o,oy,(ox>>3)+1,J->onbw,J->onbd,j))!=NULL) store_part(d,v,n1,128-n1);
+    if(n1<128 && (d=row?row[J->NB]:hmx_row(J->g->pool,o,oy,(ox>>3)+1,J->onbw,J->onbd,j))!=NULL) store_part(d,v,n1,128-n1);
 }
 static HVX_Vector hmx_quant_pair(HVX_Vector pre, HVX_Vector mult) {
     pre=Q6_Vuh_vmin_VuhVuh(pre,Q6_V_vsplat_R(4096|(4096<<16)));
@@ -138,17 +167,18 @@ static void hmx_quant_tile(const HmxJob *J, int32_t t, int32_t j) {
         HVX_Vector a=hmx_quant_pair(((const HVX_Vector *)src)[2*i],mult),b=hmx_quant_pair(((const HVX_Vector *)src)[2*i+1],mult);
         HVX_Vector v=Q6_Vub_vpack_VhVh_sat(b,a);
         const Fuse *f=J->fx;
-        if(!f) hmx_put(J,J->o,y,x,j,v);
+        if(!f) hmx_put(J,J->o,J->otab,y,x,j,v);
         else {
             /* e = min((q*mc + [b*mo] + rd) >> sh, 255) per byte, as rq_emit_fx. */
-            if(!f->dead) hmx_put(J,J->o,y,x,j,v);
+            if(!f->dead) hmx_put(J,J->o,J->otab,y,x,j,v);
             HVX_Vector rdv=Q6_V_vsplat_R((int32_t)f->rd),mcv=Q6_V_vsplat_R((int32_t)f->mc),
                        mov=Q6_V_vsplat_R((int32_t)f->mo),shv=Q6_V_vsplat_R((int32_t)f->sh),c255=Q6_V_vsplat_R(255);
             HVX_VectorPair w=Q6_Wuh_vunpack_Vub(v);
             HVX_VectorPair w0=Q6_Wuw_vunpack_Vuh(Q6_V_lo_W(w)),w1=Q6_Wuw_vunpack_Vuh(Q6_V_hi_W(w));
             HVX_Vector q[4]={Q6_V_lo_W(w0),Q6_V_hi_W(w0),Q6_V_lo_W(w1),Q6_V_hi_W(w1)},u[4],r[4];
             if(f->kind==2) {
-                HVX_Vector bv=hmx_quad(J->g->pool,&f->ob,(int64_t)f->ob.p[1]+y,(int64_t)f->ob.p[2]+x,j,J->onbw,J->onbd);
+                HVX_Vector bv=J->btab?hmx_quad_tab(J->btab,J->owb0,J->onwb,J->NB,y,(int64_t)f->ob.p[2]+x,j):
+                              hmx_quad(J->g->pool,&f->ob,(int64_t)f->ob.p[1]+y,(int64_t)f->ob.p[2]+x,j,J->onbw,J->onbd);
                 HVX_VectorPair z=Q6_Wuh_vunpack_Vub(bv);
                 HVX_VectorPair z0=Q6_Wuw_vunpack_Vuh(Q6_V_lo_W(z)),z1=Q6_Wuw_vunpack_Vuh(Q6_V_hi_W(z));
                 u[0]=Q6_V_lo_W(z0);u[1]=Q6_V_hi_W(z0);u[2]=Q6_V_lo_W(z1);u[3]=Q6_V_hi_W(z1);
@@ -158,7 +188,7 @@ static void hmx_quant_tile(const HmxJob *J, int32_t t, int32_t j) {
                 if(f->kind==2) t=Q6_Vw_vmpyieacc_VwVwVuh(t,u[k],mov);
                 r[k]=Q6_Vw_vmin_VwVw(Q6_Vw_vlsr_VwVw(t,shv),c255);
             }
-            hmx_put(J,&f->oe,y,x,j,rq_pack8(r[0],r[1],r[2],r[3]));
+            hmx_put(J,&f->oe,J->etab,y,x,j,rq_pack8(r[0],r[1],r[2],r[3]));
         }
         if((x+=4)==J->ow){x=0;y++;}
     }
@@ -168,10 +198,12 @@ static void hmx_quant_tile(const HmxJob *J, int32_t t, int32_t j) {
         for(int r=0;r<4;r++) {
             int64_t ox=o->p[2]+x+r;
             const Fuse *f=J->fx;
-            uint8_t *d=f && f->dead?NULL:hmx_row(J->g->pool,o,o->p[1]+y,ox>>3,J->onbw,J->onbd,j);
-            uint8_t *de=f?hmx_row(J->g->pool,&f->oe,(int64_t)f->oe.p[1]+y,((int64_t)f->oe.p[2]+x+r)>>3,J->onbw,J->onbd,j):NULL;
-            const uint8_t *db=f && f->kind==2?hmx_row(J->g->pool,&f->ob,(int64_t)f->ob.p[1]+y,((int64_t)f->ob.p[2]+x+r)>>3,
-                                                       J->onbw,J->onbd,j):NULL;
+            size_t ti=((size_t)y*(size_t)J->onwb+(size_t)((ox>>3)-J->owb0))*(size_t)J->NB+(size_t)j;
+            uint8_t *d=f && f->dead?NULL:J->otab?J->otab[ti]:hmx_row(J->g->pool,o,o->p[1]+y,ox>>3,J->onbw,J->onbd,j);
+            uint8_t *de=!f?NULL:J->etab?J->etab[ti]:
+                        hmx_row(J->g->pool,&f->oe,(int64_t)f->oe.p[1]+y,((int64_t)f->oe.p[2]+x+r)>>3,J->onbw,J->onbd,j);
+            const uint8_t *db=!f || f->kind!=2?NULL:J->btab?J->btab[ti]:
+                              hmx_row(J->g->pool,&f->ob,(int64_t)f->ob.p[1]+y,((int64_t)f->ob.p[2]+x+r)>>3,J->onbw,J->onbd,j);
             for(int n=0;n<32;n++) {
                 uint16_t pre;memcpy(&pre,src+((size_t)(4*i+r)*32+(size_t)n)*2,2);
                 uint32_t v=((uint32_t)(pre<4096?pre:4096)*(uint32_t)J->Mq[32*j+n]+8192u)>>14;
@@ -205,7 +237,10 @@ static int hmx_mac(const HmxJob *J, int32_t *fi, int32_t *zero, uint8_t *complet
     HVX_Vector sentinel=Q6_V_vsplat_R(-1);
     for(uint32_t i=0;i<2048;i+=128)*(HVX_Vector *)(completion+i)=sentinel;
     __asm__ volatile("barrier":::"memory");
-    for(int32_t t=0;t<J->mt;t++)for(int32_t j=0;j<J->NB;j++)
+    if(h->wide_n) for(int32_t j=0;j<J->NB;j++)
+        h->wide_n(J->A,(void *)(J->B+(size_t)j*J->KB*1024),fi+j*64,J->C+(size_t)j*2048,
+                  (uint32_t)J->KB|(uint32_t)J->NB<<16,(uint32_t)J->mt);
+    else for(int32_t t=0;t<J->mt;t++)for(int32_t j=0;j<J->NB;j++)
         h->wide(J->A+(size_t)t*J->KB*2048,(void *)(J->B+(size_t)j*J->KB*1024),fi+j*64,
                 J->C+((size_t)t*J->NB+(size_t)j)*2048,(uint32_t)J->KB);
     h->finish(zero,completion);
@@ -270,6 +305,12 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     size_t ntab=(size_t)xrows*(size_t)xnwb*(size_t)cbs,o_xtab=nbump(&at,ntab*sizeof(uint8_t *));
     int use_tab=at<=c->near_bytes;
     if(!use_tab) at=o_xtab;
+    /* Output tables: rows oh, block columns p2..p2+ow-1 (a straddling quad
+     * stays inside them), NB channel blocks; one per written tensor. */
+    const int32_t owb0=o->p[2]>>3,onwb=((o->p[2]+ow-1)>>3)-owb0+1,ntabs=1+(g->fx.kind?1:0)+(g->fx.kind==2?1:0);
+    size_t otn=(size_t)oh*(size_t)onwb*(size_t)NB,o_otab=nbump(&at,(size_t)ntabs*otn*sizeof(uint8_t *));
+    int use_otab=at<=c->near_bytes && (!g->fx.kind || (g->fx.oe.p[2]==o->p[2] && (g->fx.kind!=2 || g->fx.ob.p[2]==o->p[2])));
+    if(!use_otab) at=o_otab;
     if(at>c->near_bytes) return 0;
     uint8_t *n=c->near;
     uint32_t *ktab=(uint32_t *)(n+o_ktab);
@@ -338,10 +379,14 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     uint16_t *mv=(uint16_t *)(n+o_multv);
     for(int32_t k=0;k<co;k++) mv[(k>>5)*64+2*(k&31)]=mv[(k>>5)*64+2*(k&31)+1]=(uint16_t)Mq[k];
     uint8_t **xtab=use_tab?(uint8_t **)(n+o_xtab):NULL;
-    if(xtab) for(int32_t r=0;r<xrows;r++)for(int32_t w=0;w<xnwb;w++)for(int32_t q=0;q<cbs;q++)
-        xtab[((size_t)r*xnwb+w)*cbs+q]=hmx_row(g->pool,xt,(int64_t)xt->p[1]+r,(int64_t)xwb0+w,((int64_t)xt->m[2]+7)/8,
-                                               ((int64_t)xt->m[3]+31)/32,q);
-    HmxJob J={.g=g,.xtab=xtab,.xwb0=xwb0,.xnwb=xnwb,.cbs=cbs,.xt=xt,.o=o,.oh=oh,.ow=ow,.KB=KB,.NB=NB,.total=total,.A=A,.C=C,.B=(const uint8_t *)wbase,
+    if(xtab) hmx_tab(xtab,g->pool,xt,xt->p[1],xrows,xwb0,xnwb,cbs);
+    uint8_t **otab=NULL,**etab=NULL,**btab=NULL;
+    if(use_otab) {
+        otab=(uint8_t **)(n+o_otab);hmx_tab(otab,g->pool,o,o->p[1],oh,owb0,onwb,NB);
+        if(g->fx.kind){etab=otab+otn;hmx_tab(etab,g->pool,&g->fx.oe,g->fx.oe.p[1],oh,owb0,onwb,NB);}
+        if(g->fx.kind==2){btab=etab+otn;hmx_tab(btab,g->pool,&g->fx.ob,g->fx.ob.p[1],oh,owb0,onwb,NB);}
+    }
+    HmxJob J={.g=g,.xtab=xtab,.xwb0=xwb0,.xnwb=xnwb,.cbs=cbs,.otab=otab,.etab=etab,.btab=btab,.owb0=owb0,.onwb=onwb,.xt=xt,.o=o,.oh=oh,.ow=ow,.KB=KB,.NB=NB,.total=total,.A=A,.C=C,.B=(const uint8_t *)wbase,
               .ktab=ktab,.corr=corr,.pre=pre,.Mq=Mq,.multv=(const uint8_t *)mv,.fx=g->fx.kind?&g->fx:NULL,
               .xnbw=((int64_t)xt->m[2]+7)/8,.xnbd=((int64_t)xt->m[3]+31)/32,
               .onbw=((int64_t)o->m[2]+7)/8,.onbd=((int64_t)o->m[3]+31)/32};
