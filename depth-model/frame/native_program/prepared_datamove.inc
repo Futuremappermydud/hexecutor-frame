@@ -145,8 +145,10 @@ static inline DV dv_shuffh(DV v) {
  * the byte offset. The stage lists below were found by a bit-permutation search
  * and are proved by the sim test against the generic kernels. */
 static inline __attribute__((always_inline)) void dv_ladder(DV *r, uint32_t n, const uint8_t (*ops)[3], uint32_t nops) {
+    _Pragma("clang loop unroll(full)")
     for(uint32_t s=0;s<nops;s++) {
         const uint32_t kind=ops[s][0],bit=1u<<ops[s][1],k=ops[s][2];
+        _Pragma("clang loop unroll(full)")
         for(uint32_t i=0;i<n;i++) {
             if(i&bit) continue;
             DV lo,hi;
@@ -211,6 +213,13 @@ static inline uint8_t *bk_blk(const BK *k, int64_t B, int64_t Hb, int64_t col, i
     return pool?k->pool[pool]+(e&~127u):NULL;
 }
 
+static const uint8_t dm_zblk[2048] __attribute__((aligned(128)));
+/* Block start by index, absent blocks (NULL) replaced by `alt`. */
+static inline uint8_t *bk_blk_or(const BK *k, int64_t index, uint8_t *alt) {
+    if(index<0 || index>=k->count) return alt;
+    uint32_t e=k->blocks[index],pool=e&127u;
+    return pool?k->pool[pool]+(e&~127u):alt;
+}
 /* Vector accesses assume every pool base is 128-byte aligned (block offsets and
  * the in-block offsets used are). */
 static int dm_pools_aligned(const G *g) {
@@ -252,19 +261,38 @@ static int dm_disjoint(const uint32_t *a, uint32_t na, const uint32_t *b, uint32
 }
 /* Present blocks of a blocked region, as raw table entries. */
 typedef void (*DMVisit)(void *ctx, uint32_t entry);
-static void dm_visit(const T *t, const int32_t *dims, const int32_t *origin, DMVisit f, void *ctx) {
+static inline __attribute__((always_inline)) void dm_visit(const T *t, const int32_t *dims, const int32_t *origin, DMVisit f, void *ctx) {
     if(!dims[0] || !dims[1] || !dims[2] || !dims[3]) return;
-    int64_t cw=t->esize==1?8:t->esize==2?4:2;
-    int64_t nbh=((int64_t)t->m[1]+7)/8,nbw=((int64_t)t->m[2]+cw-1)/cw,nbd=((int64_t)t->m[3]+31)/32;
-    for(int64_t b=origin[0];b<(int64_t)origin[0]+dims[0];b++)
-     for(int64_t h=origin[1]/8;h<=((int64_t)origin[1]+dims[1]-1)/8;h++)
-      for(int64_t w=origin[2]/cw;w<=((int64_t)origin[2]+dims[2]-1)/cw;w++)
-       for(int64_t z=origin[3]/32;z<=((int64_t)origin[3]+dims[3]-1)/32;z++) {
-        int64_t index=((b*nbh+h)*nbw+w)*nbd+t->slice+z;
-        if(index<0 || index>=(int64_t)t->nblocks) continue;
+    const int cws=t->esize==1?3:t->esize==2?2:1;
+    const int64_t cw=(int64_t)1<<cws;
+    const int64_t nbh=((int64_t)t->m[1]+7)>>3,nbw=((int64_t)t->m[2]+cw-1)>>cws,nbd=((int64_t)t->m[3]+31)>>5;
+    if((origin[0]|origin[1]|origin[2]|origin[3])<0 || dims[0]<0 || dims[1]<0 || dims[2]<0 || dims[3]<0) {
+        /* sign-sensitive division: general loop */
+        for(int64_t b=origin[0];b<(int64_t)origin[0]+dims[0];b++)
+         for(int64_t h=origin[1]/8;h<=((int64_t)origin[1]+dims[1]-1)/8;h++)
+          for(int64_t w=origin[2]/cw;w<=((int64_t)origin[2]+dims[2]-1)/cw;w++)
+           for(int64_t z=origin[3]/32;z<=((int64_t)origin[3]+dims[3]-1)/32;z++) {
+            int64_t index=((b*nbh+h)*nbw+w)*nbd+t->slice+z;
+            if(index<0 || index>=(int64_t)t->nblocks) continue;
+            uint32_t e=t->blocks[index];
+            if(e&127u) f(ctx,e);
+           }
+        return;
+    }
+    const int64_t b1=(int64_t)origin[0]+dims[0],h0=origin[1]>>3,h1=((int64_t)origin[1]+dims[1]-1)>>3;
+    const int64_t w0=origin[2]>>cws,w1=((int64_t)origin[2]+dims[2]-1)>>cws,z0=origin[3]>>5,z1=((int64_t)origin[3]+dims[3]-1)>>5;
+    const int64_t cnt=(int64_t)t->nblocks;
+    for(int64_t b=origin[0];b<b1;b++)
+     for(int64_t h=h0;h<=h1;h++)
+      for(int64_t w=w0;w<=w1;w++) {
+       const int64_t base=((b*nbh+h)*nbw+w)*nbd+t->slice;
+       for(int64_t z=z0;z<=z1;z++) {
+        const int64_t index=base+z;
+        if((uint64_t)index>=(uint64_t)cnt) continue;
         uint32_t e=t->blocks[index];
         if(e&127u) f(ctx,e);
        }
+      }
 }
 /* Per-pool byte extent [lo, hi] (block start offsets). */
 typedef struct { uint32_t lo[8], hi[8]; } DMExt;
@@ -352,29 +380,35 @@ static void s2d_fast_part(void *ctx, uint32_t part, uint32_t parts) {
     const G *g=J->g;const int32_t ph=J->ph,pw=J->pw,oh=J->oh,ow=J->ow,ci=J->ci;
     BK bi,bo;
     bk_init(&bi,g,J->i);bk_init(&bo,g,J->o);
-    const int64_t s=(pw-7)/8,nk=ow/4;
+    const int64_t s=(pw-7)/8,nk=ow/4,nq=(nk+1)/2;
     int64_t i0,i1;
     dm_range(J->items,part,parts,&i0,&i1);
     for(int64_t it=i0;it<i1;it++) {
      const int64_t cb=it/oh;const int32_t h=(int32_t)(it%oh);
+     const int64_t obase=(int64_t)(h>>3)*bo.nbw*bo.nbd+bo.slice;
+     const uint32_t roff=256u*(uint32_t)(h&7);
      for(int dy=0;dy<2;dy++) {
         const int64_t H=(int64_t)ph+2*h+dy,j0=cb*4+2*dy;
-        const uint8_t *r=bk_at(&bi,0,H,s,cb);
-        DV A=r?dv_ld(r+128):dv_zero();
-        const uint8_t *nr=bk_at(&bi,0,H,s+1,cb);
-        DV nb=dv_ldz(nr),nc=dv_ldz(nr?nr+128:NULL);
-        for(int64_t k=0;k<nk;k++) {
-            DV B=nb,C=nc;
-            if(k+1<nk) {
-                nr=bk_at(&bi,0,H,k+2+s,cb);
-                nb=dv_ldz(nr);nc=dv_ldz(nr?nr+128:NULL);
+        const int64_t ibase=(H>>3)*bi.nbw*bi.nbd+bi.slice+cb;
+        const uint32_t ro=256u*(uint32_t)(H&7);
+        DV A=dv_ld(bk_blk_or(&bi,ibase+s*bi.nbd,(uint8_t *)dm_zblk)+ro+128);
+        const uint8_t *ib=bk_blk_or(&bi,ibase+(s+1)*bi.nbd,(uint8_t *)dm_zblk)+ro;
+        for(int64_t q=0;q<nq;q++) {
+            uint8_t *d1=bk_blk_or(&bo,obase+q*bo.nbd+j0+1,NULL),*d0=bk_blk_or(&bo,obase+q*bo.nbd+j0,NULL);
+            if(d1)d1+=roff;
+            if(d0)d0+=roff;
+            #pragma clang loop unroll(full)
+            for(int kk=0;kk<2;kk++) {
+                if(kk && 2*q+1>=nk) break;
+                const uint8_t *cur=ib;
+                DV B=dv_ld(cur),C=dv_ld(cur+128);
+                ib=bk_blk_or(&bi,ibase+(s+2+2*q+kk)*bi.nbd,(uint8_t *)dm_zblk)+ro;
+                DV E,O;
+                dv_deal32(dv_align(B,A,64),dv_align(C,B,64),&E,&O);
+                if(d1)dv_st(d1+128*kk,E);
+                if(d0)dv_st(d0+128*kk,O);
+                A=C;
             }
-            DV E,O;
-            dv_deal32(dv_align(B,A,64),dv_align(C,B,64),&E,&O);
-            uint8_t *d1=bk_at(&bo,0,h,k>>1,j0+1),*d0=bk_at(&bo,0,h,k>>1,j0);
-            if(d1)dv_st(d1+128*(k&1),E);
-            if(d0)dv_st(d0+128*(k&1),O);
-            A=C;
         }
      }
     }
@@ -391,11 +425,10 @@ static void s2d_fast_run(const G *g, const T *i, const T *o, int32_t ph, int32_t
 static int s2d_fast(G *g, const T *i, const T *o, int32_t ph, int32_t pw, int32_t oh, int32_t ow, int32_t ci, int32_t oc) {
     if(!s2d_fast_ok(g,i,o,ph,pw,oh,ow,ci,oc)) return -1;
     int32_t rd[4]={1,2*oh,2*ow,ci},ro[4]={0,ph,pw-1,0},wd[4]={1,oh,ow,oc},zero[4]={0,0,0,0};
-    uint32_t ka[DM_TOUCH_CAP],kb[DM_TOUCH_CAP],na,nb;
     int e=xfer_check(g,i,rd,ro,0);
     if(!e)e=xfer_check(g,o,wd,zero,1);
     if(e) return e;
-    if(!dm_touch(i,rd,ro,ka,&na) || !dm_touch(o,wd,zero,kb,&nb) || !dm_disjoint(ka,na,kb,nb)) return -1;
+    if(!dm_clear(i,rd,ro,o,wd,zero)) return -1;
     if(!g->dry){s2d_fast_run(g,i,o,ph,pw,oh,ow,ci);DM_COUNT(0,(uint64_t)oh*ow*oc);}
     return 0;
 }
@@ -428,18 +461,16 @@ static void resize_part(void *ctx, uint32_t part, uint32_t parts) {
     for(int64_t it=i0;it<i1;it++) {
         const int64_t z=it%ng;const int32_t h=(int32_t)((it/ng)%n[1]),b=(int32_t)(it/ng/n[1]);
         const int64_t H=(int64_t)hi[h]+xt->p[1],B=b+(int64_t)xt->p[0],OB=b+(int64_t)o->p[0],OH=h+(int64_t)o->p[1];
-        const uint8_t *s=bk_at(&bx,B,H,(xw)>>1,z+xt->p[3]/32);
-        DV cur=dv_ldz(s?s+128*(xw&1):NULL);
+        const int64_t ibase=(B*bx.nbh+(H>>3))*bx.nbw*bx.nbd+bx.slice+z+xt->p[3]/32;
+        const uint32_t ro=256u*(uint32_t)(H&7);
+        const int64_t obase=(OB*bo.nbh+(OH>>3))*bo.nbw*bo.nbd+bo.slice+z+o->p[3]/32;
+        const uint32_t oro=256u*(uint32_t)(OH&7);
         for(int64_t q=0;q<nq;q++) {
-            DV v=cur;
-            if(q+1<nq) {
-                s=bk_at(&bx,B,H,(xw+q+1)>>1,z+xt->p[3]/32);
-                cur=dv_ldz(s?s+128*((xw+q+1)&1):NULL);
-            }
+            const uint8_t *s=bk_blk_or(&bx,ibase+((xw+q)>>1)*bx.nbd,(uint8_t *)dm_zblk);
             DV lo,hi2;
-            dv_dup32(v,&lo,&hi2);
-            uint8_t *d=bk_at(&bo,OB,OH,ow+q,z+o->p[3]/32);
-            if(d){dv_st(d,lo);dv_st(d+128,hi2);}
+            dv_dup32(dv_ld(s+ro+128*((xw+q)&1)),&lo,&hi2);
+            uint8_t *d=bk_blk_or(&bo,obase+(ow+q)*bo.nbd,NULL);
+            if(d){dv_st(d+oro,lo);dv_st(d+oro+128,hi2);}
         }
     }
 }
@@ -449,8 +480,7 @@ static int resize_fast(G *g, const T *xt, const T *wpt, const T *o, const int32_
     int e=xfer_check(g,xt,xt->d,xt->p,0);
     if(!e)e=xfer_check(g,o,n,o->p,1);
     if(e) return e;
-    uint32_t ka[DM_TOUCH_CAP],kb[DM_TOUCH_CAP],na,nb;
-    if(!dm_touch(xt,xt->d,xt->p,ka,&na) || !dm_touch(o,n,o->p,kb,&nb) || !dm_disjoint(ka,na,kb,nb)) return -1;
+    if(!dm_clear(xt,xt->d,xt->p,o,n,o->p)) return -1;
     if(g->dry) return 0;
     int32_t hi[RS_HMAX];
     for(int32_t i=0;i<n[1];i++) {
@@ -480,26 +510,97 @@ static int tr_hw_fast_ok(const G *g, const T *xt, const T *o) {
     return dm_write_dims_match(o,n);
 }
 typedef struct { const G *g; const T *xt, *o; int32_t n[4]; } TrJob;
+/* Block-aligned geometry: every 8-row x 4-column input block maps onto half of two output blocks. */
+static int tr_hw_al(const T *xt, const T *o) {
+    return !(xt->d[1]&7) && !(xt->d[2]&3) && !(xt->p[1]&7) && !(xt->p[2]&3) && !(o->p[1]&3) && !(o->p[2]&7);
+}
+static void tr_hw_part_al(const TrJob *J, uint32_t part, uint32_t parts) {
+    const G *g=J->g;const T *xt=J->xt,*o=J->o;const int32_t *n=J->n;
+    BK bx,bo;
+    bk_init(&bx,g,xt);bk_init(&bo,g,o);
+    const int32_t H=xt->d[1],W=xt->d[2];
+    const int64_t nz=n[3]/32,nhb=H/8,nwb=W/4;
+    int64_t i0,i1;
+    dm_range((int64_t)n[0]*nz*nhb,part,parts,&i0,&i1);
+    const int64_t zi=bx.slice+xt->p[3]/32,zo=bo.slice+o->p[3]/32;
+    for(int64_t it=i0;it<i1;it++) {
+        const int64_t hb=it%nhb,z=(it/nhb)%nz,b=it/nhb/nz;
+        const int64_t ib=((b+(int64_t)xt->p[0])*bx.nbh+(hb+(xt->p[1]>>3)))*bx.nbw+(xt->p[2]>>2);
+        const int64_t obase=(b+(int64_t)o->p[0])*bo.nbh;
+        const int64_t ocol=((int64_t)8*hb+o->p[2])>>2;
+        for(int64_t wb=0;wb<nwb;wb++) {
+            const uint8_t *ip=bk_blk_or(&bx,(ib+wb)*bx.nbd+z+zi,(uint8_t *)dm_zblk);
+            const int64_t r0=4*wb+o->p[1];
+            uint8_t *o0=bk_blk_or(&bo,((obase+(r0>>3))*bo.nbw+ocol)*bo.nbd+z+zo,NULL);
+            uint8_t *o1=bk_blk_or(&bo,((obase+(r0>>3))*bo.nbw+ocol+1)*bo.nbd+z+zo,NULL);
+            const uint32_t rb=256u*(uint32_t)(r0&7);
+            #pragma clang loop unroll(full)
+            for(int hq=0;hq<4;hq++) {
+                uint8_t *ob=hq<2?o0:o1;
+                #pragma clang loop unroll(full)
+                for(int wp=0;wp<2;wp++) {
+                    DV A=dv_ld(ip+256*(2*hq)+128*wp),B=dv_ld(ip+256*(2*hq+1)+128*wp);
+                    if(ob) {
+                        uint8_t *d=ob+rb+512*wp+128*(hq&1);
+                        dv_st(d,dv_shuffe16(B,A));dv_st(d+256,dv_shuffo16(B,A));
+                    }
+                }
+            }
+        }
+    }
+}
 static void tr_hw_part(void *ctx, uint32_t part, uint32_t parts) {
     const TrJob *J=ctx;const G *g=J->g;const T *xt=J->xt,*o=J->o;const int32_t *n=J->n;
+    if(tr_hw_al(xt,o)){tr_hw_part_al(J,part,parts);return;}
     BK bx,bo;
     bk_init(&bx,g,xt);bk_init(&bo,g,o);
     const int32_t H=xt->d[1],W=xt->d[2];
     const int64_t nz=n[3]/32,hp=H/2;
     int64_t i0,i1;
     dm_range((int64_t)n[0]*nz*hp,part,parts,&i0,&i1);
+    const int64_t zi=bx.slice+xt->p[3]/32,zo=bo.slice+o->p[3]/32;
     for(int64_t it=i0;it<i1;it++) {
         const int32_t h=(int32_t)(it%hp)*2,b=(int32_t)(it/hp/nz);const int64_t z=(it/hp)%nz;
+        const int64_t AH=(int64_t)h+xt->p[1];
+        const int64_t ib=((b+(int64_t)xt->p[0])*bx.nbh+(AH>>3))*bx.nbw;
+        const uint32_t iro=256u*(uint32_t)(AH&7);
+        const int64_t OW=(int64_t)h+o->p[2],OB=b+(int64_t)o->p[0];
+        const int64_t ocol=OW>>2;
+        const uint32_t ooff=128u*(uint32_t)((OW>>1)&1);
+        const int64_t obase=OB*bo.nbh;
+        int64_t icol=-1,crb=-1;
+        const uint8_t *iblk=NULL;uint8_t *ocur=NULL;
+        if(!(o->p[1]&1)) {
+            /* output row pairs never straddle an 8-row block: run in segments that share
+             * one input block column and one output block row */
+            for(int32_t w=0;w<W;) {
+                const int64_t AW=(int64_t)w+xt->p[2],r0=(int64_t)w+o->p[1];
+                int32_t np=(int32_t)(4-(AW&3))>>1,npo=(int32_t)(8-(r0&7))>>1;
+                if(npo<np)np=npo;
+                if((W-w)/2<np)np=(W-w)/2;
+                iblk=bk_blk_or(&bx,(ib+(AW>>2))*bx.nbd+z+zi,(uint8_t *)dm_zblk);
+                ocur=bk_blk_or(&bo,((obase+(r0>>3))*bo.nbw+ocol)*bo.nbd+z+zo,NULL);
+                const uint8_t *ip=iblk+128u*(uint32_t)((AW>>1)&1)+iro;
+                uint8_t *dp=ocur?ocur+256u*(uint32_t)(r0&7)+ooff:NULL;
+                for(int32_t k=0;k<np;k++) {
+                    /* input pixel pairs of one block row alternate halves; output rows advance by two */
+                    DV A=dv_ld(ip+128*k),B=dv_ld(ip+128*k+256);
+                    if(dp){dv_st(dp+512*k,dv_shuffe16(B,A));dv_st(dp+512*k+256,dv_shuffo16(B,A));}
+                }
+                w+=2*np;
+            }
+            continue;
+        }
         for(int32_t w=0;w<W;w+=2) {
-            const int64_t AH=(int64_t)h+xt->p[1],AW=(int64_t)w+xt->p[2];
-            const uint8_t *s=bk_at(&bx,b+(int64_t)xt->p[0],AH,AW>>2,z+xt->p[3]/32);
-            DV A=dv_zero(),B=A;
-            if(s){A=dv_ld(s+128*((AW>>1)&1));B=dv_ld(s+256+128*((AW>>1)&1));}
-            const int64_t OW=(int64_t)h+o->p[2],OB=b+(int64_t)o->p[0];
-            uint8_t *d0=bk_at(&bo,OB,(int64_t)w+o->p[1],OW>>2,z+o->p[3]/32);
-            uint8_t *d1=bk_at(&bo,OB,(int64_t)w+1+o->p[1],OW>>2,z+o->p[3]/32);
-            if(d0)dv_st(d0+128*((OW>>1)&1),dv_shuffe16(B,A));
-            if(d1)dv_st(d1+128*((OW>>1)&1),dv_shuffo16(B,A));
+            const int64_t AW=(int64_t)w+xt->p[2];
+            if((AW>>2)!=icol){icol=AW>>2;iblk=bk_blk_or(&bx,(ib+icol)*bx.nbd+z+zi,(uint8_t *)dm_zblk);}
+            const uint32_t ioff=128u*(uint32_t)((AW>>1)&1)+iro;
+            DV A=dv_ld(iblk+ioff),B=dv_ld(iblk+ioff+256);
+            const int64_t r0=(int64_t)w+o->p[1],r1=r0+1;
+            if((r0>>3)!=crb){crb=r0>>3;ocur=bk_blk_or(&bo,((obase+crb)*bo.nbw+ocol)*bo.nbd+z+zo,NULL);}
+            if(ocur)dv_st(ocur+256u*(uint32_t)(r0&7)+ooff,dv_shuffe16(B,A));
+            if((r1>>3)!=crb){crb=r1>>3;ocur=bk_blk_or(&bo,((obase+crb)*bo.nbw+ocol)*bo.nbd+z+zo,NULL);}
+            if(ocur)dv_st(ocur+256u*(uint32_t)(r1&7)+ooff,dv_shuffo16(B,A));
         }
     }
 }
@@ -514,7 +615,7 @@ static int tr_hw_fast(G *g, const T *xt, const T *o) {
     DM_COUNT(2,(uint64_t)n[0]*n[1]*n[2]*n[3]);
     TrJob J={g,xt,o,{n[0],n[1],n[2],n[3]}};
     const int32_t H=xt->d[1];
-    uint32_t parts=dm_parts(g,(uint64_t)n[0]*n[1]*n[2]*n[3],(int64_t)n[0]*(n[3]/32)*(H/2));
+    uint32_t parts=dm_parts(g,(uint64_t)n[0]*n[1]*n[2]*n[3],(int64_t)n[0]*(n[3]/32)*(tr_hw_al(xt,o)?H/8:H/2));
     if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_DM,parts,tr_hw_part,&J);
     else tr_hw_part(&J,0,1);
     return 0;
@@ -723,15 +824,19 @@ static int tr_wc_common_ok(const G *g, const T *xt, const T *o, uint32_t es, int
     return dm_write_dims_match(o,n);
 }
 typedef struct { const G *g; const T *xt, *o; const int32_t *n; int es; } TrWcJob;
-/* Row runs (b, h..h+run) are independent: part p takes every parts-th run. */
-static void tr_wc_part(void *ctx, uint32_t part, uint32_t parts) {
-    const TrWcJob *J=ctx;const G *g=J->g;const T *xt=J->xt,*o=J->o;const int32_t *n=J->n;const int es=J->es;
+/* Row runs (b, h..h+run) are independent: part p takes every parts-th run.
+ * ES is a compile-time constant (1 or 2); pixels per vector pb=4/ES... (u16: 2, u8: 4). */
+static inline __attribute__((always_inline)) void tr_wc_part_es(const TrWcJob *J, uint32_t part, uint32_t parts, const int ES) {
+    const G *g=J->g;const T *xt=J->xt,*o=J->o;const int32_t *n=J->n;
     BK bx,bo;
     bk_init(&bx,g,xt);bk_init(&bo,g,o);
     const int32_t H=xt->d[1],W=xt->d[2],C=xt->d[3];
-    const int pb=es==2?2:4;      /* pixels per vector */
-    const int nin=16/(es==2?1:2); /* input vectors per tile: 32 pixels / pixels per vector */
-    const int64_t cw=es==2?4:8;  /* pixels per block column */
+    const int pb=ES==2?2:4;       /* pixels per vector */
+    const int nin=ES==2?16:8;     /* input vectors per tile: 32 pixels / pixels per vector */
+    const int cws=ES==2?2:3;      /* log2 pixels per block column */
+    const int pbs=ES==2?1:2;      /* log2 pixels per vector */
+    const int64_t zi0=xt->p[3]/32;
+    const int calign=!(((uint32_t)xt->p[2]|(uint32_t)o->p[2])&((1u<<cws)-1u));
     uint32_t runix=0;
     for(int32_t b=0;b<n[0];b++)for(int32_t h=0;h<H;runix++) {
         const int64_t Hi=(int64_t)h+xt->p[1],Ho=(int64_t)h+o->p[1],B=b+(int64_t)xt->p[0],OB=b+(int64_t)o->p[0];
@@ -739,36 +844,74 @@ static void tr_wc_part(void *ctx, uint32_t part, uint32_t parts) {
         if(8-(int32_t)(Ho&7)<run)run=8-(int32_t)(Ho&7);
         if(H-h<run)run=H-h;
         if(runix%parts!=part){h+=run;continue;}
+        const int64_t ibase=(B*bx.nbh+(Hi>>3))*bx.nbw,obase=(OB*bo.nbh+(Ho>>3))*bo.nbw;
+        const uint32_t iro=256u*(uint32_t)(Hi&7),oro=256u*(uint32_t)(Ho&7);
         for(int32_t zc=0;zc*32<C;zc++) {
             const int32_t cn=C-32*zc<32?C-32*zc:32,nout=(cn+pb-1)/pb;
             for(int32_t w0=0;w0<W;w0+=32) {
                 const uint8_t *ip[16];
                 uint8_t *op[16];
-                for(int i=0;i<nin;i++) {
-                    const int64_t aw=(int64_t)xt->p[2]+w0+(int64_t)pb*i;
-                    uint8_t *blk=bk_blk(&bx,B,Hi>>3,aw/cw,zc+xt->p[3]/32);
-                    ip[i]=blk?blk+128*((aw/pb)&1):NULL;
+                uint32_t allout=1;
+                /* p[2] is a multiple of pb, a vector's pixels share a block, and a block holds
+                 * two vectors (halves of 128 bytes): 32 pixels span nin/2 blocks. */
+                if(!calign) {
+                    #pragma clang loop unroll(full)
+                    for(int i=0;i<nin;i++) {
+                        const int64_t aw=(int64_t)xt->p[2]+w0+(int64_t)pb*i;
+                        const int64_t idx=(ibase+(aw>>cws))*bx.nbd+bx.slice+zc+zi0;
+                        ip[i]=bk_blk_or(&bx,idx,(uint8_t *)dm_zblk)+128*((aw>>pbs)&1)+iro;
+                    }
+                } else {
+                    const int64_t awb=((int64_t)xt->p[2]+w0)>>cws;
+                    #pragma clang loop unroll(full)
+                    for(int k=0;k<nin/2;k++) {
+                        uint8_t *blk=bk_blk_or(&bx,(ibase+awb+k)*bx.nbd+bx.slice+zc+zi0,(uint8_t *)dm_zblk)+iro;
+                        ip[2*k]=blk;ip[2*k+1]=blk+128;
+                    }
                 }
-                for(int i=0;i<nout;i++) {
-                    const int64_t oc=(int64_t)o->p[2]+32*zc+(int64_t)pb*i;
-                    uint8_t *blk=bk_blk(&bo,OB,Ho>>3,oc/cw,(o->p[3]+w0)/32);
-                    op[i]=blk?blk+128*((oc/pb)&1):NULL;
-                }
-                for(int32_t r=0;r<run;r++) {
-                    DV v[16];
-                    for(int i=0;i<nin;i++)v[i]=ip[i]?dv_ld(ip[i]+256*((Hi&7)+r)):dv_zero();
-                    if(es==2)dv_ladder(v,16,dm_lad_wc16,6);else dv_ladder(v,8,dm_lad_wc8,5);
+                if(cn==32 && calign) {
+                    const int64_t ocb=((int64_t)o->p[2]+32*zc)>>cws;
+                    const int64_t zo=bo.slice+(o->p[3]+w0)/32;
+                    #pragma clang loop unroll(full)
+                    for(int k=0;k<nin/2;k++) {
+                        uint8_t *blk=bk_blk_or(&bo,(obase+ocb+k)*bo.nbd+zo,NULL);
+                        op[2*k]=blk?blk+oro:NULL;op[2*k+1]=blk?blk+oro+128:NULL;
+                        allout&=blk!=NULL;
+                    }
+                } else {
                     for(int i=0;i<nout;i++) {
-                        if(!op[i]) continue;
-                        uint8_t *d=op[i]+256*((Ho&7)+r);
-                        const int32_t m=cn-pb*i<pb?cn-pb*i:pb;
-                        if(m==pb)dv_st(d,v[i]);else dv_stun(d,v[i],(uint32_t)m*(es==2?64u:32u));
+                        const int64_t oc=(int64_t)o->p[2]+32*zc+(int64_t)pb*i;
+                        const int64_t idx=(obase+(oc>>cws))*bo.nbd+bo.slice+(o->p[3]+w0)/32;
+                        uint8_t *blk=bk_blk_or(&bo,idx,NULL);
+                        op[i]=blk?blk+128*((oc>>pbs)&1)+oro:NULL;
+                    }
+                    allout=0;
+                }
+                                for(int32_t r=0;r<run;r++) {
+                    DV v[16];
+                    #pragma clang loop unroll(full)
+                    for(int i=0;i<nin;i++)v[i]=dv_ld(ip[i]+256*r);
+                    if(ES==2)dv_ladder(v,16,dm_lad_wc16,6);else dv_ladder(v,8,dm_lad_wc8,5);
+                    if(allout) {
+                        #pragma clang loop unroll(full)
+                        for(int i=0;i<nin;i++)dv_st(op[i]+256*r,v[i]);
+                    } else {
+                        for(int i=0;i<nout;i++) {
+                            if(!op[i]) continue;
+                            uint8_t *d=op[i]+256*r;
+                            const int32_t m=cn-pb*i<pb?cn-pb*i:pb;
+                            if(m==pb)dv_st(d,v[i]);else dv_stun(d,v[i],(uint32_t)m*(ES==2?64u:32u));
+                        }
                     }
                 }
             }
         }
         h+=run;
     }
+}
+static void tr_wc_part(void *ctx, uint32_t part, uint32_t parts) {
+    const TrWcJob *J=ctx;
+    if(J->es==2)tr_wc_part_es(J,part,parts,2);else tr_wc_part_es(J,part,parts,1);
 }
 static int tr_wc_hook(G *g, const T *xt, const T *o, const int32_t *n, int id, int es) {
     int e=xfer_check(g,xt,xt->d,xt->p,0);
