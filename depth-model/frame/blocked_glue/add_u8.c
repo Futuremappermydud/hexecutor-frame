@@ -103,6 +103,23 @@ static HVX_Vector add_vec(HVX_Vector a,HVX_Vector b,const QdAddU8Params *p) {
     HVX_Vector lo=Q6_Vh_vpack_VwVw_sat(q1,q0),hi=Q6_Vh_vpack_VwVw_sat(q3,q2);
     return Q6_Vub_vpack_VhVh_sat(hi,lo);
 }
+/* Same arithmetic with 16-bit multipliers (ma, mb < 2^16, shift 1..15; vasr takes the shift mod 16):
+ * a*ma + b*mb fits u32 (< 2^25), vmpy/vmpyacc uh x uh -> uw computes it
+ * exactly, and vasr uw->uh :rnd:sat adds 2^(shift-1) before the shift. The
+ * 255 clamp follows the u16 saturation. Even/odd word lanes from vmpy are
+ * re-interleaved by the narrowing vasr (hi = odd, lo = even). */
+static int params16(const QdAddU8Params *p) {return p->ma<65536u&&p->mb<65536u&&p->shift>=1&&p->shift<=15;}
+static HVX_Vector add_half16(HVX_Vector ah,HVX_Vector bh,uint32_t ma,uint32_t mb,uint32_t sh) {
+    HVX_VectorPair w=Q6_Wuw_vmpy_VuhRuh(ah,ma|ma<<16);
+    w=Q6_Wuw_vmpyacc_WuwVuhRuh(w,bh,mb|mb<<16);
+    return Q6_Vuh_vmin_VuhVuh(Q6_Vuh_vasr_VuwVuwR_rnd_sat(Q6_V_hi_W(w),Q6_V_lo_W(w),sh),Q6_Vh_vsplat_R(255));
+}
+static HVX_Vector add_vec16(HVX_Vector a,HVX_Vector b,const QdAddU8Params *p) {
+    HVX_VectorPair ah=Q6_Wuh_vunpack_Vub(a),bh=Q6_Wuh_vunpack_Vub(b);
+    HVX_Vector lo=add_half16(Q6_V_lo_W(ah),Q6_V_lo_W(bh),p->ma,p->mb,p->shift);
+    HVX_Vector hi=add_half16(Q6_V_hi_W(ah),Q6_V_hi_W(bh),p->ma,p->mb,p->shift);
+    return Q6_Vub_vpack_VhVh_sat(hi,lo);
+}
 static HVX_VectorPred prefix(unsigned n) {return n>=128?Q6_Q_not_Q(Q6_Q_vsetq_R(0)):Q6_Q_vsetq_R(n);}
 
 int qd_blocked_add_u8_apply(const QdBlockedAddU8 *prepared,const QdAddU8Params *p) {
@@ -153,12 +170,18 @@ int qd_blocked_add_u8_apply_whole(const QdBlockedAddU8 *prepared,const QdAddU8Pa
     const int nB=a->dims[0],nH=a->dims[1]/8,nW=a->dims[2]/8,nD=a->dims[3]/32;
     const int same=a==b||(a->blocks==b->blocks&&a->slice==b->slice&&!memcmp(a->origin,b->origin,sizeof a->origin)&&
                           !memcmp(a->meta,b->meta,sizeof a->meta));
+    const int f16=params16(p);
     uint32_t i=0;
     for(int B=0;B<nB;B++)for(int H=0;H<nH;H++)for(int W=0;W<nW;W++)for(int D=0;D<nD;D++,i++) {
         if(i%parts!=part)continue;
         uint8_t *po=(uint8_t *)blk(o,B,H,W,D);if(!po)continue;
         const uint8_t *pa=blk(a,B,H,W,D),*pb=same?pa:blk(b,B,H,W,D);
-        for(int v=0;v<16;v++) {
+        if(f16)for(int v=0;v<16;v++) {
+            HVX_Vector va=pa?((const HVX_Vector *)pa)[v]:Q6_V_vzero();
+            HVX_Vector vb=pb?((const HVX_Vector *)pb)[v]:Q6_V_vzero();
+            ((HVX_Vector *)po)[v]=add_vec16(va,vb,p);
+        }
+        else for(int v=0;v<16;v++) {
             HVX_Vector va=pa?((const HVX_Vector *)pa)[v]:Q6_V_vzero();
             HVX_Vector vb=pb?((const HVX_Vector *)pb)[v]:Q6_V_vzero();
             ((HVX_Vector *)po)[v]=add_vec(va,vb,p);

@@ -502,6 +502,19 @@ static int nat_mac(const NatJob *J, int32_t *fi, int32_t *zero, uint8_t *complet
     return 0;
 #endif
 }
+/* Silicon (2026-11-02): reading the input blocks in place (pool-wide Rt
+ * deltas, a workspace zero block) wedges the CDSP on the first call, and the
+ * ISS accepts it. Staging each strip's 3 block rows into one contiguous window
+ * (small positive deltas, as QNN's probe) and skipping the first two stores
+ * runs exact. SLIDE_INPLACE keeps the hanging form for experiments. */
+#if defined(NPRG2_SLIDE3) && NPRG2_SLIDE3 && !defined(SLIDE_INPLACE)
+#ifndef SLIDE_STAGE
+#define SLIDE_STAGE 1
+#endif
+#ifndef SLIDE_NODUMMY
+#define SLIDE_NODUMMY 1
+#endif
+#endif
 #ifdef SLIDE_LIMIT
 static uint32_t slide_used;
 #endif
@@ -555,7 +568,15 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
     size_t o_rec=nbump(&at,(size_t)ncol*cbs*16),o_st=nbump(&at,(size_t)ncol*8),o_tyx=nbump(&at,(size_t)total*8);
     if(at>c->near_bytes) return 0;
     const size_t fixed=((size_t)NB*256+256+2048*2+2047)&~(size_t)2047,cbytes=staged?(size_t)total*NB*2048:0;
-    const size_t need=fixed+3*2048+cbytes+2048;
+#ifdef SLIDE_STAGE
+    /* bisect: copy each strip's 3 input block rows into one contiguous
+     * workspace window (pads zero-filled), so every Rt delta is the small
+     * positive row stride, as in the silicon QNN probe (xwb1022). */
+    const size_t sbytes=(size_t)3*ncol*cbs*2048;
+#else
+    const size_t sbytes=0;
+#endif
+    const size_t need=fixed+3*2048+cbytes+sbytes+2048;
     if(c->workspace_bytes<need) return 0;
     g->wused=0;
     uint8_t *ws=walloc(g,need);
@@ -572,7 +593,8 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
     uint64_t (*clock)(void)=c->phase?c->clock:NULL,t0=clock?clock():0,t1;
     uint8_t *base=(uint8_t *)(((uintptr_t)ws+2047)&~(uintptr_t)2047);
     int32_t *fi=(int32_t *)base,*zero=(int32_t *)(base+(size_t)NB*256);
-    uint8_t *completion=base+fixed-2048,*dummy=base+fixed,*zblk=dummy+4096,*C=zblk+2048;
+    uint8_t *completion=base+fixed-2048,*dummy=base+fixed,*zblk=dummy+4096,*C=zblk+2048,*S=C+cbytes;
+    (void)S;
     uint8_t *n=c->near;
     {
         int32_t *nf=(int32_t *)n; /* the start of near is free again here (o_fi area of hmx_native) */
@@ -607,10 +629,25 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
             const uint8_t *a=hmx_row(g->pool,xt,(int64_t)(R0+by)*8,C0+cc,xnbw,xnbd,cb),
                           *b=hmx_row(g->pool,xt,(int64_t)(R0+by+1)*8,C0+cc,xnbw,xnbd,cb),
                           *d=hmx_row(g->pool,xt,(int64_t)(R0+by+2)*8,C0+cc,xnbw,xnbd,cb);
+#ifdef SLIDE_STAGE
+            {
+                const uint8_t *src[3]={a,b,d};
+                for(int rr=0;rr<3;rr++) {
+                    HVX_Vector *dv=(HVX_Vector *)(S+(((size_t)rr*ncol+cc)*cbs+cb)*2048);
+                    if(src[rr]) {const HVX_Vector *sv=(const HVX_Vector *)src[rr];for(int i=0;i<16;i++)dv[i]=sv[i];}
+                    else {HVX_Vector z=Q6_V_vzero();for(int i=0;i<16;i++)dv[i]=z;}
+                }
+                a=S+(((size_t)0*ncol+cc)*cbs+cb)*2048;b=S+(((size_t)1*ncol+cc)*cbs+cb)*2048;d=S+(((size_t)2*ncol+cc)*cbs+cb)*2048;
+            }
+#endif
             if(!a)a=zblk;if(!b)b=zblk;if(!d)d=zblk;
             r[0]=(uint32_t)(uintptr_t)a|0x740u;r[1]=((uint32_t)(uintptr_t)b-(uint32_t)(uintptr_t)a)|0x71fu;
             r[2]=(uint32_t)(uintptr_t)b|0x140u;r[3]=((uint32_t)(uintptr_t)d-(uint32_t)(uintptr_t)b)|0x71fu;
         }
+#ifdef SLIDE_STAGE
+        __asm__ volatile("barrier":::"memory");
+        {typedef uint32_t W32 __attribute__((vector_size(128)));W32 v=*(volatile W32 *)(S+sbytes-2048);__asm__ volatile(""::"r"(v[0]):"memory");}
+#endif
         for(int32_t j=0;j<NB;j++) {
             /* after input column cc the accumulator holds virtual tile cc; the
              * store (QNN's: Rs = block|0xe0, Rt = 0x700) writes output block
@@ -624,6 +661,10 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
                         if(idx<ocount){uint32_t e=oblk[idx],pool=e&127u;if(pool && g->pool[pool]) d=g->pool[pool]+(e&~127u);}
                     }
                 }
+#ifdef SLIDE_NODUMMY
+                /* QNN skips the first stores (r28/r31) instead of storing to a dummy */
+                if(bx<0) {st[2*cc]=0;st[2*cc+1]=0;continue;}
+#endif
                 st[2*cc]=(uint32_t)(uintptr_t)d|0xe0u;st[2*cc+1]=0x700u;
             }
             c->hmx->slide3_n(rec,wbase+(size_t)j*KB*1024,fi+j*64,st,(uint32_t)cbs,(uint32_t)ncol);

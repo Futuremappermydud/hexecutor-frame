@@ -161,8 +161,11 @@ qd_hmx_slide3_n:
     { p0 = cmp.gt(r8,#0) }
     { if (p0) jump 2b }
     { r12 = memw(r3+#0); r13 = memw(r3+#4); r3 = add(r3,#8) }
-    { cvt.ub = acc(r7) }
+    { p1 = cmp.eq(r12,#0)
+      cvt.ub = acc(r7) }
+    { if (p1) jump 3f }
     { mxmem(r12,r13):cm = cvt }
+3:
     { r5 = add(r5,#-1) }
     { p0 = cmp.gt(r5,#0) }
     { if (p0) jump 1b }
