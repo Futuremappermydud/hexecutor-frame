@@ -2497,14 +2497,20 @@ static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o
      * even width for the last chunk too), rows must be enough, the helper
      * slots must hold a plan, and the work must pay for the wake-up. */
     uint32_t parts=1;
-    if(g->par_slots && (direct || !BLK_HVX) && !(direct && sixteen && (ow&1)) && oh>=2*(int32_t)(kh+1) &&
+    if(g->par_slots && (direct || !BLK_HVX) && !(direct && sixteen && (ow&1)) && oh>=4 &&
        (uint64_t)oh*(uint64_t)ow*(uint64_t)co*(uint64_t)kh*(uint64_t)kw*(uint64_t)ci>=PAR_CONV_MIN_MACS &&
        priv_plan_slot(c,&J.q,ow,kh,kw,ci,co,sixteen,p->direct,p->lead,!direct)) {
+        /* At least two output rows per part: a part restages kh-1 halo rows,
+         * cheap next to the MACs (an 8-row tile on 3 parts stages 14 rows, not 10). */
         uint32_t want=1u+g->par_slots;
-        if((uint32_t)oh/(uint32_t)(kh+1)<want) want=(uint32_t)oh/(uint32_t)(kh+1);
+        if((uint32_t)oh/2u<want) want=(uint32_t)oh/2u;
         parts=nprg2_parallel_parts(g->call->parallel,want);
     }
     J.parts=parts;
+#ifdef CONV_SHAPES
+    fprintf(stderr,"PARTS s16=%d k=%dx%d ci=%d co=%d oh=%d ow=%d parts=%u slots=%u qcols=%d\n",sixteen,kh,kw,ci,co,oh,ow,parts,
+            g->par_slots,parts>1?J.q.cols:0);
+#endif
     if(parts>1) {
         nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,near_part,&J);
         if(c->phase) for(int k=0;k<4;k++) c->phase[(sixteen?4:0)+k]+=J.hph[0][k]+J.hph[1][k];
