@@ -495,6 +495,48 @@ static int read_i32(G *g, const T *t, int32_t **values, size_t *n) {
     CHECK(a.dt==DT_I32 || a.dt==DT_Q32,E_TENSOR);
     *values=a.p;*n=count4(a.n);return 0;
 }
+/* Direct views for tiny dense tensors (the dynamic-weight scale/bias chain):
+ * a run (not a dry pass) reads a dense direct tensor in place and writes a
+ * dense direct result straight to its pool, instead of copying through
+ * scratch. Both return 0 when the tensor is not exactly that shape, and the
+ * caller takes the generic t_read/t_write path. dense_in is the data t_read
+ * would copy (the region is the whole of d, contiguous); dense_out accepts
+ * only when t_write would store `n` unchanged (no padding or broadcast). */
+#ifdef DYN_TOGGLE
+extern int dyn_off; /* sim harness: run the pre-optimisation paths */
+#define DYN_OFF dyn_off
+#else
+#define DYN_OFF 0
+#endif
+static int dense_in(G *g, const T *t, A *a) {
+    if(DYN_OFF || g->dry || (t->flags&(F_DIRECT|F_SHAPE))!=(F_DIRECT|F_SHAPE) || t->pool>=7 || !g->pool[t->pool] || t->esize==0) return 0;
+    for(int i=0;i<4;i++) if(t->d[i]<0 || t->d[i]!=t->m[i] || t->p[i]) return 0;
+    uint64_t bytes=(uint64_t)count4(t->d)*t->esize;
+    if((uint64_t)t->offset+bytes>g->pool_bytes[t->pool] || ((uintptr_t)(g->pool[t->pool]+t->offset)&(t->esize-1u))) return 0;
+    a->dt=t->dtype;a->scalar=0;a->unknown=0;
+    memcpy(a->n,t->d,sizeof a->n);
+    a->p=g->pool[t->pool]+t->offset;
+    return 1;
+}
+static void *dense_out(G *g, const T *t, const int32_t *n, uint32_t dt, const void *avoid, size_t avoid_bytes) {
+    if(DYN_OFF || g->dry || (t->flags&(F_DIRECT|F_SHAPE))!=(F_DIRECT|F_SHAPE) || t->pool>=7 || !g->pool[t->pool] || t->esize==0) return NULL;
+    if(!(t->dtype==dt || (dsize(dt)==t->esize && dt!=DT_F32 && t->dtype!=DT_F32))) return NULL;
+    for(int i=0;i<4;i++) if(t->d[i]<0 || t->d[i]!=t->m[i] || t->p[i] || t->d[i]!=n[i]) return NULL;
+    if(t->crouton) {
+        int32_t e=(t->d[3]+t->p[3]+31)/32*32;
+        if(e>t->m[3])e=t->m[3];
+        if(e-t->p[3]!=t->d[3]) return NULL;
+    }
+    uint64_t bytes=(uint64_t)count4(t->d)*t->esize;
+    if((uint64_t)t->offset+bytes>g->write_limit[t->pool] || ((uintptr_t)(g->pool[t->pool]+t->offset)&(t->esize-1u))) return NULL;
+    uint8_t *p=g->pool[t->pool]+t->offset;
+    if(avoid && avoid_bytes && p<(const uint8_t *)avoid+avoid_bytes && (const uint8_t *)avoid<p+bytes) return NULL;
+    return p;
+}
+static int dense_in2(G *g, const T *t, A *a, int32_t **p, size_t *n) {
+    if(!dense_in(g,t,a) || (a->dt!=DT_I32 && a->dt!=DT_Q32)) return 0;
+    *p=a->p;*n=count4(a->n);return 1;
+}
 /* Element i of a direct constant (pool 5) tensor's dense region, read as
  * aget would. The constant pool is immutable, so a dry pass may use it to
  * size data-dependent results exactly. */
@@ -874,6 +916,25 @@ static int k_input_slice(G *g) {
     A a={{o->d[0],o->d[1],o->d[2],o->d[3]},DT_F32,0,0,(void *)input->data};
     return t_write(g,o,&a);
 }
+#ifndef WCOPY_PAR_MIN
+#define WCOPY_PAR_MIN 24576u
+#endif
+typedef struct { uint8_t *d; const uint8_t *s; size_t n; uint32_t parts; } WCopy;
+static void wcopy_part(void *c, uint32_t part, uint32_t parts) {
+    const WCopy *J=c;
+    size_t b[2];
+    for(int k=0;k<2;k++) {
+        uint32_t idx=part+(uint32_t)k;
+        if(idx>=parts) b[k]=J->n;
+        else if(idx==0) b[k]=0;
+        else {
+            uintptr_t at=((uintptr_t)J->d+(uintptr_t)((J->n/parts)*idx)+127u)&~(uintptr_t)127;
+            size_t off=at-(uintptr_t)J->d;
+            b[k]=off<J->n?off:J->n;
+        }
+    }
+    if(b[1]>b[0]) qd_vcopy_deep(J->d+b[0],J->s+b[0],b[1]-b[0]);
+}
 static int k_weights_to_vtcm(G *g) {
     CHECK(g->nin==1 && g->nout==1,E_ARGS);
     const T *s=in(g,0),*d=out0(g);
@@ -881,7 +942,15 @@ static int k_weights_to_vtcm(G *g) {
     for(int i=0;i<4;i++)CHECK(s->m[i]>=0 && d->m[i]>=0,E_SHAPE);
     size_t ns=count4(s->m)*s->esize,nd=count4(d->m)*d->esize,n=ns<nd?ns:nd;
     CHECK(s->offset+(uint64_t)n<=g->pool_bytes[s->pool] && d->offset+(uint64_t)n<=g->write_limit[d->pool],E_RANGE);
-    if(!g->dry)qd_vcopy(g->pool[d->pool]+d->offset,g->pool[s->pool]+s->offset,n);
+    if(!g->dry) {
+        WCopy J={g->pool[d->pool]+d->offset,g->pool[s->pool]+s->offset,n,1};
+        /* DDR loads are latency bound: split big copies at dst vector
+         * boundaries over the helper threads (each part is a plain qd_vcopy_deep). */
+        if(DYN_OFF){qd_vcopy(J.d,J.s,n);return 0;}
+        if(n>=WCOPY_PAR_MIN) J.parts=nprg2_parallel_parts(g->call->parallel,3);
+        if(J.parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_DM,J.parts,wcopy_part,&J);
+        else qd_vcopy_deep(J.d,J.s,n);
+    }
     return 0;
 }
 static int k_im2col(G *g) {
@@ -1747,9 +1816,14 @@ static int k_weight_scales(G *g) {
 static int k_invscale(G *g) {
     NEED(1);
     const T *o=out0(g);
-    A x;TRY(t_read(g,in(g,0),&x,0));
+    A x;
+    int dx=dense_in(g,in(g,0),&x);
+    if(!dx) TRY(t_read(g,in(g,0),&x,0));
     CHECK(x.dt==DT_F32 && (o->dtype==DT_Q32 || o->dtype==DT_I32),E_TENSOR);
-    A r;TRY(anew(g,&r,x.n,o->dtype));
+    A r;
+    int32_t *direct=dx?dense_out(g,o,x.n,o->dtype,x.p,count4(x.n)*4):NULL;
+    if(direct){r.p=direct;r.dt=o->dtype;}
+    else TRY(anew(g,&r,x.n,o->dtype));
     if(!g->dry)for(size_t j=0,n=count4(x.n);j<n;j++) {
         volatile float q=(float)65536/((float *)x.p)[j];
         volatile float s=q+0.5f;
@@ -1757,27 +1831,42 @@ static int k_invscale(G *g) {
         CHECK(t>-2147483648.0f && t<2147483648.0f,E_RANGE);
         ((int32_t *)r.p)[j]=(int32_t)t;
     }
-    return t_write(g,o,&r);
+    return direct?0:t_write(g,o,&r);
 }
 static int k_combine_scales(G *g) {
     CHECK(g->nin==3,E_ARGS);
     NEED(3);
     const T *s=in(g,2);
     CHECK((s->flags&F_SCALAR) && s->dtype==DT_F32,E_ARGS);
-    A a,b;TRY(read2(g,&a,&b));
+    A a,b;
+    int da=dense_in(g,in(g,0),&a),db=da?dense_in(g,in(g,1),&b):0;
+    if(!(da&&db)) TRY(read2(g,&a,&b));
     CHECK(a.dt==DT_F32 && b.dt==DT_F32 && !memcmp(a.n,b.n,16),E_SHAPE);
-    A r;TRY(anew(g,&r,a.n,DT_F32));
+    A r;
+    size_t nb=count4(a.n)*4;
+    float *direct=(da&&db)?dense_out(g,out0(g),a.n,DT_F32,a.p,nb):NULL;
+    if(direct && ((uint8_t *)direct<(uint8_t *)b.p+nb && (uint8_t *)b.p<(uint8_t *)direct+nb)) direct=NULL;
+    if(direct){r.p=direct;r.dt=DT_F32;}
+    else TRY(anew(g,&r,a.n,DT_F32));
     if(!g->dry) {
         float k=f32_from_bits(s->scalar);
         for(size_t j=0,n=count4(a.n);j<n;j++){volatile float p=((float *)a.p)[j]*((float *)b.p)[j];((float *)r.p)[j]=p*k;}
     }
-    return t_write(g,out0(g),&r);
+    return direct?0:t_write(g,out0(g),&r);
 }
 static int k_convert_weights(G *g) {
     CHECK(g->nin==4,E_ARGS);
     NEED(3);
     const T *i=in(g,0),*o=out0(g);
-    A x,s;TRY(t_read(g,i,&x,0));TRY(t_read(g,in(g,2),&s,0));
+    A x,s;
+    /* A run reads dense direct x and s in place (no copy through scratch). */
+    int dview=dense_in(g,i,&x) && dense_in(g,in(g,2),&s) && (o->flags&F_DIRECT) && o->pool<7 && g->pool[o->pool];
+    if(dview) {
+        const uint8_t *ob=g->pool[o->pool]+o->offset,*xb=(const uint8_t *)x.p,*sb=(const uint8_t *)s.p;
+        size_t tb=count4(x.n),sbytes=count4(s.n)*4;
+        if((ob<xb+tb && xb<ob+tb) || (ob<sb+sbytes && sb<ob+tb)) dview=0;
+    }
+    if(!dview){TRY(t_read(g,i,&x,0));TRY(t_read(g,in(g,2),&s,0));}
     CHECK(x.dt==DT_U8 && (s.dt==DT_Q32 || s.dt==DT_I32) && (o->flags&F_DIRECT),E_TENSOR);
     int32_t H=x.n[0],W=x.n[1],I=x.n[2],O=x.n[3];
     CHECK(I%4==0 && O%32==0,E_SHAPE);
@@ -1798,6 +1887,10 @@ static int k_convert_weights(G *g) {
         int8_t *const out=raw;raw=tmp;
         const uint8_t *src=x.p;const int32_t *sv=s.p;
         int32_t zp=i->zp;
+        /* dview guarantees the output does not overlap the inputs, so the
+         * whole-vector stores can go straight to it. */
+        int8_t *wr=dview?out:tmp;
+        const int direct_out=dview;
         uint32_t I4=(uint32_t)I/4,uO=(uint32_t)O,hw=0;
 #if BLK_HVX
         /* q = (v*sv+32768)>>16 in int32 lanes when |v*sv|+32768 < 2^31 for
@@ -1825,10 +1918,10 @@ static int k_convert_weights(G *g) {
                         q=Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(q,lo8),hi8);
                         word=Q6_V_vor_VV(word,Q6_Vw_vasl_VwR(Q6_V_vand_VV(q,m255),8*r));
                     }
-                    *(HVX_UVector *)(tmp+((size_t)og*(uint32_t)(H*W)*I4+(size_t)hw*I4+i4)*128u)=word;
+                    *(HVX_UVector *)(wr+((size_t)og*(uint32_t)(H*W)*I4+(size_t)hw*I4+i4)*128u)=word;
                 }
             }
-            qd_vcopy(out,tmp,total);
+            if(!direct_out) qd_vcopy(out,tmp,total);
             return 0;
         }
         hw=0;
@@ -1857,14 +1950,19 @@ static int k_convert_weights(G *g) {
 static int k_scale_convert(G *g) {
     NEED(1);
     const T *o=out0(g);
-    A x;TRY(t_read(g,in(g,0),&x,0));
+    A x;
+    int dx=dense_in(g,in(g,0),&x);
+    if(!dx) TRY(t_read(g,in(g,0),&x,0));
     CHECK(x.dt==DT_F32 && o->esize==4 && o->dtype!=DT_F32,E_TENSOR);
-    A r;TRY(anew(g,&r,x.n,o->dtype));
+    A r;
+    int32_t *direct=dx?dense_out(g,o,x.n,o->dtype,x.p,count4(x.n)*4):NULL;
+    if(direct){r.p=direct;r.dt=o->dtype;}
+    else TRY(anew(g,&r,x.n,o->dtype));
     if(!g->dry)for(size_t j=0,n=count4(x.n);j<n;j++) {
         int64_t h=((int64_t)((uint32_t *)x.p)[j]+0x1000)>>13;
         ((int32_t *)r.p)[j]=(int32_t)((h&0x3ff)+(((h&0x7c00)+0x6400)&0x7c00)+0x400000);
     }
-    return t_write(g,o,&r);
+    return direct?0:t_write(g,o,&r);
 }
 static int k_dynamic_bias(G *g) {
     CHECK(g->nout>=1,E_ARGS);
@@ -1876,6 +1974,10 @@ static int k_dynamic_bias(G *g) {
     int32_t zero=0;
     A r={{1,1,1,1},o->dtype,1,0,&zero};
     CHECK(o->esize==4 && o->dtype!=DT_F32,E_TENSOR);
+    {
+        void *z=dense_out(g,o,o->d,o->dtype,NULL,0);
+        if(z){memset(z,0,count4(o->d)*4);return 0;}
+    }
     return t_write(g,o,&r);
 }
 static int k_bias_shuffle(G *g) {
@@ -1884,10 +1986,21 @@ static int k_bias_shuffle(G *g) {
     int64_t mode;
     CHECK(!sv_or_scalar(in(g,2),&mode) && mode==0,E_UNSUPPORTED);
     int32_t *a,*b;size_t na,nb;
-    TRY(read_i32(g,in(g,0),&a,&na));TRY(read_i32(g,in(g,1),&b,&nb));
+    A xa,xb;
+    int dd=dense_in2(g,in(g,0),&xa,&a,&na) && dense_in2(g,in(g,1),&xb,&b,&nb);
+    if(!dd){TRY(read_i32(g,in(g,0),&a,&na));TRY(read_i32(g,in(g,1),&b,&nb));}
     const T *o=out0(g);
     CHECK(o->flags&F_SHAPE,E_TENSOR);
     CHECK(na==nb && na%32==0 && 2*na==count4(o->d) && o->esize==4 && o->dtype!=DT_F32,E_SHAPE);
+    int32_t *direct=NULL;
+    if(dd) {
+        direct=dense_out(g,o,o->d,o->dtype,a,na*4);
+        if(direct && ((uint8_t *)direct<(uint8_t *)b+nb*4 && (uint8_t *)b<(uint8_t *)direct+na*8)) direct=NULL;
+    }
+    if(direct){
+        for(size_t row=0;row<na/32;row++){memcpy(direct+row*64,a+row*32,128);memcpy(direct+row*64+32,b+row*32,128);}
+        return 0;
+    }
     A r;TRY(anew(g,&r,o->d,o->dtype));
     if(!g->dry){int32_t *d=r.p;for(size_t row=0;row<na/32;row++){memcpy(d+row*64,a+row*32,128);memcpy(d+row*64+32,b+row*32,128);}}
     return t_write(g,o,&r);
