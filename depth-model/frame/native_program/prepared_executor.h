@@ -133,6 +133,10 @@ typedef struct {
  * NOPs) are recorded by a full preflight in a bitmap over command indices below
  * this limit; larger indices are always decoded and dispatched. */
 #define NPRG2_EXEC_STRIP_COMMANDS 8192u
+/* One run-list record: command index, registry slot, role (fl) and, for a
+ * conv whose epilogue pair is active, the epilogue's command index. */
+enum { NPRG2_RUN_SKIP=1, NPRG2_RUN_FUSED_CONV=2, NPRG2_RUN_DEAD=4 };
+typedef struct { uint16_t ix, epi; uint8_t hi, fl; } Nprg2ExecRunRec;
 typedef struct {
     uint32_t validated_commands, executed_commands, failed_command;
     uint8_t failed_opcode, failed_variant;
@@ -150,6 +154,14 @@ typedef struct {
     uint8_t strip_valid;
     uint32_t effect_bits[NPRG2_EXEC_STRIP_COMMANDS/32u];
     uint32_t stripped_by_slot[NPRG2_EXEC_REGISTRY_CAPACITY];
+    /* Compact run list, built by the same full preflight that sets strip_valid
+     * (runs_valid): one record per dispatched command (effect-bit set), in
+     * schedule order, with the registry slot and the fusion role the run loop
+     * would otherwise re-derive. Everything from `runs` on is not cleared by
+     * a preflight; only the first run_count records are meaningful. */
+    uint8_t runs_valid;
+    uint32_t run_count;
+    Nprg2ExecRunRec runs[NPRG2_EXEC_STRIP_COMMANDS];
 } Nprg2ExecStats;
 
 typedef struct {

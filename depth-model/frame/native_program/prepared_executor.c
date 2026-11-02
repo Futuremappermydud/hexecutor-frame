@@ -2,6 +2,7 @@
 #include "prepared_vcopy.h"
 
 #include <limits.h>
+#include <stddef.h>
 #include <string.h>
 
 static uint16_t rd16e(const uint8_t *p){return (uint16_t)p[0]|(uint16_t)p[1]<<8;}
@@ -103,6 +104,12 @@ static void select_scratch(Nprg2ExecCall *call,const Nprg2ExecHandler *h){
     const Nprg2ExecBuffer *b=&call->scratch_region[h->scratch_region<NPRG2_EXEC_SCRATCH_REGIONS?h->scratch_region:0u];
     call->scratch=b->bytes?b->data:NULL;call->scratch_bytes=b->bytes;
 }
+/* Counters, effect bitmap and strip data are reset by a full preflight; the
+ * run list (last member) is rewritten up to run_count instead of cleared. */
+static void stats_reset(Nprg2ExecStats *s){memset(s,0,offsetof(Nprg2ExecStats,runs));s->failed_command=UINT32_MAX;}
+/* Stand-in for a request without a stats object: its contents are never read
+ * back, so it need not be reentrant (and the 48 KiB run list stays off the stack). */
+static Nprg2ExecStats nostats;
 static int no_graph_alias(const Nprg2Executor *e,const Nprg2ExecRequest *r,const void *ptr,size_t bytes){
     if(!bytes)return 1;
     for(unsigned i=0;i<7;i++)if(overlaps(ptr,bytes,r->pools[i].base,r->pools[i].bytes))return 0;
@@ -260,7 +267,8 @@ int nprg2_executor_preflight(const Nprg2Executor *e,const Nprg2ExecRequest *r){
         if(pr)pr->preflight_cycles+=pr->clock()-p0;
         return NPRG2_EXEC_OK;
     }
-    Nprg2ExecStats local={0};Nprg2ExecStats *s=r->stats?r->stats:&local;memset(s,0,sizeof *s);s->failed_command=UINT32_MAX;
+    Nprg2ExecStats *s=r->stats?r->stats:&nostats;stats_reset(s);
+    uint32_t nrun=0;
     /* Coverage, feature, bounds, alias, and scratch predicates are checked
      * without graph-pool writes. This public entry is also used before a
      * physical VTCM boundary copy by the DSP wrapper. */
@@ -290,7 +298,15 @@ int nprg2_executor_preflight(const Nprg2Executor *e,const Nprg2ExecRequest *r){
         if(!valid){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_REJECTED;}
         s->validated_commands++;
         if(ix<NPRG2_EXEC_STRIP_COMMANDS){
-            if(h->no_effect)s->stripped_by_slot[hi]++;else s->effect_bits[ix>>5]|=1u<<(ix&31u);
+            if(h->no_effect)s->stripped_by_slot[hi]++;
+            else{
+                s->effect_bits[ix>>5]|=1u<<(ix&31u);
+                Nprg2ExecRunRec *rec=&s->runs[nrun++];
+                rec->ix=(uint16_t)ix;rec->hi=(uint8_t)hi;rec->fl=0;rec->epi=0;
+                Nprg2FusePair *ep=fuse_pair_of_epi(r,ix);
+                if(ep&&ep->active)rec->fl=NPRG2_RUN_SKIP;
+                else if(fp&&fp->active){rec->fl=(uint8_t)(NPRG2_RUN_FUSED_CONV|(fp->dead?NPRG2_RUN_DEAD:0));rec->epi=(uint16_t)fp->epi;}
+            }
         }
     }
     if(r->stats){
@@ -298,8 +314,57 @@ int nprg2_executor_preflight(const Nprg2Executor *e,const Nprg2ExecRequest *r){
         /* Hashing the tables costs about a millisecond on the Frame: only for a request that asks to be reused. */
         if(r->reuse_preflight)s->preflight_digest=content_digest(r);
         s->strip_valid=r->command_first+r->command_count<=NPRG2_EXEC_STRIP_COMMANDS;
+        s->runs_valid=s->strip_valid;s->run_count=nrun;
     }
     if(pr){pr->preflight_cycles+=pr->clock()-p0;pr->preflight_calls++;}
+    return NPRG2_EXEC_OK;
+}
+/* Run loop over the preflight's compact run list: the registry slot, the
+ * fusion role and the epilogue index are in the record, and one call object
+ * (all request-derived fields) is built once and only the per-command fields
+ * are rewritten. Order, counters, cancellation points and profile are those
+ * of the generic loop below. */
+static int run_list(const Nprg2Executor *e,const Nprg2ExecRequest *r,Nprg2ExecStats *s,Nprg2ExecProfile *pr,uint64_t prev){
+    Nprg2ExecCall call,ecall;
+    call.command_index=0;fill_call(r,0,&call);call.preflighted=1;
+    ecall=call;
+    const uint32_t first=r->command_first;
+    const Nprg2ExecRunRec *rec=s->runs,*end=rec+s->run_count;
+    for(;rec<end;rec++){
+        uint32_t ix=rec->ix;
+        s->executed_commands=ix-first;
+        if(nprg2_command_at(r->bound,ix,&call.command)!=NPRG2_OK)return NPRG2_EXEC_REJECTED;
+        if(r->cancelled&&r->cancelled(r->cancel_ctx,ix)){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_CANCELLED;}
+        const uint32_t hi=rec->hi;const Nprg2ExecHandler *h=&e->handlers[hi];
+        if(rec->fl&NPRG2_RUN_SKIP){   /* done by the conv's fused output step */
+            if(pr&&pr->handler_run_count)pr->handler_run_count[hi]++;
+            continue;
+        }
+        call.command_index=ix;
+        {
+            const Nprg2ExecBuffer *b=&call.scratch_region[h->scratch_region<NPRG2_EXEC_SCRATCH_REGIONS?h->scratch_region:0u];
+            call.scratch=b->bytes?b->data:NULL;call.scratch_bytes=b->bytes;
+        }
+        call.epilogue=NULL;call.epilogue_dead=0;
+        if(rec->fl&NPRG2_RUN_FUSED_CONV){
+            if(nprg2_command_at(r->bound,rec->epi,&ecall.command)==NPRG2_OK){
+                ecall.command_index=rec->epi;call.epilogue=&ecall;call.epilogue_dead=(rec->fl&NPRG2_RUN_DEAD)?1:0;
+            }
+        }
+        uint32_t v=call.command.variant;
+        int timed=pr&&pr->variant_cycles&&pr->variant_count&&v<NPRG2_EXEC_PROFILE_VARIANTS;
+        uint64_t t0=pr?pr->clock():0;
+        if(pr)pr->dispatch_cycles+=t0-prev;
+        if(!h->run(&call,h->ctx)){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_HANDLER_ERROR;}
+        if(pr){
+            prev=pr->clock();uint64_t d=prev-t0;pr->run_cycles+=d;
+            if(timed){pr->variant_cycles[v]+=d;pr->variant_count[v]++;}
+            if(pr->handler_run_cycles)pr->handler_run_cycles[hi]+=d;
+            if(pr->handler_run_count)pr->handler_run_count[hi]++;
+        }
+    }
+    s->executed_commands=r->command_count;
+    if(pr)pr->dispatch_cycles+=pr->clock()-prev;
     return NPRG2_EXEC_OK;
 }
 int nprg2_executor_run(const Nprg2Executor *e,const Nprg2ExecRequest *r){
@@ -319,10 +384,11 @@ int nprg2_executor_run(const Nprg2Executor *e,const Nprg2ExecRequest *r){
         int preflight=nprg2_executor_preflight(e,r);if(preflight!=NPRG2_EXEC_OK)return preflight;
         if(r->stats)r->stats->digest_fresh=0;
     }
-    Nprg2ExecStats local={0};Nprg2ExecStats *s=r->stats?r->stats:&local;
+    Nprg2ExecStats *s=r->stats?r->stats:&nostats;
     const int strip=r->stats&&s->strip_valid;
     if(strip&&pr&&pr->handler_run_count)for(uint32_t k=0;k<NPRG2_EXEC_REGISTRY_CAPACITY;k++)pr->handler_run_count[k]+=s->stripped_by_slot[k];
     uint64_t prev=pr?pr->clock():0;
+    if(strip&&s->runs_valid)return run_list(e,r,s,pr,prev);
     for(uint32_t n=0;n<r->command_count;n++){
         uint32_t ix=r->command_first+n;Nprg2ExecCall call;
         if(strip&&!(s->effect_bits[ix>>5]>>(ix&31u)&1u)){s->executed_commands++;continue;}

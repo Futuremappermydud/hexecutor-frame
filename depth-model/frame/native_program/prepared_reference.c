@@ -7,6 +7,7 @@
 #include "prepared_exact_math.h"
 
 #include <math.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 /* The Frame engine builds with -fno-builtin: without these, every 4-byte
@@ -180,10 +181,21 @@ typedef struct {
 } Memo;
 static Memo memos[2];
 static uint32_t memo_next;
+/* The key is a hash of the pool table: remembered for the last table seen
+ * (compared field by field, cheaper than 15 64-bit multiplies per call). */
 static uint64_t memo_limits(const Nprg2ExecCall *c) {
+    static struct {uintptr_t base[7];uint32_t bytes[7],wr;uint64_t h;int valid;} last;
+    if(last.valid && last.wr==c->pool1_writable_bytes) {
+        int same=1;
+        for(int i=0;i<7;i++) same&=last.base[i]==(uintptr_t)c->pools[i].base && last.bytes[i]==c->pools[i].bytes;
+        if(same) return last.h;
+    }
     uint64_t h=0xcbf29ce484222325ull;
     for(int i=0;i<7;i++){h=(h^(uintptr_t)c->pools[i].base)*0x100000001b3ull;h=(h^c->pools[i].bytes)*0x100000001b3ull;}
-    return (h^c->pool1_writable_bytes)*0x100000001b3ull;
+    h=(h^c->pool1_writable_bytes)*0x100000001b3ull;
+    for(int i=0;i<7;i++){last.base[i]=(uintptr_t)c->pools[i].base;last.bytes[i]=c->pools[i].bytes;}
+    last.wr=c->pool1_writable_bytes;last.h=h;last.valid=1;
+    return h;
 }
 static Memo *memo_for(const Nprg2ExecCall *c) {
     if(!c->program || c->command_index>=MEMO_COMMANDS) return NULL;
@@ -3660,19 +3672,47 @@ static int variant_matches(uint32_t op, uint32_t variant) {
     if(!op || op>QDR_OPCODES || !variant || variant>QDR_VARIANTS) return 0;
     return qdr_variant_ops[variant]==op || (op==QDR_NOP && qdr_variant_ops[variant]==QDR_INPUT_SLICE_PAD);
 }
-static int setup(G *g, const Nprg2ExecCall *c, int dry, int measure, const Nprg2ReferenceConv *conv) {
-    memset(g,0,sizeof *g);
+/* Overlap verdicts of the conv-memory checks below, remembered for the last
+ * identical inputs (conv memory layout, call scratch, pool table, ceiling);
+ * only passing verdicts are stored, so a bad input is always re-checked and
+ * fails exactly as before. */
+enum { SK_WORDS=26 };
+static struct {uintptr_t key[SK_WORDS];int valid;uint32_t par_slots;uint64_t pool_bytes[7];} setup_ck;
+
+/* scr/scrb: the scratch region this setup runs on (c->scratch unless the
+ * caller moves the command into the near region). */
+static int setup_ex(G *g, const Nprg2ExecCall *c, int dry, int measure, const Nprg2ReferenceConv *conv,
+                    uint8_t *scr, uint32_t scrb) {
+    /* Everything but the decoded tensors and the fused epilogue's views (set
+     * before use: decode() and fuse_decode() clear what they fill). */
+    memset(g,0,offsetof(G,in));
+    g->measure_only=0;g->conv=NULL;g->wused=0;
+    g->fx.kind=g->fx.dead=0;g->fx.mc=g->fx.mo=g->fx.rd=g->fx.sh=0;g->fx.eb=g->fx.bb=NULL;
+    g->fx_ok=0;g->par_slots=0;g->chk_memo=NULL;g->chk_state=0;
     if(!c || !c->program || !c->bound || !c->pools) FAIL(E_ARGS);
     const Nprg2Command *k=&c->command;
     if(!variant_matches(k->opcode,k->variant)) FAIL(E_ARGS);
     g->call=c;g->dry=dry;g->measure_only=(uint8_t)measure;
-    g->scratch=measure?NULL:(uint8_t *)c->scratch;
-    g->cap=measure?SIZE_MAX:(c->scratch?c->scratch_bytes:0);
+    g->scratch=measure?NULL:scr;
+    g->cap=measure?SIZE_MAX:(scr?scrb:0);
     if(conv && k->opcode==QDR_HMX_CONV && conv->workspace && conv->workspace_bytes) g->conv=conv;
-    if(g->conv && g->conv->near) {
+    int ck_hit=0;
+    if(g->conv) {
+        uintptr_t key[SK_WORDS];unsigned n=0;
+        key[n++]=(uintptr_t)conv->near;key[n++]=conv->near_bytes;key[n++]=(uintptr_t)conv->workspace;key[n++]=conv->workspace_bytes;
+        key[n++]=(uintptr_t)conv->par_near[0];key[n++]=(uintptr_t)conv->par_near[1];key[n++]=conv->par_near_bytes;
+        key[n++]=(uintptr_t)scr;key[n++]=scrb;key[n++]=c->pool1_writable_bytes;
+        for(unsigned i=0;i<7;i++){key[n++]=(uintptr_t)c->pools[i].base;key[n++]=c->pools[i].bytes;}
+        while(n<SK_WORDS)key[n++]=0;
+        if(setup_ck.valid && !memcmp(setup_ck.key,key,sizeof key)) {
+            ck_hit=1;g->par_slots=setup_ck.par_slots;
+            for(unsigned i=0;i<7;i++) g->pool_bytes[i]=setup_ck.pool_bytes[i];
+        } else memcpy(setup_ck.key,key,sizeof key),setup_ck.valid=0;
+    }
+    if(!ck_hit && g->conv && g->conv->near) {
         uintptr_t n=(uintptr_t)conv->near,ne=n+conv->near_bytes,w=(uintptr_t)conv->workspace;
         if(n<w+conv->workspace_bytes && w<ne) FAIL(E_MEMORY);
-        if(c->scratch && c->scratch_bytes && n<(uintptr_t)c->scratch+c->scratch_bytes && (uintptr_t)c->scratch<ne)
+        if(scr && scrb && n<(uintptr_t)scr+scrb && (uintptr_t)scr<ne)
             FAIL(E_MEMORY);
         for(unsigned i=0;i<7;i++) {
             uintptr_t b=(uintptr_t)c->pools[i].base;
@@ -3686,7 +3726,7 @@ static int setup(G *g, const Nprg2ExecCall *c, int dry, int measure, const Nprg2
     }
     /* Helper near slots: 128-byte aligned, disjoint from every pool, the
      * workspace, the call scratch, near and each other, else unused. */
-    if(g->conv && g->conv->near && g->conv->par_near_bytes) {
+    if(!ck_hit && g->conv && g->conv->near && g->conv->par_near_bytes) {
         for(unsigned s=0;s<2;s++) {
             uintptr_t a=(uintptr_t)conv->par_near[s],e=a+conv->par_near_bytes;
             int ok=a && !(a&127u) && e>a;
@@ -3694,24 +3734,31 @@ static int setup(G *g, const Nprg2ExecCall *c, int dry, int measure, const Nprg2
                 if(c->pools[i].bytes && a<(uintptr_t)c->pools[i].base+c->pools[i].bytes && (uintptr_t)c->pools[i].base<e) ok=0;
             if(ok && a<(uintptr_t)conv->workspace+conv->workspace_bytes && (uintptr_t)conv->workspace<e) ok=0;
             if(ok && a<(uintptr_t)conv->near+conv->near_bytes && (uintptr_t)conv->near<e) ok=0;
-            if(ok && c->scratch && c->scratch_bytes && a<(uintptr_t)c->scratch+c->scratch_bytes && (uintptr_t)c->scratch<e) ok=0;
+            if(ok && scr && scrb && a<(uintptr_t)scr+scrb && (uintptr_t)scr<e) ok=0;
             if(ok && s && a<(uintptr_t)conv->par_near[0]+conv->par_near_bytes && (uintptr_t)conv->par_near[0]<e) ok=0;
             if(!ok) break;
             g->par_slots++;
         }
     }
-    for(unsigned i=0;i<7;i++) {
+    if(ck_hit) {
+        for(unsigned i=0;i<7;i++){g->pool[i]=c->pools[i].bytes?c->pools[i].base:NULL;g->write_limit[i]=g->pool_bytes[i];}
+    } else for(unsigned i=0;i<7;i++) {
         g->pool[i]=c->pools[i].bytes?c->pools[i].base:NULL;
         g->pool_bytes[i]=g->pool[i]?c->pools[i].bytes:0;
         if(g->conv && g->pool[i]) {
             uintptr_t b=(uintptr_t)g->pool[i],w=(uintptr_t)conv->workspace;
             if(w<b+g->pool_bytes[i] && b<w+conv->workspace_bytes) g->pool_bytes[i]=w>b?w-b:0;
-            if(c->scratch && c->scratch_bytes) {
-                uintptr_t s=(uintptr_t)c->scratch;
-                if(w<s+c->scratch_bytes && s<w+conv->workspace_bytes) FAIL(E_MEMORY);
+            if(scr && scrb) {
+                uintptr_t s=(uintptr_t)scr;
+                if(w<s+scrb && s<w+conv->workspace_bytes) FAIL(E_MEMORY);
             }
         }
         g->write_limit[i]=g->pool_bytes[i];
+    }
+    if(g->conv && !ck_hit) {   /* every check passed: remember the verdict (key stored above) */
+        setup_ck.par_slots=g->par_slots;
+        for(unsigned i=0;i<7;i++) setup_ck.pool_bytes[i]=g->pool_bytes[i];
+        setup_ck.valid=1;
     }
     if(c->pool1_writable_bytes<g->write_limit[1]) g->write_limit[1]=c->pool1_writable_bytes;
     /* The constant pool is immutable model state. */
@@ -3733,8 +3780,11 @@ static int setup(G *g, const Nprg2ExecCall *c, int dry, int measure, const Nprg2
     if(g->nout) {
         uint32_t index;Nprg2TensorView v;
         if(nprg2_exec_output(c,0,&index,&v)!=NPRG2_EXEC_OK || !decode(&v,&g->out)) FAIL(E_TENSOR);
-    }
+    } else memset(&g->out,0,sizeof g->out);
     return 0;
+}
+static int setup(G *g, const Nprg2ExecCall *c, int dry, int measure, const Nprg2ReferenceConv *conv) {
+    return setup_ex(g,c,dry,measure,conv,c?(uint8_t *)c->scratch:NULL,c?c->scratch_bytes:0);
 }
 
 /* ctx is NULL or the Nprg2ReferenceConv given at conv registration. */
@@ -3799,9 +3849,7 @@ static int nprg2_exec_reference_run_inner(const Nprg2ExecCall *c, void *ctx) {
         if(memo && g.used<0xffffffffu) *memo=(uint32_t)g.used;
     }
     if(has_near && g.used && !((uintptr_t)nr->data&63u) && g.used+64u<=nr->bytes) {
-        Nprg2ExecCall w=*c;
-        w.scratch=nr->data;w.scratch_bytes=nr->bytes;
-        if(setup(&g,&w,0,0,ctx)) return 0;
+        if(setup_ex(&g,c,0,0,ctx,nr->data,nr->bytes)) return 0;
         return run_kernel(&g)==0;
     }
     if(setup(&g,c,0,0,ctx)) return 0;
