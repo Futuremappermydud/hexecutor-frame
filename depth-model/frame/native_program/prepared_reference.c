@@ -2170,6 +2170,7 @@ static void fuse_scalar(G *g, const Fuse *fx, const uint8_t *q, int32_t nc, int3
     xfer_copy(g,&fx->oe,fx->eb,dims,eo,1);
 }
 static uint32_t conv_path;
+#include "prepared_hmx_conv.inc"
 /* Returns 1 when the command took the fast path (or would, in a dry pass),
  * 0 to use the reference convolution, or a negative error. */
 static int fast_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int s2, int sixteen, int32_t co,
@@ -2189,6 +2190,10 @@ static int fast_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, in
     ow=(ow+cw-1)/cw*cw;if(ow>o->m[2])ow=o->m[2];if(ow>xW-kw+1)ow=xW-kw+1;
     if(oh<=0 || ow<=0) return 0;
     if(wt->offset+(uint64_t)H*W*I*O>g->pool_bytes[wt->pool]){*err=E_RANGE;return -1;}
+    if(!s2 && !sixteen) {
+        int r=hmx_conv(g,xt,wt,ft,o,packed,reverse,co,oh,ow,err);
+        if(r) return r;
+    }
 
     int32_t xh=oh+kh-1,xw=ow+kw-1,groups=ci/4,blocks=co/32;
     uint32_t nt=count_taps(wt,s2,reverse,packed,kh,kw,groups);
@@ -2210,8 +2215,8 @@ static int fast_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, in
         if(!use_near){direct=0;use_near=near_plan(g,&plan,ow,kh,kw,ci,co,nt,sixteen,0,head0);}
     }
 #ifdef CONV_SHAPES
-    if(!g->dry) fprintf(stderr,"CONV op=%u var=%u s16=%d s2=%d k=%dx%d ci=%d co=%d oh=%d ow=%d xes=%u xblk=%d xp2=%d oes=%u oblk=%d op2=%d direct=%d near=%d cols=%d\n",
-        g->op,g->variant,sixteen,s2,kh,kw,ci,co,oh,ow,xt->esize,!!(xt->flags&F_BLOCKED),xt->p[2],o->esize,!!(o->flags&F_BLOCKED),
+    if(!g->dry) fprintf(stderr,"CONV wpool=%u packed=%d rev=%d fx=%d op=%u var=%u s16=%d s2=%d k=%dx%d ci=%d co=%d oh=%d ow=%d xes=%u xblk=%d xp2=%d oes=%u oblk=%d op2=%d direct=%d near=%d cols=%d\n",
+        wt->pool,is_class(wt,"Xpb","xpb"),!s2 && wt->cls==('X'|'w'<<8|'b'<<16),g->fx.kind,g->op,g->variant,sixteen,s2,kh,kw,ci,co,oh,ow,xt->esize,!!(xt->flags&F_BLOCKED),xt->p[2],o->esize,!!(o->flags&F_BLOCKED),
         o->p[2],direct,use_near,use_near?plan.cols:0);
 #endif
     if(use_near) {

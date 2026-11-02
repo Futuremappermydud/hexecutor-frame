@@ -168,6 +168,9 @@ static void register_handlers(Session *s, int mixed, int fast) {
             s->conv.par_near_bytes = sb ? (uint32_t)atoi(sb) : 0x3e00;
             for (int k = 0; k < 2; k++) s->conv.par_near[k] = aligned_alloc(128, 0x10000);
         }
+        /* QD_HMX=1: eligible u8 convs take the HMX tiling with its exact scalar model. */
+        static const Nprg2HmxOps host_hmx = {0};
+        if (getenv("QD_HMX") && atoi(getenv("QD_HMX"))) s->conv.hmx = &host_hmx;
         uint32_t added = 0;
         CHECK(nprg2_executor_register_reference_conv(e, &s->conv, &added) == NPRG2_EXEC_OK);
         printf("%s: %lu conv keys registered to the fast exact convolution\n", s->model, (unsigned long)added);

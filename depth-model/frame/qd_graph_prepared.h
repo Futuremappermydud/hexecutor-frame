@@ -91,6 +91,27 @@ static const volatile char prepared_compact3_feature[]="QD_PREPARED_A3_1";
  * open marks conv -> REQUANT_U8/ADD_U8 pairs, the fast conv then writes the
  * epilogue's output from registers (prepared_fuse.h, EXECUTOR.md). trace[12]
  * reports the pair count. */
+#ifndef QDS_PREPARED_HMX
+#define QDS_PREPARED_HMX 0
+#endif
+#if QDS_PREPARED_HMX
+/* Exact HMX for eligible u8 convs (native_program/prepared_hmx_conv.inc).
+ * HMX is powered and clocked for the whole prepared run (prepared_run
+ * requires native_1x1_hmx_owned); the conv sets SSR.XE2 on worker 0 only
+ * around its HMX work, as qd_graph_native_direct.h does, and waits for the
+ * completion tile before leaving. */
+void qd_hmx_wide(void *,void *,void *,void *,uint32_t);
+void qd_hmx_finish(void *,void *);
+static uint32_t prepared_hmx_enter(void) {
+    uint32_t saved;__asm__ volatile("%0=ssr":"=r"(saved));
+    uint32_t on=saved|(1u<<26);__asm__ volatile("ssr=%0\n isync\n barrier"::"r"(on):"memory");
+    return saved;
+}
+static void prepared_hmx_leave(uint32_t saved) {__asm__ volatile("ssr=%0\n isync\n barrier"::"r"(saved):"memory");}
+static uint64_t now_ns(void);
+static uint64_t prepared_hmx_clock(void) {return now_ns();}
+static const Nprg2HmxOps prepared_hmx_ops={prepared_hmx_enter,prepared_hmx_leave,qd_hmx_wide,qd_hmx_finish,prepared_hmx_clock};
+#endif
 #ifndef QDS_PREPARED_FUSE
 #define QDS_PREPARED_FUSE 0
 #endif
@@ -261,7 +282,10 @@ static QdPreparedState *prepared_open(QdgGraph *g,const QdsConfig *cfg,
     s->conv=(Nprg2ReferenceConv){(uint8_t *)(QD_DIRECT_VTCM_BASE+QD_DIRECT_TAIL_OFFSET+0x2000u),
                                  QD_DIRECT_TAIL_BYTES-0x2000u,
                                  (uint8_t *)QDS_REFERENCE_NEAR,QDS_REFERENCE_NEAR_BYTES,
-                                 now_ns,g->dsp_conv_phase,{NULL,NULL},0};
+                                 now_ns,g->dsp_conv_phase,{NULL,NULL},0,NULL};
+#if QDS_PREPARED_HMX
+    s->conv.hmx=&prepared_hmx_ops;
+#endif
 #if QDS_PREPARED_THREADS>1
     s->conv.par_near[0]=(uint8_t *)QDS_PAR_L2_0;s->conv.par_near[1]=(uint8_t *)QDS_PAR_L2_1;
     s->conv.par_near_bytes=QDS_PAR_L2_BYTES;

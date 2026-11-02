@@ -35,6 +35,7 @@
 #include <time.h>
 #ifdef __hexagon__
 #include <hexagon_sim_timer.h>
+#include <hexagon_standalone.h>
 #include "prepared_elementwise.h"
 #endif
 
@@ -61,6 +62,25 @@ static uint8_t ew_scratch[NPRG2_ELEMENTWISE_SCRATCH_BYTES + 8] __attribute__((al
 #endif
 static Nprg2ReferenceConv conv;
 static uint64_t conv_phase[8];
+/* "hmx" (Hexagon only, implies fast): pool 1 and the conv workspace live in
+ * VTCM, as on the Frame, and eligible u8 convs run on the simulated HMX
+ * (prepared_hmx_conv.inc) with the hybrid's qd_hmx_wide/qd_hmx_finish. */
+static uint8_t *hmx_vtcm;
+#ifdef __hexagon__
+extern void qd_hmx_wide(void *, void *, void *, void *, uint32_t);
+extern void qd_hmx_finish(void *, void *);
+static const Nprg2HmxOps sim_hmx = {.wide = qd_hmx_wide, .finish = qd_hmx_finish};
+static void hmx_map_vtcm(void) {
+    uint32_t base = __rdcfg(__vtcm_base) << 16, pn = base >> 12, index = 120;
+    uint64_t entry = ((uint64_t)(0xc0000000u | pn) << 32) | (0xf6000000u | (pn << 1) | 0x40u);
+    __asm__ volatile("tlbw(%0,%1)\n isync" ::"r"(entry), "r"(index) : "memory");
+    uint32_t ssr;
+    __asm__ volatile("%0=ssr" : "=r"(ssr));
+    ssr |= 1u << 26;
+    __asm__ volatile("ssr=%0\n isync" ::"r"(ssr) : "memory");
+    hmx_vtcm = (uint8_t *)base;
+}
+#endif
 /* "par" / "parrev" / "parshuf" / "thr": QDS_PREPARED_THREADS-style parallel hook
  * with 3 parts and the Frame's two 0x3e00-byte helper conv slots. par runs the
  * parts serially ascending, parrev descending, parshuf shuffled (any order
@@ -232,7 +252,8 @@ static void env_open(Env *v, const char *model, uint8_t *const *inputs, const ui
     for (uint32_t i = 0; i < 7; i++) {
         v->pools[i].bytes = rd32(v->raw + 144 + i * 4);
         if (!v->pools[i].bytes) continue;
-        v->pools[i].base = aligned_alloc(2048, (v->pools[i].bytes + 2047u) & ~2047u);
+        v->pools[i].base = i == 1 && hmx_vtcm ? hmx_vtcm : aligned_alloc(2048, (v->pools[i].bytes + 2047u) & ~2047u);
+        CHECK(i != 1 || !hmx_vtcm || v->pools[1].bytes <= 0x800000u);
         CHECK(v->pools[i].base);
         memset(v->pools[i].base, 0, v->pools[i].bytes);
     }
@@ -253,7 +274,11 @@ static void env_open(Env *v, const char *model, uint8_t *const *inputs, const ui
     uint32_t added = 0;
     if (use_fast) {
         if (!conv.workspace) {
-            conv.workspace = aligned_alloc(2048, CONV_WORKSPACE);
+            /* The Frame's layout: workspace at tail+0x2000, above pool 1's writable ceiling. */
+            conv.workspace = hmx_vtcm ? hmx_vtcm + 0x782000u : aligned_alloc(2048, CONV_WORKSPACE);
+#ifdef __hexagon__
+            if (hmx_vtcm) conv.hmx = &sim_hmx;
+#endif
             conv.workspace_bytes = CONV_WORKSPACE;
             conv.near = aligned_alloc(128, CONV_NEAR);
             conv.near_bytes = CONV_NEAR;
@@ -291,7 +316,7 @@ static void env_close(Env *v) {
     free(v->scratch);
     free(v->hot);
     nprg2_close(&v->p);
-    for (int i = 0; i < 7; i++) free(v->pools[i].base);
+    for (int i = 0; i < 7; i++) if (i != 1 || !hmx_vtcm) free(v->pools[i].base);
     for (int j = 0; j < 2; j++) free(v->out[j]);
     free(v->raw);
     free(v->q);
@@ -299,7 +324,7 @@ static void env_close(Env *v) {
 
 /* Sizes scratch for [first, first+count) and prints the range's census. */
 static void env_census(Env *v, uint32_t first, uint32_t count) {
-    uint32_t peak = 0, peak_cmd = first, histogram[QDR_OPCODES + 1] = {0}, ws_peak = 0, near = 0;
+    uint32_t peak = 0, peak_cmd = first, histogram[QDR_OPCODES + 1] = {0}, ws_peak = 0, near = 0, hmx = 0;
     for (uint32_t i = first; i < first + count; i++) {
         Nprg2ExecCall call = {.command_index = i, .program = &v->p, .bound = &v->b, .pools = v->pools,
                               .pool1_writable_bytes = POOL1_CEILING,
@@ -315,10 +340,11 @@ static void env_census(Env *v, uint32_t first, uint32_t count) {
         if (need > peak) { peak = need; peak_cmd = i; }
         if (ws > ws_peak) ws_peak = ws;
         if (call.command.opcode == QDR_HMX_CONV && nprg2_exec_reference_conv_path() == 2) near++;
+        if (call.command.opcode == QDR_HMX_CONV && nprg2_exec_reference_conv_path() == 3) hmx++;
     }
     if (use_fast)
-        printf("%s: fast convolution workspace peak %lu bytes, %lu convolutions with near memory\n", v->model,
-               (unsigned long)ws_peak, (unsigned long)near);
+        printf("%s: fast convolution workspace peak %lu bytes, %lu convolutions with near memory, %lu on HMX\n", v->model,
+               (unsigned long)ws_peak, (unsigned long)near, (unsigned long)hmx);
     free(v->scratch);
     v->scratch_bytes = (peak + 4095u) & ~4095u;
     v->scratch = v->scratch_bytes ? aligned_alloc(128, v->scratch_bytes) : NULL;
@@ -462,12 +488,15 @@ static void env_run(Env *v, uint32_t first, uint32_t count, const uint8_t *const
 
 static int env_pools_match(Env *v, const uint8_t *const *want) {
     for (int i = 0; i < 7; i++) {
-        if (!v->pools[i].bytes || !memcmp(v->pools[i].base, want[i], v->pools[i].bytes)) continue;
+        /* hmx: the conv workspace is pool 1's reserved tail above the writable
+         * ceiling (the Frame layout), so that range is scratch, not state. */
+        uint32_t len = i == 1 && hmx_vtcm && v->pools[1].bytes > POOL1_CEILING ? POOL1_CEILING : v->pools[i].bytes;
+        if (!len || !memcmp(v->pools[i].base, want[i], len)) continue;
         uint32_t diff = 0;
         if (i == 1 && use_fuse) {
             int bad = 0;
-            for (uint32_t b = 0; b * 2048u < v->pools[1].bytes && !bad; b++) {
-                uint32_t n = v->pools[1].bytes - b * 2048u < 2048u ? v->pools[1].bytes - b * 2048u : 2048u;
+            for (uint32_t b = 0; b * 2048u < len && !bad; b++) {
+                uint32_t n = len - b * 2048u < 2048u ? len - b * 2048u : 2048u;
                 if (v->mask[b] || !memcmp(v->pools[1].base + b * 2048u, want[1] + b * 2048u, n)) continue;
                 diff = b * 2048u;
                 while (v->pools[1].base[diff] == want[1][diff]) diff++;
@@ -478,7 +507,7 @@ static int env_pools_match(Env *v, const uint8_t *const *want) {
         fprintf(stderr, "%s pool mismatch: pool=%d off=0x%lx prepared=%u want=%u\n", v->model, i, (unsigned long)diff,
                 v->pools[i].base[diff], want[i][diff]);
         uint32_t n = 0, lines = 0, last = 0, prev_line = UINT32_MAX;
-        for (uint32_t k = diff; k < v->pools[i].bytes; k++)
+        for (uint32_t k = diff; k < len; k++)
             if (v->pools[i].base[k] != want[i][k]) { n++; last = k; if (k / 128u != prev_line) { lines++; prev_line = k / 128u; } }
         fprintf(stderr, "  %lu bytes differ in %lu 128-byte lines, first 0x%lx last 0x%lx\n", (unsigned long)n, (unsigned long)lines,
                 (unsigned long)diff, (unsigned long)last);
@@ -763,6 +792,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "cycles")) use_cycles = 1;
         else if (!strcmp(argv[i], "ew")) use_ew = 1;
         else if (!strcmp(argv[i], "fuse")) use_fuse = 1;
+        else if (!strcmp(argv[i], "hmx")) {
+#ifdef __hexagon__
+            use_fast = 1;
+            hmx_map_vtcm();
+#else
+            use_fast = 1; /* host (split): HMX only exists in the simulator */
+#endif
+        }
         else if (!strcmp(argv[i], "par") || !strcmp(argv[i], "parrev") || !strcmp(argv[i], "parshuf") || !strcmp(argv[i], "thr")) {
             use_par = 1;
             par_hook.max_parts = 3;

@@ -27,6 +27,7 @@ docker run --rm --platform linux/amd64 -v "$task_sdk_root:/sdk:ro" -v "$PWD/fram
    -e QDS_PREPARED_FUSE="${QDS_PREPARED_FUSE:-0}" \
    -e QDS_L2_CACHE="${QDS_L2_CACHE:-0}" \
    -e QDS_PREPARED_THREADS="${QDS_PREPARED_THREADS:-1}" \
+   -e QDS_PREPARED_HMX="${QDS_PREPARED_HMX:-0}" \
    depth-model-hmx-tools:latest sh -eu -c '
 cc=/sdk/tools/HEXAGON_Tools/19.0.07/Tools/bin/hexagon-clang
 flags="-mv75 -mhvx -mhvx-length=128b -O2 -G0 -ffreestanding -fno-builtin -fno-vectorize -fno-slp-vectorize -ffp-contract=off -fno-strict-aliasing -Wall -Wextra -DQDO_SCALAR_CACHE=$QDS_SCALAR_CACHE"
@@ -143,6 +144,9 @@ if [ "$QDS_PREPARED_THREADS" = 3 ] && [ "$QDS_L2_CACHE" != 0 ]; then
   echo "QDS_PREPARED_THREADS=3 with QDS_L2_CACHE: helper slots and follower stacks are L2-TCM, unusable during the lease" >&2; exit 1
 fi
 engine_flags="$engine_flags -DQDS_PREPARED_THREADS=$QDS_PREPARED_THREADS"
+case "$QDS_PREPARED_HMX" in 0|1) ;; *) echo "QDS_PREPARED_HMX must be 0 or 1" >&2; exit 1;; esac
+if [ "$QDS_PREPARED_HMX" = 1 ] && [ "$QDS_PREPARED_REFERENCE" != 1 ]; then echo "QDS_PREPARED_HMX=1 requires QDS_PREPARED_REFERENCE=1" >&2; exit 1; fi
+engine_flags="$engine_flags -DQDS_PREPARED_HMX=$QDS_PREPARED_HMX"
 glue_src=
 native_src=
 if [ "$QDS_DYNAMIC_TCM" = 1 ]; then engine="${engine%.elf}-dynamic-tcm.elf"; fi
@@ -189,6 +193,7 @@ if [ "$QDS_PREPARED_QUANTIZE" = 1 ]; then
   native_src="$native_src native_program/prepared_quantize.c native_program/prepared_quantize_core.c"
 fi
 if [ "$QDS_PREPARED_FUSE" = 1 ]; then engine="${engine%.elf}-fuse.elf"; fi
+if [ "$QDS_PREPARED_HMX" = 1 ]; then engine="${engine%.elf}-hmx.elf"; fi
 if [ "$QDS_PREPARED_COMPACT_3X3" = 1 ]; then engine="${engine%.elf}-compact-3x3.elf"; fi
 if [ "$QDS_PREPARED_REFERENCE" = 1 ]; then
   engine="${engine%.elf}-reference.elf"

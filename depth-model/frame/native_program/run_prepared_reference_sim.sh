@@ -70,7 +70,7 @@ docker run --rm --platform linux/amd64 $SDKARG ${DOCKER_EXTRA:-} \
       frame/blocked_glue/linearclip_u16.c \
       frame/blocked_glue/sign_levels.c \
       frame/blocked_glue/sign_blocked.c \
-      frame/native_program/nprg2_runtime.c -lhexagon -lm -o "$ELF"
+      frame/native_program/nprg2_runtime.c frame/qd_hmx_ops_encoded.S -lhexagon -lm -o "$ELF"
     if [ "$MODE" != segments ]; then
       exec "$SDK/bin/hexagon-sim" -mv75 --quiet "$ELF" -- "$WHICH" "$MODE" $EXTRA
     fi

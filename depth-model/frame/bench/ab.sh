@@ -40,6 +40,7 @@ flags() {
     thr3) echo "$(base) QDS_PREPARED_THREADS=3";;
     fuse) echo "$(base) QDS_PREPARED_FUSE=1";;
     thr3fuse) echo "$(base) QDS_PREPARED_THREADS=3 QDS_PREPARED_FUSE=1";;
+    hmx) echo "$(base) QDS_PREPARED_THREADS=3 QDS_PREPARED_FUSE=1 QDS_PREPARED_HMX=1";;
     l2) echo "$(base) QDS_L2_CACHE=5";;
     l2fuse) echo "$(base) QDS_L2_CACHE=5 QDS_PREPARED_FUSE=1";;
     *) echo "unknown variant $1" >&2; exit 2;;

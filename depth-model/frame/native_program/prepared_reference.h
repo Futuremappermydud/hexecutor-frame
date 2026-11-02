@@ -61,7 +61,22 @@ typedef struct {
      * nprg2_parallel_parts); without them, or when a slot is not usable or
      * too small for the command, it runs on the calling thread. */
     uint8_t *par_near[2]; uint32_t par_near_bytes;
+    /* Optional: exact HMX for eligible u8 convs (prepared_hmx_conv.inc).
+     * The workspace must then be VTCM, and so must the weights' pool. */
+    const struct Nprg2HmxOps *hmx;
 } Nprg2ReferenceConv;
+/* HMX entry points, all called on the executor's own thread (the HMX
+ * owner): enter sets up the thread for HMX instructions (SSR.XE2 on the
+ * Frame) and returns what leave restores; wide/finish are qd_hmx_wide and
+ * qd_hmx_finish (qd_hmx_ops*.S). Off Hexagon only the pointer's presence
+ * matters: the conv path then runs an exact scalar model of the same tiles. */
+typedef struct Nprg2HmxOps {
+    uint32_t (*enter)(void);
+    void (*leave)(uint32_t saved);
+    void (*wide)(void *a, void *b, void *fi, void *c, uint32_t kb);
+    void (*finish)(void *zero, void *completion);
+    uint64_t (*clock)(void);
+} Nprg2HmxOps;
 /* Fuse hook registered with the conv keys: the conv handler can run the
  * REQUANT_U8/70 or ADD_U8/13 command `epilogue` fused into its output step
  * (Nprg2ExecFuse; see prepared_fuse.h). */
@@ -72,7 +87,7 @@ int nprg2_executor_register_reference_conv(Nprg2Executor *executor, Nprg2Referen
 int nprg2_exec_reference_conv_measure(const Nprg2ExecCall *call, const Nprg2ReferenceConv *conv,
                                       uint32_t *scratch_bytes, uint32_t *workspace_bytes);
 /* Path the most recently measured or run convolution took: 0 reference,
- * 1 fast with the workspace only, 2 fast with near (diagnostics only). */
+ * 1 fast with the workspace only, 2 fast with near, 3 HMX (diagnostics only). */
 uint32_t nprg2_exec_reference_conv_path(void);
 
 /* Rewrites an existing registration so commands its validator rejects use the
