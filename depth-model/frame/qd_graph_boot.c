@@ -33,6 +33,9 @@ static const uint8_t qds_entry_features[12] __attribute__((used)) =
 static uint64_t cycles(void){uint64_t c;__asm__ volatile("%0=upcycle":"=r"(c));return c;}
 #if QDS_PRESERVE_VTCM
 #include "qd_axim.h"
+#ifndef QDS_AXIM_RUN
+#define QDS_AXIM_RUN 0
+#endif
 #include <stddef.h>
 _Static_assert(offsetof(QdVtcmLease,checksum_xor)==44,"host fingerprint ABI changed");
 #endif
@@ -110,7 +113,14 @@ __attribute__((section(".text.entry"))) void payload(void) {
             uint64_t started=cycles();
             if(!err)err=qds_lease_on_stack(qds_save_vtcm);
             timing[0]=cycles()-started;
+#if QDS_AXIM_RUN
+            /* Keep the AXI master at 750 MHz for the engine run too (Valve's
+             * firmware leaves it on XO; QuRT runs it raised): restored after
+             * the VTCM restore below, or on any error here. */
+            if(err){uint32_t ce=clock_restore(lease_clocks);(void)ce;}
+#else
             uint32_t ce=clock_restore(lease_clocks);if(!err)err=ce;
+#endif
             if(err)err+=32;
         }
 #endif
@@ -153,6 +163,9 @@ __attribute__((section(".text.entry"))) void payload(void) {
         } else if(lease->magic==QDVT_MAGIC && lease->phase!=2) {
             err=QDVT_BAD_STATE;sync[4]=64+err;
         }
+#endif
+#if QDS_AXIM_RUN
+        {uint32_t ce=clock_restore(lease_clocks);if(ce && !err){err=ce;sync[4]=64+ce;}}
 #endif
         /* A failed memory restore retains the private mapping and snapshot
          * for host-directed recovery. All workers still quiesce normally. */

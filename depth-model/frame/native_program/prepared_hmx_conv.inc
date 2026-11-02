@@ -25,7 +25,7 @@
  * Off Hexagon the same tiling, k order and addressing run with a scalar model:
  * A tiles hold the raw quads (32 pixels x 32 u8 per tile), C holds x as u16
  * [pixel][channel]; the host full-model test checks it against the emulator. */
-#ifdef NAT_CHECK
+#if defined(NAT_CHECK) || defined(SLIDE_TRACE)
 #include <stdio.h>
 #endif
 #define HMX_TERMS_MAX 2304 /* largest K the v6 cases proved exact: 3x3x256 */
@@ -502,6 +502,163 @@ static int nat_mac(const NatJob *J, int32_t *fi, int32_t *zero, uint8_t *complet
     return 0;
 #endif
 }
+#ifdef SLIDE_LIMIT
+static uint32_t slide_used;
+#endif
+#if BLK_HVX
+/* Staging-free 3x3 stride 1 (qd_hmx_slide3_n): the window of output block
+ * (by, bx) is input rows 8by+7.., columns 8bx+7.. of the command's input view
+ * (origin p ≡ 7 mod 8), read straight from the input blocks: per strip, input
+ * block rows R, R+1, R+2 and columns C0..C0+bw+1. Weights: the reversed
+ * unpacked 3x3 order (ktab = cb*9 + ky*3 + (2-kx)), i.e. the hardware's tap
+ * order. Output blocks are written in place (2048-aligned) or into C blocks
+ * for the HVX epilogue. Same arithmetic as the native path (Fi, cvt.ub).
+ * 1 ran (or would, dry), 0 not eligible (no side effects), -1 error. */
+static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int32_t cbs, int32_t co, int32_t oh,
+                     int32_t ow, const uint32_t *ktab, const int32_t *corr, const int32_t *pre, const int32_t *Mq,
+                     const int8_t *wbase, int staged, size_t at, int32_t *err) {
+    const Nprg2ReferenceConv *c=g->conv;
+    if(!c->hmx->slide3_n || KB!=9*cbs || cbs<1 || cbs>8) return 0;
+#ifdef SLIDE_LIMIT
+    if(!g->dry && slide_used>=SLIDE_LIMIT) return 0;
+#endif
+#ifdef SLIDE_ONLY_CBS
+    if(cbs!=SLIDE_ONLY_CBS) return 0;
+#endif
+    if((xt->p[1]&7)!=7 || (xt->p[2]&7)!=7) return 0;
+    for(int32_t cb=0;cb<cbs;cb++)for(int32_t ky=0;ky<3;ky++)for(int32_t kp=0;kp<3;kp++)
+        if(ktab[cb*9+ky*3+kp]!=((uint32_t)ky|(uint32_t)(2-kp)<<8|(uint32_t)cb<<16)) return 0;
+    if((uintptr_t)wbase&1023u) return 0;
+    const int32_t bw=ow/8,bh=oh/8,total=bh*bw,ncol=bw+2;
+    const int64_t xnbw=((int64_t)xt->m[2]+7)/8,xnbd=((int64_t)xt->m[3]+31)/32;
+    const int32_t R0=xt->p[1]>>3,C0=xt->p[2]>>3;
+    /* every present input block of the windows 2048-aligned (else not eligible) */
+    {
+        Memo *mm=g->dry?NULL:memo_for(g->call);
+        uint8_t *mb=mm?&mm->slide[g->call->command_index]:NULL;
+        if(!mb || !*mb) {
+            int ok=1;
+            for(int32_t r=0;r<bh+2 && ok;r++)for(int32_t cc=0;cc<ncol && ok;cc++)for(int32_t cb=0;cb<cbs;cb++) {
+                const uint8_t *p=hmx_row(g->pool,xt,(int64_t)(R0+r)*8,C0+cc,xnbw,xnbd,cb);
+                if(p && ((uintptr_t)p&2047u)){ok=0;break;}
+#ifdef SLIDE_POSDELTA
+                if(r) {
+                    const uint8_t *q=hmx_row(g->pool,xt,(int64_t)(R0+r-1)*8,C0+cc,xnbw,xnbd,cb);
+                    if(p && q && p<q){ok=0;break;}
+                }
+#endif
+            }
+            if(mb && !g->dry) *mb=ok?1:2;
+            if(!ok) return 0;
+        } else if(*mb==2) return 0;
+    }
+    size_t o_rec=nbump(&at,(size_t)ncol*cbs*16),o_st=nbump(&at,(size_t)ncol*8),o_tyx=nbump(&at,(size_t)total*8);
+    if(at>c->near_bytes) return 0;
+    const size_t fixed=((size_t)NB*256+256+2048*2+2047)&~(size_t)2047,cbytes=staged?(size_t)total*NB*2048:0;
+    const size_t need=fixed+3*2048+cbytes+2048;
+    if(c->workspace_bytes<need) return 0;
+    g->wused=0;
+    uint8_t *ws=walloc(g,need);
+    if(!ws){*err=E_MEMORY;return -1;}
+    conv_path=5;
+    if(g->fx.kind) g->fx_ok=1;
+    if(g->dry) return 1;
+#ifdef SLIDE_LIMIT
+    slide_used++;
+#endif
+#ifdef SLIDE_TRACE
+    printf("SLIDE cmd %u cbs=%d NB=%d oh=%d ow=%d staged=%d\n",(unsigned)g->call->command_index,(int)cbs,(int)NB,(int)oh,(int)ow,staged);
+#endif
+    uint64_t (*clock)(void)=c->phase?c->clock:NULL,t0=clock?clock():0,t1;
+    uint8_t *base=(uint8_t *)(((uintptr_t)ws+2047)&~(uintptr_t)2047);
+    int32_t *fi=(int32_t *)base,*zero=(int32_t *)(base+(size_t)NB*256);
+    uint8_t *completion=base+fixed-2048,*dummy=base+fixed,*zblk=dummy+4096,*C=zblk+2048;
+    uint8_t *n=c->near;
+    {
+        int32_t *nf=(int32_t *)n; /* the start of near is free again here (o_fi area of hmx_native) */
+        nf=(int32_t *)(n+nbump(&at,(size_t)NB*256+256));
+        if(at>c->near_bytes) return 0;
+        int32_t *nz=nf+NB*64;
+        for(int32_t k=0;k<co;k++) {
+            nf[(k>>5)*64+(k&31)]=(int32_t)(0x400000u|((uint32_t)(20-pre[k])<<10)|(uint32_t)(Mq[k]-1024));
+            nf[(k>>5)*64+32+(k&31)]=corr[k];
+        }
+        for(int k=0;k<64;k++) nz[k]=k<32?0x404000:0;
+        near_copy(base,(const uint8_t *)nf,(size_t)NB*256+256);
+    }
+    {HVX_Vector z=Q6_V_vzero();for(int i=0;i<16;i++)((HVX_Vector *)zblk)[i]=z;}
+    /* HVX stores (Fi, zero block) must land before HMX reads them: on silicon
+     * a stale Fi can leave HMX never completing (the ISS orders them anyway). */
+    __asm__ volatile("barrier":::"memory");
+    { /* an HVX VTCM read after the stores forces their completion (HMX.md) */
+        typedef uint32_t W32 __attribute__((vector_size(128)));
+        W32 a=*(volatile W32 *)base,b=*(volatile W32 *)zblk;
+        __asm__ volatile(""::"r"(a[0]),"r"(b[0]):"memory");
+    }
+    uint32_t *rec=(uint32_t *)(n+o_rec),*st=(uint32_t *)(n+o_st);
+    int32_t *tyx=(int32_t *)(n+o_tyx);
+    const uint32_t onbw=(uint32_t)(o->m[2]+7)/8u,onbd=(uint32_t)(o->m[3]+31)/32u,ocount=o->nblocks;
+    const uint32_t *oblk=o->blocks;
+    if(clock){t1=clock();c->phase[HMX_SETUP_SLOT]+=t1-t0;t0=t1;}
+    uint32_t saved=c->hmx->enter?c->hmx->enter():0;
+    for(int32_t by=0;by<bh;by++) {
+        for(int32_t cc=0;cc<ncol;cc++)for(int32_t cb=0;cb<cbs;cb++) {
+            uint32_t *r=rec+((size_t)cc*cbs+cb)*4;
+            const uint8_t *a=hmx_row(g->pool,xt,(int64_t)(R0+by)*8,C0+cc,xnbw,xnbd,cb),
+                          *b=hmx_row(g->pool,xt,(int64_t)(R0+by+1)*8,C0+cc,xnbw,xnbd,cb),
+                          *d=hmx_row(g->pool,xt,(int64_t)(R0+by+2)*8,C0+cc,xnbw,xnbd,cb);
+            if(!a)a=zblk;if(!b)b=zblk;if(!d)d=zblk;
+            r[0]=(uint32_t)(uintptr_t)a|0x740u;r[1]=((uint32_t)(uintptr_t)b-(uint32_t)(uintptr_t)a)|0x71fu;
+            r[2]=(uint32_t)(uintptr_t)b|0x140u;r[3]=((uint32_t)(uintptr_t)d-(uint32_t)(uintptr_t)b)|0x71fu;
+        }
+        for(int32_t j=0;j<NB;j++) {
+            /* after input column cc the accumulator holds virtual tile cc; the
+             * store (QNN's: Rs = block|0xe0, Rt = 0x700) writes output block
+             * cc-2 = previous tile's pixels 1..7 and this tile's pixel 0. */
+            for(int32_t cc=0;cc<ncol;cc++) {
+                int32_t bx=cc-2;uint8_t *d=dummy;
+                if(bx>=0 && bx<bw) {
+                    if(staged) d=C+((size_t)(by*bw+bx)*NB+(size_t)j)*2048;
+                    else {
+                        uint32_t idx=(((uint32_t)(o->p[1]>>3)+(uint32_t)by)*onbw+(uint32_t)(o->p[2]>>3)+(uint32_t)bx)*onbd+o->slice+(uint32_t)j;
+                        if(idx<ocount){uint32_t e=oblk[idx],pool=e&127u;if(pool && g->pool[pool]) d=g->pool[pool]+(e&~127u);}
+                    }
+                }
+                st[2*cc]=(uint32_t)(uintptr_t)d|0xe0u;st[2*cc+1]=0x700u;
+            }
+            c->hmx->slide3_n(rec,wbase+(size_t)j*KB*1024,fi+j*64,st,(uint32_t)cbs,(uint32_t)ncol);
+        }
+    }
+    int e=0;
+    {
+        HVX_Vector sentinel=Q6_V_vsplat_R(-1);
+        for(uint32_t i=0;i<2048;i+=128)*(HVX_Vector *)(completion+i)=sentinel;
+        __asm__ volatile("barrier":::"memory");
+        c->hmx->finish(zero,completion);
+        uint64_t end=c->hmx->clock?c->hmx->clock()+1000000000ull:0;
+        for(uint64_t spin=0;;spin++) {
+            typedef uint32_t HmxWords __attribute__((vector_size(128)));
+            HmxWords v=*(volatile HmxWords *)completion;
+            if(v[0]==0) break;
+            if(c->hmx->clock?c->hmx->clock()>end:spin>100000000ull){e=1;break;}
+        }
+        __asm__ volatile("barrier":::"memory");
+    }
+    if(c->hmx->leave) c->hmx->leave(saved);
+    if(clock){t1=clock();c->phase[1]+=t1-t0;t0=t1;}
+    if(e){*err=E_RANGE;return -1;}
+    if(staged) {
+        int32_t y=0,x=0;
+        for(int32_t t=0;t<total;t++){tyx[2*t]=y;tyx[2*t+1]=x;if(++x==bw){x=0;y++;}}
+        NatJob J={.g=g,.xt=xt,.o=o,.fx=g->fx.kind?&g->fx:NULL,.KB=KB,.NB=NB,.cbs=cbs,.bw=bw,.mt=total,.C=C,.tyx=tyx};
+        uint32_t parts=nprg2_parallel_parts(g->call->parallel,3);
+        if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,nat_fx_part,&J);
+        else nat_fx_part(&J,0,1);
+        if(clock){t1=clock();c->phase[3]+=t1-t0;t0=t1;}
+    }
+    return 1;
+}
+#endif
 /* 1 ran (or would, dry), 0 not eligible, -1 error. Called by hmx_conv with
  * its validated geometry, tables and parameters. */
 static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int32_t cbs, int32_t co, int32_t oh,
@@ -533,6 +690,12 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
             if(mb && !g->dry) *mb|=(uint8_t)(64u|(staged?128u:0u));
         }
     }
+#if BLK_HVX && defined(NPRG2_SLIDE3) && NPRG2_SLIDE3
+    if(!bcopy) {
+        int r=hmx_slide(g,xt,o,KB,NB,cbs,co,oh,ow,ktab,corr,pre,Mq,wbase,staged,at,err);
+        if(r) return r;
+    }
+#endif
     const size_t fixed=((size_t)NB*256+256+2048*2+2047)&~(size_t)2047,
                  bsz=bcopy?((size_t)KB*NB*1024+2047)&~(size_t)2047:0,per=(size_t)KB*2048+(staged?(size_t)NB*2048:0);
     if(c->workspace_bytes<fixed+bsz+2048+per+2048) return 0;

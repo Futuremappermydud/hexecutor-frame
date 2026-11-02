@@ -172,6 +172,8 @@ typedef struct {
     uint64_t limits;
     uint32_t need[MEMO_COMMANDS];
     uint8_t conv_checked[MEMO_COMMANDS];
+    uint8_t chain[MEMO_COMMANDS]; /* chain_run's wrapped validate: 0 unknown, 1 passed, 2 rejected */
+    uint8_t slide[MEMO_COMMANDS]; /* hmx_slide's input-block alignment: 0 unknown, 1 aligned, 2 not */
 } Memo;
 static Memo memos[2];
 static uint32_t memo_next;
@@ -186,7 +188,7 @@ static Memo *memo_for(const Nprg2ExecCall *c) {
     for(int i=0;i<2;i++) if(memos[i].program==c->program && memos[i].limits==lim) return &memos[i];
     Memo *m=&memos[memo_next++&1u];
     m->program=c->program;m->limits=lim;
-    memset(m->need,0xff,sizeof m->need);memset(m->conv_checked,0,sizeof m->conv_checked);
+    memset(m->need,0xff,sizeof m->need);memset(m->conv_checked,0,sizeof m->conv_checked);memset(m->chain,0,sizeof m->chain);memset(m->slide,0,sizeof m->slide);
     return m;
 }
 static uint32_t *memo_slot(const Nprg2ExecCall *c) {
@@ -3662,9 +3664,19 @@ static int chain_validate(const Nprg2ExecCall *c, void *ctx) {
     const Nprg2ReferenceChain *k=ctx;Nprg2ExecCall w;
     return (chain_call(c,k,&w) && k->validate(&w,k->ctx)) || nprg2_exec_reference_validate(c,NULL);
 }
+/* The wrapped validators read only geometry, call records, pool bases and
+ * limits and the immutable constant pool (never activation values), so the
+ * verdict is a property of the bound program: memoised per command. */
 static int chain_run(const Nprg2ExecCall *c, void *ctx) {
     const Nprg2ReferenceChain *k=ctx;Nprg2ExecCall w;
-    if(chain_call(c,k,&w) && k->validate(&w,k->ctx)) return k->run(&w,k->ctx);
+    Memo *m=memo_for(c);
+    uint8_t *v=m?&m->chain[c->command_index]:NULL;
+    if(v && *v==2) return nprg2_exec_reference_run(c,NULL);
+    if(!chain_call(c,k,&w)) return nprg2_exec_reference_run(c,NULL);
+    if(v && *v==1) return k->run(&w,k->ctx);
+    int ok=k->validate(&w,k->ctx);
+    if(v) *v=ok?1:2;
+    if(ok) return k->run(&w,k->ctx);
     return nprg2_exec_reference_run(c,NULL);
 }
 int nprg2_executor_chain_reference(Nprg2Executor *e, uint8_t opcode, uint8_t variant, Nprg2ReferenceChain *storage) {

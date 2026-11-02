@@ -26,3 +26,7 @@ int qd_blocked_linearclip_u16_apply_params(const QdBlockedU16Linearclip *prepare
         const QdLinearclipParams *p) {
     (void)prepared;(void)p;return 1;
 }
+int qd_blocked_add_u8_whole(const QdBlockedAddU8 *p) { (void)p; return 0; }
+int qd_blocked_add_u8_apply_whole(const QdBlockedAddU8 *p,const QdAddU8Params *q,uint32_t part,uint32_t parts) {
+    (void)p; (void)q; (void)part; (void)parts; return 0;
+}

@@ -128,3 +128,42 @@ qd_hmx_native16_n:
     { p0 = cmp.gt(r5,#0) }
     { if (p0) jump 2b }
     { jumpr r31 }
+/* Native int8 3x3 stride-1 HMX conv for one N block over one 8-row strip,
+ * no A staging (QNN's hmx_v73_convbbb_stride1 scheme, decoded on the V75 ISS):
+ * the activation loads read the input crouton blocks in place and HMX makes
+ * the taps (horizontal shifts 0..2, rows via the block below), the
+ * accumulator slides one tile per cvt, and the store splits the tile over
+ * two output blocks. Per column c (input block columns), per channel block:
+ *   activation.ub = mxmem(rsA, rtA):above:cm  (ky=0: rows 7.. of block by)
+ *     weight.b    = 3 tiles (stored taps ky0 kx'0..2)
+ *   activation.ub = mxmem(rsC, rtC):cm        (ky=1,2: block by+1, rows 0.., 1..)
+ *     weight.b    = 6 tiles
+ * then cvt.ub and the split store. r0 = 16-byte records {rsA, rtA, rsC, rtC}
+ * per (c, cb), c-major; r1 = B of this N block (KB = 9*cbs tiles, cb-major,
+ * stored taps ky*3+kx'); r2 = Fi; r3 = per c {rsO, rtO} store words;
+ * r4 = cbs, r5 = number of columns. */
+    .globl qd_hmx_slide3_n
+qd_hmx_slide3_n:
+    { r7 = #0; r10 = #3071; r11 = #6143 }
+    { mxclracc }
+    { bias = mxmem2(r2) }
+1:
+    { r8 = r4; r9 = r1 }
+2:
+    { r12 = memw(r0+#0); r13 = memw(r0+#4) }
+    { r14 = memw(r0+#8); r15 = memw(r0+#12) }
+    { activation.ub = mxmem(r12,r13):above:cm
+      weight.b = mxmem(r9,r10) }
+    { r9 = add(r9,#3072) }
+    { activation.ub = mxmem(r14,r15):cm
+      weight.b = mxmem(r9,r11) }
+    { r9 = add(r9,#6144); r0 = add(r0,#16); r8 = add(r8,#-1) }
+    { p0 = cmp.gt(r8,#0) }
+    { if (p0) jump 2b }
+    { r12 = memw(r3+#0); r13 = memw(r3+#4); r3 = add(r3,#8) }
+    { cvt.ub = acc(r7) }
+    { mxmem(r12,r13):cm = cvt }
+    { r5 = add(r5,#-1) }
+    { p0 = cmp.gt(r5,#0) }
+    { if (p0) jump 1b }
+    { jumpr r31 }

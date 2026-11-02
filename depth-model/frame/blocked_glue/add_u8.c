@@ -3,6 +3,7 @@
 #include <hvx_hexagon_protos.h>
 #include <limits.h>
 #include <stdlib.h>
+#include <string.h>
 
 static int valid(const QdBlockedU8 *t) {
     if(!t||!t->pools||!t->blocks||t->meta[1]>INT32_MAX-7||
@@ -83,7 +84,9 @@ static uint8_t *vector_ptr(const QdBlockedU8 *t,int b,int h,int w,int db) {
     return t->pools[pool]+(e&~127u)+(H%8)*256+(W%8)*32;
 }
 static HVX_Vector mul_u32(HVX_Vector x,uint32_t m) {
-    HVX_Vector lo=Q6_V_vsplat_R(m&65535u),hi=Q6_V_vsplat_R(m>>16);
+    HVX_Vector lo=Q6_V_vsplat_R(m&65535u);
+    if(!(m>>16))return Q6_Vw_vmpyie_VwVuh(x,lo); /* the high product is 0 */
+    HVX_Vector hi=Q6_V_vsplat_R(m>>16);
     return Q6_Vw_vadd_VwVw(Q6_Vw_vmpyie_VwVuh(x,lo),Q6_Vw_vasl_VwR(Q6_Vw_vmpyie_VwVuh(x,hi),16));
 }
 static HVX_Vector add_words(HVX_Vector a,HVX_Vector b,const QdAddU8Params *p) {
@@ -124,5 +127,42 @@ int qd_blocked_add_u8_apply(const QdBlockedAddU8 *prepared,const QdAddU8Params *
             mask=Q6_Q_or_QQ(mask,Q6_Q_and_QQn(prefix((unsigned)(j*32+last)),prefix((unsigned)(j*32+first))));
         if(first<last)Q6_vmem_QRIV(mask,(HVX_Vector *)po,vr);
       }
+    return 1;
+}
+
+/* Whole-block form: every tensor's region is whole 8x8x32 blocks (origins and
+ * extents multiples of 8, 8, 32), so each output block is 16 full vectors
+ * computed from the matching input blocks; same lanes and the same absent-
+ * block rules (absent input = zeros, absent output = no store) as apply.
+ * Blocks i = part, part+parts, ... of the region in (B, H, W, D) order. */
+static int whole(const QdBlockedU8 *t) {
+    return !(t->origin[1]&7)&&!(t->origin[2]&7)&&!(t->origin[3]&31)&&!(t->dims[1]&7)&&!(t->dims[2]&7)&&!(t->dims[3]&31);
+}
+int qd_blocked_add_u8_whole(const QdBlockedAddU8 *prepared) {
+    if(!prepared||prepared->cookie!=0x51444138u)return 0;
+    return whole(&prepared->a)&&whole(&prepared->b)&&whole(&prepared->out);
+}
+static const uint8_t *blk(const QdBlockedU8 *t,int B,int H,int W,int D) {
+    int nh=(t->meta[1]+7)/8,nw=(t->meta[2]+7)/8,nd=(t->meta[3]+31)/32;
+    int64_t ix=((((int64_t)(B+t->origin[0])*nh+H+t->origin[1]/8)*nw+W+t->origin[2]/8)*nd)+t->slice+D+t->origin[3]/32;
+    return (const uint8_t *)block_start(t,ix);
+}
+int qd_blocked_add_u8_apply_whole(const QdBlockedAddU8 *prepared,const QdAddU8Params *p,uint32_t part,uint32_t parts) {
+    if(!qd_blocked_add_u8_whole(prepared)||!params_ok(p)||!parts)return 0;
+    const QdBlockedU8 *a=&prepared->a,*b=&prepared->b,*o=&prepared->out;
+    const int nB=a->dims[0],nH=a->dims[1]/8,nW=a->dims[2]/8,nD=a->dims[3]/32;
+    const int same=a==b||(a->blocks==b->blocks&&a->slice==b->slice&&!memcmp(a->origin,b->origin,sizeof a->origin)&&
+                          !memcmp(a->meta,b->meta,sizeof a->meta));
+    uint32_t i=0;
+    for(int B=0;B<nB;B++)for(int H=0;H<nH;H++)for(int W=0;W<nW;W++)for(int D=0;D<nD;D++,i++) {
+        if(i%parts!=part)continue;
+        uint8_t *po=(uint8_t *)blk(o,B,H,W,D);if(!po)continue;
+        const uint8_t *pa=blk(a,B,H,W,D),*pb=same?pa:blk(b,B,H,W,D);
+        for(int v=0;v<16;v++) {
+            HVX_Vector va=pa?((const HVX_Vector *)pa)[v]:Q6_V_vzero();
+            HVX_Vector vb=pb?((const HVX_Vector *)pb)[v]:Q6_V_vzero();
+            ((HVX_Vector *)po)[v]=add_vec(va,vb,p);
+        }
+    }
     return 1;
 }

@@ -214,7 +214,7 @@ $cc $engine_flags -ffunction-sections -fdata-sections -nostdlib -Wl,--gc-section
 # Experiments only write a separate engine. Use the existing mode-specific
 # bootstrap; never replace the normal bootstrap/probe during these builds.
 if [ "$QDS_PRESERVE_VTCM" = 1 ]; then
-  $cc $flags -DQDS_PRESERVE_VTCM=1 -DQDS_ENTRY_GUARD=1 -DQDS_L2_CACHE=$QDS_L2_CACHE -nostdlib -Wl,-T,qd_payload.ld qd_graph_boot.c qd_graph_stack.S -o "$bootstrap"
+  $cc $flags -DQDS_PRESERVE_VTCM=1 -DQDS_ENTRY_GUARD=1 -DQDS_L2_CACHE=$QDS_L2_CACHE $(echo "$QDS_EXTRA_CFLAGS" | tr + " ") -nostdlib -Wl,-T,qd_payload.ld qd_graph_boot.c qd_graph_stack.S -o "$bootstrap"
   echo "Experimental engine: $engine; preserving bootstrap: $bootstrap"
   exit 0
 fi
@@ -222,7 +222,7 @@ if [ "$QDS_DYNAMIC_TCM" = 1 ] || [ "$QDS_FALLBACK_TCM" != 0 ] || [ "$QDS_BLOCKED
   echo "Experimental engine: $engine; use existing bootstrap: $bootstrap"
   exit 0
 fi
-$cc $flags -nostdlib -Wl,-T,qd_payload.ld qd_graph_boot.c qd_graph_stack.S -o "$bootstrap"
+$cc $flags $(echo "$QDS_EXTRA_CFLAGS" | tr + " ") -nostdlib -Wl,-T,qd_payload.ld qd_graph_boot.c qd_graph_stack.S -o "$bootstrap"
 $cc $flags -nostdlib -Wl,-T,qd_payload.ld bench/qd_owned_mem_probe.c -o "$probe"
 if [ "$QDS_SCALAR_CACHE" = 0 ]; then
   cp "$bootstrap" build/qd_graph_boot.elf

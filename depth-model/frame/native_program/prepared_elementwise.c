@@ -255,7 +255,27 @@ static void add_part(void *ctx,uint32_t part,uint32_t parts) {
     QdBlockedAddU8 prepared;prepared.a=j.a;prepared.b=j.b;prepared.out=j.out;prepared.cookie=0x51444138u;
     (void)qd_blocked_add_u8_apply(&prepared,&j.p);
 }
+typedef struct { QdBlockedAddU8 pr; QdAddU8Params p; } AddWholeJob;
+static void add_whole_part(void *ctx,uint32_t part,uint32_t parts) {
+    const AddWholeJob *j=(const AddWholeJob *)ctx;
+    (void)qd_blocked_add_u8_apply_whole(&j->pr,&j->p,part,parts);
+}
 static int add_apply_parts(const Nprg2ExecCall *c,const QdBlockedU8 *a,const QdBlockedU8 *b,const QdBlockedU8 *o,const QdAddU8Params *p) {
+#if defined(EXP_EW) && EXP_EW==1
+    (void)c;(void)a;(void)b;(void)o;(void)p;return 1;
+#endif
+    {
+        AddWholeJob j;j.pr.a=*a;j.pr.b=*b;j.pr.out=*o;j.pr.cookie=0x51444138u;j.p=*p;
+        if (qd_blocked_add_u8_whole(&j.pr)) {
+            uint32_t parts=ew_parts(c,a->dims);
+#if defined(EXP_EW) && EXP_EW==2
+            parts=1;
+#endif
+            if (parts>1) nprg2_parallel_for(c->parallel,NPRG2_PAR_EW,parts,add_whole_part,&j);
+            else return qd_blocked_add_u8_apply_whole(&j.pr,&j.p,0,1);
+            return 1;
+        }
+    }
     uint32_t parts=ew_parts(c,a->dims);
     if (parts>1) {
         AddJob j={*a,*b,*o,*p};
