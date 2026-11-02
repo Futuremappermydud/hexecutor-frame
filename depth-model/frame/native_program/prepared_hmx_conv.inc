@@ -760,7 +760,7 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
  * its validated geometry, tables and parameters. */
 static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int32_t cbs, int32_t co, int32_t oh,
                       int32_t ow, const uint32_t *ktab, const int32_t *corr, const int32_t *pre, const int32_t *Mq,
-                      const int8_t *wbase, int bcopy, int32_t kvec, const uint32_t *s2off, uint32_t js, int32_t xrows, int32_t xwb0,
+                      const int8_t *wbase, int bcopy, int32_t kvec, const uint32_t *s2off, uint32_t js, int s2ip, int32_t xrows, int32_t xwb0,
                       int32_t xnwb, uint8_t **xtab, const uint8_t *fipre, int hit, size_t at, int32_t *err) {
     const Nprg2ReferenceConv *c=g->conv;
     /* 1x1 conv (ktab k = (0,0,k)), input origin on a block corner: no row table */
@@ -796,7 +796,7 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
         }
     }
 #if BLK_HVX && defined(NPRG2_SLIDE3) && NPRG2_SLIDE3
-    if(!bcopy) {
+    if(!bcopy && !s2ip) {
         int r=hmx_slide(g,xt,o,KB,NB,cbs,co,oh,ow,ktab,corr,pre,Mq,wbase,staged,fipre,at,err);
         if(r) return r;
     }
@@ -880,6 +880,39 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
     return 1;
 }
 #endif
+/* Stride-2 conv weights. The raw 3x3 tensor holds, per output block j, the
+ * 9*cbO tiles (cb, h, x) in raw order, each a contiguous 1024-byte K block,
+ * and every one of them feeds exactly one (ky, kx, cb2) of the 2x2 conv over
+ * the space-to-depth channels. Taking K in raw order (k = cb*9 + h*3 + x) makes
+ * B the raw tensor itself (block j at j*KB*1024): no copy, no scans. The MAC
+ * sums are order independent. */
+#ifdef S2_COUNT
+static uint32_t s2_ip_taken,s2_bc_taken;
+#endif
+#ifndef S2_FORCE_BCOPY
+#define S2_FORCE_BCOPY 0
+#endif
+static void s2_ktab(uint32_t *ktab, int32_t cbO) {
+    uint32_t t9[9];
+    for(int r=0;r<9;r++) {
+        int y3=S2_TAPS[r][0],x3=S2_TAPS[r][1];
+        t9[r]=(uint32_t)(y3>>1)|(uint32_t)((x3+1)>>1)<<8|(uint32_t)((y3&1)*2+(x3&1))<<16;
+    }
+    for(int32_t cb=0;cb<cbO;cb++)for(int r=0;r<9;r++) ktab[cb*9+r]=t9[r]+((uint32_t)(4*cb)<<16);
+}
+/* Fallback (weights not 1024-aligned): the present K blocks' raw offsets in
+ * 2x2 order, copied per command. Returns KB or -1. */
+static int32_t s2_scan(const T *wt, int32_t cbs, uint32_t *s2off) {
+    int32_t KB=0;
+    for(int32_t ky=0;ky<2;ky++)for(int32_t kx=0;kx<2;kx++)for(int32_t cb=0;cb<cbs;cb++) {
+        uint32_t t=weight_tile(wt,1,0,0,ky,kx,cb*8,0);
+        if(t==NO_TILE) continue;
+        for(int32_t q=1;q<8;q++) if(weight_tile(wt,1,0,0,ky,kx,cb*8+q,0)!=t+(uint32_t)q*128u) return -1;
+        if(KB>=255) return -1;
+        s2off[KB++]=t;
+    }
+    return KB;
+}
 static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int packed, int reverse, int s2, int32_t co,
                     int32_t oh, int32_t ow, int32_t *err) {
     const Nprg2ReferenceConv *c=g->conv;
@@ -915,19 +948,18 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     if(xt->p[0] || o->p[0] || xt->m[0]!=1 || o->m[0]!=1 || wt->pool!=1) return 0;
     const int32_t cbs=I/32,NB=co/32;
     int32_t KB=H*W*cbs;
+    const int8_t *wbase=(const int8_t *)g->pool[wt->pool]+wt->offset;
+    int s2ip=0; /* stride 2 with the raw weights used in place (see s2_ktab) */
     if(s2) {
-        KB=0;
-        for(int32_t ky=0;ky<2;ky++)for(int32_t kx=0;kx<2;kx++)for(int32_t cb=0;cb<cbs;cb++) {
-            uint32_t t=weight_tile(wt,1,0,0,ky,kx,cb*8,0);
-            if(t==NO_TILE) continue;
-            for(int32_t q=1;q<8;q++) if(weight_tile(wt,1,0,0,ky,kx,cb*8+q,0)!=t+(uint32_t)q*128u) return 0;
-            if(KB>=255) return 0;
-            s2off[KB++]=t|(uint32_t)0; /* offset; the (ky,kx,cb) goes to ktab below */
-        }
+        if(!((uintptr_t)wbase&1023u) && !S2_FORCE_BCOPY) {s2ip=1;bcopy=0;KB=9*(cbs/4);}
+        else KB=s2_scan(wt,cbs,s2off);
+#ifdef S2_COUNT
+        if(!g->dry){if(s2ip)s2_ip_taken++;else s2_bc_taken++;}
+#endif
+        if(KB<0) return 0;
     }
     if(bcopy && !s2) s2off[0]=0; /* KB == 1 */
     if(!KB || KB*32>HMX_TERMS_MAX || KB>255) return 0;
-    const int8_t *wbase=(const int8_t *)g->pool[wt->pool]+wt->offset;
     if(!bcopy && ((uintptr_t)wbase&1023u)) return 0;
     int32_t dims[4]={1,oh+H-1,ow+W-1,Ireal},origin[4]={0,xt->p[1],xt->p[2],0};
     int32_t on[4]={1,oh,ow,co},oorigin[4]={0,o->p[1],o->p[2],0};
@@ -1062,9 +1094,12 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     HMX_MARK(2);
     /* k order of the weight layout, enumerated without divides. */
     if(s2) {
-        int32_t k=0;
-        for(int32_t ky=0;ky<2;ky++)for(int32_t kx=0;kx<2;kx++)for(int32_t cb=0;cb<cbs;cb++)
-            if(weight_tile(wt,1,0,0,ky,kx,cb*8,0)!=NO_TILE) ktab[k++]=(uint32_t)ky|(uint32_t)kx<<8|(uint32_t)cb<<16;
+        if(s2ip) s2_ktab(ktab,cbs/4);
+        else {
+            int32_t k=0;
+            for(int32_t ky=0;ky<2;ky++)for(int32_t kx=0;kx<2;kx++)for(int32_t cb=0;cb<cbs;cb++)
+                if(weight_tile(wt,1,0,0,ky,kx,cb*8,0)!=NO_TILE) ktab[k++]=(uint32_t)ky|(uint32_t)kx<<8|(uint32_t)cb<<16;
+        }
     } else {
         int32_t k=0;
         if(packed) {for(int32_t h=0;h<H;h++)for(int32_t x=0;x<W;x++)for(int32_t cb=0;cb<cbs;cb++,k++)
@@ -1078,7 +1113,7 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     uint8_t *nat_snap=NULL;int32_t nat_dims[4]={1,oh,ow,co},nat_org[4]={0,o->p[1],o->p[2],0};
 #endif
     {
-        int r=hmx_native(g,xt,o,KB,NB,cbs,co,oh,ow,ktab,corr,pre,Mq,wbase,bcopy,kvec,s2off,js,xrows,xwb0,xnwb,
+        int r=hmx_native(g,xt,o,KB,NB,cbs,co,oh,ow,ktab,corr,pre,Mq,wbase,bcopy,kvec,s2off,js,s2ip,xrows,xwb0,xnwb,
                          use_tab?(uint8_t **)(n+o_xtab):NULL,vec_done?fipre:NULL,0,at,err);
 #ifdef NAT_CHECK
         if(r==1 && !g->dry && !g->fx.kind) {
