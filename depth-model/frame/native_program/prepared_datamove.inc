@@ -389,48 +389,75 @@ static int s2d_fast_ok(const G *g, const T *i, const T *o, int32_t ph, int32_t p
     return DM_ENABLED && dm_blocked_u8(i) && dm_blocked_u8(o) && ci>0 && !(ci&31) && oc==4*ci && ow>0 && !(ow&3) &&
            oh>0 && ph>=0 && pw>=7 && (pw&7)==7 && dm_pools_aligned(g);
 }
-typedef struct { const G *g; const T *i, *o; int32_t ph, pw, oh, ow, ci; int64_t items; } S2dJob;
+typedef struct { const G *g; const T *i, *o; int32_t ph, pw, oh, ow, ci; int64_t items, nq, nhb, nz; } S2dJob;
+/* One item = (depth group cb, output block row hb, output block column q): the
+ * input block pointers (up to 3 block rows x 3 block columns) and the 4 output
+ * block pointers are looked up once, then every row of the block is moved with
+ * a rolling 8-pixel window and no further address arithmetic. */
 static void s2d_fast_part(void *ctx, uint32_t part, uint32_t parts) {
     const S2dJob *J=ctx;
-    const G *g=J->g;const int32_t ph=J->ph,pw=J->pw,oh=J->oh,ow=J->ow,ci=J->ci;
+    const G *g=J->g;const int32_t ph=J->ph,pw=J->pw,oh=J->oh,ow=J->ow;
     BK bi,bo;
     bk_init(&bi,g,J->i);bk_init(&bo,g,J->o);
-    const int64_t s=(pw-7)/8,nk=ow/4,nq=(nk+1)/2;
+    const int64_t s=(pw-7)/8,nk=ow/4,nq=J->nq,nhb=J->nhb;
+    const int64_t irow=bi.nbw*bi.nbd,orow=bo.nbw*bo.nbd;
     int64_t i0,i1;
     dm_range(J->items,part,parts,&i0,&i1);
     for(int64_t it=i0;it<i1;it++) {
-     const int64_t cb=it/oh;const int32_t h=(int32_t)(it%oh);
-     const int64_t obase=(int64_t)(h>>3)*bo.nbw*bo.nbd+bo.slice;
-     const uint32_t roff=256u*(uint32_t)(h&7);
-     for(int dy=0;dy<2;dy++) {
-        const int64_t H=(int64_t)ph+2*h+dy,j0=cb*4+2*dy;
-        const int64_t ibase=(H>>3)*bi.nbw*bi.nbd+bi.slice+cb;
-        const uint32_t ro=256u*(uint32_t)(H&7);
-        DV A=dv_ld(bk_blk_or(&bi,ibase+s*bi.nbd,(uint8_t *)dm_zblk)+ro+128);
-        const uint8_t *ib=bk_blk_or(&bi,ibase+(s+1)*bi.nbd,(uint8_t *)dm_zblk)+ro;
-        for(int64_t q=0;q<nq;q++) {
-            uint8_t *d1=bk_blk_or(&bo,obase+q*bo.nbd+j0+1,NULL),*d0=bk_blk_or(&bo,obase+q*bo.nbd+j0,NULL);
-            if(d1)d1+=roff;
-            if(d0)d0+=roff;
+        const int64_t q=it%nq,hb=(it/nq)%nhb,cb=it/nq/nhb;
+        const int32_t nr=oh-8*(int32_t)hb<8?oh-8*(int32_t)hb:8;
+        const int64_t H0=(int64_t)ph+16*hb,H1=H0+2*(nr-1)+1,hb0=H0>>3;
+        const int nrow=(int)((H1>>3)-hb0)+1;
+        const int two=2*q+1<nk;
+        const uint8_t *ip[3][3];
+        #pragma clang loop unroll(full)
+        for(int r=0;r<3;r++) {
+            if(r>=nrow) {
+                #pragma clang loop unroll(full)
+                for(int c=0;c<3;c++)ip[r][c]=dm_zblk;
+                continue;
+            }
+            const int64_t base=(hb0+r)*irow+bi.slice+cb+(s+2*q)*bi.nbd;
             #pragma clang loop unroll(full)
-            for(int kk=0;kk<2;kk++) {
-                if(kk && 2*q+1>=nk) break;
-                const uint8_t *cur=ib;
-                DV B=dv_ld(cur),C=dv_ld(cur+128);
-                ib=bk_blk_or(&bi,ibase+(s+2+2*q+kk)*bi.nbd,(uint8_t *)dm_zblk)+ro;
-                DV E,O;
-                dv_deal32(dv_align(B,A,64),dv_align(C,B,64),&E,&O);
-                if(d1)dv_st(d1+128*kk,E);
-                if(d0)dv_st(d0+128*kk,O);
-                A=C;
+            for(int c=0;c<3;c++) {
+                if(c==2 && !two){ip[r][c]=dm_zblk;continue;}
+                ip[r][c]=bk_blk_or(&bi,base+c*bi.nbd,(uint8_t *)dm_zblk);
             }
         }
-     }
+        uint8_t *op[4];
+        {
+            const int64_t base=hb*orow+bo.slice+q*bo.nbd+cb*4;
+            #pragma clang loop unroll(full)
+            for(int j=0;j<4;j++)op[j]=bk_blk_or(&bo,base+j,NULL);
+        }
+        for(int32_t r=0;r<nr;r++) {
+            #pragma clang loop unroll(full)
+            for(int dy=0;dy<2;dy++) {
+                const int64_t H=H0+2*r+dy;
+                const int ri=(int)((H>>3)-hb0);
+                const uint32_t ro=256u*(uint32_t)(H&7);
+                const uint8_t *p0=ip[ri][0]+ro,*p1=ip[ri][1]+ro,*p2=ip[ri][2]+ro;
+                uint8_t *d1=op[2*dy+1],*d0=op[2*dy];
+                const uint32_t roff=256u*(uint32_t)r;
+                DV A=dv_ld(p0+128);
+                DV B=dv_ld(p1),C=dv_ld(p1+128);
+                DV E,O;
+                dv_deal32(dv_align(B,A,64),dv_align(C,B,64),&E,&O);
+                if(d1)dv_st(d1+roff,E);
+                if(d0)dv_st(d0+roff,O);
+                if(two) {
+                    DV B2=dv_ld(p2),C2=dv_ld(p2+128);
+                    dv_deal32(dv_align(B2,C,64),dv_align(C2,B2,64),&E,&O);
+                    if(d1)dv_st(d1+roff+128,E);
+                    if(d0)dv_st(d0+roff+128,O);
+                }
+            }
+        }
     }
-    (void)ci;
 }
 static void s2d_fast_run(const G *g, const T *i, const T *o, int32_t ph, int32_t pw, int32_t oh, int32_t ow, int32_t ci) {
-    S2dJob J={g,i,o,ph,pw,oh,ow,ci,(int64_t)(ci/32)*oh};
+    S2dJob J={g,i,o,ph,pw,oh,ow,ci,0,(((int64_t)ow/4)+1)/2,((int64_t)oh+7)/8,ci/32};
+    J.items=J.nq*J.nhb*J.nz;
     uint32_t parts=dm_parts(g,(uint64_t)oh*ow*4u*(uint64_t)ci,J.items);
     if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_DM,parts,s2d_fast_part,&J);
     else s2d_fast_part(&J,0,1);
@@ -465,27 +492,37 @@ static int resize_fast_ok(const G *g, const T *xt, const T *wpt, const T *o) {
     if(xt->d[2]<n[2]/2 || (xt->p[2]&3) || (o->p[2]&7) || xt->d[1]<=0) return 0;
     return dm_write_dims_match(o,n);
 }
-typedef struct { const G *g; const T *xt, *o; const int32_t *hi; int32_t n[4]; } RsJob;
+typedef struct { const G *g; const T *xt, *o; const int32_t *hi; int32_t n[4]; int64_t nohb, ohb0; } RsJob;
+/* One item = (batch, depth group, output block row, output block column): the
+ * output block is looked up once and its input block only when the (monotone
+ * in practice) row map moves to a new input block row. */
 static void resize_part(void *ctx, uint32_t part, uint32_t parts) {
     const RsJob *J=ctx;const G *g=J->g;const T *xt=J->xt,*o=J->o;const int32_t *hi=J->hi,*n=J->n;
     BK bx,bo;
     bk_init(&bx,g,xt);bk_init(&bo,g,o);
-    const int64_t ng=n[3]/32,nq=n[2]/8,xw=xt->p[2]/4,ow=o->p[2]/8;
+    const int64_t ng=n[3]/32,nq=n[2]/8,xw=xt->p[2]/4,ow=o->p[2]/8,nohb=J->nohb;
+    const int64_t xrow=bx.nbw*bx.nbd,orow=bo.nbw*bo.nbd;
+    const int64_t zi=bx.slice+xt->p[3]/32,zo=bo.slice+o->p[3]/32;
     int64_t i0,i1;
-    dm_range((int64_t)n[0]*n[1]*ng,part,parts,&i0,&i1);
+    dm_range((int64_t)n[0]*ng*nohb*nq,part,parts,&i0,&i1);
     for(int64_t it=i0;it<i1;it++) {
-        const int64_t z=it%ng;const int32_t h=(int32_t)((it/ng)%n[1]),b=(int32_t)(it/ng/n[1]);
-        const int64_t H=(int64_t)hi[h]+xt->p[1],B=b+(int64_t)xt->p[0],OB=b+(int64_t)o->p[0],OH=h+(int64_t)o->p[1];
-        const int64_t ibase=(B*bx.nbh+(H>>3))*bx.nbw*bx.nbd+bx.slice+z+xt->p[3]/32;
-        const uint32_t ro=256u*(uint32_t)(H&7);
-        const int64_t obase=(OB*bo.nbh+(OH>>3))*bo.nbw*bo.nbd+bo.slice+z+o->p[3]/32;
-        const uint32_t oro=256u*(uint32_t)(OH&7);
-        for(int64_t q=0;q<nq;q++) {
-            const uint8_t *s=bk_blk_or(&bx,ibase+((xw+q)>>1)*bx.nbd,(uint8_t *)dm_zblk);
+        const int64_t q=it%nq,ohb=J->ohb0+(it/nq)%nohb,z=(it/nq/nohb)%ng,b=it/nq/nohb/ng;
+        const int64_t B=b+(int64_t)xt->p[0],OB=b+(int64_t)o->p[0];
+        int32_t h0=(int32_t)(8*ohb-o->p[1]),h1=h0+8;
+        if(h0<0)h0=0;
+        if(h1>n[1])h1=n[1];
+        uint8_t *d=bk_blk_or(&bo,(OB*bo.nbh+ohb)*orow+zo+z+(ow+q)*bo.nbd,NULL);
+        if(!d) continue;
+        const int64_t xc=xw+q,xcol=(xc>>1)*bx.nbd;
+        const uint32_t half=128u*(uint32_t)(xc&1);
+        int64_t cH=-1;const uint8_t *s=NULL;
+        for(int32_t h=h0;h<h1;h++) {
+            const int64_t H=(int64_t)hi[h]+xt->p[1];
+            if((H>>3)!=cH){cH=H>>3;s=bk_blk_or(&bx,(B*bx.nbh+cH)*xrow+zi+z+xcol,(uint8_t *)dm_zblk);}
             DV lo,hi2;
-            dv_dup32(dv_ld(s+ro+128*((xw+q)&1)),&lo,&hi2);
-            uint8_t *d=bk_blk_or(&bo,obase+(ow+q)*bo.nbd,NULL);
-            if(d){dv_st(d+oro,lo);dv_st(d+oro+128,hi2);}
+            dv_dup32(dv_ld(s+256u*(uint32_t)(H&7)+half),&lo,&hi2);
+            const uint32_t oro=256u*(uint32_t)((h+(int64_t)o->p[1])&7);
+            dv_st(d+oro,lo);dv_st(d+oro+128,hi2);
         }
     }
 }
@@ -504,8 +541,9 @@ static int resize_fast(G *g, const T *xt, const T *wpt, const T *o, const int32_
         CHECK(v>=0 && v<xt->d[1],E_RANGE);hi[i]=(int32_t)v;
     }
     DM_COUNT(1,(uint64_t)n[0]*n[1]*n[2]*n[3]);
-    RsJob J={g,xt,o,hi,{n[0],n[1],n[2],n[3]}};
-    uint32_t parts=dm_parts(g,(uint64_t)n[0]*n[1]*n[2]*n[3],(int64_t)n[0]*n[1]*(n[3]/32));
+    RsJob J={g,xt,o,hi,{n[0],n[1],n[2],n[3]},0,0};
+    J.ohb0=o->p[1]>>3;J.nohb=((o->p[1]+n[1]-1)>>3)-J.ohb0+1;
+    uint32_t parts=dm_parts(g,(uint64_t)n[0]*n[1]*n[2]*n[3],(int64_t)n[0]*(n[3]/32)*J.nohb*(n[2]/8));
     if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_DM,parts,resize_part,&J);
     else resize_part(&J,0,1);
     return 0;

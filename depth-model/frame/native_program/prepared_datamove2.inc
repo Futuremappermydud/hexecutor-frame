@@ -323,3 +323,75 @@ static int dq_blk_fast(G *g, const T *it, const T *ot, const DqCtx *c) {
     return -1;
 #endif
 }
+
+
+/* -------------------------------------------------------------- Decimate */
+/* u8 blocked in and out, column stride 2, depth stride 1, any batch/row
+ * stride. Output pixel (b,h,w) is input pixel (b*sv0, h*sv1, 2w). One item =
+ * (batch, depth group, output block row, output block column): an output
+ * block row (8 pixels, two vectors) is the even pixels of two input block
+ * rows' 16-pixel run (4 vectors, vdeal). The two input blocks and the output
+ * block are looked up once per item (input again only when the row map moves
+ * to another input block row). */
+static int dec_fast_ok(const G *g, const T *it, const T *ot, const int32_t *sv, int32_t *n) {
+    if(!DM_ENABLED || !dm_blocked_u8(it) || !dm_blocked_u8(ot) || !dm_pools_aligned(g)) return 0;
+    if(sv[0]<1 || sv[1]<1 || sv[2]!=2 || sv[3]!=1) return 0;
+    for(int i=0;i<4;i++){n[i]=(it->d[i]+sv[i]-1)/sv[i];if(it->d[i]<=0 || n[i]!=ot->d[i]) return 0;}
+    if((n[3]&31) || (it->p[3]&31) || (ot->p[3]&31) || (n[2]&7) || (it->p[2]&7) || (ot->p[2]&7)) return 0;
+    return dm_write_dims_match(ot,n);
+}
+typedef struct { const G *g; const T *it, *ot; const int32_t *sv; int32_t n[4]; int64_t nohb, ohb0; } DecJob;
+static void dec_part(void *ctx, uint32_t part, uint32_t parts) {
+    const DecJob *J=ctx;const T *it=J->it,*ot=J->ot;const int32_t *n=J->n,*sv=J->sv;
+    BK bi,bo;
+    bk_init(&bi,J->g,it);bk_init(&bo,J->g,ot);
+    const int64_t ng=n[3]/32,nq=n[2]/8,nohb=J->nohb;
+    const int64_t irow=bi.nbw*bi.nbd,orow=bo.nbw*bo.nbd;
+    const int64_t zi=bi.slice+it->p[3]/32,zo=bo.slice+ot->p[3]/32;
+    const int64_t ic0=it->p[2]/8,oc0=ot->p[2]/8;
+    int64_t i0,i1;
+    dm_range((int64_t)n[0]*ng*nohb*nq,part,parts,&i0,&i1);
+    for(int64_t k=i0;k<i1;k++) {
+        const int64_t q=k%nq,ohb=J->ohb0+(k/nq)%nohb,z=(k/nq/nohb)%ng,b=k/nq/nohb/ng;
+        const int64_t B=it->p[0]+b*sv[0],OB=b+(int64_t)ot->p[0];
+        int32_t h0=(int32_t)(8*ohb-ot->p[1]),h1=h0+8;
+        if(h0<0)h0=0;
+        if(h1>n[1])h1=n[1];
+        uint8_t *d=bk_blk_or(&bo,(OB*bo.nbh+ohb)*orow+zo+z+(oc0+q)*bo.nbd,NULL);
+        if(!d) continue;
+        const int64_t icol=(ic0+2*q)*bi.nbd;
+        int64_t cH=-1;const uint8_t *s0=NULL,*s1=NULL;
+        for(int32_t h=h0;h<h1;h++) {
+            const int64_t H=(int64_t)it->p[1]+(int64_t)h*sv[1];
+            if((H>>3)!=cH) {
+                cH=H>>3;
+                const int64_t base=(B*bi.nbh+cH)*irow+zi+z+icol;
+                s0=bk_blk_or(&bi,base,(uint8_t *)dm_zblk);
+                s1=bk_blk_or(&bi,base+bi.nbd,(uint8_t *)dm_zblk);
+            }
+            const uint32_t ro=256u*(uint32_t)(H&7);
+            DV a0=dv_ld(s0+ro),a1=dv_ld(s0+ro+128),b0=dv_ld(s1+ro),b1=dv_ld(s1+ro+128);
+            DV e0,o0,e1,o1;
+            dv_deal32(a0,a1,&e0,&o0);dv_deal32(b0,b1,&e1,&o1);
+            const uint32_t oro=256u*(uint32_t)((h+(int64_t)ot->p[1])&7);
+            dv_st(d+oro,e0);dv_st(d+oro+128,e1);
+        }
+    }
+}
+static int dec_fast(G *g, const T *it, const T *ot, const int32_t *sv) {
+    int32_t n[4];
+    if(!dec_fast_ok(g,it,ot,sv,n)) return -1;
+    int e=xfer_check(g,it,it->d,it->p,0);
+    if(!e)e=xfer_check(g,ot,n,ot->p,1);
+    if(e) return e;
+    if(!dm_clear(it,it->d,it->p,ot,n,ot->p)) return -1;
+    if(g->dry) return 0;
+    DecJob J={g,it,ot,sv,{n[0],n[1],n[2],n[3]},0,0};
+    J.ohb0=ot->p[1]>>3;J.nohb=((ot->p[1]+n[1]-1)>>3)-J.ohb0+1;
+    const int64_t items=(int64_t)n[0]*(n[3]/32)*J.nohb*(n[2]/8);
+    uint32_t parts=dm_parts(g,(uint64_t)n[0]*n[1]*n[2]*n[3],items);
+    if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_DM,parts,dec_part,&J);
+    else dec_part(&J,0,1);
+    DM_COUNT(10,(uint64_t)n[0]*n[1]*n[2]*n[3]);
+    return 0;
+}

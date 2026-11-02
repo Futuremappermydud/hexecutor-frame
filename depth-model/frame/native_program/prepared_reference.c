@@ -1610,6 +1610,7 @@ static int k_decimate(G *g) {
     const T *s=in(g,1);
     CHECK(g->nin==2 && (s->flags&F_SV),E_ARGS);
     if(s->sv[0]>0 && s->sv[1]>0 && s->sv[2]>0 && s->sv[3]>0) {
+        {int fr=dec_fast(g,in(g,0),out0(g),s->sv);DMPATH(g,"decimate",fr);if(fr>=0)return fr;}
         int r=decimate_strips(g,in(g,0),out0(g),s->sv);
         if(r>=0) return r;
     }
