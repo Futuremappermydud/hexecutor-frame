@@ -747,6 +747,8 @@ static void dq_strip(const void *c_, const uint8_t *src, uint8_t *dst, size_t n,
         d[j]=exact==((double)rounded+(double)away)*0.5?away:rounded;
     }
 }
+/* Exact HVX fast paths, part 2 (DepthToSpace, blocked SlicePad, Gather, blocked Dequantize). */
+#include "prepared_datamove2.inc"
 typedef struct { int32_t zp; uint32_t mi; int32_t ei, fast; double inv; } QCtx;
 #if BLK_HVX
 /* q_exact on 32 float lanes (bits sb): the clipped u16 values as int32 lanes,
@@ -1363,7 +1365,7 @@ static int k_gather(G *g) {
     NEED(3);
     int64_t axis;TRY(read_scalar(g,in(g,1),&axis));
     int32_t *idx;size_t ni;TRY(read_i32(g,in(g,2),&idx,&ni));
-    {int fr=gather_fast(g,in(g,0),in(g,1),out0(g),idx,ni);if(fr>=0)return fr;}
+    {int fr=gather_fast2(g,in(g,0),in(g,1),out0(g),idx,ni);DMPATH(g,"gather",fr);if(fr>=0)return fr;fr=gather_fast(g,in(g,0),in(g,1),out0(g),idx,ni);if(fr>=0)return fr;}
     A x;TRY(t_read(g,in(g,0),&x,0));
     if(g->dry && !const_value(g,in(g,1),0,&axis)) {
         size_t worst=0;
@@ -1407,6 +1409,7 @@ static int k_slice_pad(G *g) {
     NEED(5);
     const T *pad=in(g,1),*st=in(g,2),*sz=in(g,3);
     CHECK(pad->flags&st->flags&sz->flags&F_SV,E_ARGS);
+    {int fr=slice_pad_blk(g,in(g,0),out0(g),pad,st,sz,in(g,4));DMPATH(g,"slice_pad_blk",fr);if(fr>=0)return fr;}
     int64_t fill;TRY(read_scalar(g,in(g,4),&fill));
     {int fr=slice_pad_fast(g,in(g,0),out0(g),pad,st,sz,fill);DMPATH(g,"slice_pad",fr);if(fr>=0)return fr;}
     A x;TRY(t_read(g,in(g,0),&x,0));
@@ -1525,6 +1528,13 @@ static int k_depth_to_space(G *g) {
     int32_t *f;size_t nf;
     TRY(read_i32(g,in(g,1),&f,&nf));
     CHECK(nf==2,E_ARGS);
+    {
+        int64_t v0=f[0],v1=f[1];
+        int fr=-1;
+        if(!g->dry || (const_value(g,in(g,1),0,&v0) && const_value(g,in(g,1),1,&v1)))fr=d2s_fast(g,in(g,0),out0(g),v0,v1);
+        DMPATH(g,"d2s",fr);
+        if(fr>=0) return fr;
+    }
     A x;TRY(t_read(g,in(g,0),&x,0));
     int32_t known[2];
     if(g->dry) {
@@ -1636,6 +1646,7 @@ static int k_dequantize(G *g) {
         float scf=(float)i->scale;
         DqCtx c={i->zp,0,0,0,(double)scf,i->esize};
         c.fast=dq_scale(f32_bits(scf),&c.m24,&c.e);
+        {int fr=dq_blk_fast(g,i,out0(g),&c);DMPATH(g,"dequantize",fr);if(fr>=0)return fr;}
         int r=ew_strips(g,i,out0(g),i->esize,4,dq_strip,&c);
         if(r>=0) return r;
     }
