@@ -161,9 +161,6 @@ static int64_t clip64(int64_t v, int64_t lo, int64_t hi) {return v<lo?lo:v>hi?hi
 static int64_t dtmax(uint32_t dt) {return dt==DT_U8?255:dt==DT_U16?65535:dt==DT_I8?127:dt==DT_I16?32767:2147483647;}
 static int64_t s32(uint64_t v) {return (int64_t)(int32_t)(uint32_t)v;}
 
-#ifndef FIC_BYTES_CFG
-#define FIC_BYTES_CFG (64*1024)
-#endif
 /* Per-command memos, keyed by (program, command index); two programs (the
  * two models) are kept. Not thread-safe: reference commands run on the
  * executor's thread.
@@ -173,7 +170,7 @@ static int64_t s32(uint64_t v) {return (int64_t)(int32_t)(uint32_t)v;}
  * conv_checked: bit k set once hmx_conv's bounds checks (xfer_check,
  *   blocked_overlap: geometry and pool limits only) passed with epilogue kind
  *   k, so later runs skip them. Pool bases/limits are part of the key. */
-enum { MEMO_COMMANDS=8192, CHK_SLOTS=4, FIC_BYTES=FIC_BYTES_CFG };
+enum { MEMO_COMMANDS=8192, CHK_SLOTS=4 };
 typedef struct {
     const void *program;
     uint64_t limits;
@@ -182,13 +179,7 @@ typedef struct {
     uint8_t chain[MEMO_COMMANDS]; /* chain_run's wrapped validate: 0 unknown, 1 passed, 2 rejected */
     uint8_t slide[MEMO_COMMANDS]; /* hmx_slide's input-block alignment: 0 unknown, 1 aligned, 2 not */
     uint32_t chk[MEMO_COMMANDS][CHK_SLOTS]; /* data-mover check verdicts, see chk_hit */
-    /* hmx_conv: per-command Fi words (NB*256 bytes: requant word and offset vectors per 32 channels) of
-     * static-weight convs (class Xwb weights, constant filter pool), built from the weights and filter
-     * rows once. fic[cmd] = 0 or arena byte offset + 1. Weights are written only by weights_to_vtcm
-     * from constants, filter rows are constants, so the Fi words are a property of the bound program. */
-    uint32_t fic[MEMO_COMMANDS];
-    uint32_t fic_used;
-    uint8_t fic_buf[FIC_BYTES] __attribute__((aligned(128)));
+    uint16_t fz[MEMO_COMMANDS]; /* fuse_cached: fz_cache entry + 1 of the command's decoded epilogue, 0 none */
 } Memo;
 static Memo memos[2];
 static uint32_t memo_next;
@@ -214,7 +205,7 @@ static Memo *memo_for_lim(const Nprg2ExecCall *c, uint64_t lim) {
     Memo *m=&memos[memo_next++&1u];
     m->program=c->program;m->limits=lim;
     memset(m->need,0xff,sizeof m->need);memset(m->conv_checked,0,sizeof m->conv_checked);memset(m->chain,0,sizeof m->chain);memset(m->slide,0,sizeof m->slide);memset(m->chk,0,sizeof m->chk);
-    memset(m->fic,0,sizeof m->fic);m->fic_used=0;
+    memset(m->fz,0,sizeof m->fz);
     return m;
 }
 static Memo *memo_for(const Nprg2ExecCall *c) {return memo_for_lim(c,memo_limits(c));}
@@ -3549,20 +3540,32 @@ static int fuse_decode(G *g, const T *xt, const T *wt, const T *ft, const T *o) 
 }
 /* Decoded fused epilogues, after fuse_decode first validated them: geometry
  * and call arguments only (the bound program's), keyed by program, pool
- * limits and command; dead comes from the call each time. Direct-mapped. */
-enum { FZ_CACHE=256 };
+ * limits and command; dead comes from the call each time. Each command has
+ * its own entry (Memo.fz): a direct-mapped table made 120 of the primary's
+ * 210 fused convs evict each other and re-decode on every run. Entries are
+ * handed out in order; when the pool is full it wraps, and the key check
+ * turns any stale Memo.fz index into a miss. */
+enum { FZ_CACHE=512 };
 static struct { const void *program; uint64_t limits; uint32_t cmd, valid; Fuse fx; } fz_cache[FZ_CACHE];
+static uint32_t fz_next;
 static int fuse_cached(G *g, const T *xt, const T *wt, const T *ft, const T *o) {
     const Nprg2ExecCall *c=g->call;
+    Memo *m=g->dry?NULL:gmemo(g);
     uint64_t lim=g_limits(g);
-    uint32_t i=c->command_index&(FZ_CACHE-1u);
-    if(!g->dry && fz_cache[i].valid && fz_cache[i].program==c->program && fz_cache[i].limits==lim &&
-       fz_cache[i].cmd==c->command_index) {
-        g->fx=fz_cache[i].fx;g->fx.dead=c->epilogue_dead;
-        return 0;
+    uint16_t *slot=m?&m->fz[c->command_index]:NULL;
+    if(slot && *slot) {
+        uint32_t i=*slot-1u;
+        if(fz_cache[i].valid && fz_cache[i].program==c->program && fz_cache[i].limits==lim && fz_cache[i].cmd==c->command_index) {
+            g->fx=fz_cache[i].fx;g->fx.dead=c->epilogue_dead;
+            return 0;
+        }
     }
     TRY(fuse_decode(g,xt,wt,ft,o));
-    if(!g->dry) {fz_cache[i].program=c->program;fz_cache[i].limits=lim;fz_cache[i].cmd=c->command_index;fz_cache[i].fx=g->fx;fz_cache[i].valid=1;}
+    if(slot) {
+        uint32_t i=fz_next++%FZ_CACHE;
+        fz_cache[i].program=c->program;fz_cache[i].limits=lim;fz_cache[i].cmd=c->command_index;fz_cache[i].fx=g->fx;fz_cache[i].valid=1;
+        *slot=(uint16_t)(i+1u);
+    }
     return 0;
 }
 static int k_hmx_conv(G *g) {

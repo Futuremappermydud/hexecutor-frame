@@ -930,17 +930,8 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     const int64_t bound=(int64_t)KB*32*255*128;
     /* The filter rows (per 32 channels: 32 mults, 32 biases) are in VTCM:
      * one vector copy to near instead of scalar VTCM loads. */
-    int vec_done=0,fic_hit=0;
+    int vec_done=0;
     const uint8_t *fipre=NULL;
-#if BLK_HVX && NPRG2_HW_ROUNDING
-    /* Static weights (class Xwb) and constant filter rows: the Fi words are the same on every run. */
-    Memo *cm=NULL;
-    if(!g->dry && wt->cls==('X'|'w'<<8|'b'<<16) && ft->pool==5 && !g->write_limit[5]) cm=gmemo(g);
-    if(cm && cm->fic[g->call->command_index]) {
-        fipre=cm->fic_buf+(cm->fic[g->call->command_index]-1u);
-        fic_hit=1;vec_done=1;
-    }
-#endif
 #if BLK_HVX
     /* Vector form of everything up to HMX_MARK(2): per block, M = 1024+(mult&1023),
      * pre = 20-((mult>>10)&31) (post is 14 by construction), wsum by vrmpy,
@@ -1047,24 +1038,8 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     uint8_t *nat_snap=NULL;int32_t nat_dims[4]={1,oh,ow,co},nat_org[4]={0,o->p[1],o->p[2],0};
 #endif
     {
-#if BLK_HVX && NPRG2_HW_ROUNDING
-        uint32_t fic_at=0;
-        if(cm && vec_done && !fic_hit && cm->fic_used+(uint32_t)NB*256<=(uint32_t)FIC_BYTES) {
-            /* first run of a static-weight conv: keep its Fi words (committed below once it ran native) */
-            fic_at=cm->fic_used;
-            const HVX_Vector *fs=(const HVX_Vector *)fipre;HVX_Vector *fd=(HVX_Vector *)(cm->fic_buf+fic_at);
-            for(int32_t i=0;i<NB*2;i++) fd[i]=fs[i];
-        }
-#endif
         int r=hmx_native(g,xt,o,KB,NB,cbs,co,oh,ow,ktab,corr,pre,Mq,wbase,bcopy,kvec,s2off,js,xrows,xwb0,xnwb,
-                         use_tab?(uint8_t **)(n+o_xtab):NULL,vec_done?fipre:NULL,fic_hit,at,err);
-#if BLK_HVX && NPRG2_HW_ROUNDING
-        if(r==1 && cm && !g->dry && vec_done && !fic_hit && cm->fic_used+(uint32_t)NB*256<=(uint32_t)FIC_BYTES) {
-            cm->fic[g->call->command_index]=fic_at+1u;
-            cm->fic_used=fic_at+(uint32_t)NB*256;
-        }
-        if(fic_hit && r==0) return 0; /* cannot differ from the first run; the other paths do not need the tables */
-#endif
+                         use_tab?(uint8_t **)(n+o_xtab):NULL,vec_done?fipre:NULL,0,at,err);
 #ifdef NAT_CHECK
         if(r==1 && !g->dry && !g->fx.kind) {
             nat_snap=malloc((size_t)oh*ow*co);
