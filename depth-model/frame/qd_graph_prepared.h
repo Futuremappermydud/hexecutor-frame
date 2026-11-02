@@ -30,7 +30,11 @@ static const volatile char qds_l2_engine_feature[] __attribute__((used))="QDL2EN
  * Profiles: per-variant cycles in g->stats, conv phases (staging, MAC,
  * requant, output write) in g->dsp_conv_phase[0..3]. */
 #define QDS_REFERENCE_SCRATCH_BYTES 0x100000u
-#if QDS_L2_CACHE
+#if QDS_L2_CACHE==1
+/* Lower L2 half stays TCM through the lease: conv near as without L2. */
+#define QDS_REFERENCE_NEAR 0x30078000u
+#define QDS_ELEMENTWISE_L2 QDS_L2_ELEMENTWISE
+#elif QDS_L2_CACHE
 /* Scalar-heavy conv state: C7 DDR hits L1/L2; VTCM scalar loads are slow. */
 #define QDS_REFERENCE_NEAR QDS_L2_NEAR
 #define QDS_ELEMENTWISE_L2 QDS_L2_ELEMENTWISE
@@ -275,7 +279,7 @@ static QdPreparedState *prepared_open(QdgGraph *g,const QdsConfig *cfg,
     int e=nprg2_runner_open(&s->runner,(const void *)(QDO_BASE+p->offset),p->bytes,
         &hashes,pools,(Nprg2Allocator){0},
 #if QDS_L2_CACHE
-        (void *)0xa7100000u,0x76000u,(void *)0xa7180000u,0x3f000u,
+        (void *)QDS_L2_BLOCKS,0x76000u,(void *)QDS_L2_HOT,QDS_L2_HOT_BYTES,
 #else
         (void *)0x30002000u,0x76000u,(void *)0x300b0000u,0x3f000u,
 #endif

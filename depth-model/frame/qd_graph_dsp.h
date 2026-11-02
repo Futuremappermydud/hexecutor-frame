@@ -5,7 +5,10 @@
 #define QDS_MAGIC 0x31534451u
 #define QDS_CONFIG 4096u
 #define QDS_WORK 8192u
-#if QDS_L2_CACHE
+#if QDS_L2_CACHE==1
+/* Lower, still-TCM L2 half (qd_l2_cache.h layout): followers poll it during the lease. */
+#define QDS_WORK_L2 0x30074000u
+#elif QDS_L2_CACHE
 #define QDS_WORK_L2 0xf1802000u
 #else
 #define QDS_WORK_L2 0x300f0000u

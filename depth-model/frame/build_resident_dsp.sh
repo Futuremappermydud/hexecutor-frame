@@ -68,9 +68,9 @@ if [ "$QDS_PREPARED_ELEMENTWISE" = 1 ] && { [ "$QDS_NATIVE_PREPARED" != 1 ] || [
   echo "QDS_PREPARED_ELEMENTWISE requires prepared and blocked glue" >&2; exit 1
 fi
 case "$QDS_PREPARED_REFERENCE" in 0|1) ;; *) echo "QDS_PREPARED_REFERENCE must be 0 or 1" >&2; exit 1;; esac
-case "$QDS_L2_CACHE" in 0|5) ;; *) echo "QDS_L2_CACHE must be 0 or 5" >&2; exit 1;; esac
-if [ "$QDS_L2_CACHE" = 5 ] && { [ "$QDS_NATIVE_PREPARED" != 1 ] || [ "$QDS_PRESERVE_VTCM" != 1 ] || [ "$QDS_PREPARED_REFERENCE" != 1 ]; }; then
-  echo "QDS_L2_CACHE=5 requires prepared reference dispatch and preserving bootstrap" >&2; exit 1
+case "$QDS_L2_CACHE" in 0|1|5) ;; *) echo "QDS_L2_CACHE must be 0, 1 or 5" >&2; exit 1;; esac
+if [ "$QDS_L2_CACHE" != 0 ] && { [ "$QDS_NATIVE_PREPARED" != 1 ] || [ "$QDS_PRESERVE_VTCM" != 1 ] || [ "$QDS_PREPARED_REFERENCE" != 1 ]; }; then
+  echo "QDS_L2_CACHE requires prepared reference dispatch and preserving bootstrap" >&2; exit 1
 fi
 # Reference scratch is L1-cached heap: no HVX may touch it, so no
 # autovectorized engine. Elementwise handlers are allowed: with the reference
@@ -142,7 +142,7 @@ engine_flags="$engine_flags -DQDS_PREPARED_FUSE=$QDS_PREPARED_FUSE"
 engine_flags="$engine_flags -DQDS_L2_CACHE=$QDS_L2_CACHE"
 case "$QDS_PREPARED_THREADS" in 1|3) ;; *) echo "QDS_PREPARED_THREADS must be 1 or 3" >&2; exit 1;; esac
 if [ "$QDS_PREPARED_THREADS" = 3 ] && [ "$QDS_PREPARED_REFERENCE" != 1 ]; then echo "QDS_PREPARED_THREADS=3 requires QDS_PREPARED_REFERENCE=1" >&2; exit 1; fi
-# QDS_PREPARED_THREADS=3 with QDS_L2_CACHE=5: followers and helper slots move to page 7 for the lease.
+# QDS_PREPARED_THREADS=3 with QDS_L2_CACHE: followers and helper slots move off the TCM part that becomes cache (qd_l2_cache.h).
 engine_flags="$engine_flags -DQDS_PREPARED_THREADS=$QDS_PREPARED_THREADS"
 case "$QDS_PREPARED_HMX" in 0|1) ;; *) echo "QDS_PREPARED_HMX must be 0 or 1" >&2; exit 1;; esac
 if [ "$QDS_PREPARED_HMX" = 1 ] && [ "$QDS_PREPARED_REFERENCE" != 1 ]; then echo "QDS_PREPARED_HMX=1 requires QDS_PREPARED_REFERENCE=1" >&2; exit 1; fi
@@ -203,10 +203,10 @@ if [ "$QDS_PRESERVE_VTCM" = 1 ]; then
   engine="${engine%.elf}-vtcm-lease.elf"
   bootstrap="${bootstrap%.elf}-preserve-vtcm-guarded-entry.elf"
 fi
-if [ "$QDS_L2_CACHE" = 5 ]; then
-  engine="${engine%.elf}-l2cache.elf"
+if [ "$QDS_L2_CACHE" != 0 ]; then
+  engine="${engine%.elf}-l2cache$QDS_L2_CACHE.elf"
   native_src="$native_src qd_graph_stack.S"
-  bootstrap="${bootstrap%.elf}-l2cache.elf"
+  bootstrap="${bootstrap%.elf}-l2cache$QDS_L2_CACHE.elf"
 fi
 $cc $engine_flags -ffunction-sections -fdata-sections -nostdlib -Wl,--gc-sections,-T,qd_graph_dsp.ld \
   qd_graph_dsp.c qd_resident.c qd_resident_conv.c qd_hmx_ops_encoded.S $glue_src $native_src \
