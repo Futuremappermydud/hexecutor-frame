@@ -2567,6 +2567,7 @@ static void fuse_scalar(G *g, const Fuse *fx, const uint8_t *q, int32_t nc, int3
     xfer_copy(g,&fx->oe,fx->eb,dims,eo,1);
 }
 static uint32_t conv_path;
+static uint64_t hmx_t_entry; /* HMX_PROF step 5: clock at k_hmx_conv entry */
 #include "prepared_hmx_conv.inc"
 /* Returns 1 when the command took the fast path (or would, in a dry pass),
  * 0 to use the reference convolution, or a negative error. */
@@ -3097,7 +3098,26 @@ static int fuse_decode(G *g, const T *xt, const T *wt, const T *ft, const T *o) 
     CHECK(!fz_meet(Z,X) && !fz_meet(Z,W) && !fz_meet(Z,B) && !fz_meet(B,O),E_UNSUPPORTED);
     return 0;
 }
+/* Decoded fused epilogues, after fuse_decode first validated them: geometry
+ * and call arguments only (the bound program's), keyed by program, pool
+ * limits and command; dead comes from the call each time. Direct-mapped. */
+enum { FZ_CACHE=256 };
+static struct { const void *program; uint64_t limits; uint32_t cmd, valid; Fuse fx; } fz_cache[FZ_CACHE];
+static int fuse_cached(G *g, const T *xt, const T *wt, const T *ft, const T *o) {
+    const Nprg2ExecCall *c=g->call;
+    uint64_t lim=memo_limits(c);
+    uint32_t i=c->command_index&(FZ_CACHE-1u);
+    if(!g->dry && fz_cache[i].valid && fz_cache[i].program==c->program && fz_cache[i].limits==lim &&
+       fz_cache[i].cmd==c->command_index) {
+        g->fx=fz_cache[i].fx;g->fx.dead=c->epilogue_dead;
+        return 0;
+    }
+    TRY(fuse_decode(g,xt,wt,ft,o));
+    if(!g->dry) {fz_cache[i].program=c->program;fz_cache[i].limits=lim;fz_cache[i].cmd=c->command_index;fz_cache[i].fx=g->fx;fz_cache[i].valid=1;}
+    return 0;
+}
 static int k_hmx_conv(G *g) {
+    if(g->conv && g->conv->clock && g->conv->phase && !g->dry) hmx_t_entry=g->conv->clock();
     CHECK(g->nin>=3 && g->nout==1,E_ARGS);
     const T *xt=in(g,0),*wt=in(g,1),*ft=in(g,2),*o=out0(g);
     int s2=g->variant==36;
@@ -3116,7 +3136,7 @@ static int k_hmx_conv(G *g) {
     int fused=g->call->epilogue!=NULL;
     if(fused) {
         CHECK(!sixteen,E_UNSUPPORTED);
-        TRY(fuse_decode(g,xt,wt,ft,o));
+        TRY(fuse_cached(g,xt,wt,ft,o));
     }
     int fast=fast_conv(g,xt,wt,ft,o,s2,sixteen,co,oh,ow,&ferr);
     if(fast<0) FAIL(ferr);

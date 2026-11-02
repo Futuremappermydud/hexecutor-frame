@@ -33,7 +33,8 @@
 #define HMX_SETUP_SLOT 2 /* phase slot that HMX per-command setup is charged to */
 #endif
 /* Profiling builds: HMX_PROF=s charges setup sub-step s (1 bounds checks,
- * 2 filter rows/requant/wsum, 3 fi/multv records, 4 row pointer tables) to
+ * 2 filter rows/requant/wsum, 3 fi/multv records, 4 row pointer tables; native: 5 k_hmx_conv
+ * entry to hmx_conv, 6 Fi build + B copy, 7 row table, 8 per-batch output table) to
  * the output slot (3) instead, so it is the difference against a normal build. */
 #ifndef HMX_PROF
 #define HMX_PROF 0
@@ -367,11 +368,14 @@ static void nat_tile(const NatJob *J, int32_t t, int32_t k) {
 #if BLK_HVX
         /* Stream V = p0's 256 bytes then p1's; the row is bytes 32s..32s+255:
          * vector index s>>2, shift (s&3)*32 (valign uses its shift mod 128). */
-        HVX_Vector z=Q6_V_vzero(),V[4];
-        V[0]=p0?((const HVX_Vector *)p0)[0]:z;V[1]=p0?((const HVX_Vector *)p0)[1]:z;
-        V[2]=p1?((const HVX_Vector *)p1)[0]:z;V[3]=p1?((const HVX_Vector *)p1)[1]:z;
+        /* only the 2-3 vectors this window uses: stream vectors i, i+1 (and i+2) */
+        HVX_Vector z=Q6_V_vzero();
         int32_t i=s>>2,sh=(s&3)*32;
-        HVX_Vector o0=sh?Q6_V_valign_VVR(V[i+1],V[i],sh):V[i],o1=sh?Q6_V_valign_VVR(V[i+2],V[i+1],sh):V[i+1];
+#define NAT_V(k) ((k)<2?(p0?((const HVX_Vector *)p0)[(k)]:z):(p1?((const HVX_Vector *)p1)[(k)-2]:z))
+        HVX_Vector a0=NAT_V(i),a1=NAT_V(i+1);
+        HVX_Vector o0=a0,o1=a1;
+        if(sh) {HVX_Vector a2=NAT_V(i+2);o0=Q6_V_valign_VVR(a1,a0,sh);o1=Q6_V_valign_VVR(a2,a1,sh);}
+#undef NAT_V
         ((HVX_Vector *)dst)[2*r]=o0;((HVX_Vector *)dst)[2*r+1]=o1;
 #else
         uint8_t *d=dst+256*r;
@@ -563,10 +567,15 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
         for(int k=0;k<64;k++) nz[k]=k<32?0x404000:0;
         near_copy(base,(const uint8_t *)nf,(size_t)NB*256+256);
     }
+    HMX_MARK(6);
     hmx_tab(xtab,g->pool,xt,xt->p[1],xrows,xwb0,xnwb,cbs);
+    HMX_MARK(7);
     int32_t *tyx=(int32_t *)(n+o_tyx);
     uint8_t **outp=(uint8_t **)(n+o_out);
-    int64_t onbw=((int64_t)o->m[2]+7)/8,onbd=((int64_t)o->m[3]+31)/32;
+    /* Output block of tile (by, bx), channel block j: table entry
+     * ((oy0/8 + by)*nbw + owb0 + bx)*nbd + slice + j, 32-bit (rows aligned). */
+    const uint32_t onbw=(uint32_t)(o->m[2]+7)/8u,onbd=(uint32_t)(o->m[3]+31)/32u,ocount=o->nblocks;
+    const uint32_t *oblk=o->blocks;
     NatJob J={.g=g,.xt=xt,.o=o,.fx=fused?&g->fx:NULL,.KB=KB,.NB=NB,.cbs=cbs,.bw=bw,.xwb0=xwb0,.xnwb=xnwb,
               .ktab=ktab,.xtab=xtab,.A=A,.C=staged?C:NULL,.tyx=tyx,.pre=pre,.Mq=Mq,.corr=corr,.B=(const uint8_t *)wbase};
     uint32_t parts=nprg2_parallel_parts(g->call->parallel,3);
@@ -577,14 +586,19 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
         J.m0=m0;J.mt=total-m0<mt?total-m0:mt;
         for(int32_t t=0;t<J.mt;t++) {
             tyx[2*t]=by;tyx[2*t+1]=bx;
+            uint32_t idx=(((uint32_t)(o->p[1]>>3)+(uint32_t)by)*onbw+(uint32_t)(o->p[2]>>3)+(uint32_t)bx)*onbd+o->slice;
             for(int32_t j=0;j<NB;j++) {
-                uint8_t *d=staged?C+((size_t)t*NB+(size_t)j)*2048:
-                           hmx_row(g->pool,o,(int64_t)o->p[1]+by*8,((int64_t)o->p[2]>>3)+bx,onbw,onbd,j);
-                outp[(size_t)j*J.mt+(size_t)t]=d?d:dummy;
+                uint8_t *d=dummy;
+                if(staged) d=C+((size_t)t*NB+(size_t)j)*2048;
+                else if(idx+(uint32_t)j<ocount) {
+                    uint32_t e=oblk[idx+(uint32_t)j],pool=e&127u;
+                    if(pool && g->pool[pool]) d=g->pool[pool]+(e&~127u);
+                }
+                outp[(size_t)j*J.mt+(size_t)t]=d;
             }
             if(++bx==bw){bx=0;by++;}
         }
-        if(clock){t1=clock();c->phase[HMX_SETUP_SLOT]+=t1-t0;t0=t1;}
+        HMX_MARK(8);
         if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,nat_prep_part,&J);
         else nat_prep_part(&J,0,1);
         if(clock){t1=clock();c->phase[0]+=t1-t0;t0=t1;}
@@ -606,6 +620,9 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
                     int32_t oh, int32_t ow, int32_t *err) {
     const Nprg2ReferenceConv *c=g->conv;
     uint64_t (*clock)(void)=c->phase && !g->dry?c->clock:NULL,t0=clock?clock():0,t1;
+#if HMX_PROF==5
+    if(clock && hmx_t_entry && hmx_t_entry<=t0) c->phase[3]+=t0-hmx_t_entry;
+#endif
     if(!c->hmx || !c->near || ((uintptr_t)c->near&127u)) return 0;
     /* A fused epilogue must cover exactly the region the conv writes. */
     if(g->fx.kind && (oh!=o->d[1] || ow!=o->d[2] || co!=o->d[3])) return 0;
