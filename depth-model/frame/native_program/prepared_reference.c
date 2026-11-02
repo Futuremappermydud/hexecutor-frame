@@ -100,6 +100,8 @@ typedef struct {
     Fuse fx;
     int fx_ok;
     uint32_t par_slots; /* usable helper near slots (Nprg2ReferenceConv.par_near) */
+    void *chk_memo;     /* data-mover check memo (chk_slots), resolved lazily */
+    int chk_state;      /* 0 unresolved, 1 resolved (chk_memo may be NULL) */
 } G;
 
 static uint32_t rd32(const uint8_t *p){return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
@@ -166,7 +168,7 @@ static int64_t s32(uint64_t v) {return (int64_t)(int32_t)(uint32_t)v;}
  * conv_checked: bit k set once hmx_conv's bounds checks (xfer_check,
  *   blocked_overlap: geometry and pool limits only) passed with epilogue kind
  *   k, so later runs skip them. Pool bases/limits are part of the key. */
-enum { MEMO_COMMANDS=8192 };
+enum { MEMO_COMMANDS=8192, CHK_SLOTS=4 };
 typedef struct {
     const void *program;
     uint64_t limits;
@@ -174,6 +176,7 @@ typedef struct {
     uint8_t conv_checked[MEMO_COMMANDS];
     uint8_t chain[MEMO_COMMANDS]; /* chain_run's wrapped validate: 0 unknown, 1 passed, 2 rejected */
     uint8_t slide[MEMO_COMMANDS]; /* hmx_slide's input-block alignment: 0 unknown, 1 aligned, 2 not */
+    uint32_t chk[MEMO_COMMANDS][CHK_SLOTS]; /* data-mover check verdicts, see chk_hit */
 } Memo;
 static Memo memos[2];
 static uint32_t memo_next;
@@ -188,7 +191,7 @@ static Memo *memo_for(const Nprg2ExecCall *c) {
     for(int i=0;i<2;i++) if(memos[i].program==c->program && memos[i].limits==lim) return &memos[i];
     Memo *m=&memos[memo_next++&1u];
     m->program=c->program;m->limits=lim;
-    memset(m->need,0xff,sizeof m->need);memset(m->conv_checked,0,sizeof m->conv_checked);memset(m->chain,0,sizeof m->chain);memset(m->slide,0,sizeof m->slide);
+    memset(m->need,0xff,sizeof m->need);memset(m->conv_checked,0,sizeof m->conv_checked);memset(m->chain,0,sizeof m->chain);memset(m->slide,0,sizeof m->slide);memset(m->chk,0,sizeof m->chk);
     return m;
 }
 static uint32_t *memo_slot(const Nprg2ExecCall *c) {
@@ -390,10 +393,63 @@ static int direct_check(G *g, const T *t, const int32_t *dims, const int32_t *or
     CHECK((uint64_t)t->offset+(last+1)*es<=limit,E_RANGE);
     return 0;
 }
-static int xfer_check(G *g, const T *t, const int32_t *dims, const int32_t *origin, int store) {
+static int xfer_check_raw(G *g, const T *t, const int32_t *dims, const int32_t *origin, int store) {
     if(t->flags&F_DIRECT) return direct_check(g,t,dims,origin,store);
     if(t->flags&F_BLOCKED) return blocked_check(g,t,dims,origin,store);
     FAIL(E_TENSOR);
+}
+/* Per-command memo of passed data-mover checks (xfer_check, dm_clear, the
+ * flat/blocked apart test). Each verdict is a pure function of the arguments
+ * hashed here (tensor geometry, block-table identity, region, direction), of
+ * the pool bases/limits (part of the Memo key) and of the block-table contents,
+ * which are fixed once the program is bound (as conv_checked assumes). Only
+ * passes are recorded, so the first run of a command (and any failing one)
+ * performs the full check. A slot holds a nonzero 32-bit tag; CHK_SLOTS tags
+ * per command, probed linearly, evicted by tag. Executor thread only (these
+ * checks run before any parallel dispatch). */
+static inline uint32_t chk_mix(uint32_t h, uint32_t x) {h=(h^x)*0x9E3779B1u;return h^(h>>15);}
+static uint32_t chk_t(uint32_t h, const T *t) {
+    h=chk_mix(h,t->flags);h=chk_mix(h,t->esize);h=chk_mix(h,t->pool);h=chk_mix(h,t->offset);
+    h=chk_mix(h,t->nblocks);h=chk_mix(h,t->slice);
+    h=chk_mix(h,(uint32_t)(uintptr_t)t->blocks);h=chk_mix(h,(uint32_t)((uint64_t)(uintptr_t)t->blocks>>32));
+    for(int i=0;i<4;i++)h=chk_mix(h,(uint32_t)t->m[i]);
+    return h;
+}
+static uint32_t chk_r(uint32_t h, const int32_t *a) {
+    for(int i=0;i<4;i++)h=chk_mix(h,(uint32_t)a[i]);
+    return h;
+}
+static uint32_t *chk_slots(G *g) {
+#ifdef CHK_NOMEMO
+    (void)g;return NULL;
+#endif
+    if(!g->chk_state) {
+        Memo *m=memo_for(g->call);
+        g->chk_memo=m?&m->chk[g->call->command_index][0]:NULL;
+        g->chk_state=1;
+    }
+    return (uint32_t *)g->chk_memo;
+}
+static inline int chk_hit(const uint32_t *s, uint32_t tag) {
+    if(!s) return 0;
+    for(int i=0;i<CHK_SLOTS;i++) if(s[i]==tag) return 1;
+    return 0;
+}
+static void chk_put(uint32_t *s, uint32_t tag) {
+    if(!s) return;
+    for(int i=0;i<CHK_SLOTS;i++) if(!s[i]){s[i]=tag;return;}
+    s[tag&(CHK_SLOTS-1)]=tag;
+}
+static int xfer_check(G *g, const T *t, const int32_t *dims, const int32_t *origin, int store) {
+    uint32_t *s=chk_slots(g);
+    uint32_t tag=0;
+    if(s) {
+        tag=chk_r(chk_r(chk_t(0x9d2c5680u^(uint32_t)store,t),dims),origin)|1u;
+        if(chk_hit(s,tag)) return 0;
+    }
+    int e=xfer_check_raw(g,t,dims,origin,store);
+    if(!e) chk_put(s,tag);
+    return e;
 }
 /* The data movement of xfer for a region xfer_check accepted. */
 static void xfer_copy(G *g, const T *t, void *values, const int32_t *dims, const int32_t *origin, int store) {
@@ -1331,6 +1387,9 @@ static int k_copy_values(G *g) {
     {
         int fr=copy_c2_fast(g,in(g,0),o,1);   /* flat flow -> padded blocked */
         if(fr<0)fr=copy_c2_fast(g,o,in(g,0),0);   /* padded blocked -> flat flow */
+#ifndef CV_OFF
+        if(fr<0)fr=copy_vals_fast(g,in(g,0),o);
+#endif
         if(fr<0)fr=copy_runs(g,in(g,0),o);
         DMPATH(g,"copy_values",fr);
         if(fr>=0) return fr;

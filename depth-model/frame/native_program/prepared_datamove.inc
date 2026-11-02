@@ -323,7 +323,7 @@ static void dm_v_bits(void *c, uint32_t e) {
 /* 1 when no block of region a shares a byte with a block of region b: disjoint
  * per-pool extents, else an exact slot-bitmap test of the overlapping pools
  * (blocks on a 2048 grid), else the pairwise test when both fit dm_touch. */
-static int dm_clear(const T *a, const int32_t *da, const int32_t *oa, const T *b, const int32_t *db, const int32_t *ob) {
+static int dm_clear_raw(const T *a, const int32_t *da, const int32_t *oa, const T *b, const int32_t *db, const int32_t *ob) {
     DMExt x,y;
     dm_extent(a,da,oa,&x);dm_extent(b,db,ob,&y);
     int exact=0;
@@ -344,6 +344,21 @@ static int dm_clear(const T *a, const int32_t *da, const int32_t *oa, const T *b
     uint32_t ka[DM_TOUCH_CAP],kb[DM_TOUCH_CAP],na,nb;
     return dm_touch(a,da,oa,ka,&na) && dm_touch(b,db,ob,kb,&nb) && dm_disjoint(ka,na,kb,nb);
 }
+/* dm_clear for the kernel's G: the passing verdict is memoised per command
+ * (see chk_hit). Callers have `g` in scope; this keeps their call sites as is. */
+static int dm_clear_m(G *g, const T *a, const int32_t *da, const int32_t *oa, const T *b, const int32_t *db, const int32_t *ob) {
+    uint32_t *s=chk_slots(g);
+    uint32_t tag=0;
+    if(s) {
+        tag=chk_r(chk_r(chk_t(0x2545f491u,a),da),oa);
+        tag=chk_r(chk_r(chk_t(tag,b),db),ob)|1u;
+        if(chk_hit(s,tag)) return 1;
+    }
+    int ok=dm_clear_raw(a,da,oa,b,db,ob);
+    if(ok) chk_put(s,tag);
+    return ok;
+}
+#define dm_clear(a,da,oa,b,db,ob) dm_clear_m(g,(a),(da),(oa),(b),(db),(ob))
 /* dims the generic t_write uses for a same-shape value of d, or 0 when the
  * value would be padded or broadcast (n != dims). */
 static int dm_write_dims_match(const T *t, const int32_t *n) {
@@ -982,7 +997,7 @@ static void dm_v_flat(void *c, uint32_t e) {
     if(o<k->hi && o+BLOCK_BYTES>k->lo) k->hit=1;
 }
 /* 1 when the flat region f shares no byte with a block of the blocked region b. */
-static int dm_flat_apart_blocked(const T *f, const int32_t *fd, const int32_t *fo, const T *b, const int32_t *bd, const int32_t *bo) {
+static int dm_flat_apart_blocked_raw(const T *f, const int32_t *fd, const int32_t *fo, const T *b, const int32_t *bd, const int32_t *bo) {
     if(fl_empty(fd)) return 1;
     DMFlat k;
     k.pool=f->pool;k.hit=0;
@@ -990,6 +1005,20 @@ static int dm_flat_apart_blocked(const T *f, const int32_t *fd, const int32_t *f
     dm_visit(b,bd,bo,dm_v_flat,&k);
     return !k.hit;
 }
+/* Memoised per command like dm_clear (callers have `g` in scope). */
+static int dm_flat_apart_blocked_m(G *g, const T *f, const int32_t *fd, const int32_t *fo, const T *b, const int32_t *bd, const int32_t *bo) {
+    uint32_t *s=chk_slots(g);
+    uint32_t tag=0;
+    if(s) {
+        tag=chk_r(chk_r(chk_t(0x7f4a7c15u,f),fd),fo);
+        tag=chk_r(chk_r(chk_t(tag,b),bd),bo)|1u;
+        if(chk_hit(s,tag)) return 1;
+    }
+    int ok=dm_flat_apart_blocked_raw(f,fd,fo,b,bd,bo);
+    if(ok) chk_put(s,tag);
+    return ok;
+}
+#define dm_flat_apart_blocked(f,fd,fo,b,bd,bo) dm_flat_apart_blocked_m(g,(f),(fd),(fo),(b),(bd),(bo))
 /* A blocked u16 tensor written (or read) as pixels with 2 channels in lanes 0..1:
  * the geometry the flow tensors use. */
 static int dm_blocked_c2(const T *t, int crouton) {
@@ -1055,6 +1084,132 @@ static int copy_c2_fast(G *g, const T *f, const T *b, int to_blocked) {
             }
         }
         h+=run;
+    }
+    return 0;
+}
+
+/* COPY_VALUES (a reshape / format change that keeps the dense pixel order and
+ * the channel count D) between blocked and blocked, blocked and flat, and flat
+ * and blocked, without the strip buffer. Pixels move in runs inside one row of
+ * both sides. Same bytes as copy_runs / t_read + t_write; -1 when not covered.
+ *   blocked -> blocked: D a multiple of 32 and both sides chunk-aligned in width
+ *     (8 u8 / 4 u16 / 2 u32 pixels): a chunk of one depth group is 256 bytes in
+ *     the same layout on both sides, so it is two vector copies. An absent source
+ *     block reads as zero; an absent destination block is skipped.
+ *   blocked <-> flat (u8): a pixel's 32 channels of a depth group are a 32-byte
+ *     unit of the block row; units move through partial vector stores. A crouton
+ *     destination whose depth widens to a multiple of 32 zero fills the unit's
+ *     tail, as the padded t_write does. */
+typedef struct { int32_t b, h, w; } CvCur;
+static inline void cv_adv(CvCur *c, int32_t n, int32_t d1, int32_t d2) {
+    if((c->w+=n)==d2){c->w=0;if(++c->h==d1){c->h=0;c->b++;}}
+}
+static int copy_vals_fast(G *g, const T *it, const T *ot) {
+    if(!DM_ENABLED || !(it->flags&F_SHAPE) || !(ot->flags&F_SHAPE) || it->esize!=ot->esize || it->dtype!=ot->dtype || it->dtype==DT_F32 ||
+       !dm_pools_aligned(g)) return -1;
+    if(count4(it->d)!=count4(ot->d) || it->d[3]!=ot->d[3] || it->d[3]<=0) return -1;
+    for(int i=0;i<4;i++) if(it->d[i]<=0 || ot->d[i]<=0) return -1;
+    const int ibk=!!(it->flags&F_BLOCKED),obk=!!(ot->flags&F_BLOCKED);
+    if(!ibk && !obk) return -1;
+    if((!ibk && !(it->flags&F_DIRECT)) || (!obk && !(ot->flags&F_DIRECT))) return -1;
+    const uint32_t es=it->esize;
+    if(es!=1 && es!=2 && es!=4) return -1;
+    const int32_t D=it->d[3];
+    int32_t Dw=D;
+    if(ot->crouton) {
+        int32_t e=(ot->d[3]+ot->p[3]+31)/32*32;
+        if(e>ot->m[3])e=ot->m[3];
+        Dw=e-ot->p[3];
+        if(Dw<D) return -1;
+    }
+    const int32_t cw=es==1?8:es==2?4:2,cws=es==1?3:es==2?2:1;
+    if((ibk && (it->p[3]&31)) || (obk && (ot->p[3]&31))) return -1;
+    if(ibk && obk) {
+        if((D&31) || Dw!=D || (it->d[2]%cw) || (ot->d[2]%cw) || (it->p[2]%cw) || (ot->p[2]%cw)) return -1;
+    } else {
+        if(es!=1 || ibk) return -1;   /* blocked -> flat measured slower than copy_runs */
+        if(obk && ((Dw&31) || (!ot->crouton && (D&31)))) return -1;
+    }
+    const int32_t ow[4]={ot->d[0],ot->d[1],ot->d[2],Dw};
+    {
+        int e=xfer_check(g,it,it->d,it->p,0);
+        if(!e)e=xfer_check(g,ot,ow,ot->p,1);
+        if(e) return e;
+    }
+    if(ibk && obk) {if(!dm_clear(it,it->d,it->p,ot,ow,ot->p)) return -1;}
+    else if(ibk) {if(!dm_flat_apart_blocked(ot,ow,ot->p,it,it->d,it->p)) return -1;}
+    else {if(!dm_flat_apart_blocked(it,it->d,it->p,ot,ow,ot->p)) return -1;}
+    if(g->dry) return 0;
+    DM_COUNT(5,count4(it->d));
+    BK bi,bo;
+    if(ibk)bk_init(&bi,g,it);
+    if(obk)bk_init(&bo,g,ot);
+    const int32_t nz=(Dw+31)/32;
+    const int64_t total=(int64_t)it->d[0]*it->d[1]*it->d[2];
+    const uint8_t *fsrc=ibk?NULL:g->pool[it->pool]+it->offset;
+    uint8_t *fdst=obk?NULL:g->pool[ot->pool]+ot->offset;
+    const size_t fsi=ibk?0:(size_t)it->m[3],fso=obk?0:(size_t)ot->m[3];
+    CvCur ci={0,0,0},co={0,0,0};
+    for(int64_t P=0;P<total;) {
+        int32_t n=cw;
+        if(!(ibk && obk)) {
+            const int32_t Wb=ibk?ci.w+it->p[2]:co.w+ot->p[2];
+            n=cw-(Wb&(cw-1));
+            if(it->d[2]-ci.w<n)n=it->d[2]-ci.w;
+            if(ot->d[2]-co.w<n)n=ot->d[2]-co.w;
+        }
+        /* index of depth group 0 and byte offset of the first pixel in the block row */
+        int64_t ixi=0,ixo=0;uint32_t rowi=0,rowo=0;int32_t pxi=0,pxo=0;
+        if(ibk) {
+            const int64_t Hi=(int64_t)ci.h+it->p[1],Wi=(int64_t)ci.w+it->p[2];
+            ixi=((((int64_t)ci.b+it->p[0])*bi.nbh+(Hi>>3))*bi.nbw+(Wi>>cws))*bi.nbd+bi.slice+it->p[3]/32;
+            rowi=256u*(uint32_t)(Hi&7);pxi=(int32_t)(Wi&(cw-1));
+        }
+        if(obk) {
+            const int64_t Ho=(int64_t)co.h+ot->p[1],Wo=(int64_t)co.w+ot->p[2];
+            ixo=((((int64_t)co.b+ot->p[0])*bo.nbh+(Ho>>3))*bo.nbw+(Wo>>cws))*bo.nbd+bo.slice+ot->p[3]/32;
+            rowo=256u*(uint32_t)(Ho&7);pxo=(int32_t)(Wo&(cw-1));
+        }
+        if(ibk && obk) {
+            for(int32_t z=0;z<nz;z++) {
+                uint8_t *d=bk_blk_or(&bo,ixo+z,NULL);
+                if(!d) continue;
+                d+=rowo;
+                const uint8_t *sb=bk_blk_or(&bi,ixi+z,NULL);
+                if(sb){sb+=rowi;DV a=dv_ld(sb),b=dv_ld(sb+128);dv_st(d,a);dv_st(d+128,b);}
+                else {dv_st(d,dv_zero());dv_st(d+128,dv_zero());}
+            }
+        } else if(ibk) {
+            uint8_t *fd=fdst+fl_lin(ot,(int32_t[4]){ot->p[0]+co.b,ot->p[1]+co.h,ot->p[2]+co.w,ot->p[3]});
+            for(int32_t z=0;z<nz;z++) {
+                const uint32_t nb=(D-32*z)<32?(uint32_t)(D-32*z):32u;
+                const uint8_t *sb=bk_blk_or(&bi,ixi+z,NULL);
+                if(sb) {
+                    sb+=rowi;
+                    const DV va=dv_ld(sb),vb=dv_ld(sb+128);
+                    for(int32_t k=0;k<n;k++) {
+                        const int32_t px=pxi+k;
+                        dv_stup(fd+(size_t)k*fso+32*(size_t)z,px<4?va:vb,32u*(uint32_t)(px&3),nb);
+                    }
+                } else {
+                    for(int32_t k=0;k<n;k++)dv_stup(fd+(size_t)k*fso+32*(size_t)z,dv_zero(),0,nb);
+                }
+            }
+        } else {
+            const uint8_t *fs=fsrc+fl_lin(it,(int32_t[4]){it->p[0]+ci.b,it->p[1]+ci.h,it->p[2]+ci.w,it->p[3]});
+            for(int32_t z=0;z<nz;z++) {
+                uint8_t *d=bk_blk_or(&bo,ixo+z,NULL);
+                if(!d) continue;
+                d+=rowo;
+                const uint32_t nb=(D-32*z)<32?(uint32_t)(D-32*z):32u;
+                for(int32_t k=0;k<n;k++) {
+                    DV v=dv_ldn(fs+(size_t)k*fsi+32*(size_t)z,nb);
+                    if(nb<32)v=dv_keep(v,nb);
+                    dv_stun(d+32*(size_t)(pxo+k),v,32);
+                }
+            }
+        }
+        P+=n;cv_adv(&ci,n,it->d[1],it->d[2]);cv_adv(&co,n,ot->d[1],ot->d[2]);
     }
     return 0;
 }
