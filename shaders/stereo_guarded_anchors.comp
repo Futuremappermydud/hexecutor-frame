@@ -1,0 +1,17 @@
+#version 450
+layout(local_size_x=16,local_size_y=16) in;
+layout(binding=0,r32f) uniform readonly image2D leftSeed;
+layout(binding=1,r32f) uniform readonly image2D rightSeed;
+layout(binding=2,r32f) uniform writeonly image2D leftAnchor;
+layout(binding=3,r32f) uniform writeonly image2D rightAnchor;
+void main() {
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy);bool right=gl_GlobalInvocationID.z!=0u;
+    if(any(greaterThanEqual(p,ivec2(616))))return;
+    float d=right?imageLoad(rightSeed,p).r:imageLoad(leftSeed,p).r;
+    float anchor=0.0;int tx=p.x+(right?int(d):-int(d));
+    if(d>=2.0&&tx>=0&&tx<616) {
+        float td=right?imageLoad(leftSeed,ivec2(tx,p.y)).r:imageLoad(rightSeed,ivec2(tx,p.y)).r;
+        if(td>=2.0&&abs(d-td)<=1.0)anchor=d;
+    }
+    if(right)imageStore(rightAnchor,p,vec4(anchor));else imageStore(leftAnchor,p,vec4(anchor));
+}

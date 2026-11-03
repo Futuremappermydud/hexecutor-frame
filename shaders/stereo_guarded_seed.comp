@@ -1,0 +1,120 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rg32ui) uniform readonly uimage2D u_LeftCensus;
+layout(binding = 1, rg32ui) uniform readonly uimage2D u_RightCensus;
+layout(binding = 2, r32f) uniform writeonly image2D u_LeftDisparity;
+layout(binding = 3, r32f) uniform writeonly image2D u_RightDisparity;
+
+#ifdef FRAME_STEREO_DIAGNOSTICS
+layout(binding = 4, rgba32f) uniform writeonly image2D u_LeftMatch;
+layout(binding = 5, rgba32f) uniform writeonly image2D u_RightMatch;
+void storeMatch(ivec2 p, vec4 value, bool rightReference) {
+    if (rightReference) imageStore(u_RightMatch, p, value);
+    else imageStore(u_LeftMatch, p, value);
+}
+#endif
+
+const int WIDTH = 616;
+const int HEIGHT = 616;
+const int MAX_DISPARITY = 96;
+
+uint hamming(uvec2 a, uvec2 b) {
+    uvec2 bits = a ^ b;
+    return bitCount(bits.x) + bitCount(bits.y);
+}
+
+// The 7x7 census descriptor already supplies a robust local feature. A sparse
+// cross aggregation adds support without constructing a 616x616x96 cost volume.
+uint aggregateCost(ivec2 p, int disparity, bool rightReference) {
+    const ivec2 offsets[5] = ivec2[5](
+        ivec2(0, 0), ivec2(-2, 0), ivec2(2, 0),
+        ivec2(0, -2), ivec2(0, 2));
+    uint cost = 0u;
+    for (int i = 0; i < 5; ++i) {
+        ivec2 reference = p + offsets[i];
+        ivec2 target = reference + ivec2(rightReference ? disparity : -disparity, 0);
+        uvec2 a = rightReference
+            ? imageLoad(u_RightCensus, reference).rg
+            : imageLoad(u_LeftCensus, reference).rg;
+        uvec2 b = rightReference
+            ? imageLoad(u_LeftCensus, target).rg
+            : imageLoad(u_RightCensus, target).rg;
+        cost += hamming(a, b);
+    }
+    return cost;
+}
+
+void storeDisparity(ivec2 p, float value, bool rightReference) {
+    if (rightReference) imageStore(u_RightDisparity, p, vec4(value, 0.0, 0.0, 0.0));
+    else imageStore(u_LeftDisparity, p, vec4(value, 0.0, 0.0, 0.0));
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    bool rightReference = gl_GlobalInvocationID.z != 0u;
+    if (p.x >= WIDTH || p.y >= HEIGHT) return;
+
+    if (p.y < 5 || p.y >= HEIGHT - 5 || p.x < 5 || p.x >= WIDTH - 5) {
+        storeDisparity(p, 0.0, rightReference);
+#ifdef FRAME_STEREO_DIAGNOSTICS
+        storeMatch(p, vec4(-1.0, -1.0, 0.0, 1.0), rightReference);
+#endif
+        return;
+    }
+
+    int available = rightReference ? WIDTH - 6 - p.x : p.x - 5;
+    int maxD = min(MAX_DISPARITY - 1, available);
+    if (maxD < 3) {
+        storeDisparity(p, 0.0, rightReference);
+#ifdef FRAME_STEREO_DIAGNOSTICS
+        storeMatch(p, vec4(-1.0, -1.0, 0.0, 2.0), rightReference);
+#endif
+        return;
+    }
+
+    uint bestCost = 0xffffffffu;
+    // The three disparities around a subpixel minimum describe one match.
+    // Keep four ranked hypotheses so at least one lies outside that basin;
+    // counting d +/- 1 as a competitor needlessly rejects smooth minima.
+    uint rankedCost[4] = uint[4](0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu);
+    int rankedD[4] = int[4](0, 0, 0, 0);
+    int bestD = 0;
+    for (int d = 1; d <= maxD; ++d) {
+        uint cost = aggregateCost(p, d, rightReference);
+        if (cost < bestCost) {
+            bestCost = cost;
+            bestD = d;
+        }
+        for (int rank = 0; rank < 4; ++rank) {
+            if (cost >= rankedCost[rank]) continue;
+            for (int shift = 3; shift > rank; --shift) {
+                rankedCost[shift] = rankedCost[shift - 1];
+                rankedD[shift] = rankedD[shift - 1];
+            }
+            rankedCost[rank] = cost;
+            rankedD[rank] = d;
+            break;
+        }
+    }
+    uint secondCost = 0xffffffffu;
+    for (int rank = 0; rank < 4; ++rank)
+        if (abs(rankedD[rank] - bestD) > 1)
+            secondCost = min(secondCost, rankedCost[rank]);
+
+#ifdef FRAME_STEREO_DIAGNOSTICS
+    uint rejection = (bestD < 2 ? 4u : 0u) | (bestCost >= 90u ? 8u : 0u) |
+                     (secondCost <= bestCost + 6u ? 16u : 0u);
+    storeMatch(p, vec4(float(bestCost), secondCost == 0xffffffffu ? -1.0 :
+               float(secondCost - bestCost), float(bestD), float(rejection)), rightReference);
+#endif
+    // Five 48-bit census comparisons have a maximum cost of 240. Reject weak
+    // matches and ambiguous minima before the consistency pass.
+    if (bestD < 2 || bestCost >= 90u || secondCost <= bestCost + 6u) {
+        storeDisparity(p, 0.0, rightReference);
+        return;
+    }
+
+    storeDisparity(p, float(bestD), rightReference);
+}

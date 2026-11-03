@@ -1,0 +1,76 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform sampler2D u_LeftRaw;
+layout(binding = 1) uniform sampler2D u_RightRaw;
+layout(binding = 2, r8) uniform writeonly image2D u_LeftRect;
+layout(binding = 3, r8) uniform writeonly image2D u_RightRect;
+
+// Output resolution: 616 x 616
+const float OUT_W = 616.0;
+const float OUT_H = 616.0;
+const float F_RECT = 380.0; // Scaled focal length for 616x616 rectified view (~90 deg FOV)
+const float CX_RECT = 308.0;
+const float CY_RECT = 308.0;
+
+// Left Camera Intrinsics & Distortion (from factory calibration)
+const float FX_L = 1477.53;
+const float FY_L = 1479.15;
+const float CX_L = 1082.43;
+const float CY_L = 1243.37;
+const float K1_L = -0.027497;
+const float K2_L = -0.16945;
+const float K3_L = 0.10018;
+const float K4_L = -0.01506;
+
+// Right Camera Intrinsics & Distortion
+const float FX_R = 1476.21;
+const float FY_R = 1478.26;
+const float CX_R = 1078.65;
+const float CY_R = 1238.10;
+const float K1_R = -0.031552;
+const float K2_R = -0.14942;
+const float K3_R = 0.07644;
+const float K4_R = -0.00628;
+
+vec2 projectKannalaBrandt(vec3 ray, float fx, float fy, float cx, float cy, float k1, float k2, float k3, float k4) {
+    float r_xy = length(ray.xy);
+    if (r_xy < 1e-6) return vec2(cx, cy);
+
+    float theta = atan(r_xy, ray.z);
+    float theta2 = theta * theta;
+    float theta4 = theta2 * theta2;
+    float theta6 = theta4 * theta2;
+    float theta8 = theta4 * theta4;
+
+    float r_dist = theta * (1.0 + k1 * theta2 + k2 * theta4 + k3 * theta6 + k4 * theta8);
+    float scale = r_dist / r_xy;
+
+    float u = cx + fx * ray.x * scale;
+    float v = cy + fy * ray.y * scale;
+    return vec2(u, v);
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= int(OUT_W) || coord.y >= int(OUT_H)) return;
+
+    // Ray in rectified camera space
+    // Standard pinhole ray
+    float x = (float(coord.x) - CX_RECT) / F_RECT;
+    float y = (float(coord.y) - CY_RECT) / F_RECT;
+    vec3 rayL = normalize(vec3(x, y, 1.0));
+
+    // Left camera distorted pixel
+    vec2 pxL = projectKannalaBrandt(rayL, FX_L, FY_L, CX_L, CY_L, K1_L, K2_L, K3_L, K4_L);
+    vec2 uvL = pxL / 2464.0;
+    float valL = texture(u_LeftRaw, uvL).r;
+    imageStore(u_LeftRect, coord, vec4(valL, 0.0, 0.0, 0.0));
+
+    // Right camera: sensor is mounted 180 deg inverted relative to Left, so ray is (-x, -y, 1.0)
+    vec3 rayR = normalize(vec3(-x, -y, 1.0));
+    vec2 pxR = projectKannalaBrandt(rayR, FX_R, FY_R, CX_R, CY_R, K1_R, K2_R, K3_R, K4_R);
+    vec2 uvR = pxR / 2464.0;
+    float valR = texture(u_RightRaw, uvR).r;
+    imageStore(u_RightRect, coord, vec4(valR, 0.0, 0.0, 0.0));
+}

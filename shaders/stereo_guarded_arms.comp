@@ -1,0 +1,35 @@
+#version 450
+// Four packed bytes: low nibble = extent (0..8); bit 4 = anchor stop.
+// A luma/bounds stop takes priority over an anchor stop at the same sample.
+layout(local_size_x=16,local_size_y=16) in;
+layout(binding=0,r8ui) uniform readonly uimage2D leftLuma;
+layout(binding=1,r8ui) uniform readonly uimage2D rightLuma;
+layout(binding=2,r32f) uniform readonly image2D leftAnchor;
+layout(binding=3,r32f) uniform readonly image2D rightAnchor;
+layout(binding=4,r32ui) uniform writeonly uimage2D leftArms;
+layout(binding=5,r32ui) uniform writeonly uimage2D rightArms;
+layout(push_constant) uniform Settings { uint leftSpan;uint rightSpan;uint integerMode;uint rowOffset; } settings;
+int lumaAt(ivec2 p,bool right) {return int(right?imageLoad(rightLuma,p).r:imageLoad(leftLuma,p).r);}
+float anchorAt(ivec2 p,bool right) {return right?imageLoad(rightAnchor,p).r:imageLoad(leftAnchor,p).r;}
+void main() {
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy);bool right=gl_GlobalInvocationID.z!=0u;
+    if(any(greaterThanEqual(p,ivec2(616))))return;
+    const ivec2 offsets[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
+    int center=lumaAt(p,right),span=int(right?settings.rightSpan:settings.leftSpan);
+    uint packed=0u;
+    for(int arm=0;arm<4;++arm) {
+        int previous=center;float label=anchorAt(p,right);uint extent=0u,stop=0u;
+        for(int k=1;k<=8;++k) {
+            ivec2 q=p+offsets[arm]*k;
+            if(any(lessThan(q,ivec2(3)))||any(greaterThanEqual(q,ivec2(613))))break;
+            int value=lumaAt(q,right);
+            if(2*abs(value-center)>span||2*abs(value-previous)>span)break;
+            float a=anchorAt(q,right);
+            if(label>0.0&&a>0.0&&abs(label-a)>1.0) {stop=16u;break;}
+            if(label==0.0&&a>0.0)label=a;
+            extent=uint(k);previous=value;
+        }
+        packed|=(extent|stop)<<uint(8*arm);
+    }
+    if(right)imageStore(rightArms,p,uvec4(packed));else imageStore(leftArms,p,uvec4(packed));
+}

@@ -1,0 +1,109 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, r8) uniform readonly image2D u_LeftRect;
+layout(binding = 1, r8) uniform readonly image2D u_RightRect;
+layout(binding = 2, r32f) uniform writeonly image2D u_DepthMap;     // Metric depth Z in meters
+layout(binding = 3, r32f) uniform writeonly image2D u_DisparityMap; // Raw disparity in pixels
+
+const int WIDTH = 616;
+const int HEIGHT = 616;
+const int MAX_DISP = 64;
+const float BASELINE_M = 0.06396; // 63.96 mm
+const float F_RECT = 380.0;
+const float F_B = F_RECT * BASELINE_M; // 24.3048
+
+// Compute 64-bit census transform over 7x7 window
+uvec2 computeCensus(ivec2 p, bool isLeft) {
+    float center = isLeft ? imageLoad(u_LeftRect, p).r : imageLoad(u_RightRect, p).r;
+    uvec2 census = uvec2(0, 0);
+    int bitIdx = 0;
+
+    for (int dy = -3; dy <= 3; dy++) {
+        for (int dx = -3; dx <= 3; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            ivec2 q = p + ivec2(dx, dy);
+            q = clamp(q, ivec2(0), ivec2(WIDTH - 1, HEIGHT - 1));
+            float val = isLeft ? imageLoad(u_LeftRect, q).r : imageLoad(u_RightRect, q).r;
+
+            if (val > center) {
+                if (bitIdx < 32) {
+                    census.x |= (1u << bitIdx);
+                } else {
+                    census.y |= (1u << (bitIdx - 32));
+                }
+            }
+            bitIdx++;
+        }
+    }
+    return census;
+}
+
+uint hammingDist(uvec2 c1, uvec2 c2) {
+    uvec2 diff = c1 ^ c2;
+    return bitCount(diff.x) + bitCount(diff.y);
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= WIDTH || coord.y >= HEIGHT) return;
+
+    // Boundary check for 7x7 census window
+    if (coord.x < 3 || coord.x >= WIDTH - 3 || coord.y < 3 || coord.y >= HEIGHT - 3) {
+        imageStore(u_DepthMap, coord, vec4(0.0));
+        imageStore(u_DisparityMap, coord, vec4(0.0));
+        return;
+    }
+
+    uvec2 leftCensus = computeCensus(coord, true);
+
+    uint minCost = 999999u;
+    int bestD = 0;
+    uint costs[MAX_DISP];
+
+    // Search disparity range [0, MAX_DISP - 1]
+    for (int d = 0; d < MAX_DISP; d++) {
+        int rx = coord.x - d;
+        if (rx < 3) {
+            costs[d] = 48u;
+            continue;
+        }
+
+        uvec2 rightCensus = computeCensus(ivec2(rx, coord.y), false);
+        uint cost = hammingDist(leftCensus, rightCensus);
+        costs[d] = cost;
+
+        if (cost < minCost) {
+            minCost = cost;
+            bestD = d;
+        }
+    }
+
+    // Subpixel interpolation using quadratic fit
+    float subD = float(bestD);
+    if (bestD > 0 && bestD < MAX_DISP - 1) {
+        float c0 = float(costs[bestD - 1]);
+        float c1 = float(costs[bestD]);
+        float c2 = float(costs[bestD + 1]);
+        float denom = 2.0 * (c0 - 2.0 * c1 + c2);
+        if (abs(denom) > 1e-4) {
+            subD += (c0 - c2) / denom;
+        }
+    }
+
+    // Disparity validation: check cost threshold & confidence
+    float depth = 0.0;
+    if (subD > 1.5 && minCost < 25u) {
+        depth = F_B / subD;
+        // Clamp to realistic indoor range [0.2m, 12.0m]
+        if (depth < 0.2 || depth > 12.0) {
+            depth = 0.0;
+            subD = 0.0;
+        }
+    } else {
+        subD = 0.0;
+    }
+
+    imageStore(u_DepthMap, coord, vec4(depth, 0.0, 0.0, 0.0));
+    imageStore(u_DisparityMap, coord, vec4(subD, 0.0, 0.0, 0.0));
+}

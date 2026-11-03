@@ -1,0 +1,110 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer LeftRawBuf {
+    uint u_LeftData[];
+};
+layout(std430, binding = 1) readonly buffer RightRawBuf {
+    uint u_RightData[];
+};
+layout(binding = 2, r8) uniform writeonly image2D u_LeftRect;
+layout(binding = 3, r8) uniform writeonly image2D u_RightRect;
+
+const int RAW_W = 2464;
+const int RAW_H = 2464;
+const float OUT_W = 616.0;
+const float OUT_H = 616.0;
+const float F_RECT = 380.0;
+const float CX_RECT = 308.0;
+const float CY_RECT = 308.0;
+
+// Left Camera (factory calibration)
+const float FX_L = 1477.53;
+const float FY_L = 1479.15;
+const float CX_L = 1082.43;
+const float CY_L = 1243.37;
+const float K1_L = -0.027497;
+const float K2_L = -0.16945;
+const float K3_L = 0.10018;
+const float K4_L = -0.01506;
+
+// Right Camera (factory calibration)
+const float FX_R = 1476.21;
+const float FY_R = 1478.26;
+const float CX_R = 1078.65;
+const float CY_R = 1238.10;
+const float K1_R = -0.031552;
+const float K2_R = -0.14942;
+const float K3_R = 0.07644;
+const float K4_R = -0.00628;
+
+float sampleBuffer(bool isLeft, int px, int py) {
+    px = clamp(px, 0, RAW_W - 1);
+    py = clamp(py, 0, RAW_H - 1);
+    int idx = py * RAW_W + px;
+    uint word = isLeft ? u_LeftData[idx / 4] : u_RightData[idx / 4];
+    uint b = (word >> ((idx % 4) * 8)) & 0xffu;
+    return float(b) / 255.0;
+}
+
+float sampleBilinear(bool isLeft, vec2 uv) {
+    float fx = uv.x;
+    float fy = uv.y;
+    int x0 = int(floor(fx));
+    int y0 = int(floor(fy));
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+    float wx = fx - float(x0);
+    float wy = fy - float(y0);
+
+    float p00 = sampleBuffer(isLeft, x0, y0);
+    float p10 = sampleBuffer(isLeft, x1, y0);
+    float p01 = sampleBuffer(isLeft, x0, y1);
+    float p11 = sampleBuffer(isLeft, x1, y1);
+
+    return mix(mix(p00, p10, wx), mix(p01, p11, wx), wy);
+}
+
+vec2 projectKannalaBrandt(vec3 ray, float fx, float fy, float cx, float cy, float k1, float k2, float k3, float k4) {
+    float r_xy = length(ray.xy);
+    if (r_xy < 1e-6) return vec2(cx, cy);
+
+    float theta = atan(r_xy, ray.z);
+    float theta2 = theta * theta;
+    float theta4 = theta2 * theta2;
+    float theta6 = theta4 * theta2;
+    float theta8 = theta4 * theta4;
+
+    float r_dist = theta * (1.0 + k1 * theta2 + k2 * theta4 + k3 * theta6 + k4 * theta8);
+    float scale = r_dist / r_xy;
+
+    float u = cx + fx * ray.x * scale;
+    float v = cy + fy * ray.y * scale;
+    return vec2(u, v);
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= int(OUT_W) || coord.y >= int(OUT_H)) return;
+
+    float x = (float(coord.x) - CX_RECT) / F_RECT;
+    float y = (float(coord.y) - CY_RECT) / F_RECT;
+
+    // Left camera
+    vec3 rayL = normalize(vec3(x, y, 1.0));
+    vec2 pxL = projectKannalaBrandt(rayL, FX_L, FY_L, CX_L, CY_L, K1_L, K2_L, K3_L, K4_L);
+    float valL = 0.0;
+    if (pxL.x >= 0.0 && pxL.x < float(RAW_W) && pxL.y >= 0.0 && pxL.y < float(RAW_H)) {
+        valL = sampleBilinear(true, pxL);
+    }
+    imageStore(u_LeftRect, coord, vec4(valL, 0.0, 0.0, 0.0));
+
+    // Right camera (sensor mounted 180 deg inverted relative to Left)
+    vec3 rayR = normalize(vec3(-x, -y, 1.0));
+    vec2 pxR = projectKannalaBrandt(rayR, FX_R, FY_R, CX_R, CY_R, K1_R, K2_R, K3_R, K4_R);
+    float valR = 0.0;
+    if (pxR.x >= 0.0 && pxR.x < float(RAW_W) && pxR.y >= 0.0 && pxR.y < float(RAW_H)) {
+        valR = sampleBilinear(false, pxR);
+    }
+    imageStore(u_RightRect, coord, vec4(valR, 0.0, 0.0, 0.0));
+}

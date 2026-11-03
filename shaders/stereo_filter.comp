@@ -1,0 +1,42 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, r32f) uniform readonly image2D u_LeftDisparity;
+layout(binding = 1, r32f) uniform readonly image2D u_RightDisparity;
+layout(binding = 2, r32f) uniform writeonly image2D u_Depth;
+
+#ifdef FRAME_STEREO_DIAGNOSTICS
+layout(binding = 3, r32ui) uniform writeonly uimage2D u_Rejection;
+#endif
+const int WIDTH = 616;
+const int HEIGHT = 616;
+const float FOCAL_BASELINE = 24.282608;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= WIDTH || p.y >= HEIGHT) return;
+
+    float leftDisparity = imageLoad(u_LeftDisparity, p).r;
+    float depth = 0.0;
+#ifdef FRAME_STEREO_DIAGNOSTICS
+    uint rejection = leftDisparity > 1.5 ? 1u : (leftDisparity > 0.0 ? 4u : 0u);
+#endif
+    if (leftDisparity > 1.5) {
+        int rightX = int(round(float(p.x) - leftDisparity));
+        if (rightX >= 0) {
+            float rightDisparity = imageLoad(u_RightDisparity, ivec2(rightX, p.y)).r;
+            if (rightDisparity > 1.5 && abs(leftDisparity - rightDisparity) <= 1.25) {
+                float candidate = FOCAL_BASELINE / leftDisparity;
+#ifdef FRAME_STEREO_DIAGNOSTICS
+                rejection = candidate >= 0.25 && candidate <= 5.0 ? 0u : 2u;
+#endif
+                if (candidate >= 0.25 && candidate <= 5.0) depth = candidate;
+            }
+        }
+    }
+#ifdef FRAME_STEREO_DIAGNOSTICS
+    imageStore(u_Rejection, p, uvec4(rejection, 0u, 0u, 0u));
+#endif
+    imageStore(u_Depth, p, vec4(depth, 0.0, 0.0, 0.0));
+}

@@ -1,0 +1,137 @@
+#version 450
+// Fixed combined guards / contrast-scaled support: g3/e1/r8/t32/c120/m3.
+layout(local_size_x_id=0,local_size_y_id=1) in;
+layout(constant_id=2) const bool precomputeArms=false;
+layout(constant_id=3) const bool cacheNeighbors=false;
+layout(binding=0,rg32ui) uniform readonly uimage2D leftCensus;
+layout(binding=1,rg32ui) uniform readonly uimage2D rightCensus;
+layout(binding=2,r32f) uniform writeonly image2D leftDisparity;
+layout(binding=3,r32f) uniform writeonly image2D rightDisparity;
+layout(binding=4,r8ui) uniform readonly uimage2D leftLuma;
+layout(binding=5,r8ui) uniform readonly uimage2D rightLuma;
+layout(binding=6,r32f) uniform readonly image2D leftAnchor;
+layout(binding=7,r32f) uniform readonly image2D rightAnchor;
+layout(binding=8,rg32ui) uniform readonly uimage2D leftMask;
+layout(binding=9,rg32ui) uniform readonly uimage2D rightMask;
+layout(binding=10,r32ui) uniform readonly uimage2D leftArms;
+layout(binding=11,r32ui) uniform readonly uimage2D rightArms;
+#ifdef FRAME_STEREO_DIAGNOSTICS
+layout(binding=12,rgba32f) uniform writeonly image2D leftMatch;
+layout(binding=13,rgba32f) uniform writeonly image2D rightMatch;
+layout(binding=14,rgba32f) uniform writeonly image2D leftEvidence;
+layout(binding=15,rgba32f) uniform writeonly image2D rightEvidence;
+#endif
+layout(push_constant) uniform Settings { uint leftSpan;uint rightSpan;uint integerMode;uint rowOffset; } settings;
+int lumaAt(ivec2 p,bool right) {return int(right?imageLoad(rightLuma,p).r:imageLoad(leftLuma,p).r);}
+float anchorAt(ivec2 p,bool right) {return right?imageLoad(rightAnchor,p).r:imageLoad(leftAnchor,p).r;}
+uvec2 censusAt(ivec2 p,bool right) {return right?imageLoad(rightCensus,p).rg:imageLoad(leftCensus,p).rg;}
+uvec2 maskAt(ivec2 p,bool right) {return right?imageLoad(rightMask,p).rg:imageLoad(leftMask,p).rg;}
+uvec2 sampleAt(ivec2 rp,ivec2 tp,bool right) {
+    uvec2 mask=maskAt(rp,right)&maskAt(tp,!right);
+    uint bits=uint(bitCount(mask.x)+bitCount(mask.y));
+    uvec2 diff=(censusAt(rp,right)^censusAt(tp,!right))&mask;
+    uint disagreements=uint(bitCount(diff.x)+bitCount(diff.y));
+    return uvec2(bits>=24u?(disagreements*48u+bits/2u)/bits:0u,bits);
+}
+// cost, selected observation count, selected joint bit count, anchor-stopped arm count.
+uvec4 costAt(ivec2 p,int d,bool right) {
+    ivec2 t=p+ivec2(right?d:-d,0);
+    uvec2 first=sampleAt(p,t,right);
+    if(first.y<24u)return uvec4(240u,0u,0u,0u);
+    uint sum=first.x,count=1u,bits=first.y,stops=0u;
+    int rc=lumaAt(p,right),tc=lumaAt(t,!right),rmin=rc,rmax=rc,tmin=tc,tmax=tc;
+    int rspan=int(right?settings.rightSpan:settings.leftSpan),tspan=int(right?settings.leftSpan:settings.rightSpan);
+    const ivec2 offsets[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
+    uint packedR=0u,packedT=0u;
+    if(precomputeArms) {
+        packedR=right?imageLoad(rightArms,p).r:imageLoad(leftArms,p).r;
+        packedT=right?imageLoad(leftArms,t).r:imageLoad(rightArms,t).r;
+    }
+    for(int arm=0;arm<4;++arm) {
+        if(precomputeArms) {
+            uint ar=(packedR>>uint(8*arm))&255u,at=(packedT>>uint(8*arm))&255u;
+            uint extent=min(ar&15u,at&15u),selected=0u;
+            for(uint k=1u;k<=extent;++k) {
+                ivec2 rp=p+offsets[arm]*int(k),tp=t+offsets[arm]*int(k);
+                uvec2 observation=sampleAt(rp,tp,right);
+                if(observation.y<24u)break;
+                sum+=observation.x;++count;bits+=observation.y;++selected;
+                int rv=lumaAt(rp,right),tv=lumaAt(tp,!right);
+                rmin=min(rmin,rv);rmax=max(rmax,rv);tmin=min(tmin,tv);tmax=max(tmax,tv);
+            }
+            // Count the next anchor stop only if no earlier joint-mask stop,
+            // and neither view fails luma/bounds at that same next position.
+            bool ra=(ar&15u)==extent,ta=(at&15u)==extent;
+            if(selected==extent&&extent<8u&&(!ra||(ar&16u)!=0u)&&(!ta||(at&16u)!=0u))++stops;
+            continue;
+        }
+        int previousR=rc,previousT=tc;
+        float labelR=anchorAt(p,right),labelT=anchorAt(t,!right);
+        for(int k=1;k<=8;++k) {
+            ivec2 rp=p+offsets[arm]*k,tp=t+offsets[arm]*k;
+            if(any(lessThan(rp,ivec2(3)))||any(greaterThanEqual(rp,ivec2(613)))||
+               any(lessThan(tp,ivec2(3)))||any(greaterThanEqual(tp,ivec2(613))))break;
+            int rv=lumaAt(rp,right),tv=lumaAt(tp,!right);
+            // Exact integer equivalent of the CPU's contrast-scaled thresholds.
+            if(2*abs(rv-rc)>rspan||2*abs(tv-tc)>tspan||
+               2*abs(rv-previousR)>rspan||2*abs(tv-previousT)>tspan)break;
+            float ra=anchorAt(rp,right),ta=anchorAt(tp,!right);
+            if((labelR>0.0&&ra>0.0&&abs(labelR-ra)>1.0)||
+               (labelT>0.0&&ta>0.0&&abs(labelT-ta)>1.0)) {++stops;break;}
+            if(labelR==0.0&&ra>0.0)labelR=ra;
+            if(labelT==0.0&&ta>0.0)labelT=ta;
+            uvec2 observation=sampleAt(rp,tp,right);
+            if(observation.y<24u)break;
+            sum+=observation.x;++count;bits+=observation.y;
+            rmin=min(rmin,rv);rmax=max(rmax,rv);tmin=min(tmin,tv);tmax=max(tmax,tv);
+            previousR=rv;previousT=tv;
+        }
+    }
+    uint cost=count>=5u&&16*(rmax-rmin)>=rspan&&16*(tmax-tmin)>=tspan?(sum*5u+count/2u)/count:240u;
+    return uvec4(cost,count,bits,stops);
+}
+void store(ivec2 p,bool right,float d,vec4 match,uvec4 evidence) {
+    if(right)imageStore(rightDisparity,p,vec4(d));else imageStore(leftDisparity,p,vec4(d));
+#ifdef FRAME_STEREO_DIAGNOSTICS
+    if(right) {imageStore(rightMatch,p,match);imageStore(rightEvidence,p,vec4(evidence.yzw,0u));}
+    else {imageStore(leftMatch,p,match);imageStore(leftEvidence,p,vec4(evidence.yzw,0u));}
+#endif
+}
+void main() {
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy)+ivec2(0,int(settings.rowOffset));bool right=gl_GlobalInvocationID.z!=0u;
+    if(any(greaterThanEqual(p,ivec2(616))))return;
+    if(any(lessThan(p,ivec2(5)))||any(greaterThanEqual(p,ivec2(611)))) {
+        store(p,right,0.0,vec4(-1.0,-1.0,0.0,1.0),uvec4(0u));return;
+    }
+    int maxD=min(95,right?610-p.x:p.x-5);
+    if(maxD<3) {store(p,right,0.0,vec4(-1.0,-1.0,0.0,2.0),uvec4(0u));return;}
+    uint best=0xffffffffu;int bestD=0;uvec4 evidence=uvec4(0u);
+    uint ranked[4]=uint[4](0xffffffffu,0xffffffffu,0xffffffffu,0xffffffffu);
+    int rankedD[4]=int[4](0,0,0,0);
+    uint previousCost=240u,beforeBest=240u,afterBest=240u;
+    for(int d=1;d<=maxD;++d) {
+        uvec4 value=costAt(p,d,right);uint cost=value.x;
+        if(cacheNeighbors&&d==bestD+1)afterBest=cost;
+        if(cost<best) {
+            best=cost;bestD=d;evidence=value;
+            if(cacheNeighbors) {beforeBest=previousCost;afterBest=240u;}
+        }
+        previousCost=cost;
+        for(int rank=0;rank<4;++rank) {
+            if(cost>=ranked[rank])continue;
+            for(int k=3;k>rank;--k) {ranked[k]=ranked[k-1];rankedD[k]=rankedD[k-1];}
+            ranked[rank]=cost;rankedD[rank]=d;break;
+        }
+    }
+    uint second=0xffffffffu;
+    for(int k=0;k<4;++k)if(abs(rankedD[k]-bestD)>1)second=min(second,ranked[k]);
+    uint rejection=(bestD<2?4u:0u)|(best>=120u?8u:0u)|(second<=best+3u?16u:0u);
+    precise float disparity=rejection==0u?float(bestD):0.0;
+    if(rejection==0u&&settings.integerMode==0u&&bestD>1&&bestD<maxD) {
+        float before=float(cacheNeighbors?beforeBest:costAt(p,bestD-1,right).x);
+        float after=float(cacheNeighbors?afterBest:costAt(p,bestD+1,right).x);
+        float denominator=2.0*(before-2.0*float(best)+after);
+        if(abs(denominator)>1e-4)disparity+=clamp((before-after)/denominator,-1.0,1.0);
+    }
+    store(p,right,disparity,vec4(float(best),second==0xffffffffu?-1.0:float(second-best),float(bestD),float(rejection)),evidence);
+}

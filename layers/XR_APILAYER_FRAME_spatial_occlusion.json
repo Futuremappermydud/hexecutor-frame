@@ -1,0 +1,10 @@
+{
+  "file_format_version": "1.0.0",
+  "api_layer": {
+    "name": "XR_APILAYER_FRAME_spatial_occlusion",
+    "library_path": "../bin/libframe_openxr_occlusion.so",
+    "api_version": "1.0",
+    "implementation_version": "1",
+    "description": "IMX616 point-cloud occlusion for Vulkan passthrough applications submitting depth"
+  }
+}

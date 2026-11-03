@@ -1,0 +1,36 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, r8ui) uniform readonly uimage2D u_Left;
+layout(binding = 1, r8ui) uniform readonly uimage2D u_Right;
+layout(binding = 2, rg32ui) uniform writeonly uimage2D u_LeftCensus;
+layout(binding = 3, rg32ui) uniform writeonly uimage2D u_RightCensus;
+
+const ivec2 SIZE = ivec2(616, 616);
+
+uvec2 censusAt(ivec2 p, bool left) {
+    uint center = left ? imageLoad(u_Left, p).r : imageLoad(u_Right, p).r;
+    uvec2 descriptor = uvec2(0u);
+    int bit = 0;
+    for (int dy = -3; dy <= 3; ++dy) {
+        for (int dx = -3; dx <= 3; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), SIZE - 1);
+            uint value = left ? imageLoad(u_Left, q).r : imageLoad(u_Right, q).r;
+            if (value > center) {
+                if (bit < 32) descriptor.x |= 1u << bit;
+                else descriptor.y |= 1u << (bit - 32);
+            }
+            ++bit;
+        }
+    }
+    return descriptor;
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, SIZE))) return;
+    imageStore(u_LeftCensus, p, uvec4(censusAt(p, true), 0u, 0u));
+    imageStore(u_RightCensus, p, uvec4(censusAt(p, false), 0u, 0u));
+}

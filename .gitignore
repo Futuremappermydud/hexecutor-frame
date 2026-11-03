@@ -1,0 +1,23 @@
+# Binaries and object files
+bin/
+*.o
+*.so
+*.spv
+
+# Captures and logs
+captures/
+*.raw
+*.ppm
+*.png
+*.ply
+*.obj
+
+# OS metadata
+.DS_Store
+*.swp
+*~
+
+# Generated benchmark reports and Python cache
+artifacts/
+__pycache__/
+*.d
