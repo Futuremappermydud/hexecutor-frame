@@ -53,7 +53,7 @@ bool ModelDepthPipeline::initialize(const std::string& script) {
     const std::string package=setting("FRAME_DEPTH_PACKAGE",home+(qnn?"/frame-dsp/depth-model/wave1-20261101":prepared?"/frame-dsp/depth-model/perf-20261029"
                                                                           :"/frame-dsp/depth-model/depth-model-direct-v5"));
     const std::string model=setting("FRAME_DEPTH_MODEL","primary");
-    timeoutSeconds_=std::atoi(setting("FRAME_DEPTH_TIMEOUT_S",qnn?"10":prepared?"60":"30").c_str());
+    timeoutSeconds_=std::atoi(setting("FRAME_DEPTH_TIMEOUT_S",qnn?"30":prepared?"60":"30").c_str());
     if(timeoutSeconds_<=0){error_="FRAME_DEPTH_TIMEOUT_S must be a positive number of seconds";return false;}
     int sockets[2];
     if(socketpair(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0,sockets)) {error_=std::strerror(errno);return false;}

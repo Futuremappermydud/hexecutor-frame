@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <thread>
 #include <fstream>
 #include <iostream>
 #include <vector>
@@ -22,8 +23,16 @@ int main(int argc,char** argv) {
         // With FRAME_DEPTH_TEMPORAL=1 the same pair is a static camera: identity motion.
         const char* framesSetting=std::getenv("MODEL_TEST_FRAMES");
         const int frames=framesSetting?std::max(1,std::atoi(framesSetting)):3;
+        // Optional mid-run pause (MODEL_TEST_PAUSE_AFTER frames, MODEL_TEST_PAUSE_S
+        // seconds) to exercise the bridge's idle close/reopen.
+        const char* pauseAfter=std::getenv("MODEL_TEST_PAUSE_AFTER");
+        const char* pauseSeconds=std::getenv("MODEL_TEST_PAUSE_S");
         std::vector<float> previous;
         for(int i=0;i<frames;i++) {
+            if(pauseAfter && pauseSeconds && i==std::atoi(pauseAfter)) {
+                std::cout<<"pausing "<<pauseSeconds<<" s"<<std::endl;
+                std::this_thread::sleep_for(std::chrono::seconds(std::atoi(pauseSeconds)));
+            }
             const auto begin=std::chrono::steady_clock::now();
             ModelMotion motion;motion.aligned=i>0;
             if(!model.process(l,r,depth,motion)){std::cerr<<model.lastError()<<'\n';return 1;}

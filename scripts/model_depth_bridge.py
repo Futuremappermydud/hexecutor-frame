@@ -116,14 +116,30 @@ def main():
     zero_hidden=np.zeros((1,2,320,256),np.float32)
     zero_t=np.zeros((1,2,4,4),np.float32)
     temporal=ModelTemporalState() if args.temporal else None
-    if args.backend=='prepared-qnn':
-        if args.model!='primary':ap.error('prepared-qnn has a captured run list for primary only')
-        session=prepared_session(root,args.model,QNN_ENGINE,QNN_BOOTSTRAP)
-    else:session=(prepared_session if args.backend=='prepared' else hybrid_session)(root,args.model)
-    with socket.socket(fileno=args.fd) as sock,session as infer:
-        print(f'[ModelDepth] {args.backend} backend ready ({args.model}, {root}, temporal={bool(temporal)})',flush=True)
+    # The engine exits by itself after ~36.9 s without a command, and dsp_service
+    # then stays at control (2,0,8) until reboot. Never let it get there: close
+    # the whole session after an idle gap and reopen on the next request.
+    idle_close=float(os.environ.get('FRAME_DEPTH_IDLE_CLOSE_S','15'))
+    import contextlib,select
+    stack=contextlib.ExitStack()
+    infer=None
+    def open_session():
+        if args.backend=='prepared-qnn':
+            if args.model!='primary':ap.error('prepared-qnn has a captured run list for primary only')
+            return stack.enter_context(prepared_session(root,args.model,QNN_ENGINE,QNN_BOOTSTRAP))
+        return stack.enter_context((prepared_session if args.backend=='prepared' else hybrid_session)(root,args.model))
+    with socket.socket(fileno=args.fd) as sock,stack:
+        infer=open_session()
+        print(f'[ModelDepth] {args.backend} backend ready ({args.model}, {root}, temporal={bool(temporal)}, idle close {idle_close:g} s)',flush=True)
         sock.sendall(struct.pack('<4I',0x36524451,256,320,3))
+        last_request=time.monotonic()
         while True:
+            if infer is not None and not select.select([sock],[],[],1.0)[0]:
+                if time.monotonic()-last_request>=idle_close:
+                    stack.close();infer=None
+                    if temporal is not None:temporal.reset()
+                    print(f'[ModelDepth] idle {idle_close:g} s: DSP session closed cleanly; reopens on the next pair',flush=True)
+                continue
             header=receive(sock,16,allow_eof=True)
             if header is None:break
             magic,sequence,width,height=struct.unpack('<4I',header)
@@ -133,6 +149,9 @@ def main():
             pair=receive(sock,2*width*height)
             images=np.frombuffer(pair,np.uint8).reshape(2,height,width)
             begin=time.monotonic()
+            if infer is None:
+                infer=open_session()
+                print(f'[ModelDepth] DSP session reopened in {(time.monotonic()-begin)*1000:.0f} ms',flush=True)
             if temporal is not None:
                 flags=motion_block[0]
                 if flags&2:temporal.reset()
@@ -153,6 +172,7 @@ def main():
             sock.sendall(disparity.tobytes())
             # v3: plane-0 uint8 uncertainty (the outputs' 'confidence' head; high at depth edges).
             sock.sendall(np.ascontiguousarray(uncertainty.reshape(2,height,width)[0],dtype=np.uint8).tobytes())
+            last_request=time.monotonic()
 
 
 if __name__=='__main__':
