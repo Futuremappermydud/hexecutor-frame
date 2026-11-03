@@ -89,4 +89,66 @@ inline std::vector<float> modelMetricDepth(const std::vector<float>& disparity,
     }
     return out;
 }
+// Model-style rectified spherical model images (see model_spherical.py):
+// column u -> azimuth (u-127.5)*k, row v -> elevation (v-159.5)*k, baseline B
+// along +x. rho = B/(tan aL - tan aR) is the distance from the baseline axis;
+// a pinhole ray (rx, ry, 1) at elevation el sees z = rho * cos(el).
+// Gate: uncertainty < maxUncertainty, depth range, right column inside, and
+// 3 of 8 neighbours within max(4 cm, 4%) of rho. Output: pinhole depth map.
+struct ModelSphericalMap {
+    float step=0,baseline=0;
+    int width=0,height=0;
+    std::vector<int32_t> modelIndex;   // per pinhole pixel, -1 outside
+    std::vector<float> cosElevation;   // per pinhole pixel
+};
+inline ModelSphericalMap modelSphericalMap(float step,float baseline,int width,int height,
+                                           float focal,float cx,float cy) {
+    ModelSphericalMap m;m.step=step;m.baseline=baseline;m.width=width;m.height=height;
+    m.modelIndex.assign(size_t(width)*height,-1);m.cosElevation.assign(size_t(width)*height,0);
+    for(int y=0;y<height;y++)for(int x=0;x<width;x++) {
+        const float rx=(x-cx)/focal,ry=(y-cy)/focal;
+        const float az=std::atan2(rx,std::hypot(ry,1.f)),el=std::atan2(ry,1.f);
+        const int u=int(std::lround(az/step+(MODEL_WIDTH-1)*.5f)),v=int(std::lround(el/step+(MODEL_HEIGHT-1)*.5f));
+        const size_t i=size_t(y)*width+x;
+        m.cosElevation[i]=std::cos(el);
+        if(u>=0 && v>=0 && u<MODEL_WIDTH && v<MODEL_HEIGHT)m.modelIndex[i]=v*MODEL_WIDTH+u;
+    }
+    return m;
+}
+inline std::vector<float> modelSphericalDepth(const std::vector<float>& disparity,
+    const std::vector<uint8_t>& uncertainty,const ModelSphericalMap& map,int maxUncertainty=89,
+    float minDepth=.25f,float maxDepth=5.f) {
+    const size_t pixels=MODEL_WIDTH*MODEL_HEIGHT;
+    if(disparity.size()!=pixels || uncertainty.size()!=pixels || !(map.step>0))
+        throw std::invalid_argument("invalid Model spherical depth input");
+    std::vector<float> rho(pixels,0),supported(pixels,0);
+    for(int v=2;v<MODEL_HEIGHT-2;v++)for(int u=2;u<MODEL_WIDTH-2;u++) {
+        const size_t i=size_t(v)*MODEL_WIDTH+u;const float d=disparity[i];
+        if(!std::isfinite(d) || d<=0 || uncertainty[i]>=maxUncertainty || u-d<2)continue;
+        const float al=(u-(MODEL_WIDTH-1)*.5f)*map.step,ar=al-d*map.step;
+        if(al>1.5f || ar<-1.5f)continue;
+        const float gap=std::tan(al)-std::tan(ar);
+        if(!(gap>0))continue;
+        const float r=map.baseline/gap;
+        const float z=r*std::cos((v-(MODEL_HEIGHT-1)*.5f)*map.step);
+        if(z<minDepth || z>maxDepth)continue;
+        rho[i]=r;
+    }
+    for(int v=2;v<MODEL_HEIGHT-2;v++)for(int u=2;u<MODEL_WIDTH-2;u++) {
+        const size_t i=size_t(v)*MODEL_WIDTH+u;const float r=rho[i];if(r<=0)continue;
+        int support=0;
+        for(int dy=-1;dy<=1;dy++)for(int dx=-1;dx<=1;dx++) {
+            if(!dx && !dy)continue;
+            const float n=rho[size_t(v+dy)*MODEL_WIDTH+u+dx];
+            if(n>0 && std::abs(n-r)<=std::max(.04f,.04f*r))++support;
+        }
+        if(support>=3)supported[i]=r;
+    }
+    std::vector<float> out(size_t(map.width)*map.height,0);
+    for(size_t i=0;i<out.size();i++) {
+        const int m=map.modelIndex[i];
+        if(m>=0 && supported[m]>0)out[i]=supported[m]*map.cosElevation[i];
+    }
+    return out;
+}
 } // namespace FrameSpatial

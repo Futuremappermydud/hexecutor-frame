@@ -534,7 +534,8 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
                 }
             }
             matched = modelStereo.process(rectifier.getRectifiedLeft(), rectifier.getRectifiedRight(),
-                                          depth, modelMotion);
+                                          depth, modelMotion, &rectifier.getSphericalLeft(),
+                                          &rectifier.getSphericalRight(), rectifier.sphericalStepRadians());
             previousModelPose = head;
             previousModelAtCapture = locatedAtCapture;
         } else if (sgbm) {

@@ -25,10 +25,16 @@ W, H = 256, 320
 
 class ModelTemporalState:
     def __init__(self, focal=380.0, cx=308.0, cy=308.0, baseline=24.3048 / 380.0,
-                 rect_w=616, rect_h=616, pyramid=1):
+                 rect_w=616, rect_h=616, pyramid=1, spherical_deg=None):
         self.f, self.cx, self.cy, self.b = float(focal), float(cx), float(cy), float(baseline)
         self.sx, self.sy = W / rect_w, H / rect_h
         self.p = pyramid
+        # spherical_deg: model images are Model-style rectified spherical
+        # (model_spherical.SphericalModel) instead of the resized pinhole.
+        self.sph = None
+        if spherical_deg:
+            from model_spherical import SphericalModel
+            self.sph = SphericalModel(spherical_deg, baseline)
         self.prev = None
         self.stats = {}
 
@@ -67,20 +73,27 @@ class ModelTemporalState:
             d = low[i, j].astype(np.float64) * k        # full-resolution model disparity
             u = j * k + (k - 1) / 2.0                   # block centre, full-res model pixels
             v = i * k + (k - 1) / 2.0
-            xr = (u + 0.5) / self.sx - 0.5
-            yr = (v + 0.5) / self.sy - 0.5
-            z = self.f * self.b / (d / self.sx)
-            x = (xr - self.cx) * z / self.f + (self.b if e else 0.0)
-            y = (yr - self.cy) * z / self.f
-            P = R @ np.stack([x, y, z]) + t[:, None]
-            ok = P[2] > 0.05
-            P = P[:, ok]
-            ulr = self.f * P[0] / P[2] + self.cx
-            urr = self.f * (P[0] - self.b) / P[2] + self.cx
-            vr = self.f * P[1] / P[2] + self.cy
-            disp = (ulr - urr) * self.sx
-            col = np.floor(((urr if e else ulr) + 0.5) * self.sx - 0.5).astype(np.int64)
-            row = np.floor((vr + 0.5) * self.sy - 0.5).astype(np.int64)
+            if self.sph is not None:
+                P = R @ self.sph.triangulate(u, v, d, right_image=bool(e)) + t[:, None]
+                P = P[:, np.isfinite(P).all(0) & (P[2] > 0.05)]
+                ul, ur, vv, disp = self.sph.project(P)
+                col = np.floor(ur if e else ul).astype(np.int64)
+                row = np.floor(vv).astype(np.int64)
+            else:
+                xr = (u + 0.5) / self.sx - 0.5
+                yr = (v + 0.5) / self.sy - 0.5
+                z = self.f * self.b / (d / self.sx)
+                x = (xr - self.cx) * z / self.f + (self.b if e else 0.0)
+                y = (yr - self.cy) * z / self.f
+                P = R @ np.stack([x, y, z]) + t[:, None]
+                ok = P[2] > 0.05
+                P = P[:, ok]
+                ulr = self.f * P[0] / P[2] + self.cx
+                urr = self.f * (P[0] - self.b) / P[2] + self.cx
+                vr = self.f * P[1] / P[2] + self.cy
+                disp = (ulr - urr) * self.sx
+                col = np.floor(((urr if e else ulr) + 0.5) * self.sx - 0.5).astype(np.int64)
+                row = np.floor((vr + 0.5) * self.sy - 0.5).astype(np.int64)
             inb = (col >= 0) & (col < W) & (row >= 0) & (row < H)
             col, row, disp = col[inb] >> self.p, row[inb] >> self.p, disp[inb]
             buf = np.zeros(h * w, np.float32)

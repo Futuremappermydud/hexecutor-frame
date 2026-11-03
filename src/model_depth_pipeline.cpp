@@ -66,6 +66,8 @@ bool ModelDepthPipeline::initialize(const std::string& script) {
     posix_spawn_file_actions_adddup2(&actions,STDERR_FILENO,STDOUT_FILENO);
     temporal_=setting("FRAME_DEPTH_TEMPORAL","0")==std::string("1");
     censusGate_=setting("FRAME_DEPTH_GATE","uncertainty")==std::string("census");
+    spherical_=setting("FRAME_DEPTH_SPHERICAL","0")==std::string("1");
+    sphericalDegrees_=setting("FRAME_DEPTH_SPHERICAL_DEG","0.29");
     maxUncertainty_=std::clamp(std::atoi(setting("FRAME_DEPTH_UNCERTAINTY_MAX","89").c_str()),1,256);
     // Optional replay capture: every request (header, motion block, resized pair).
     const std::string record=setting("FRAME_DEPTH_RECORD","");
@@ -73,9 +75,12 @@ bool ModelDepthPipeline::initialize(const std::string& script) {
         recordFd_=open(record.c_str(),O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0644);
         recordLimit_=uint32_t(std::max(1,std::atoi(setting("FRAME_DEPTH_RECORD_FRAMES","200").c_str())));
         if(recordFd_<0)std::cerr<<"[ModelDepth] cannot record to "<<record<<": "<<std::strerror(errno)<<std::endl;
+        // Spherical runs also keep the spherical inputs, for an offline A/B on identical captures.
+        if(spherical_)recordSphericalFd_=open((record+".sph").c_str(),O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0644);
     }
     const char* args[]{python.c_str(),"-u",script.c_str(),"--fd","3","--package",package.c_str(),"--model",model.c_str(),
-                       "--backend",backend.c_str(),temporal_?"--temporal":nullptr,nullptr};
+                       "--backend",backend.c_str(),"--spherical-deg",spherical_?sphericalDegrees_.c_str():"0",
+                       temporal_?"--temporal":nullptr,nullptr};
     pid_t child=-1;
     const int result=posix_spawn(&child,python.c_str(),&actions,nullptr,const_cast<char* const*>(args),environ);
     posix_spawn_file_actions_destroy(&actions);close(sockets[1]);
@@ -89,15 +94,21 @@ bool ModelDepthPipeline::initialize(const std::string& script) {
     std::cout<<"[ModelDepth] Persistent "<<(qnn?"QNN run-list executor (~23 ms)":prepared?"prepared-executor (exact)":"HMX hybrid")
              <<" worker ready; experimental plane-0 disparity, "
              <<(temporal_?"Model-style warped temporal state":"zero temporal state (t=0)")
-             <<", gate="<<(censusGate_?"contrast+census":"uncertainty<"+std::to_string(maxUncertainty_))<<std::endl;
+             <<", gate="<<(censusGate_ && !spherical_?"contrast+census":"uncertainty<"+std::to_string(maxUncertainty_))
+             <<", input="<<(spherical_?"spherical "+sphericalDegrees_+" deg/px":"resized pinhole")<<std::endl;
     return true;
 }
 bool ModelDepthPipeline::process(const std::vector<uint8_t>& left,const std::vector<uint8_t>& right,std::vector<float>& depth,
-                                 const ModelMotion& motion) {
+                                 const ModelMotion& motion,const std::vector<uint8_t>* sphericalLeft,
+                                 const std::vector<uint8_t>* sphericalRight,float sphericalStep) {
     depth.clear();
     if(fd_<0){error_="Model depth worker is not initialized";return false;}
     try {
         auto l=modelResize(left,RECT_WIDTH,RECT_HEIGHT),r=modelResize(right,RECT_WIDTH,RECT_HEIGHT);
+        const size_t modelPixels=size_t(MODEL_WIDTH)*MODEL_HEIGHT;
+        const bool useSpherical=spherical_ && sphericalLeft && sphericalRight && sphericalStep>0 &&
+                                sphericalLeft->size()==modelPixels && sphericalRight->size()==modelPixels;
+        if(spherical_ && !useSpherical){error_="spherical Model input requested but not provided";return false;}
         uint32_t header[]{0x36504451,++sequence_,MODEL_WIDTH,MODEL_HEIGHT};
         // flags (bit0 aligned, bit1 reset), R row-major, t, three pad words.
         uint32_t block[16]{};
@@ -115,9 +126,17 @@ bool ModelDepthPipeline::process(const std::vector<uint8_t>& left,const std::vec
                 std::cout<<"[ModelDepth] recording "<<(ok?"complete":"failed")<<": "<<recorded_<<" pairs"<<std::endl;
                 close(recordFd_);recordFd_=-1;
             }
+            if(recordSphericalFd_>=0) {
+                const bool sok=write(recordSphericalFd_,header,sizeof(header))==ssize_t(sizeof(header)) &&
+                    write(recordSphericalFd_,block,sizeof(block))==ssize_t(sizeof(block)) &&
+                    write(recordSphericalFd_,sphericalLeft->data(),modelPixels)==ssize_t(modelPixels) &&
+                    write(recordSphericalFd_,sphericalRight->data(),modelPixels)==ssize_t(modelPixels);
+                if(!sok || recordFd_<0){close(recordSphericalFd_);recordSphericalFd_=-1;}
+            }
         }
         if(!transfer(header,sizeof(header),true) || !transfer(block,sizeof(block),true) ||
-           !transfer(l.data(),l.size(),true) || !transfer(r.data(),r.size(),true))return false;
+           !transfer(const_cast<uint8_t*>(useSpherical?sphericalLeft->data():l.data()),modelPixels,true) ||
+           !transfer(const_cast<uint8_t*>(useSpherical?sphericalRight->data():r.data()),modelPixels,true))return false;
         // Reply: magic, sequence, pixel count, inference milliseconds (f32).
         uint32_t reply[4]{};
         if(!transfer(reply,sizeof(reply),false))return false;
@@ -127,20 +146,30 @@ bool ModelDepthPipeline::process(const std::vector<uint8_t>& left,const std::vec
         if(!transfer(disparity.data(),disparity.size()*sizeof(float),false))return false;
         std::vector<uint8_t> uncertainty(MODEL_WIDTH*MODEL_HEIGHT);
         if(!transfer(uncertainty.data(),uncertainty.size(),false))return false;
-        depth=modelMetricDepth(disparity,l,r,RECT_WIDTH,RECT_HEIGHT,FOCAL_BASELINE,.25f,5.f,
-                               censusGate_?nullptr:&uncertainty,maxUncertainty_);
-        confidence_.assign(size_t(RECT_WIDTH)*RECT_HEIGHT,1.f);
-        for(int y=0;y<RECT_HEIGHT;y++)for(int x=0;x<RECT_WIDTH;x++) {
-            const int mx=std::min(MODEL_WIDTH-1,int((x+.5f)*MODEL_WIDTH/RECT_WIDTH));
-            const int my=std::min(MODEL_HEIGHT-1,int((y+.5f)*MODEL_HEIGHT/RECT_HEIGHT));
-            const float u=uncertainty[size_t(my)*MODEL_WIDTH+mx];
-            confidence_[size_t(y)*RECT_WIDTH+x]=std::clamp((maxUncertainty_-u)/float(maxUncertainty_-50),.05f,1.f);
+        const auto confidenceOf=[&](float u){return std::clamp((maxUncertainty_-u)/float(maxUncertainty_-50),.05f,1.f);};
+        confidence_.assign(size_t(RECT_WIDTH)*RECT_HEIGHT,.05f);
+        if(useSpherical) {
+            if(sphericalMap_.step!=sphericalStep)
+                sphericalMap_=modelSphericalMap(sphericalStep,FOCAL_BASELINE/RECT_FOCAL,RECT_WIDTH,RECT_HEIGHT,
+                                                RECT_FOCAL,RECT_CX,RECT_CY);
+            depth=modelSphericalDepth(disparity,uncertainty,sphericalMap_,maxUncertainty_);
+            for(size_t i=0;i<confidence_.size();i++)
+                if(sphericalMap_.modelIndex[i]>=0)confidence_[i]=confidenceOf(uncertainty[sphericalMap_.modelIndex[i]]);
+        } else {
+            depth=modelMetricDepth(disparity,l,r,RECT_WIDTH,RECT_HEIGHT,FOCAL_BASELINE,.25f,5.f,
+                                   censusGate_?nullptr:&uncertainty,maxUncertainty_);
+            for(int y=0;y<RECT_HEIGHT;y++)for(int x=0;x<RECT_WIDTH;x++) {
+                const int mx=std::min(MODEL_WIDTH-1,int((x+.5f)*MODEL_WIDTH/RECT_WIDTH));
+                const int my=std::min(MODEL_HEIGHT-1,int((y+.5f)*MODEL_HEIGHT/RECT_HEIGHT));
+                confidence_[size_t(y)*RECT_WIDTH+x]=confidenceOf(uncertainty[size_t(my)*MODEL_WIDTH+mx]);
+            }
         }
         return true;
     } catch(const std::exception& e){error_=e.what();return false;}
 }
 void ModelDepthPipeline::stop() {
     if(recordFd_>=0){close(recordFd_);recordFd_=-1;}
+    if(recordSphericalFd_>=0){close(recordSphericalFd_);recordSphericalFd_=-1;}
     if(fd_>=0){shutdown(fd_,SHUT_RDWR);close(fd_);fd_=-1;}
     if(pid_<0)return;
     // EOF normally exits the Python context, restoring clocks, workers and gaze.

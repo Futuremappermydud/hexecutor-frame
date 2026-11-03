@@ -1084,6 +1084,10 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--occlusion-demo") == 0) {
             demo = true;
+        } else if (std::strcmp(argv[i], "--model-spherical") == 0) {
+            setenv("FRAME_DEPTH_SPHERICAL", "1", 1);
+        } else if (std::strcmp(argv[i], "--model-pinhole") == 0) {
+            setenv("FRAME_DEPTH_SPHERICAL", "0", 1);
         } else if (std::strcmp(argv[i], "--tsdf") == 0) {
             mesh = true;
             tsdfMesh = true;
@@ -1115,6 +1119,8 @@ int main(int argc, char** argv) {
                       << "  --depth-model            Use Model depth neural model\n"
                       << "  --depth-model-prepared   Use prepared Model depth executor\n"
                       << "  --depth-model-qnn        Use QNN run-list Model depth executor (~23 ms)\n"
+                      << "  --model-spherical        Model-style spherical model inputs, 0.29 deg/px (default with Model depth)\n"
+                      << "  --model-pinhole          Previous resized-pinhole model inputs\n"
                       << "  --tsdf                   Fused room mesh from a Vogon-style sparse TSDF\n"
                       << "  --model-temporal         Feed Model-style warped history (hidden/t) to the model\n"
                       << "  --occlusion-demo         Render test occlusion panels\n"
@@ -1129,6 +1135,9 @@ int main(int argc, char** argv) {
 
     if (model) setenv("FRAME_CLOUD_STEREO", "model", 1);
     if (modelPrepared) setenv("FRAME_DEPTH_BACKEND", modelQnn ? "prepared-qnn" : "prepared", 1);
+    // 2026-11-02 A/B on 300 headset captures: spherical inputs gave -22% frame-to-frame
+    // depth change and +1 pt valid depth at equal L/R consistency and scale.
+    if (model) setenv("FRAME_DEPTH_SPHERICAL", "1", 0);
 
     // Set cloud worker mode: 0 = PointCloud, 1 = LiveMesh, 3 = Wireframe
     FrameSpatialCloud::gMeshViewerMode.store(tsdfMesh ? 2 : mesh ? (wireframe ? 3 : 1) : 0);

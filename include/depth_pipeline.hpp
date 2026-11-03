@@ -32,6 +32,13 @@ public:
     // Accessors for debug / visualization
     const std::vector<uint8_t>& getRectifiedLeft() const { return m_rectL; }
     const std::vector<uint8_t>& getRectifiedRight() const { return m_rectR; }
+    // Model-style rectified spherical images (256x320, same rectified basis):
+    // column -> azimuth (u - 127.5) * k, row -> elevation (v - 159.5) * k,
+    // ray ~ (tan az, sin el, cos el). Empty unless FRAME_DEPTH_SPHERICAL=1.
+    static constexpr int SPHERICAL_WIDTH = 256, SPHERICAL_HEIGHT = 320;
+    const std::vector<uint8_t>& getSphericalLeft() const { return m_sphL; }
+    const std::vector<uint8_t>& getSphericalRight() const { return m_sphR; }
+    float sphericalStepRadians() const { return m_sphK; }
     const std::vector<float>& getDepthMap() const { return m_depthMap; }
 
 private:
@@ -39,6 +46,9 @@ private:
     std::vector<Point2D> m_lutR;
     std::vector<uint8_t> m_rectL;
     std::vector<uint8_t> m_rectR;
+    std::vector<Point2D> m_sphLutL, m_sphLutR;  // 9 supersamples per pixel
+    std::vector<uint8_t> m_sphL, m_sphR;
+    float m_sphK = 0;
     std::vector<uint64_t> m_censusL;
     std::vector<uint64_t> m_censusR;
     std::vector<float> m_depthMap;

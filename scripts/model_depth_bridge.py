@@ -103,6 +103,8 @@ def main():
     ap.add_argument('--package',type=Path,required=True)
     ap.add_argument('--model',choices=('primary','alternate'),default='primary')
     ap.add_argument('--backend',choices=('hybrid','prepared','prepared-qnn'),default='hybrid')
+    ap.add_argument('--spherical-deg',type=float,default=0,
+                    help='model inputs are Model-style spherical at this deg/px (0 = resized pinhole)')
     ap.add_argument('--temporal',action='store_true',
                     help='Model-style hidden state: warp the previous disparity by the sent motion')
     args=ap.parse_args();root=args.package.resolve()
@@ -115,7 +117,7 @@ def main():
     # Identity transforms are not a state the Model runtime produces.
     zero_hidden=np.zeros((1,2,320,256),np.float32)
     zero_t=np.zeros((1,2,4,4),np.float32)
-    temporal=ModelTemporalState() if args.temporal else None
+    temporal=ModelTemporalState(spherical_deg=args.spherical_deg or None) if args.temporal else None
     # The engine exits by itself after ~36.9 s without a command, and dsp_service
     # then stays at control (2,0,8) until reboot. Never let it get there: close
     # the whole session after an idle gap and reopen on the next request.

@@ -214,6 +214,37 @@ void DepthPipeline::initialize() {
         }
     }
 
+    // Model-style spherical model inputs, 3x3 supersampled against aliasing
+    // (the raw fisheye is ~7.5x finer than 0.29 deg/px).
+    if (const char* enabled = std::getenv("FRAME_DEPTH_SPHERICAL"); enabled && std::string(enabled) == "1") {
+        const char* degrees = std::getenv("FRAME_DEPTH_SPHERICAL_DEG");
+        m_sphK = float((degrees ? std::atof(degrees) : 0.29) * M_PI / 180.0);
+        const int w = SPHERICAL_WIDTH, h = SPHERICAL_HEIGHT;
+        m_sphLutL.resize(size_t(w) * h * 9);
+        m_sphLutR.resize(size_t(w) * h * 9);
+        m_sphL.assign(size_t(w) * h, 0);
+        m_sphR.assign(size_t(w) * h, 0);
+        for (int v = 0; v < h; ++v)
+            for (int u = 0; u < w; ++u)
+                for (int s = 0; s < 9; ++s) {
+                    const float az = (u + (s % 3 - 1) / 3.0f - (w - 1) * 0.5f) * m_sphK;
+                    const float el = (v + (s / 3 - 1) / 3.0f - (h - 1) * 0.5f) * m_sphK;
+                    const float a = std::tan(az), b = std::sin(el), c = std::cos(el);
+                    const Vec3 leftRay{rectX[0] * a + rectY[0] * b + rectZ[0] * c,
+                                       rectX[1] * a + rectY[1] * b + rectZ[1] * c,
+                                       rectX[2] * a + rectY[2] * b + rectZ[2] * c};
+                    const Vec3 rightRay = multiply(rightFromLeft, leftRay);
+                    const size_t i = (size_t(v) * w + u) * 9 + s;
+                    m_sphLutL[i] = projectKannalaBrandt(leftRay[0], leftRay[1], leftRay[2],
+                        FX_L, FY_L, CX_L, CY_L, K1_L, K2_L, K3_L, K4_L);
+                    m_sphLutR[i] = projectKannalaBrandt(rightRay[0], rightRay[1], rightRay[2],
+                        FX_R, FY_R, CX_R, CY_R, K1_R, K2_R, K3_R, K4_R);
+                }
+        std::cout << "[DepthPipeline] Model spherical inputs " << w << "x" << h << " at "
+                  << m_sphK * 180.0 / M_PI << " deg/px (" << w * m_sphK * 180.0 / M_PI << " x "
+                  << h * m_sphK * 180.0 / M_PI << " deg)" << std::endl;
+    }
+
     m_initialized = true;
     std::cout << "[DepthPipeline] Initialized full-extrinsic rectification ("
               << RECT_WIDTH << "x" << RECT_HEIGHT << ", 64 disparities)" << std::endl;
@@ -354,6 +385,21 @@ void DepthPipeline::rectify(const uint8_t* leftRaw, const uint8_t* rightRaw) {
             int idx = y * RECT_WIDTH + x;
             m_rectL[idx] = (uint8_t)sampleBilinear(leftRaw, m_lutL[idx].x, m_lutL[idx].y);
             m_rectR[idx] = (uint8_t)sampleBilinear(rightRaw, m_lutR[idx].x, m_lutR[idx].y);
+        }
+    }
+    if (!m_sphLutL.empty()) {
+        const int pixels = SPHERICAL_WIDTH * SPHERICAL_HEIGHT;
+        #pragma omp parallel for
+        for (int i = 0; i < pixels; i++) {
+            float l = 0, r = 0;
+            for (int s = 0; s < 9; ++s) {
+                const auto& pl = m_sphLutL[size_t(i) * 9 + s];
+                const auto& pr = m_sphLutR[size_t(i) * 9 + s];
+                l += sampleBilinear(leftRaw, pl.x, pl.y);
+                r += sampleBilinear(rightRaw, pr.x, pr.y);
+            }
+            m_sphL[i] = (uint8_t)std::lround(l / 9);
+            m_sphR[i] = (uint8_t)std::lround(r / 9);
         }
     }
 }
