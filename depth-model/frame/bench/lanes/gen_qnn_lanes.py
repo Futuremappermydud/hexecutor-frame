@@ -29,6 +29,7 @@ ap.add_argument('--scale', default='', help='model only: op/var:factor list appl
 ap.add_argument('--main-steal-us', type=float, default=0, help='main runs ready worker commands up to this cost when it has no conv ready')
 ap.add_argument('--search', type=int, default=0, help='randomized priority search: this many trials, keep the best modeled end')
 ap.add_argument('--cpu-weights', default='', help='op/var list of weight copies built with WEIGHTS_CPU_BELOW: they never use the DMA queue')
+ap.add_argument('--serial', action='store_true', help='profiling only: every command waits for the previous, so each runs alone with all helpers free')
 ap.add_argument('--no-dma-edges', action='store_true', help='model only: leave out the DMA landing edges')
 ap.add_argument('--strict', action='store_true', help='also enforce conflicts QNN lists leave unordered (they race in QNN too)')
 a = ap.parse_args()
@@ -193,6 +194,21 @@ for k, e in enumerate(main):
             if hb(wc, i): add(wc, i); dma_edges += 1
             else: dma_skip += 1
 print(f'DMA wait edges added {dma_edges}, not ordered by QNN {dma_skip}')
+if a.serial:
+    # A chain along a topological order of the existing edges.
+    d_ = [0] * N
+    for u in range(N):
+        for v in succ[u]: d_[v] += 1
+    q_ = [i for i in range(N) if d_[i] == 0]; heapq.heapify(q_); order_s = []
+    while q_:
+        u = heapq.heappop(q_); order_s.append(u)
+        for v in succ[u]:
+            d_[v] -= 1
+            if d_[v] == 0: heapq.heappush(q_, v)
+    assert len(order_s) == N
+    kept = [i for i in order_s if i not in dropped_cmds]
+    for x, y in zip(kept, kept[1:]): add(x, y)
+    print('serial chain over', len(kept))
 # --- topological order and critical path
 indeg = [0] * N
 for u in range(N):
