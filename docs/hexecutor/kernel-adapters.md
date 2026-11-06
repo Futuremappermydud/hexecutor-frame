@@ -14,4 +14,4 @@ Captured arrays, generated fixture headers, disassembly dumps, and provider bina
 
 The prepared resolver must opt into a proved adapter. Missing geometry/quantization coverage rejects before executing the model range. An experimental adapter does not silently fall back to old VTCM scratch while pool 1 occupies VTCM.
 
-Source locations: `hexecutor/frame/native_adapter/`, `native_kernels/`, `native_stride2/`, `native_runtime/stride2/`, and `native_u16/`. See the canonical memory and kernel guides in `docs/hexecutor/` for the shared contracts.
+Source locations: `hexecutor/native/kernels/adapters/`, `native_kernels/`, `native_stride2/`, `native_runtime/stride2/`, and `native_u16/`. See the canonical memory and kernel guides in `docs/hexecutor/` for the shared contracts.

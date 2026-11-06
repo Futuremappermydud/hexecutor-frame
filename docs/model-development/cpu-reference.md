@@ -15,6 +15,6 @@ Use `--help` for raw input, explicit resizing, hidden-state, and transform optio
 
 Outputs include both float planes, the native auxiliary head, dequantized auxiliary values, previews, and hashes/provenance. The float output is treated as disparity by the current runtime. Preview normalization and auxiliary dequantization are visualization/reference operations, not confidence calibration.
 
-`htp_emu.py` implements the memory-level numerical oracle; `run_htp_emu.py`, `sim_trace.py`, and related tools provide execution/graph inspection. `hexecutor/frame/fast_depth.py` is a CPU-only accelerated reference with native tensor access. Production DSP transport and kernel utilities remain separate.
+`htp_emu.py` implements the memory-level numerical oracle; `run_htp_emu.py`, `sim_trace.py`, and related tools provide execution/graph inspection. `depth-model/python/depth_model/reference/native_reference.py` is a CPU-only accelerated reference with native tensor access. Production DSP transport and kernel utilities remain separate.
 
 `depth-model/tools/build_cpu_package.py` can assemble a local portable package and reads this guide through the compatibility README path. Generated packages contain local artifacts and remain ignored. A source checkout alone is intentionally insufficient for full-model inference.

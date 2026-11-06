@@ -50,4 +50,4 @@ The lease must clean scalar cache lines, preserve the TCM region that becomes ca
 
 Repeated work showed that uncached DDR stacks and scalar near-state placement could erase the cache benefit. Scalar access cost, vector access cost, and coherency differ. Cache attributes, alias views, stack location, and transition code must be reviewed together. A byte-count budget alone does not validate the placement.
 
-Source: [owned DDR](../../hexecutor/frame/qd_owned_memory.h), [lease map](../../hexecutor/frame/qd_l2_cache.h), [worker layout](../../hexecutor/frame/qd_graph_dsp.h), and [configuration/binding](../../hexecutor/frame/qd_graph_prepared.h).
+Source: [owned DDR](../../hexecutor/native/qd_owned_memory.h), [lease map](../../hexecutor/native/qd_l2_cache.h), [worker layout](../../hexecutor/native/qd_graph_dsp.h), and [configuration/binding](../../hexecutor/native/qd_graph_prepared.h).

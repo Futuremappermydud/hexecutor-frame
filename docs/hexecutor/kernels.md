@@ -28,4 +28,4 @@ Later standalone graph comparisons found Conv, Add, Convert, and a tested dynami
 
 `native_adapter`, `native_kernels`, `native_stride2`, `native_runtime/stride2`, and `native_u16` contain probes and adapters for particular provider layouts. Their results are shape-specific. See [kernel adapters](kernel-adapters.md) before expanding a resolver's accepted feature set.
 
-Source: [reference handlers](../../hexecutor/frame/native_program/prepared_reference.c), [HMX paths](../../hexecutor/frame/native_program/prepared_hmx_conv.inc), [data movement](../../hexecutor/frame/native_program/prepared_datamove.inc), and [blocked glue](../../hexecutor/frame/blocked_glue/).
+Source: [reference handlers](../../hexecutor/native/program/prepared_reference.c), [HMX paths](../../hexecutor/native/program/prepared_hmx_conv.inc), [data movement](../../hexecutor/native/program/prepared_datamove.inc), and [blocked glue](../../hexecutor/native/kernels/blocked/).

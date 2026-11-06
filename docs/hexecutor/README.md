@@ -6,20 +6,22 @@ Hexecutor executes native Hexagon work through the Frame's existing CDSP callbac
 
 | Layer | Implementation | Responsibility |
 | --- | --- | --- |
-| Application IPC | `runtime/scripts/model_depth_bridge.py` | Persistent socket, input/output framing, backend/package identity |
-| Session host | `resident_dsp.py`, `frame_transport.py` | Exclusive ownership, image upload, memory checks, commands, cleanup |
-| Bootstrap/entry | `qd_graph_boot.c`, loader/linker files | Guarded entry, stack/context setup, execution handoff |
-| Prepared integration | `qd_graph_prepared.h` | Pool binding, leases, execution hooks, lane/helper dispatch |
-| Reader and runner | `native_program/nprg2_runtime.*`, `prepared_executor.*`, `prepared_runner.*` | Format validation, coverage preflight, dispatch and accounting |
-| Kernels | Prepared handlers, `qd_hmx_*`, `blocked_glue/` | Convolution, layout, elementwise, and data movement |
+| Application IPC | `runtime/tools/frame_depth_worker.cpp` | Persistent native socket protocol and lifecycle |
+| Model adapter | `depth-model/deployment/cpp/package.cpp` | Depth contract, package identities, and model selection |
+| Executor host | `hexecutor/host/cpp/` | Generic tensors/programs, transport, private memory, dispatch and cleanup |
+| Bootstrap/entry | `hexecutor/native/qd_graph_boot.c` and loader/linker files | Guarded entry and stack/context setup |
+| Prepared integration | `hexecutor/native/qd_graph_prepared.h` | Pool binding, leases, execution and helpers |
+| Reader and runner | `hexecutor/native/program/` | Format validation, preflight, dispatch and accounting |
+| Kernels | `hexecutor/native/kernels/` and native HMX headers | Convolution, layout, elementwise and data movement |
 
-Implementation paths in the table, except the application bridge, are relative to `hexecutor/frame/`.
+
+Paths in the table are relative to the repository root. Read [the native API guide](api.md) for embedding the host.
 
 The fixed loader at `0x87606000` invalidates the payload instruction/data-cache range before entry. Basic callback payloads use the linker-defined region starting at `0x87610000`. The full prepared engine has its own private code/heap allocation contract; do not treat the small callback payload limit as the size of every engine.
 
 ## Execution modes
 
-The ordinary learned-depth runtime supports `prepared-qnn` and `prepared`. Both retain Python for session control while running graph operations on the DSP. The old hybrid scheduler, its entry points/builders, and its shipped archives were removed. `fast_depth.py` remains a CPU-only validation reference; low-level transport and kernel utilities remain shared infrastructure.
+The ordinary learned-depth runtime supports `prepared-qnn` and `prepared`. Both use the native C++ host for session control and run graph operations on the DSP. The old hybrid scheduler, its entry points/builders, and its shipped archives were removed. `depth_model.reference.native_reference` remains a CPU-only validation reference; low-level transport and kernel utilities remain shared infrastructure.
 
 The reference prepared path executes a serial schedule with optional data-parallel handlers. The optimized primary recipe uses generated run/lane tables and cooperative helpers. A schedule valid for the primary model does not establish alternate-model coverage.
 
@@ -27,4 +29,4 @@ Before execution, validate the image and trusted hashes, bind non-overlapping po
 
 Firmware state is borrowed. Loader identity, TLB entries, L2 contents, stacks, vector context, callback registration, clocks, and the eye client all belong to the session's restoration contract. See [operations](operations.md) and [memory layout](memory-layout.md).
 
-Peripheral directories retain focused roles: `frame-dsp-followup/` contains early callback probes; `qurt_boot/` explores boot/runtime behavior; `native_adapter/`, `native_stride2/`, and `native_u16/` investigate shape-specific kernels; `llm/` demonstrates another DSP client. These do not independently expand the prepared executor's supported graph contract.
+Peripheral directories retain focused roles: `research/bringup/` contains early callback probes; `research/qurt-boot/` explores boot/runtime behavior; `native/kernels/adapters/`, `native/kernels/stride2/`, and `native/kernels/u16/` investigate shape-specific kernels; `examples/llm/` demonstrates another DSP client. These do not independently expand the prepared executor's supported graph contract.

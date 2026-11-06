@@ -32,4 +32,4 @@ Splitting each u8 convolution into a main staging/MAC job and an independently s
 
 Likewise, more helper parts, alternate pauses, sparse L2 saves, and moving all non-convolution work off main did not reliably improve the latest recipe. Preserve the reason for a rejected direction instead of repeatedly treating it as untried.
 
-Source: [lane generator](../../hexecutor/frame/bench/lanes/gen_qnn_lanes.py), [memory analysis](../../hexecutor/frame/bench/lanes/mem_layout.py), [best recipe](../../hexecutor/frame/bench/lanes/build_best.sh), and [executor](../../hexecutor/frame/native_program/prepared_executor.c).
+Source: [lane generator](../../depth-model/deployment/lanes/gen_qnn_lanes.py), [memory analysis](../../depth-model/deployment/lanes/mem_layout.py), [best recipe](../../depth-model/deployment/lanes/build_best.sh), and [executor](../../hexecutor/native/program/prepared_executor.c).

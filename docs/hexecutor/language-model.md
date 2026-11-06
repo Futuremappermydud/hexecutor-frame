@@ -1,8 +1,8 @@
 # Language-model DSP client
 
-The Qwen3-0.6B Q4_0 example under `hexecutor/frame/llm/` demonstrates a second client of the loader, transport, private-memory module, HVX, and clock infrastructure. It is not part of the spatial depth pipeline and cannot run concurrently with a client claiming the same DSP session.
+The Qwen3-0.6B Q4_0 example under `hexecutor/examples/llm/` demonstrates a second client of the loader, transport, private-memory module, HVX, and clock infrastructure. It is not part of the spatial depth pipeline and cannot run concurrently with a client claiming the same DSP session.
 
-The ARM host tokenizes text, supplies embedding rows, and reads token IDs. `qwen_dsp.c` performs the model command on the DSP: quantized matrix products, attention, normalization, residuals, and output selection. Weights stream through a three-slot DMA/VTCM ring; the KV cache is fp16 with transposed K storage. Synchronization uses TCM-resident flags rather than high-latency uncached-DDR barriers.
+The separate language-model example's ARM host tokenizes text, supplies embedding rows, and reads token IDs. `qwen_dsp.c` performs the model command on the DSP: quantized matrix products, attention, normalization, residuals, and output selection. Weights stream through a three-slot DMA/VTCM ring; the KV cache is fp16 with transposed K storage. Synchronization uses TCM-resident flags rather than high-latency uncached-DDR barriers.
 
 `pack_dsp.py` creates the local DSP image from the supplied GGUF. `dsp_qwen.py` owns the host engine; `chat_session.py` implements ChatML, prompt chunks, and prompt-lookup speculative decoding. The Gamescope/X11 launcher presents a SteamVR dashboard panel. The retained session pauses eye tracking for the life of the app; starting a new chat rewinds context rather than reopening the session.
 

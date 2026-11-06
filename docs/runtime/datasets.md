@@ -45,4 +45,4 @@ IR-to-RGB projection needs the session's measured stereo yaw, extrinsics, and ex
 
 Compositor loss and DSP cleanup failures are retained in session logs. The launcher blocks another NPU capture in a boot marked by failed cleanup. After reboot, restore ptrace/memory prerequisites before recording again.
 
-Source: [harness](../../runtime/scripts/room_dataset.py), [offline inference](../../runtime/scripts/model_offline_batch.py), [transfer](../../runtime/scripts/pull_room_dataset.py), and [IR refinement](../../runtime/scripts/ir_dot_lib.py).
+These dataset tools remain local work in progress: `runtime/scripts/room_dataset.py`, `model_offline_batch.py`, `pull_room_dataset.py`, and `ir_dot_lib.py`. They are separate from the committed executor restructuring.

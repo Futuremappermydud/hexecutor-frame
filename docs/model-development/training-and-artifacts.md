@@ -13,10 +13,10 @@ The artifact policy excludes common weight/container formats, tensor arrays, mem
 | `depth-model/models/`, `recovered/`, `metadata/` | Legacy local model resources and evidence |
 | `hand-tracking/models/`, `model-assets/` | Private hand/model collections |
 | Model `training/checkpoints/`, `datasets/`, `runs/` | New training artifacts |
-| `hexecutor/frame/build/`, fixture directories | Compiled engines, generated packages, numerical captures |
+| `hexecutor/native/build/`, fixture directories | Compiled engines, generated packages, numerical captures |
 | `runtime/experiments/` | Recorded sessions, replay products, and evaluation data |
 
-Compatibility links under `hexecutor/` expose the appropriate model resources to existing tools. A fresh clone may have links to locations that have not been provisioned yet. Full-model builds/validation require the corresponding local assets; generic geometry, protocol, and repository-policy checks do not.
+Model data, engine artifacts, and generated programs have explicit paths. `FRAME_DEPTH_DATA` configures offline model resources; the native model adapter accepts package/artifact/program locations without filesystem aliases. Full-model builds/validation require the corresponding local assets; generic geometry, protocol, and repository-policy checks do not.
 
 ## Replacement model record
 

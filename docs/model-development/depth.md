@@ -16,7 +16,7 @@ Keep the transform convention and state initialization explicit. The live native
 
 ## Tooling pipeline
 
-`depth-model/tools/` contains context extraction, graph/weight recovery, quantization checks, simulator execution, synthetic probes, and the memory-level reference. `hexecutor/frame/resident_program.py` and `resident_image.py` lower the recovered program into audited execution representations; the prepared-program tools produce native tables.
+`depth-model/tools/` contains context extraction, graph/weight recovery, quantization checks, simulator execution, synthetic probes, and the memory-level reference. `depth-model/python/depth_model/lowering/resident_program.py` and `resident_image.py` lower the recovered program into audited execution representations; the prepared-program tools produce native tables.
 
 The reference reconstructs compiled/tiled arithmetic and layouts. It is not an untiled training network. Source recovery, compatible QNN context loading, exact compiled execution, camera integration, and model training are separate deliverables.
 

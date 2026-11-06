@@ -24,9 +24,11 @@ python3 tools/test_model_artifact_policy.py
 python3 tools/model_artifact_policy.py --history
 ```
 
-From `runtime/`, `tools/test_model_depth_bridge.py` exercises native-backend selection and socket framing without DSP hardware. Geometry/temporal source checks can be compiled with the appropriate host toolchain. `tools/test_room_dataset.py` exercises conversion, pose composition, replay, and manifests using an offline fixture. Use the Makefile/source dependencies for the change rather than treating this short list as the whole test suite.
+Use `make check` for the portable C++ host and worker protocol, geometry/temporal checks, documentation links, and artifact policy. The protocol tests exercise v3/v4 replies, temporal inputs, and session reuse/close through an injected inference implementation.
 
-Full model execution and many kernel probes require private generated fixtures or the compatible SDK/device. Document unavailable prerequisites instead of substituting an unrelated passing check. The last cleanup observed five transport lifecycle fixture errors caused by a missing `worker_tids` field; they also occurred in the untouched original checkout. Do not claim that the entire transport suite passed.
+`make check-model` additionally requires private local assets. It validates the program/image readers and compares both models' native host outputs with saved oracle hashes. Offline Python diagnostics remain under the model and executor development packages; they are not part of the application's live path.
+
+A Linux compile check covers the real device-transport branch; the macOS build covers portable APIs and protocol behavior. Neither proves headset inference or firmware restoration. Device validation must include repeated inference, idle close/reopen, worker exit, VTCM and clock restoration, and eye-client recovery with the provisioned pinned artifacts.
 
 ## Documentation and reproducibility
 

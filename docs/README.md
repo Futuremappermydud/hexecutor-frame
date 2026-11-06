@@ -24,6 +24,7 @@ This is the maintained handbook for the spatial application, Hexecutor DSP execu
 
 | Guide | What it explains |
 | --- | --- |
+| [Native host API](hexecutor/api.md) | C++ tensors/programs, explicit packages, and worker lifecycle |
 | [Executor architecture](hexecutor/README.md) | Host/DSP responsibilities, loader, transport, and execution modes |
 | [Memory layout](hexecutor/memory-layout.md) | Private DDR, VTCM, L2 leases, aliasing, and workspace limits |
 | [Clocks and bandwidth](hexecutor/clocks.md) | AXI and HMX clock findings, controlled measurements, and restoration |

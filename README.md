@@ -15,3 +15,5 @@ Spatial capture, depth, reconstruction, and rendering for Steam Frame, with the 
 Weights, model dumps, generated model headers, and datasets remain local and ignored. The history was sanitized; do not reintroduce unfiltered refs. See [artifact policy](docs/model-development/training-and-artifacts.md).
 
 The temporal-fusion report and related working notes remain in their original locations and were not rewritten.
+
+Root development commands: `make build-host`, `make check`, `make check-model`, `make build-runtime`, and `make build-dsp`. `make help` lists the tasks. The live depth pipeline uses the C++ worker; Python remains available through `make run SCRIPT=...` for offline tools.

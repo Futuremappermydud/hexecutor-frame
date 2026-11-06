@@ -7,16 +7,16 @@ The basic Makefile accepts `HEX_CC`, `HEX_LD`, and `HOST_CC`. A host compiler bu
 From the monorepo root:
 
 ```sh
-make -C hexecutor/frame HEX_CC=clang-14 HEX_LD=ld.lld-14
+make -C hexecutor/native HEX_CC=clang-14 HEX_LD=ld.lld-14
 ```
 
 This builds basic callback targets. For the current measured primary recipe:
 
 ```sh
-sh hexecutor/frame/bench/lanes/build_best.sh NAME
+sh depth-model/deployment/lanes/build_best.sh NAME
 ```
 
-That script changes to the resource root, uses the prepared engine recipe, and expects separately provisioned program data, measured-cost inputs, and generated lane headers. Its recorded generator options include two worker lanes and `--active block`. Regenerate model-specific headers when the program or schedule policy changes; the last generated header is not a universal schedule.
+That script changes to the monorepo root, uses the prepared engine recipe, and expects separately provisioned program data, measured-cost inputs, and generated lane headers. Its recorded generator options include two worker lanes and `--active block`. Regenerate model-specific headers when the program or schedule policy changes; the last generated header is not a universal schedule.
 
 Record source revision/dirty patch, compiler, flags, generated-header identity, package hashes, engine/bootstrap hashes, and device report together. Files in `build/` are private local artifacts and are not shipped by Git. Do not infer that a renamed ELF is the one a launcher pins.
 
@@ -36,10 +36,12 @@ Keep `dsp_service` alive. One custom inference client runs at a time. Eye tracki
 
 ## Failure handling
 
-`bench/depth_state.py` inspects service/worker state. `bench/chunk_map.py` checks owned memory. Preserve the reports when a worker times out or cleanup fails. A zero process exit code, an old JSON file, or restored output buffers alone does not prove the DSP session exited cleanly.
+`hexecutor/benchmarks/depth_state.py` inspects service/worker state. `hexecutor/benchmarks/chunk_map.py` checks owned memory. Preserve the reports when a worker times out or cleanup fails. A zero process exit code, an old JSON file, or restored output buffers alone does not prove the DSP session exited cleanly.
 
 The recorded idle-exit failure left control state `(2,0,8)` and required a reboot. The bridge closes idle sessions early to avoid that path. If the capture harness marks the current boot as an NPU-cleanup fault, do not clear the marker to force another scan; recover the device and re-establish prerequisites.
 
 No device clock, firmware, kernel module, or service is changed merely by reading these guides. Device operations should be performed from a known package and recorded configuration.
 
-Source: [build script](../../hexecutor/frame/build_resident_dsp.sh), [session](../../hexecutor/frame/resident_dsp.py), [transport](../../hexecutor/frame/frame_transport.py), and [module build](../../hexecutor/frame/kmod/build.sh).
+Source: [build script](../../hexecutor/build-scripts/build_resident_dsp.sh), [session](../../hexecutor/host/cpp/executor.cpp), [transport](../../hexecutor/host/cpp/frame_transport.cpp), and [module build](../../hexecutor/device/kmod/build.sh).
+
+The native host is built with the root CMake project (`make build-host`). `HEXECUTOR_SDK_ROOT` supplies the Hexagon SDK path for DSP build scripts, and `HEXECUTOR_TOOLCHAIN_IMAGE` selects an already installed Docker toolchain image. Build wrappers mount the source tree explicitly; they no longer rely on a synthetic model/resource directory. Offline Python tools use `make run SCRIPT=...` or an editable development install.

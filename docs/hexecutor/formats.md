@@ -35,4 +35,4 @@ The recorded primary graph has 5,336 tensors and 5,068 commands; alternate has 5
 
 Read [memory layout](memory-layout.md) before assigning hot metadata or worker scratch addresses. When changing the registry, ABI fingerprint, or serialized fields, update producer and consumer together and reject mismatched packages explicitly.
 
-Source: [QDRX producer](../../hexecutor/frame/resident_image.py), [NPRG producer](../../hexecutor/frame/native_program/), [wire constants/API](../../hexecutor/frame/native_program/nprg2_runtime.h), [reader](../../hexecutor/frame/native_program/nprg2_runtime.c), and [runner](../../hexecutor/frame/native_program/prepared_runner.c).
+Source: [QDRX producer](../../depth-model/python/depth_model/lowering/resident_image.py), [NPRG producer](../../hexecutor/native/program/), [wire constants/API](../../hexecutor/native/program/nprg2_runtime.h), [reader](../../hexecutor/native/program/nprg2_runtime.c), and [runner](../../hexecutor/native/program/prepared_runner.c).
