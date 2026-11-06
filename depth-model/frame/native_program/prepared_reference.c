@@ -266,6 +266,9 @@ static uint32_t *memo_slot(const Nprg2ExecCall *c) {
 /* Geometry records are packed little-endian fields at 2-byte offsets: with a
  * 2-byte aligned record, halfword loads replace byte-by-byte assembly (the
  * per-run decode of every tensor view was ~1/3 loads). */
+#if defined(SETUP_FAST) && !defined(__hexagon__)
+#undef SETUP_FAST /* its stores assume the 32-bit layouts of T and G */
+#endif
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__==__ORDER_LITTLE_ENDIAN__
 typedef uint16_t __attribute__((may_alias)) u16a;
 static inline uint32_t h32(const uint8_t *p){const u16a *h=(const u16a *)p;return (uint32_t)h[0]|(uint32_t)h[1]<<16;}
@@ -2123,6 +2126,22 @@ static int k_mean(G *g) {
     if(!g->dry){int64_t s=0;for(size_t j=0;j<32;j++)s+=aget(&x,j);from_i64(&r,0,clip64((s+33)>>5,0,65535));}
     return t_write(g,o,&r);
 }
+#ifdef CHAIN_LUT
+/* s = max(a/16256, 1) with its low 12 mantissa bits rounded off, as f32 bits, without
+ * the software divide: checked exhaustively against IEEE float32 for a up to 32640.
+ * s >= 2 (a >= 32512) changes the mantissa step, so those take the float path. */
+static inline uint32_t scale_bits(int32_t a) {
+    if(a<16256) return 0x3f800000u;
+    if(a>=32512) {
+        float s=(float)a/(float)16256;
+        return (f32_bits(s)+0x800u)&0xfffff000u;
+    }
+    const uint32_t n=(uint32_t)(((uint64_t)(32u*(uint32_t)(a-16256)+127u)*528417u)>>27);
+    return 0x3f800000u+(n<<12);
+}
+/* 65536/s for the 2065 values scale_bits can return, filled on first use. */
+static uint32_t invscale_lut[2100];
+#endif
 static int k_weight_scales(G *g) {
     NEED(1);
     const T *i=in(g,0),*o=out0(g);
@@ -2146,9 +2165,13 @@ static int k_weight_scales(G *g) {
                 for(int32_t k=0;k<64;k++) {
                     int32_t mn=(int32_t)mnb[k]-i->zp,mx=(int32_t)mxb[k]-i->zp;
                     int32_t a=-127*mn>128*mx?-127*mn:128*mx;
+#ifdef CHAIN_LUT
+                    ((uint32_t *)r.p)[k]=scale_bits(a);
+#else
                     float s=(float)a/(float)16256;
                     if(!(s>=1.0f))s=s!=s?s:1.0f;
                     ((float *)r.p)[k]=f32_from_bits((f32_bits(s)+0x800u)&0xfffff000u);
+#endif
                 }
             }
             return t_write(g,o,&r);
@@ -2166,9 +2189,13 @@ static int k_weight_scales(G *g) {
             int32_t mn=INT32_MAX,mx=INT32_MIN;
             for(size_t j=0;j<rows;j++){int32_t v=((uint8_t *)x.p)[j*co+k]-i->zp;if(v<mn)mn=v;if(v>mx)mx=v;}
             int32_t a=-127*mn>128*mx?-127*mn:128*mx;
+#ifdef CHAIN_LUT
+            ((uint32_t *)r.p)[k]=scale_bits(a);
+#else
             float s=(float)a/(float)16256;
             if(!(s>=1.0f))s=s!=s?s:1.0f;
             ((float *)r.p)[k]=f32_from_bits((f32_bits(s)+0x800u)&0xfffff000u);
+#endif
         }
     }
     return t_write(g,o,&r);
@@ -2185,11 +2212,19 @@ static int k_invscale(G *g) {
     if(direct){r.p=direct;r.dt=o->dtype;}
     else TRY(anew(g,&r,x.n,o->dtype));
     if(!g->dry)for(size_t j=0,n=count4(x.n);j<n;j++) {
+#ifdef CHAIN_LUT
+        const uint32_t fb=((const uint32_t *)x.p)[j],ix=(fb-0x3f800000u)>>12;
+        const int lutok=!(fb&0xfffu) && ix<2100u;
+        if(lutok && invscale_lut[ix]){((int32_t *)r.p)[j]=(int32_t)invscale_lut[ix];continue;}
+#endif
         volatile float q=(float)65536/((float *)x.p)[j];
         volatile float s=q+0.5f;
         float t=truncf(s);
         CHECK(t>-2147483648.0f && t<2147483648.0f,E_RANGE);
         ((int32_t *)r.p)[j]=(int32_t)t;
+#ifdef CHAIN_LUT
+        if(lutok && t!=0.0f) invscale_lut[ix]=(uint32_t)(int32_t)t;
+#endif
     }
     return direct?0:t_write(g,o,&r);
 }

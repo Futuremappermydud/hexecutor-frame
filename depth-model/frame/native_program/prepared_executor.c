@@ -561,7 +561,7 @@ int nprg2_executor_run_preflighted_command_prepared(const Nprg2Executor *e,
        ix<full->command_first || ix-full->command_first>=full->command_count)
         return NPRG2_EXEC_ARGUMENT;
     Nprg2ExecCall call;
-#ifdef SETUP_FAST
+#if defined(SETUP_FAST) && defined(__hexagon__)
     /* Preflight validated this record: halfword loads, no re-validation. */
     {
         const uint8_t *r=full->bound->command.data+(size_t)ix*NPRG2_COMMAND_BYTES;
