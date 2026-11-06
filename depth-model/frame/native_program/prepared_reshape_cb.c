@@ -2,6 +2,10 @@
 
 #include <stdint.h>
 #include <string.h>
+#if defined(CMD_MEMO) && defined(__hexagon__) && defined(__HVX__)
+#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
+#endif
 
 enum { VARIANT_RESHAPE_HW_CB = 49, DTYPE_U8 = 1, STORAGE_BLOCKED = 2,
        SHAPE = 1, QUANT = 32, CROUTON = 64, PAGE_BYTES = 2048,
@@ -95,10 +99,38 @@ int nprg2_exec_reshape_cb_validate(const Nprg2ExecCall *c, void *ctx) {
     return make_plan(c, &plan);
 }
 
+#ifdef CMD_MEMO
+/* Every row is 8 pixels of 32 bytes, contiguous and 256-byte aligned on both sides. */
+static void reshape_rows(const ReshapePlan *p) {
+    for (uint32_t h = 0; h < 8; h++)
+        for (uint32_t d = 0; d < 4; d++) {
+            const uint8_t *src = p->source[h * 4 + d] + p->source_row * 256;
+            uint8_t *dst = p->dest[d] + h * 256;
+#if defined(__hexagon__) && defined(__HVX__)
+            const HVX_Vector a = ((const HVX_Vector *)src)[0], b = ((const HVX_Vector *)src)[1];
+            ((HVX_Vector *)dst)[0] = a; ((HVX_Vector *)dst)[1] = b;
+#else
+            memcpy(dst, src, 256);
+#endif
+        }
+}
+#endif
 int nprg2_exec_reshape_cb_run(const Nprg2ExecCall *c, void *ctx) {
     (void)ctx;
+#ifdef CMD_MEMO
+    {
+        const ReshapePlan *m = nprg2_exec_cmd_memo(c);
+        if (m) { reshape_rows(m); return 1; }
+    }
+#endif
     ReshapePlan plan;
     if (!make_plan(c, &plan)) return 0;
+#ifdef CMD_MEMO
+    if (plan.source_row < 8u) {
+        ReshapePlan *n = nprg2_exec_cmd_memo_new(c, sizeof plan);
+        if (n) { *n = plan; nprg2_exec_cmd_memo_commit(c, n); reshape_rows(n); return 1; }
+    }
+#endif
     for (uint32_t h = 0; h < 8; h++)
         for (uint32_t w = 0; w < 8; w++)
             for (uint32_t d = 0; d < 4; d++) {

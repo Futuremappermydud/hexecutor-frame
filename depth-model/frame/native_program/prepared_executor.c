@@ -611,6 +611,38 @@ int nprg2_exec_weights_validate(const Nprg2ExecCall *c,void *ctx){
     if(s.offset>c->pools[s.pool].bytes||n>c->pools[s.pool].bytes-s.offset||d.offset>dlimit||n>dlimit-d.offset)return 0;
     return 1;
 }
+#ifdef CMD_MEMO
+/* Per-command memos: what a handler proved once for a program and pool table, it need not
+ * prove again. Each command has one owner lane, and each lane has its own arena. */
+#include <stdlib.h>
+#define CMD_MEMO_COMMANDS 8192u
+#define CMD_MEMO_ARENA 0x10000u
+static void **cmd_memo;static uint8_t *cmd_arena[3];static uint32_t cmd_arena_used[3];
+static const void *cmd_memo_program;static const uint8_t *cmd_memo_pool1;
+void nprg2_exec_cmd_memo_begin(const void *program,const uint8_t *pool1){
+    if(!cmd_memo)cmd_memo=malloc(sizeof(void *)*CMD_MEMO_COMMANDS);
+    for(unsigned i=0;i<3;i++)if(!cmd_arena[i])cmd_arena[i]=malloc(CMD_MEMO_ARENA);
+    if(!cmd_memo||!cmd_arena[0]||!cmd_arena[1]||!cmd_arena[2]){cmd_memo_program=NULL;return;}
+    if(cmd_memo_program==program&&cmd_memo_pool1==pool1)return;
+    memset(cmd_memo,0,sizeof(void *)*CMD_MEMO_COMMANDS);
+    cmd_arena_used[0]=cmd_arena_used[1]=cmd_arena_used[2]=0;
+    cmd_memo_program=program;cmd_memo_pool1=pool1;
+}
+void *nprg2_exec_cmd_memo(const Nprg2ExecCall *c){
+    if(!c->preflighted||!cmd_memo_program||c->command_index>=CMD_MEMO_COMMANDS||
+       (const void *)c->program!=cmd_memo_program||c->pools[1].base!=cmd_memo_pool1)return NULL;
+    return cmd_memo[c->command_index];
+}
+void *nprg2_exec_cmd_memo_new(const Nprg2ExecCall *c,uint32_t bytes){
+    uint32_t l=c->execution_lane;
+    if(!c->preflighted||!cmd_memo_program||c->command_index>=CMD_MEMO_COMMANDS||l>2u||
+       (const void *)c->program!=cmd_memo_program||c->pools[1].base!=cmd_memo_pool1)return NULL;
+    bytes=(bytes+7u)&~7u;
+    if(cmd_arena_used[l]+bytes>CMD_MEMO_ARENA)return NULL;
+    void *p=cmd_arena[l]+cmd_arena_used[l];cmd_arena_used[l]+=bytes;return p;
+}
+void nprg2_exec_cmd_memo_commit(const Nprg2ExecCall *c,void *p){cmd_memo[c->command_index]=p;}
+#endif
 #ifdef WEIGHTS_MEMO
 /* After preflight, a weight copy's addresses are fixed for a program and pool table: keep
  * them per command instead of revalidating on every run. WEIGHTS_CPU_BELOW: tensors under
@@ -623,6 +655,10 @@ void nprg2_exec_weights_memo_begin(void){if(!weights_memo)weights_memo=calloc(81
 #define WEIGHTS_CPU_BELOW 0u
 #endif
 static int weights_copy(const Nprg2ExecCall *c,uint8_t *dst,const uint8_t *src,uint32_t n){
+#ifdef WEIGHTS_CPU_VARIANTS
+    /* These variants may run on any lane, so they must never use the DMA queue. */
+    if(!((WEIGHTS_CPU_VARIANTS>>c->command.variant)&1u))
+#endif
     if(n>=WEIGHTS_CPU_BELOW){
         int queued=nprg2_exec_weights_async_try(c,dst,src,n);
         if(queued>0)return 1;if(queued<0)return 0;

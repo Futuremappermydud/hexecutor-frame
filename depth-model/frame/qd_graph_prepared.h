@@ -34,6 +34,11 @@
 #ifndef QDS_QNN_LANES
 #define QDS_QNN_LANES 0
 #endif
+#ifndef QDS_LANE_PAUSE
+#define QDS_LANE_PAUSE 32
+#endif
+#define QDS_PAUSE_STR2(x) #x
+#define QDS_PAUSE_STR(x) QDS_PAUSE_STR2(x)
 #if QDS_QNN_LANES
 #include "native_program/qnn_lanes_primary.generated.h"
 #endif
@@ -172,12 +177,24 @@ void qd_hmx_nativep_n(void *,void *,void *,void *const *,uint32_t,uint32_t);
 void qd_hmx_slide3p_n(const uint32_t *,const void *,const void *,const uint32_t *,uint32_t,uint32_t);
 void qd_hmx_nativep1_n(const void *const *,void *,void *,void *const *,uint32_t,uint32_t);
 void qd_hmx_slide2p_n(const uint32_t *,const void *,const void *,const uint32_t *,uint32_t,uint32_t);
+#ifdef QDS_HMX_STAY
+/* The main list enables HMX once for the whole run instead of toggling SSR per conv. */
+static uint32_t prepared_hmx_held;
+#endif
 static uint32_t prepared_hmx_enter(void) {
+#ifdef QDS_HMX_STAY
+    if(prepared_hmx_held)return 0;
+#endif
     uint32_t saved;__asm__ volatile("%0=ssr":"=r"(saved));
     uint32_t on=saved|(1u<<26);__asm__ volatile("ssr=%0\n isync\n barrier"::"r"(on):"memory");
     return saved;
 }
-static void prepared_hmx_leave(uint32_t saved) {__asm__ volatile("ssr=%0\n isync\n barrier"::"r"(saved):"memory");}
+static void prepared_hmx_leave(uint32_t saved) {
+#ifdef QDS_HMX_STAY
+    if(prepared_hmx_held)return;
+#endif
+    __asm__ volatile("ssr=%0\n isync\n barrier"::"r"(saved):"memory");
+}
 static uint64_t now_ns(void);
 #ifndef QDS_PART_TIMING
 #define QDS_PART_TIMING 0
@@ -383,7 +400,10 @@ static int qnn_claim_serve(uint32_t self) {
     /* Slots are live only between qnn_claim_reset and qnn_claim_close; any
      * slot still unretired at close was cancelled by its owner (skip only). */
     if(qnn_claim->magic!=QDS_QNN_CLAIM_MAGIC)return 0;
+#ifndef CLAIM_NOBAR
+    /* Idle threads spin through here. With CLAIM_NOBAR only a posted part pays for a barrier. */
     __asm__ volatile("barrier":::"memory");
+#endif
     for(uint32_t o=0;o<QDS_QNN_OWNERS;o++) {
         QdsQnnSlot *sl=&qnn_claim->slot[o][self];
         uint32_t g=sl->gen;
@@ -463,7 +483,11 @@ static int qnn_claim_run(void *impl,uint32_t parts,Nprg2ParallelFn fn,void *ctx)
         while(sl[i]->done!=g[i]) {
             if(!qnn_claim_serve(self)) {
                 if(now_ns()>end){prepared_par_fault=1;break;}
+#ifdef QDS_JOIN_PAUSE
+                __asm__ volatile("pause(#" QDS_PAUSE_STR(QDS_JOIN_PAUSE) ")");
+#else
                 __asm__ volatile("pause(#8)");
+#endif
             }
         }
         __asm__ volatile("barrier":::"memory");
@@ -668,6 +692,7 @@ typedef struct {
     volatile uint32_t error;
     volatile uint32_t completed[3];
     volatile uint32_t excl_flag[2],excl_victim;
+    uint16_t last_wait[3][2];
 #if QDS_PREPARED_PROFILE
     uint64_t wait[3],wall[3],pre[3];
 #endif
@@ -737,7 +762,9 @@ static int prepared_qnn_command(QdQnnListRun *run,const Nprg2QnnRunEntry *entry,
         __asm__ volatile("pause(#32)");
     }
 #endif
+#ifndef LANE_BAR
     __asm__ volatile("barrier":::"memory");
+#endif
 #if QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM && !QDS_QNN_LANES
     qnn_claim->idle[list]=0;__asm__ volatile("barrier":::"memory");
     (void)qnn_claim_serve(list);   /* a part posted just before we left the wait */
@@ -848,7 +875,7 @@ static int prepared_lane_step(QdQnnListRun *run,const Nprg2QnnLaneEntry *e,uint3
                 if(run->error || resident_cancelled()){qnn_claim->idle[list]=0;return NPRG2_EXEC_CANCELLED;}
                 if(now_ns()>deadline){qnn_claim->idle[list]=0;return NPRG2_EXEC_REJECTED;}
             }
-            __asm__ volatile("pause(#32)");
+            __asm__ volatile("pause(#" QDS_PAUSE_STR(QDS_LANE_PAUSE) ")");
         }
         qnn_claim->idle[list]=0;__asm__ volatile("barrier":::"memory");
         (void)qnn_claim_serve(list);   /* a part posted just before we left the wait */
@@ -856,13 +883,26 @@ static int prepared_lane_step(QdQnnListRun *run,const Nprg2QnnLaneEntry *e,uint3
         run->wait[list]+=now_ns()-p0;
 #endif
     }
+#ifdef LANE_ACQ
+    /* Reads of data another list produced need a barrier only after a new threshold. */
+    if(wa!=run->last_wait[list][0] || wb!=run->last_wait[list][1]) {
+        run->last_wait[list][0]=wa;run->last_wait[list][1]=wb;
+        __asm__ volatile("barrier":::"memory");
+    }
+#else
     __asm__ volatile("barrier":::"memory");
+#endif
     Nprg2QnnRunEntry t={e->command,0,0,e->dma_event_id,e->dma_event_kind};
     int rc=prepared_qnn_command(run,&t,list);
     if(rc)return rc;
+#ifdef LANE_PUBLISH
+    if(!e->publish)return NPRG2_EXEC_OK;
+#endif
     __asm__ volatile("barrier":::"memory");
     prepared_lane_progress[list*QDS_LANE_STRIDE]=i+1u;
+#ifndef LANE_BAR
     __asm__ volatile("barrier":::"memory");
+#endif
     return NPRG2_EXEC_OK;
 }
 #endif
@@ -967,12 +1007,18 @@ static int prepared_qnn_runlists(QdgGraph *g,QdPreparedState *s,uint32_t first,u
     uint32_t generation=send_work_start(8,0);
     uint32_t completed=0;
 #if QDS_QNN_LANES
+#ifdef QDS_HMX_STAY
+    uint32_t hmx_saved=prepared_hmx_enter();prepared_hmx_held=1;
+#endif
     {uint32_t rng=0x2545f491u;
      for(uint32_t i=0;i<QD_QNN_LANE0_COUNT;i++) {
         int rc=prepared_lane_step(&run,&nprg2_qnn_lane0[i],0,i,&rng);
         if(rc){run.error=(uint32_t)rc;__asm__ volatile("barrier":::"memory");break;}
         completed++;
      }}
+#ifdef QDS_HMX_STAY
+    prepared_hmx_held=0;prepared_hmx_leave(hmx_saved);
+#endif
 #else
     for(uint32_t i=0;i<QD_QNN_PRIMARY_MAIN_COUNT;i++) {
         int rc=prepared_qnn_command(&run,&nprg2_qnn_primary_main[i],0);
@@ -991,7 +1037,7 @@ static int prepared_qnn_runlists(QdgGraph *g,QdPreparedState *s,uint32_t first,u
         uint32_t all=1;
         for(uint32_t t=1;t<QDS_WORKER_SLOTS;t++)if(work->done[t]!=generation)all=0;
         if(all || now_ns()>end)break;
-        if(!qnn_claim_serve(0))__asm__ volatile("pause(#16)");
+        if(!qnn_claim_serve(0))__asm__ volatile("pause(#" QDS_PAUSE_STR(QDS_LANE_PAUSE) ")");
      }
      qnn_claim->idle[0]=0;__asm__ volatile("barrier":::"memory");}
 #endif
@@ -1284,6 +1330,9 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
             (void)nprg2_exec_reference_plan_begin(&q,&s->conv);
 #ifdef WEIGHTS_MEMO
             nprg2_exec_weights_memo_begin();
+#ifdef CMD_MEMO
+            nprg2_exec_cmd_memo_begin(q.program,q.pools[1].base);
+#endif
 #endif
 #ifdef EW_MEMO
             nprg2_exec_elementwise_memo_begin(q.program,q.pools);

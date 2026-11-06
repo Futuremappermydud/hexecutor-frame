@@ -512,7 +512,7 @@ static void follower_leased(uint32_t tid) {
 #if NPRG2_OVERLAP || NPRG2_QNN_RUNLISTS
             if(!follower_subjob(tid,&sub_seen))
 #endif
-                __asm__ volatile("pause(#32)");
+                __asm__ volatile("pause(#" QDS_PAUSE_STR(QDS_LANE_PAUSE) ")");
         }
         __asm__ volatile("barrier":::"memory");seen=work->generation;
         uint32_t op=work->op;

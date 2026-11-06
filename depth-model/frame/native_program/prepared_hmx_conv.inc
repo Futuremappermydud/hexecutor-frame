@@ -352,7 +352,12 @@ static int hmx_mac(const HmxJob *J, int32_t *fi, int32_t *zero, uint8_t *complet
     const Nprg2HmxOps *h=J->g->conv->hmx;
 #if BLK_HVX
     HVX_Vector sentinel=Q6_V_vsplat_R(-1);
-    for(uint32_t i=0;i<2048;i+=128)*(HVX_Vector *)(completion+i)=sentinel;
+    #ifdef SLIDE_TRIM2
+        /* Completion is polled on the first word only. */
+        *(HVX_Vector *)completion=sentinel;
+#else
+        for(uint32_t i=0;i<2048;i+=128)*(HVX_Vector *)(completion+i)=sentinel;
+#endif
     __asm__ volatile("barrier":::"memory");
     if(h->wide_n) for(int32_t j=0;j<J->NB;j++)
         h->wide_n(J->A,(void *)(J->B+(size_t)j*J->KB*1024),fi+j*64,J->C+(size_t)j*2048,
@@ -693,7 +698,12 @@ static int nat_mac(const NatJob *J, int32_t *fi, int32_t *zero, uint8_t *complet
     const Nprg2HmxOps *h=J->conv->hmx;
 #if BLK_HVX
     HVX_Vector sentinel=Q6_V_vsplat_R(-1);
-    for(uint32_t i=0;i<2048;i+=128)*(HVX_Vector *)(completion+i)=sentinel;
+    #ifdef SLIDE_TRIM2
+        /* Completion is polled on the first word only. */
+        *(HVX_Vector *)completion=sentinel;
+#else
+        for(uint32_t i=0;i<2048;i+=128)*(HVX_Vector *)(completion+i)=sentinel;
+#endif
     __asm__ volatile("barrier":::"memory");
 #if NPRG2_PLANES
     for(int32_t j=0;j<J->NB;j++)
@@ -944,7 +954,12 @@ static int plane_slide_run(const ConvPlan *P, const Nprg2ReferenceConv *c, uint8
     int e=0;
     {
         HVX_Vector sentinel=Q6_V_vsplat_R(-1);
+        #ifdef SLIDE_TRIM2
+        /* Completion is polled on the first word only. */
+        *(HVX_Vector *)completion=sentinel;
+#else
         for(uint32_t i=0;i<2048;i+=128)*(HVX_Vector *)(completion+i)=sentinel;
+#endif
         __asm__ volatile("barrier":::"memory");
         c->hmx->finish(zero,completion);
         uint64_t end=c->hmx->clock?c->hmx->clock()+1000000000ull:0;
@@ -1186,7 +1201,12 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
     int e=0;
     {
         HVX_Vector sentinel=Q6_V_vsplat_R(-1);
+        #ifdef SLIDE_TRIM2
+        /* Completion is polled on the first word only. */
+        *(HVX_Vector *)completion=sentinel;
+#else
         for(uint32_t i=0;i<2048;i+=128)*(HVX_Vector *)(completion+i)=sentinel;
+#endif
         __asm__ volatile("barrier":::"memory");
         c->hmx->finish(zero,completion);
         uint64_t end=c->hmx->clock?c->hmx->clock()+1000000000ull:0;
@@ -1352,7 +1372,12 @@ static int plane_native_run(const NativePlan *Q, const Nprg2ReferenceConv *c, ui
             __asm__ volatile("barrier":::"memory");
             {W32I v=*(volatile W32I *)base;__asm__ volatile(""::"r"(v[0]):"memory");}
             HVX_Vector sentinel=Q6_V_vsplat_R(-1);
-            for(uint32_t i=0;i<2048;i+=128)*(HVX_Vector *)(completion+i)=sentinel;
+            #ifdef SLIDE_TRIM2
+        /* Completion is polled on the first word only. */
+        *(HVX_Vector *)completion=sentinel;
+#else
+        for(uint32_t i=0;i<2048;i+=128)*(HVX_Vector *)(completion+i)=sentinel;
+#endif
             __asm__ volatile("barrier":::"memory");
             if(clock){t1=clock();c->phase[0]+=t1-t0;t0=t1;}
             for(int32_t j=0;j<NB;j++)
@@ -2193,7 +2218,12 @@ static int n16_exec(const Nprg2ReferenceConv *c, N16Job *J, int32_t nbuf, Nprg2P
     for(int32_t ci=0;ci<nch && !e;ci++) {
         N16Job *Jc=&J[ci%nbuf];
         HVX_Vector sentinel=Q6_V_vsplat_R(-1);
+        #ifdef SLIDE_TRIM2
+        /* Completion is polled on the first word only. */
+        *(HVX_Vector *)completion=sentinel;
+#else
         for(uint32_t i=0;i<2048;i+=128)*(HVX_Vector *)(completion+i)=sentinel;
+#endif
         __asm__ volatile("barrier":::"memory");
         for(int32_t j=0;j<NB;j++)
             h->native16_n(Jc->A,(void *)(wbase+(size_t)j*KB*1024),fi+j*64,(void *const *)(Jc->outp+(size_t)j*Jc->mt),(uint32_t)KB,(uint32_t)Jc->mt);

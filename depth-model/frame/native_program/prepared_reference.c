@@ -2154,7 +2154,15 @@ static int k_weight_scales(G *g) {
        count4(o->d)==64 && i->pool<7 && g->pool[i->pool]) {
         const size_t bytes=count4(i->d),rows=bytes/64;
         if(rows>0 && !(rows&1) && i->offset+(uint64_t)bytes<=g->pool_bytes[i->pool]) {
-            A r;TRY(anew(g,&r,o->d,DT_F32));
+            A r;
+#ifdef CHAIN_HVX
+            float *direct=dense_out(g,o,o->d,DT_F32,g->pool[i->pool]+i->offset,bytes);
+            if(direct){r.p=direct;r.dt=DT_F32;}
+            else
+#else
+            float *direct=NULL;
+#endif
+            TRY(anew(g,&r,o->d,DT_F32));
             if(!g->dry) {
                 const HVX_UVector *v=(const HVX_UVector *)(const void *)(g->pool[i->pool]+i->offset);
                 HVX_Vector lo=Q6_V_vsplat_R(-1),hi=Q6_V_vzero();
@@ -2174,7 +2182,7 @@ static int k_weight_scales(G *g) {
 #endif
                 }
             }
-            return t_write(g,o,&r);
+            return direct?0:t_write(g,o,&r);
         }
     }
 #endif
@@ -2243,6 +2251,15 @@ static int k_combine_scales(G *g) {
     if(direct && ((uint8_t *)direct<(uint8_t *)b.p+nb && (uint8_t *)b.p<(uint8_t *)direct+nb)) direct=NULL;
     if(direct){r.p=direct;r.dt=DT_F32;}
     else TRY(anew(g,&r,a.n,DT_F32));
+#if defined(CHAIN_HVX) && BLK_HVX && defined(__HVX_IEEE_FP__)
+    /* Q6_Vsf_vmpy_VsfVsf is bit-identical to scalar IEEE here (bench/lanes/sfmpy_sim.c); the qf32 path is not. */
+    if(!g->dry && !(count4(a.n)&31u)) {
+        const HVX_Vector kv=Q6_V_vsplat_R((int32_t)s->scalar);
+        for(size_t j=0,n=count4(a.n);j<n;j+=32)
+            *(HVX_UVector *)((float *)r.p+j)=Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(*(const HVX_UVector *)((const float *)a.p+j),*(const HVX_UVector *)((const float *)b.p+j)),kv);
+        return direct?0:t_write(g,out0(g),&r);
+    }
+#endif
     if(!g->dry) {
         float k=f32_from_bits(s->scalar);
         for(size_t j=0,n=count4(a.n);j<n;j++){volatile float p=((float *)a.p)[j]*((float *)b.p)[j];((float *)r.p)[j]=p*k;}
@@ -2353,6 +2370,18 @@ static int k_scale_convert(G *g) {
     int32_t *direct=dx?dense_out(g,o,x.n,o->dtype,x.p,count4(x.n)*4):NULL;
     if(direct){r.p=direct;r.dt=o->dtype;}
     else TRY(anew(g,&r,x.n,o->dtype));
+#if defined(CHAIN_HVX) && BLK_HVX
+    /* Only the low 15 bits of h are used, so a 32-bit add is enough. */
+    if(!g->dry && !(count4(x.n)&31u)) {
+        const HVX_Vector c1000=Q6_V_vsplat_R(0x1000),m3ff=Q6_V_vsplat_R(0x3ff),m7c00=Q6_V_vsplat_R(0x7c00),c6400=Q6_V_vsplat_R(0x6400),c400000=Q6_V_vsplat_R(0x400000);
+        for(size_t j=0,n=count4(x.n);j<n;j+=32) {
+            const HVX_Vector h=Q6_Vuw_vlsr_VuwR(Q6_Vw_vadd_VwVw(*(const HVX_UVector *)((const uint32_t *)x.p+j),c1000),13);
+            *(HVX_UVector *)((int32_t *)r.p+j)=Q6_Vw_vadd_VwVw(Q6_Vw_vadd_VwVw(Q6_V_vand_VV(h,m3ff),
+                Q6_V_vand_VV(Q6_Vw_vadd_VwVw(Q6_V_vand_VV(h,m7c00),c6400),m7c00)),c400000);
+        }
+        return direct?0:t_write(g,o,&r);
+    }
+#endif
     if(!g->dry)for(size_t j=0,n=count4(x.n);j<n;j++) {
         int64_t h=((int64_t)((uint32_t *)x.p)[j]+0x1000)>>13;
         ((int32_t *)r.p)[j]=(int32_t)((h&0x3ff)+(((h&0x7c00)+0x6400)&0x7c00)+0x400000);

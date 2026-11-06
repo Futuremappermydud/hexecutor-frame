@@ -61,8 +61,24 @@ int nprg2_exec_flat_vtcm_validate(const Nprg2ExecCall *c, void *ctx) {
 
 int nprg2_exec_flat_vtcm_run(const Nprg2ExecCall *c, void *ctx) {
     (void)ctx;
+#ifdef CMD_MEMO
+    typedef struct { uint8_t *dst; const uint8_t *src; uint32_t n; } FlatMemo;
+    {
+        const FlatMemo *m = nprg2_exec_cmd_memo(c);
+        if (m) { memcpy(m->dst, m->src, m->n); return 1; }
+    }
+#endif
     FlatVtcmPlan p;
     if (!make_plan(c, &p)) return 0;
+#ifdef CMD_MEMO
+    {
+        FlatMemo *n = nprg2_exec_cmd_memo_new(c, sizeof *n);
+        if (n) {
+            n->dst = c->pools[1].base + p.out.offset; n->src = c->pools[3].base + p.in.offset; n->n = p.bytes;
+            nprg2_exec_cmd_memo_commit(c, n);
+        }
+    }
+#endif
     memcpy(c->pools[1].base + p.out.offset, c->pools[3].base + p.in.offset, p.bytes);
     return 1;
 }

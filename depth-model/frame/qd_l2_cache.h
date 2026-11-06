@@ -188,7 +188,42 @@ typedef struct {uint32_t syscfg,ccr,active;
 #ifdef QDS_L2_SIG
     uint64_t sig_upper,sig_lower;
 #endif
+#ifdef QDS_L2_SPARSE
+    uint32_t nz[8];   /* per 2 KiB block of the upper half: holds a non-zero byte */
+#endif
 } QdsL2Cache;
+#ifdef QDS_L2_SPARSE
+/* The uncached backup is the slow part of a lease. All-zero blocks of the half that becomes
+ * cache are not copied there and are simply zeroed again on restore; the signature check
+ * still covers the whole half. No HVX stores to the stack here. */
+#define QDS_L2_SPARSE_BLOCKS (QDS_L2_SAVE_BYTES/2048u)
+_Static_assert(QDS_L2_SPARSE_BLOCKS<=256u,"sparse bitmap too small");
+static void qds_l2_sparse_save(QdsL2Cache *s){
+    for(uint32_t i=0;i<8u;i++)s->nz[i]=0;
+    const uint32_t bk=QDS_L2_BACKUP+(QDS_L2_SAVE-QDS_L2_TCM);
+    for(uint32_t b=0;b<QDS_L2_SPARSE_BLOCKS;b++) {
+        const HVX_Vector *v=(const HVX_Vector *)(QDS_L2_SAVE+b*2048u);
+        HVX_Vector a=v[0];
+        for(uint32_t i=1;i<16u;i++)a=Q6_V_vor_VV(a,v[i]);
+        a=Q6_V_vor_VV(a,Q6_V_vror_VR(a,64));a=Q6_V_vor_VV(a,Q6_V_vror_VR(a,32));a=Q6_V_vor_VV(a,Q6_V_vror_VR(a,16));
+        a=Q6_V_vor_VV(a,Q6_V_vror_VR(a,8));a=Q6_V_vor_VV(a,Q6_V_vror_VR(a,4));
+        if(Q6_R_vextract_VR(a,0)) {
+            s->nz[b>>5]|=1u<<(b&31u);
+            qds_l2_vcopy_n(bk+b*2048u,QDS_L2_SAVE+b*2048u,2048u);
+        }
+    }
+    __asm__ volatile("barrier":::"memory");
+}
+static void qds_l2_sparse_restore(const QdsL2Cache *s){
+    const uint32_t bk=QDS_L2_BACKUP+(QDS_L2_SAVE-QDS_L2_TCM);
+    const HVX_Vector zero=Q6_V_vzero();
+    for(uint32_t b=0;b<QDS_L2_SPARSE_BLOCKS;b++) {
+        if(s->nz[b>>5]>>(b&31u)&1u)qds_l2_vcopy_n(QDS_L2_SAVE+b*2048u,bk+b*2048u,2048u);
+        else {HVX_Vector *d=(HVX_Vector *)(QDS_L2_SAVE+b*2048u);for(uint32_t i=0;i<16u;i++)d[i]=zero;}
+    }
+    __asm__ volatile("barrier":::"memory");
+}
+#endif
 static uint32_t qds_l2_begin(QdsL2Cache *s){
     s->active=0;s->syscfg=qds_l2_syscfg();s->ccr=qds_l2_ccr();
     if(((s->syscfg>>16)&7u)!=0u || s->syscfg!=0x0a80a057u || s->ccr!=0x150049u)return 1;
@@ -196,7 +231,11 @@ static uint32_t qds_l2_begin(QdsL2Cache *s){
     qds_l2_l1_tcm(1);
     s->sig_upper=qds_l2_sig_range(0xcbf29ce484222325ull,QDS_L2_SAVE,QDS_L2_SAVE_BYTES);
     s->sig_lower=qds_l2_sig_lower();
+#ifdef QDS_L2_SPARSE
+    qds_l2_sparse_save(s);
+#else
     qds_l2_vcopy_n(QDS_L2_BACKUP+(QDS_L2_SAVE-QDS_L2_TCM),QDS_L2_SAVE,QDS_L2_SAVE_BYTES);
+#endif
 #elif QDS_L2_CACHE==1 && defined(QDS_L2_NO_VERIFY)
     /* Opt-in: only the half that becomes cache is saved, nothing is compared. */
     qds_l2_l1_range(QDS_L2_SAVE,QDS_L2_SAVE_BYTES,1);
@@ -237,7 +276,11 @@ static uint32_t qds_l2_end(QdsL2Cache *s){
     /* One statement: no stack access between the flush and TCM mode. */
     __asm__ volatile("syncht\n\tl2gcleaninv\n\tsyncht\n\tisync\n\tsyncht\n\tsyscfg=%0\n\tisync"
                      ::"r"(s->syscfg):"memory");
+#ifdef QDS_L2_SPARSE
+    qds_l2_sparse_restore(s);
+#else
     qds_l2_vcopy_n(QDS_L2_SAVE,QDS_L2_BACKUP+(QDS_L2_SAVE-QDS_L2_TCM),QDS_L2_SAVE_BYTES);
+#endif
 #if QDS_L2_CACHE==1 && defined(QDS_L2_SIG)
     uint32_t bad=qds_l2_sig_lower()!=s->sig_lower ||
                  qds_l2_sig_range(0xcbf29ce484222325ull,QDS_L2_SAVE,QDS_L2_SAVE_BYTES)!=s->sig_upper;
