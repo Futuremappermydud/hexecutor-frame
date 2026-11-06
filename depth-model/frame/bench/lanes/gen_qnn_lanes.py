@@ -30,6 +30,7 @@ ap.add_argument('--main-steal-us', type=float, default=0, help='main runs ready 
 ap.add_argument('--search', type=int, default=0, help='randomized priority search: this many trials, keep the best modeled end')
 ap.add_argument('--cpu-weights', default='', help='op/var list of weight copies built with WEIGHTS_CPU_BELOW: they never use the DMA queue')
 ap.add_argument('--serial', action='store_true', help='profiling only: every command waits for the previous, so each runs alone with all helpers free')
+ap.add_argument('--true-flow', action='store_true', help='model only: drop memory-reuse ordering')
 ap.add_argument('--no-dma-edges', action='store_true', help='model only: leave out the DMA landing edges')
 ap.add_argument('--strict', action='store_true', help='also enforce conflicts QNN lists leave unordered (they race in QNN too)')
 a = ap.parse_args()
@@ -175,6 +176,52 @@ if a.strict:
         else: add(p, i); extra += 1
 print(f'edges: honored {honored}, QNN-reversed kept {dropped}, unordered-in-QNN {unordered} (enforced {extra}, cycle-rejected {rejected})')
 
+# Model only: what if memory reuse were not a constraint? Keep true data flow (each read after
+# the last writer of its granules), the one HMX unit and DMA queue order; drop reuse ordering.
+if a.true_flow:
+    last = {}; rp = [set() for _ in range(N)]; nreuse = 0
+    for i in range(N):
+        for g in R[i]:
+            if g in last: rp[i].add(last[g])
+        for g in W[i]: last[g] = i
+        rp[i].discard(i)
+    tot = sum(len(x) for x in preds)
+    s2 = [set() for _ in range(N)]
+    for i in range(N):
+        for p_ in rp[i]: s2[p_].add(i)
+    dq_ = [e for e in kept_main if e[4] or (cmds[e[0]][1] == 4 and (cmds[e[0]][1], cmds[e[0]][2]) not in cpuw)]
+    for x, y in zip(dq_, dq_[1:]): s2[x[0]].add(y[0])
+    indeg_ = [0] * N
+    for u in range(N):
+        for v in s2[u]: indeg_[v] += 1
+    d_ = list(indeg_); order = [i for i in range(N) if d_[i] == 0]; q_ = list(order)
+    while q_:
+        u = q_.pop()
+        for v in s2[u]:
+            d_[v] -= 1
+            if d_[v] == 0: order.append(v); q_.append(v)
+    assert len(order) == N, 'cycle in true-flow graph'
+    rm = [0.0] * N
+    for u in reversed(order): rm[u] = cost[u] + max((rm[v] for v in s2[u]), default=0.0)
+    print('true flow: edges %d of %d conflict pairs, critical path %.3f ms' % (sum(len(x) for x in rp), tot, max(rm)))
+    for nw_ in (2, 3):
+        d_ = list(indeg_); rdy = []; mq = []
+        for i in range(N):
+            if d_[i] == 0: heapq.heappush(mq if lane[i] == 0 else rdy, (-rm[i], i))
+        fr = list(range(1, nw_ + 1)); ev = []; now_ = 0.0; mf = True; dn = 0
+        while dn < N:
+            if mf and mq:
+                i = heapq.heappop(mq)[1]; mf = False; heapq.heappush(ev, (now_ + cost[i], i, 0))
+            while fr and rdy:
+                _, i = heapq.heappop(rdy); l = fr.pop(); heapq.heappush(ev, (now_ + cost[i], i, l))
+            t_, i, l = heapq.heappop(ev); now_ = t_; dn += 1
+            if l == 0: mf = True
+            else: fr.append(l)
+            for v in s2[i]:
+                d_[v] -= 1
+                if d_[v] == 0: heapq.heappush(mq if lane[v] == 0 else rdy, (-rm[v], v))
+        print('true flow, one HMX list + %d workers: modeled end %.3f ms' % (nw_, now_))
+    sys.exit(0)
 # --- async weight copies land only at their later checkpoint wait
 mainpos = {e[0]: k for k, e in enumerate(main)}
 dma_edges = dma_skip = 0

@@ -1240,6 +1240,29 @@ static void __attribute__((noinline)) prepared_leased(uint32_t unused) {
 #endif
     if(qds_l2_end(&l2))c->l2_error|=8;
     trace[5]=(uint32_t)(now_ns()-t);
+#ifdef QDS_CLK_PROBE
+    {
+        /* Diagnostic: clock registers read from inside a live run, and raw DDR read timing.
+         * Same register range the boot and HMX power code already access from the DSP. */
+        static const uint32_t regs[]={0x32008404u,0x3200822cu,0x32008414u,0x32008248u,0x32008410u,0x32008254u,0x32008258u,
+            0x3200825cu,0x32008264u,0x32008124u,0x32008128u,0x32008270u,0x32008130u,
+            0x32348020u,0x32348024u,0x32348180u,0x32348184u,0x323481a0u,
+            0x32341000u,0x32341004u,0x32341010u,0x32341014u,0x32002000u,0x32002004u,0x32002010u,0x32002014u};
+        volatile uint32_t *out=(volatile uint32_t *)0xa7810000u;
+        for(uint32_t i=0;i<sizeof regs/4u;i++)out[i]=*(volatile uint32_t *)regs[i];
+        /* Uncached DDR: 256 KiB of the backup with HVX, then twice more for a stable figure. */
+        for(uint32_t r=0;r<3u;r++){
+            uint64_t a=now_ns();
+            const HVX_Vector *v=(const HVX_Vector *)(QDS_L2_BACKUP+0x80000u);HVX_Vector x=Q6_V_vzero();
+            for(uint32_t i=0;i<2048u;i++)x=Q6_V_vor_VV(x,v[i]);
+            out[40+r]=(uint32_t)(now_ns()-a);out[44+r]=(uint32_t)Q6_R_vextract_VR(x,0);
+        }
+        /* Same amount of VTCM, for scale. */
+        {uint64_t a=now_ns();const HVX_Vector *v=(const HVX_Vector *)QD_DIRECT_VTCM_BASE;HVX_Vector x=Q6_V_vzero();
+         for(uint32_t i=0;i<2048u;i++)x=Q6_V_vor_VV(x,v[i]);
+         out[48]=(uint32_t)(now_ns()-a);out[49]=(uint32_t)Q6_R_vextract_VR(x,0);}
+    }
+#endif
 }
 #endif
 

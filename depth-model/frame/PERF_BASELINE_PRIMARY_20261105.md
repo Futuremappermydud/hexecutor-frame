@@ -771,7 +771,25 @@ Rejected, measured:
 
 **Verification:** `q1`, same code before removing the rejected options: 54/54 twice, 10.97 and 10.96 ms; jitter 255 54/54; jitter 31 54/54 twice, 270 runs. Final `r0`: 54/54, 10.949 ms; jitter 255 54/54. Barrier removal is the part most exposed to rare races, and those runs reduce that risk without excluding it. The HVX float multiply `Q6_Vsf_vmpy_VsfVsf` matched scalar IEEE on 6.4 M ISS samples (the qf32 path mismatched about 40%), and the gate covers its real inputs on silicon. It needs `-mhvx-ieee-fp`.
 
-**Next:** about 0.45 ms short of 10.5 ms. Candidates: conv staging and setup (about 1.8 ms), a u16 3×3 walk from `hmx_v75_convhbh_stride1_aligned`, truly parking idle threads instead of spinning (riskier: firmware interplay), and copy elimination (up to 0.63 ms, modeled, upper bound).
+**Next:** about 0.45 ms short of 10.5 ms. Largest lead: a memory plan fitted to the schedule (13.5f). Then conv staging and setup (about 1.8 ms), a u16 3×3 walk from `hmx_v75_convhbh_stride1_aligned`, and copy elimination (up to 0.63 ms, modeled, upper bound).
+
+### 13.5f Is the hardware or the path limiting?
+
+**No misconfigured clock in what was read.** Registers read from inside a live run (`QDS_CLK_PROBE`, `bench/lanes/device_clkprobe.py`): HMX PLL multiplier 51, 979.2 MHz. AXI PLL multiplier 78, divide 2, about 749 MHz, with or without `QDS_AXIM_RUN`, which is why that flag gains nothing. The core clock's PLL was not read; 1843 MHz comes from earlier upcycle measurements. Raw reads: about 11 GB/s from the backup region mapped as uncached, about 84 GB/s from VTCM on one thread. The VTCM figure is one vector load about every 2.8 cycles. Model's clocks were not measured.
+
+**Rejected, smoke pairs against 10.89 ms:** idle back-off with extra pauses, +0.25 ms, so waits are latency-sensitive. Separate L1 flush per buffer, +0.15 ms, lease end 0.49 against 0.40 ms.
+
+**Critical path, model with measured costs:**
+
+| Constraints | Critical path | Modeled end |
+|---|---:|---:|
+| Today: QNN order on every conflict, DMA queue order | 8.67 ms | 10.37 ms |
+| True data flow only, one HMX list, DMA queue order, 2 workers | 5.04 ms | 7.49 ms |
+| Same, 3 workers | 5.04 ms | 7.07 ms |
+
+About 0.6 ms outside the lists comes on top. So memory reuse and ordering appear to account for most of the gap, and a plan free of them models at about 8.1 ms in total, below Model's 8.8 ms DSP time. **This is an upper bound on the gain:** the model ignores capacity and contention. VTCM is nearly full (7.5 MiB of tile blocks touched of 8 MiB, plus 3.25 MB spill traffic), so a new plan can't remove all reuse. Crouton tensors go through block tables, which suggests blocks could be reassigned offline to suit the schedule, but nothing has been built or tested. Direct tensors would need new offsets.
+
+**Parking idle threads: not attempted.** With no spare wake-up mechanism proven safe, a lost `resume` would hang the DSP. Back-off shows waits are latency-sensitive, so it only helps if wake-up is nearly instant. Rough best case about 0.2 ms, an estimate.
 
 ### 13.6 Provenance
 
