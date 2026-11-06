@@ -483,11 +483,7 @@ static int qnn_claim_run(void *impl,uint32_t parts,Nprg2ParallelFn fn,void *ctx)
         while(sl[i]->done!=g[i]) {
             if(!qnn_claim_serve(self)) {
                 if(now_ns()>end){prepared_par_fault=1;break;}
-#ifdef QDS_JOIN_PAUSE
-                __asm__ volatile("pause(#" QDS_PAUSE_STR(QDS_JOIN_PAUSE) ")");
-#else
                 __asm__ volatile("pause(#8)");
-#endif
             }
         }
         __asm__ volatile("barrier":::"memory");
@@ -692,7 +688,6 @@ typedef struct {
     volatile uint32_t error;
     volatile uint32_t completed[3];
     volatile uint32_t excl_flag[2],excl_victim;
-    uint16_t last_wait[3][2];
 #if QDS_PREPARED_PROFILE
     uint64_t wait[3],wall[3],pre[3];
 #endif
@@ -883,15 +878,7 @@ static int prepared_lane_step(QdQnnListRun *run,const Nprg2QnnLaneEntry *e,uint3
         run->wait[list]+=now_ns()-p0;
 #endif
     }
-#ifdef LANE_ACQ
-    /* Reads of data another list produced need a barrier only after a new threshold. */
-    if(wa!=run->last_wait[list][0] || wb!=run->last_wait[list][1]) {
-        run->last_wait[list][0]=wa;run->last_wait[list][1]=wb;
-        __asm__ volatile("barrier":::"memory");
-    }
-#else
     __asm__ volatile("barrier":::"memory");
-#endif
     Nprg2QnnRunEntry t={e->command,0,0,e->dma_event_id,e->dma_event_kind};
     int rc=prepared_qnn_command(run,&t,list);
     if(rc)return rc;
