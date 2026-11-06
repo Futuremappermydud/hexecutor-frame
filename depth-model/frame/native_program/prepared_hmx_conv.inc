@@ -855,12 +855,6 @@ static int plane_slide_run(const ConvPlan *P, const Nprg2ReferenceConv *c, uint8
     if(clock){t1=clock();c->phase[HMX_SETUP_SLOT]+=t1-t0;t0=t1;}
     uint32_t saved=c->hmx->enter?c->hmx->enter():0;
     uint32_t sparts=groups>=SLIDE_STAGE_SERIAL_BELOW?nprg2_parallel_parts(par,NPRG2_PAR_MAX_PARTS):1u;
-#ifdef SLIDE_PROF
-#define SP4(slot) do { if(clock){uint64_t x_=clock();c->phase[slot]+=x_-sp_t;sp_t=x_;} } while(0)
-    uint64_t sp_t=clock?clock():0;
-#else
-#define SP4(slot) do {} while(0)
-#endif
     for(int32_t by=0;by<bh;by++) {
 #ifdef SLIDE_INPLACE_ALL
         if(P->s2) {
@@ -931,7 +925,6 @@ static int plane_slide_run(const ConvPlan *P, const Nprg2ReferenceConv *c, uint8
         }
         __asm__ volatile("barrier":::"memory");
         {W32 v=*(volatile W32 *)(S+sbytes-2048);__asm__ volatile(""::"r"(v[0]):"memory");}
-        SP4(4);
         if(clock){t1=clock();c->phase[0]+=t1-t0;t0=t1;}
         for(int32_t j=0;j<NB;j++) {
             /* whole tiles, realigned by plane_part: column 0 holds no output pixel */
@@ -963,10 +956,8 @@ static int plane_slide_run(const ConvPlan *P, const Nprg2ReferenceConv *c, uint8
         __asm__ volatile("barrier":::"memory");
     }
     if(c->hmx->leave) c->hmx->leave(saved);
-    SP4(5);
     if(clock){t1=clock();c->phase[1]+=t1-t0;t0=t1;}
     if(e){*err=E_RANGE;return -1;}
-    SP4(7);
     PlaneJob J={.C=C,.mh=mh,.mt=total,.NB=NB,.bw=bw,.ncol=ncol,.shift=1,.tile0=P->s2?0:1,
                 .rows=P->oh&7,.partial_from=(P->oh&7)?(bh-1)*bw:total,
                 .pool=pool,.oblk=P->oblk,.ocount=P->ocount,.oslice=P->oslice,.onbw=P->onbw,.onbd=P->onbd,.oR=P->oR,.oC=P->oC};
@@ -974,9 +965,6 @@ static int plane_slide_run(const ConvPlan *P, const Nprg2ReferenceConv *c, uint8
     if(parts>1) nprg2_parallel_for(par,NPRG2_PAR_CONV,parts,plane_part,&J);
     else plane_part(&J,0,1);
     if(clock){t1=clock();c->phase[3]+=t1-t0;t0=t1;}
-#ifdef SLIDE_PROF
-    if(clock){uint64_t x_=clock();c->phase[2]+=x_-sp_t;}
-#endif
     return 1;
 }
 /* Plans of the bound program, by command index (lane 0, the conv list). */
@@ -1448,44 +1436,6 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
     uint8_t *ws=walloc(g,plane_native_ws(&Q));
     if(!ws){*err=E_MEMORY;return -1;}
     conv_path[g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u]=4;
-#ifdef SLIDE_GEOM
-    if(!g->dry && !bcopy && !s2ip && KB==9*cbs && (xt->p[1]&7)==7 && (xt->p[2]&7)==7) {
-        const int32_t Rg=xt->p[1]>>3,Cg=xt->p[2]>>3,nbwg=(xt->m[2]+7)/8,nbdg=(xt->m[3]+31)/32,ncg=bw+2;
-        long dmin=1L<<40,dmax=-(1L<<40),absent=0,nonv=0,unal=0,total_=0,negd=0;uint32_t pools=0;
-        for(int32_t rr=0;rr<3;rr++)for(int32_t cc=0;cc<ncg;cc++)for(int32_t cb=0;cb<cbs;cb++) {
-            uint32_t ix=(uint32_t)(((Rg+rr)*nbwg+Cg+cc)*nbdg)+xt->slice+(uint32_t)cb;
-            uint32_t e=ix<xt->nblocks&&Cg+cc<nbwg?xt->blocks[ix]:0;total_++;
-            if(!(e&127u)){absent++;continue;}
-            pools|=1u<<(e&127u);if((e&127u)!=1u)nonv++;if((e&~127u)&2047u)unal++;
-            if(rr<2){uint32_t ix2=(uint32_t)(((Rg+rr+1)*nbwg+Cg+cc)*nbdg)+xt->slice+(uint32_t)cb;uint32_t e2=ix2<xt->nblocks?xt->blocks[ix2]:0;
-                if(e2&127u){long d=(long)(e2&~127u)-(long)(e&~127u);if(d<dmin)dmin=d;if(d>dmax)dmax=d;if(d<0)negd++;}}
-        }
-        {/* block regularity: per row, per channel block, address = a0 + cc*sx? */
-         long runs=0;long ent=0,breaks=0;
-         for(int32_t rr=0;rr<3;rr++){uint32_t prev=0;long pd=0;int have=0;
-           for(int32_t cc=0;cc<ncg;cc++)for(int32_t cb=0;cb<cbs;cb++){uint32_t ix=(uint32_t)(((Rg+rr)*nbwg+Cg+cc)*nbdg)+xt->slice+(uint32_t)cb;uint32_t e=ix<xt->nblocks&&Cg+cc<nbwg?xt->blocks[ix]:0;ent++;
-              if(have){long dd=(long)(e&~127u)-(long)(prev&~127u);if(have>1&&dd!=pd)breaks++;pd=dd;}prev=e;have++;}
-           runs++;}
-         /* output */
-         long obreaks=0,oent=0;{uint32_t onw=(uint32_t)(o->m[2]+7)/8u,ond=(uint32_t)(o->m[3]+31)/32u;uint32_t prev=0;long pd=0;int have=0;
-           for(int32_t bx=0;bx<bw;bx++)for(int32_t j=0;j<NB;j++){uint32_t ix=((uint32_t)(o->p[1]>>3)*onw+(uint32_t)(o->p[2]>>3)+(uint32_t)bx)*ond+o->slice+(uint32_t)j;uint32_t e=ix<o->nblocks?o->blocks[ix]:0;oent++;
-              if(have){long dd=(long)(e&~127u)-(long)(prev&~127u);if(have>1&&dd!=pd)obreaks++;pd=dd;}prev=e;have++;}}
-         fprintf(stderr,"SLIDEREG cmd=%u ent=%ld breaks=%ld oent=%ld obreaks=%ld\n",(unsigned)g->call->command_index,ent,breaks,oent,obreaks);}
-        {long gt=0,gcross=0,gmix=0,g64=0;
-         for(int32_t cc=0;cc<ncg;cc++)for(int32_t cb=0;cb<cbs;cb++){
-            uint32_t ee[3];int pr=0;
-            for(int32_t rr=0;rr<3;rr++){uint32_t ix=(uint32_t)(((Rg+rr)*nbwg+Cg+cc)*nbdg)+xt->slice+(uint32_t)cb;ee[rr]=ix<xt->nblocks&&Cg+cc<nbwg?xt->blocks[ix]:0;if(ee[rr]&127u)pr++;}
-            gt++;
-            if(pr<3){gmix++;continue;}
-            uint32_t a=ee[0]&~127u,b=ee[1]&~127u,d=ee[2]&~127u;
-            if((a>>22)!=(b>>22)||(b>>22)!=(d>>22))gcross++;
-            long d1=(long)b-(long)a,d2=(long)d-(long)b;
-            if(d1<0)d1=-d1;if(d2<0)d2=-d2;if(d1<65536&&d2<65536)g64++;
-         }
-         fprintf(stderr,"SLIDEPAGE cmd=%u groups=%ld cross=%ld absent=%ld small=%ld\n",(unsigned)g->call->command_index,gt,gcross,gmix,g64);}
-        fprintf(stderr,"SLIDEGEOM cmd=%u cbs=%d bw=%d total=%ld absent=%ld nonvtcm=%ld unaligned=%ld neg=%ld dmin=%ld dmax=%ld pools=%x\n",(unsigned)g->call->command_index,(int)cbs,(int)bw,total_,absent,nonv,unal,negd,dmin,dmax,(unsigned)pools);
-    }
-#endif
 #ifdef CONV_SHAPES
     if(!g->dry) fprintf(stderr,"NATCONV var=%u KB=%d cbs=%d NB=%d oh=%d ow=%d px=%d py=%d one=%d bcopy=%d s2ip=%d\n",g->variant,KB,cbs,NB,oh,ow,xt->p[2]&7,xt->p[1]&7,one,bcopy,s2ip);
 #endif
@@ -1562,44 +1512,6 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
     if(!ws){*err=E_MEMORY;return -1;}
     conv_path[g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u]=4;
     if(fused) g->fx_ok=1;
-#ifdef SLIDE_GEOM
-    if(!g->dry && !bcopy && !s2ip && KB==9*cbs && (xt->p[1]&7)==7 && (xt->p[2]&7)==7) {
-        const int32_t Rg=xt->p[1]>>3,Cg=xt->p[2]>>3,nbwg=(xt->m[2]+7)/8,nbdg=(xt->m[3]+31)/32,ncg=bw+2;
-        long dmin=1L<<40,dmax=-(1L<<40),absent=0,nonv=0,unal=0,total_=0,negd=0;uint32_t pools=0;
-        for(int32_t rr=0;rr<3;rr++)for(int32_t cc=0;cc<ncg;cc++)for(int32_t cb=0;cb<cbs;cb++) {
-            uint32_t ix=(uint32_t)(((Rg+rr)*nbwg+Cg+cc)*nbdg)+xt->slice+(uint32_t)cb;
-            uint32_t e=ix<xt->nblocks&&Cg+cc<nbwg?xt->blocks[ix]:0;total_++;
-            if(!(e&127u)){absent++;continue;}
-            pools|=1u<<(e&127u);if((e&127u)!=1u)nonv++;if((e&~127u)&2047u)unal++;
-            if(rr<2){uint32_t ix2=(uint32_t)(((Rg+rr+1)*nbwg+Cg+cc)*nbdg)+xt->slice+(uint32_t)cb;uint32_t e2=ix2<xt->nblocks?xt->blocks[ix2]:0;
-                if(e2&127u){long d=(long)(e2&~127u)-(long)(e&~127u);if(d<dmin)dmin=d;if(d>dmax)dmax=d;if(d<0)negd++;}}
-        }
-        {/* block regularity: per row, per channel block, address = a0 + cc*sx? */
-         long runs=0;long ent=0,breaks=0;
-         for(int32_t rr=0;rr<3;rr++){uint32_t prev=0;long pd=0;int have=0;
-           for(int32_t cc=0;cc<ncg;cc++)for(int32_t cb=0;cb<cbs;cb++){uint32_t ix=(uint32_t)(((Rg+rr)*nbwg+Cg+cc)*nbdg)+xt->slice+(uint32_t)cb;uint32_t e=ix<xt->nblocks&&Cg+cc<nbwg?xt->blocks[ix]:0;ent++;
-              if(have){long dd=(long)(e&~127u)-(long)(prev&~127u);if(have>1&&dd!=pd)breaks++;pd=dd;}prev=e;have++;}
-           runs++;}
-         /* output */
-         long obreaks=0,oent=0;{uint32_t onw=(uint32_t)(o->m[2]+7)/8u,ond=(uint32_t)(o->m[3]+31)/32u;uint32_t prev=0;long pd=0;int have=0;
-           for(int32_t bx=0;bx<bw;bx++)for(int32_t j=0;j<NB;j++){uint32_t ix=((uint32_t)(o->p[1]>>3)*onw+(uint32_t)(o->p[2]>>3)+(uint32_t)bx)*ond+o->slice+(uint32_t)j;uint32_t e=ix<o->nblocks?o->blocks[ix]:0;oent++;
-              if(have){long dd=(long)(e&~127u)-(long)(prev&~127u);if(have>1&&dd!=pd)obreaks++;pd=dd;}prev=e;have++;}}
-         fprintf(stderr,"SLIDEREG cmd=%u ent=%ld breaks=%ld oent=%ld obreaks=%ld\n",(unsigned)g->call->command_index,ent,breaks,oent,obreaks);}
-        {long gt=0,gcross=0,gmix=0,g64=0;
-         for(int32_t cc=0;cc<ncg;cc++)for(int32_t cb=0;cb<cbs;cb++){
-            uint32_t ee[3];int pr=0;
-            for(int32_t rr=0;rr<3;rr++){uint32_t ix=(uint32_t)(((Rg+rr)*nbwg+Cg+cc)*nbdg)+xt->slice+(uint32_t)cb;ee[rr]=ix<xt->nblocks&&Cg+cc<nbwg?xt->blocks[ix]:0;if(ee[rr]&127u)pr++;}
-            gt++;
-            if(pr<3){gmix++;continue;}
-            uint32_t a=ee[0]&~127u,b=ee[1]&~127u,d=ee[2]&~127u;
-            if((a>>22)!=(b>>22)||(b>>22)!=(d>>22))gcross++;
-            long d1=(long)b-(long)a,d2=(long)d-(long)b;
-            if(d1<0)d1=-d1;if(d2<0)d2=-d2;if(d1<65536&&d2<65536)g64++;
-         }
-         fprintf(stderr,"SLIDEPAGE cmd=%u groups=%ld cross=%ld absent=%ld small=%ld\n",(unsigned)g->call->command_index,gt,gcross,gmix,g64);}
-        fprintf(stderr,"SLIDEGEOM cmd=%u cbs=%d bw=%d total=%ld absent=%ld nonvtcm=%ld unaligned=%ld neg=%ld dmin=%ld dmax=%ld pools=%x\n",(unsigned)g->call->command_index,(int)cbs,(int)bw,total_,absent,nonv,unal,negd,dmin,dmax,(unsigned)pools);
-    }
-#endif
 #ifdef CONV_SHAPES
     if(!g->dry) fprintf(stderr,"NATCONV var=%u KB=%d cbs=%d NB=%d oh=%d ow=%d px=%d py=%d ox=%d oy=%d one=%d bcopy=%d s2ip=%d\n",g->variant,KB,cbs,NB,oh,ow,xt->p[2]&7,xt->p[1]&7,o->p[2]&7,o->p[1]&7,one,bcopy,s2ip);
 #endif
@@ -2261,11 +2173,7 @@ static void n16_build_ptab(const uint8_t **pt, uint8_t *const *pool, const T *xt
 static int n16_exec(const Nprg2ReferenceConv *c, N16Job *J, int32_t nbuf, Nprg2Parallel *par, int32_t KB, int32_t NB, int32_t mt, int32_t total,
                     const int8_t *wbase, int32_t *fi, int32_t *zero, uint8_t *completion, int32_t *err) {
     const Nprg2HmxOps *h=c->hmx;
-#ifdef SLIDE_PROF
-    uint64_t (*clock)(void)=NULL,t0=0,t1;
-#else
     uint64_t (*clock)(void)=c->phase?c->clock:NULL,t0=clock?clock():0,t1;
-#endif
     uint32_t parts=nprg2_parallel_parts(par,NPRG2_PAR_MAX_PARTS);
     uint32_t saved=h->enter?h->enter():0;
     int e=0;

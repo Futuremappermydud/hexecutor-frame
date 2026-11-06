@@ -245,9 +245,6 @@ static int ew_range(int32_t H,uint32_t part,uint32_t parts,int32_t *h0,int32_t *
 }
 static uint32_t ew_parts(const Nprg2ExecCall *c,const int32_t *dims) {
     uint64_t n=(uint64_t)dims[0]*(uint64_t)dims[1]*(uint64_t)dims[2]*(uint64_t)dims[3];
-#ifdef EW_SHAPES
-    fprintf(stderr,"EWSHAPE %u/%u %d %d %d %d\n",c->command.opcode,c->command.variant,dims[0],dims[1],dims[2],dims[3]);
-#endif
     if (n<PAR_EW_MIN_ELEMS || dims[1]<2) return 1;
     return nprg2_parallel_parts(c->parallel,(uint32_t)dims[1]);
 }

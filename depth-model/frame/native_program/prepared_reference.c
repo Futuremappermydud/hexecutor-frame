@@ -2691,19 +2691,6 @@ static void requant_params(const int32_t *mult, int32_t co, int sixteen, int32_t
 #endif
 static inline int64_t rq_round(int sixteen, int32_t M, int32_t post) {
     int64_t r=(int64_t)1<<(post-1);
-#ifdef NPRG2_U8_RULE
-    /* Host-only hypotheses for Model's u8 rule: 1 = silicon midpoint with a floor scale word
-     * (no bit 22): floor((q+1/2)*M/2^14). 2 = silicon midpoint with rounding. */
-    if(!sixteen && NPRG2_U8_RULE==1) r=M>>1;
-    if(!sixteen && NPRG2_U8_RULE==2) r+=M>>1;
-#endif
-#ifdef NPRG2_RULE_SEL
-    /* Host-only: same rules, only for the commands listed in QD_RULE_CMDS (u8) / QD_RULE16_CMDS (u16). */
-    {extern int nprg2_rule_now,nprg2_rule16_now;
-     if(!sixteen && nprg2_rule_now==1) r=M>>1;
-     if(!sixteen && nprg2_rule_now==2) r+=M>>1;
-     if(sixteen && nprg2_rule16_now==3) r=(int64_t)1<<(post-1);}
-#endif
 #if NPRG2_HW_ROUNDING
     if(!sixteen) r+=M>>1;
 #endif
@@ -4279,18 +4266,8 @@ static int nprg2_exec_reference_run_inner(const Nprg2ExecCall *c, void *ctx);
 uint64_t nprg2_ref_split[2][48][80][3];
 static uint64_t ref_t_entry_raw[2];
 #endif
-#ifdef NPRG2_RULE_SEL
-#include <stdio.h>
-int nprg2_rule_now,nprg2_rule16_now;
-static uint8_t rule_map[8192],rule16_map[8192];
-static void rule_load(const char *e,uint8_t *m,int v){const char *f=getenv(e);if(!f)return;FILE *h=fopen(f,"r");if(!h)abort();int i;while(fscanf(h,"%d",&i)==1)if(i>=0&&i<8192)m[i]=(uint8_t)v;fclose(h);}
-#endif
 int nprg2_exec_reference_run(const Nprg2ExecCall *c, void *ctx) {
     G g;
-#ifdef NPRG2_RULE_SEL
-    {static int once;if(!once){once=1;rule_load("QD_RULE_CMDS",rule_map,getenv("QD_RULE")?atoi(getenv("QD_RULE")):2);rule_load("QD_RULE16_CMDS",rule16_map,3);}
-     nprg2_rule_now=c->command_index<8192?rule_map[c->command_index]:0;nprg2_rule16_now=c->command_index<8192?rule16_map[c->command_index]:0;}
-#endif
     const Nprg2ReferenceConv *pc=ctx;
     uint64_t prof_t0=pc && pc->clock && pc->phase && c->command.opcode==QDR_HMX_CONV?pc->clock():0;
     uint32_t lane=c->execution_lane<MEMO_LANES?c->execution_lane:0u;
@@ -4479,9 +4456,7 @@ int nprg2_exec_reference_plan_run(uint32_t command, Nprg2Parallel *par, int32_t 
         if(!ix) return 0;
         N16Plan *P=&n16_plan_pool[ix-1u];
         if(!plan_fi16(P->ft,P->NB,base)) return 0;
-#ifndef SLIDE_PROF
         if(clock) c->phase[6]+=clock()-t0;
-#endif
         const size_t fixed=((size_t)P->NB*256+256+2048*2+2047)&~(size_t)2047;
         return n16_exec(c,&P->J,1,par,P->KB,P->NB,P->mt,P->total,P->wbase,(int32_t *)base,(int32_t *)(base+(size_t)P->NB*256),base+fixed-2048,err);
     }
@@ -4491,9 +4466,6 @@ int nprg2_exec_reference_plan_run(uint32_t command, Nprg2Parallel *par, int32_t 
     if(P->valid) {
         size_t o_mh=nbump(&at,(size_t)P->NB*128);
         if(!plan_fi(P->ft,P->wbase,P->NB,P->KB,P->zp,(uint32_t)P->KB*1024u,(uint32_t)P->KB*8u,base,n+o_mh)) return 0;
-#ifdef SLIDE_PROF
-        if(clock) c->phase[6]+=clock()-t0;
-#endif
         if(clock) c->phase[HMX_SETUP_SLOT]+=clock()-t0;
         return plane_slide_run(P,c,plan_pool,par,base,n+o_mh,at,err);
     }
