@@ -971,7 +971,23 @@ static void __attribute__((noinline)) prepared_leased(uint32_t unused) {
     qds_l2_lease_active=0;
     t=now_ns();
 #if QDS_L2_POOL_C7
-    if(qds_l2_pool_cache(0))c->l2_error|=32;
+    {
+        /* With QDS_POOL1_NOCOPY the run never touches pool 1's DDR image, the first
+         * 8 MiB of this page: only pools 3, 4, 6 and the I/O buffers can hold L1
+         * lines. (Inputs too: their clean lines would be stale on the next run.) */
+        uint32_t lo=0,hi=0;
+#if QDS_POOL1_NOCOPY
+        lo=0xffffffffu;
+        static const uint8_t ps[3]={QDG_POOL_DDR3,QDG_POOL_DDR4,QDG_POOL_SPILL};
+#define QDS_L1_SPAN(b,n) do { uint32_t b_=(uint32_t)(uintptr_t)(b),e_=b_+(uint32_t)(n); if((n) && b_<lo)lo=b_; if((n) && e_>hi)hi=e_; } while(0)
+        for(uint32_t i=0;i<3;i++)QDS_L1_SPAN(c->g->pool[ps[i]],c->g->pool_bytes[ps[i]]);
+        for(uint32_t i=0;i<4;i++)QDS_L1_SPAN(c->s->inputs[i].data,c->s->inputs[i].bytes);
+        for(uint32_t i=0;i<2;i++)QDS_L1_SPAN(c->s->outputs[i].data,c->s->outputs[i].bytes);
+#undef QDS_L1_SPAN
+        if(lo<QDS_L2_POOL_VA || hi>QDS_L2_POOL_VA+0x1000000u || lo>=hi){lo=0;hi=0;} /* anything unexpected: whole page */
+#endif
+        if(qds_l2_pool_cache_range(0,lo,hi))c->l2_error|=32;
+    }
 #endif
     if(qds_l2_end(&l2))c->l2_error|=8;
     trace[5]=(uint32_t)(now_ns()-t);

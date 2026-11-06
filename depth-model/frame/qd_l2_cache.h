@@ -142,17 +142,21 @@ static uint64_t qds_l2_pool_entry(uint32_t attr){
     if(((uint32_t)(e>>32)&0xfffffu)!=(QDS_L2_POOL_VA>>12))return 0;
     return (e&~(0xfull<<24))|((uint64_t)attr<<24);
 }
-static uint32_t qds_l2_pool_cache(int on){
+/* Leaving: every L1 line of the page must go. flush_first..flush_end limits that
+ * to what the run can touch (0, 0: the whole page, 524288 cache operations). */
+static uint32_t qds_l2_pool_cache_range(int on,uint32_t flush_first,uint32_t flush_end){
     uint64_t e=qds_l2_pool_entry(on?7u:6u);
     if(!e)return 1;
     if(!on){
-        for(uint32_t a=QDS_L2_POOL_VA;a<QDS_L2_POOL_VA+0x1000000u;a+=32)
+        if(!flush_end){flush_first=QDS_L2_POOL_VA;flush_end=QDS_L2_POOL_VA+0x1000000u;}
+        for(uint32_t a=flush_first&~31u;a<flush_end;a+=32)
             __asm__ volatile("dccleaninva(%0)"::"r"(a):"memory");
         __asm__ volatile("barrier\n\tsyncht":::"memory");
     }
     __asm__ volatile("tlbw(%0,%1)\n\tisync"::"r"(e),"r"(QDS_L2_POOL_TLB):"memory");
     return 0;
 }
+static uint32_t qds_l2_pool_cache(int on){return qds_l2_pool_cache_range(on,0,0);}
 typedef struct {uint32_t syscfg,ccr,active;} QdsL2Cache;
 static uint32_t qds_l2_begin(QdsL2Cache *s){
     s->active=0;s->syscfg=qds_l2_syscfg();s->ccr=qds_l2_ccr();
