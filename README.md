@@ -28,6 +28,24 @@ links when packaging or syncing these components. The app deployment script
 deploys the app from `runtime/`; the existing remote DSP package paths remain
 valid and can still be selected with `FRAME_DEPTH_PACKAGE`.
 
+## Model development
+
+Depth and hand tracking will have independent distillation/fine-tuning workflows:
+[depth training](depth-model/training/README.md) and
+[hand-tracking training](hand-tracking/training/README.md).
+Keep new training code, model definitions, and evaluation recipes in those
+component directories. Keep checkpoints and datasets out of Git. Existing
+recovered models and research form the legacy reference; new models should have
+explicit input/output contracts and their own provenance, configuration, and
+validation results. Existing depth-specific DSP code may need adaptation for a
+replacement model.
+
+The intended migration is to replace legacy model dependencies and remove
+obsolete assets and references from the current tree once replacements are
+validated. Preserving the original Git history retains historical material in
+past commits. Fine-tuning or distillation alone does not establish that a
+replacement has independent provenance; record its actual dependencies.
+
 ## Git history and migration
 
 The `monorepo/hexecutor` branch joins the original `model-tsdf` runtime tip and

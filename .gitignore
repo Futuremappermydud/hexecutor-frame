@@ -13,3 +13,11 @@ __pycache__/
 
 # Local runtime recordings and generated datasets.
 /runtime/experiments/
+
+# Model development artifacts; keep recipes and evaluation code in Git.
+/depth-model/training/checkpoints/
+/depth-model/training/datasets/
+/depth-model/training/runs/
+/hand-tracking/training/checkpoints/
+/hand-tracking/training/datasets/
+/hand-tracking/training/runs/
