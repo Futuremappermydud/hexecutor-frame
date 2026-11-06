@@ -2691,6 +2691,12 @@ static void requant_params(const int32_t *mult, int32_t co, int sixteen, int32_t
 #endif
 static inline int64_t rq_round(int sixteen, int32_t M, int32_t post) {
     int64_t r=(int64_t)1<<(post-1);
+#ifdef NPRG2_U8_RULE
+    /* Host-only hypotheses for Model's u8 rule: 1 = silicon midpoint with a floor scale word
+     * (no bit 22): floor((q+1/2)*M/2^14). 2 = silicon midpoint with rounding. */
+    if(!sixteen && NPRG2_U8_RULE==1) r=M>>1;
+    if(!sixteen && NPRG2_U8_RULE==2) r+=M>>1;
+#endif
 #if NPRG2_HW_ROUNDING
     if(!sixteen) r+=M>>1;
 #endif

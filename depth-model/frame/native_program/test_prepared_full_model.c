@@ -378,6 +378,10 @@ static void check_outputs(Session *s, uint8_t *const *out, const char *what) {
         CHECK(strlen(env) == 129 && env[64] == ',');
         memcpy(ov[0], env, 64); memcpy(ov[1], env + 65, 64);
     }
+    if (getenv("QD_DUMP")) for (int k = 0; k < 2; k++) {
+        char dp[512]; snprintf(dp, sizeof dp, "%s/out%d.raw", getenv("QD_DUMP"), k);
+        FILE *df = fopen(dp, "wb"); CHECK(df && fwrite(out[k], 1, bytes[k], df) == bytes[k]); fclose(df);
+    }
     for (int k = 0; k < 2; k++) {
         uint8_t sha[32];
         char hex[65];

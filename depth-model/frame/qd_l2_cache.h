@@ -121,6 +121,33 @@ static uint32_t qds_l2_vdiff(void){
     return qds_l2_vdiff_n(0,QDS_L2_TCM_BYTES);
 #endif
 }
+/* QDS_L2_SIG: check the mode switches with a signature of live TCM instead of comparing
+ * against the uncached backup. Reading TCM needs no DDR traffic, so the lower half never
+ * goes to the backup. Word sum and XOR over all vectors, folded to 64 bits; no HVX on the
+ * stack (it may be entered before L2 is cache). */
+#ifdef QDS_L2_SIG
+static uint64_t qds_l2_sig_range(uint64_t h,uint32_t base,uint32_t bytes){
+    const HVX_Vector *a=(const HVX_Vector *)base;
+    HVX_Vector x=Q6_V_vzero(),t=Q6_V_vzero();
+    for(uint32_t i=0;i<bytes/128u;i++){
+        HVX_Vector v=a[i];
+        x=Q6_V_vxor_VV(x,v);t=Q6_Vw_vadd_VwVw(Q6_Vw_vsub_VwVw(t,x),v);
+    }
+    for(uint32_t i=0;i<32u;i++){
+        h=(h^(uint32_t)Q6_R_vextract_VR(x,i*4u))*0x100000001b3ull;
+        h=(h^(uint32_t)Q6_R_vextract_VR(t,i*4u))*0x100000001b3ull;
+    }
+    return h;
+}
+#if QDS_L2_CACHE==1
+static uint64_t qds_l2_sig_lower(void){
+    uint64_t h=0xcbf29ce484222325ull;
+    h=qds_l2_sig_range(h,QDS_L2_TCM,QDS_L2_LIVE_SKIP-QDS_L2_TCM);
+    h=qds_l2_sig_range(h,QDS_L2_LIVE_SKIP_END,QDS_L2_WORK_SKIP-QDS_L2_LIVE_SKIP_END);
+    return qds_l2_sig_range(h,QDS_L2_WORK_SKIP_END,QDS_L2_SAVE-QDS_L2_WORK_SKIP_END);
+}
+#endif
+#endif
 #if QDS_L2_CACHE==1
 static uint32_t qds_l2_lower_diff(void){
     return qds_l2_vdiff_n(0,QDS_L2_LIVE_SKIP-QDS_L2_TCM) |
@@ -157,11 +184,20 @@ static uint32_t qds_l2_pool_cache_range(int on,uint32_t flush_first,uint32_t flu
     return 0;
 }
 static uint32_t qds_l2_pool_cache(int on){return qds_l2_pool_cache_range(on,0,0);}
-typedef struct {uint32_t syscfg,ccr,active;} QdsL2Cache;
+typedef struct {uint32_t syscfg,ccr,active;
+#ifdef QDS_L2_SIG
+    uint64_t sig_upper,sig_lower;
+#endif
+} QdsL2Cache;
 static uint32_t qds_l2_begin(QdsL2Cache *s){
     s->active=0;s->syscfg=qds_l2_syscfg();s->ccr=qds_l2_ccr();
     if(((s->syscfg>>16)&7u)!=0u || s->syscfg!=0x0a80a057u || s->ccr!=0x150049u)return 1;
-#if QDS_L2_CACHE==1 && defined(QDS_L2_NO_VERIFY)
+#if QDS_L2_CACHE==1 && defined(QDS_L2_SIG)
+    qds_l2_l1_tcm(1);
+    s->sig_upper=qds_l2_sig_range(0xcbf29ce484222325ull,QDS_L2_SAVE,QDS_L2_SAVE_BYTES);
+    s->sig_lower=qds_l2_sig_lower();
+    qds_l2_vcopy_n(QDS_L2_BACKUP+(QDS_L2_SAVE-QDS_L2_TCM),QDS_L2_SAVE,QDS_L2_SAVE_BYTES);
+#elif QDS_L2_CACHE==1 && defined(QDS_L2_NO_VERIFY)
     /* Opt-in: only the half that becomes cache is saved, nothing is compared. */
     qds_l2_l1_range(QDS_L2_SAVE,QDS_L2_SAVE_BYTES,1);
     qds_l2_vcopy_n(QDS_L2_BACKUP+(QDS_L2_SAVE-QDS_L2_TCM),QDS_L2_SAVE,QDS_L2_SAVE_BYTES);
@@ -176,7 +212,9 @@ static uint32_t qds_l2_begin(QdsL2Cache *s){
     qds_l2_setcfg(s->syscfg|(QDS_L2_FIELD<<16));
     s->active=1;
     uint32_t bad=qds_l2_syscfg()!=(s->syscfg|(QDS_L2_FIELD<<16));
-#if QDS_L2_CACHE==1 && !defined(QDS_L2_NO_VERIFY)
+#if QDS_L2_CACHE==1 && defined(QDS_L2_SIG)
+    bad|=qds_l2_sig_lower()!=s->sig_lower;
+#elif QDS_L2_CACHE==1 && !defined(QDS_L2_NO_VERIFY)
     /* The live lower half must have come through l2kill and the switch. */
     bad|=qds_l2_lower_diff()!=0;
 #endif
@@ -187,7 +225,10 @@ static uint32_t qds_l2_end(QdsL2Cache *s){
     if(!s->active)return 0;
     uint32_t cleared=s->ccr&~(15u<<16);
     __asm__ volatile("ccr=%0\n\tisync"::"r"(cleared):"memory");
-#if QDS_L2_CACHE==1 && !defined(QDS_L2_NO_VERIFY)
+#if QDS_L2_CACHE==1 && defined(QDS_L2_SIG)
+    qds_l2_l1_range(QDS_L2_TCM,QDS_L2_SAVE-QDS_L2_TCM,1);
+    s->sig_lower=qds_l2_sig_lower();
+#elif QDS_L2_CACHE==1 && !defined(QDS_L2_NO_VERIFY)
     /* Snapshot the live lower half (scalar lines published first) so the
      * switch back can be checked like the restored upper half. */
     qds_l2_l1_range(QDS_L2_TCM,QDS_L2_SAVE-QDS_L2_TCM,1);
@@ -197,7 +238,10 @@ static uint32_t qds_l2_end(QdsL2Cache *s){
     __asm__ volatile("syncht\n\tl2gcleaninv\n\tsyncht\n\tisync\n\tsyncht\n\tsyscfg=%0\n\tisync"
                      ::"r"(s->syscfg):"memory");
     qds_l2_vcopy_n(QDS_L2_SAVE,QDS_L2_BACKUP+(QDS_L2_SAVE-QDS_L2_TCM),QDS_L2_SAVE_BYTES);
-#ifdef QDS_L2_NO_VERIFY
+#if QDS_L2_CACHE==1 && defined(QDS_L2_SIG)
+    uint32_t bad=qds_l2_sig_lower()!=s->sig_lower ||
+                 qds_l2_sig_range(0xcbf29ce484222325ull,QDS_L2_SAVE,QDS_L2_SAVE_BYTES)!=s->sig_upper;
+#elif defined(QDS_L2_NO_VERIFY)
     uint32_t bad=0;
 #else
     uint32_t bad=qds_l2_vdiff();

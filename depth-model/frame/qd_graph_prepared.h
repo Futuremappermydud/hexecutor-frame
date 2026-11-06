@@ -789,6 +789,9 @@ static int prepared_qnn_command(QdQnnListRun *run,const Nprg2QnnRunEntry *entry,
         if(nprg2_command_at(run->requests[list].bound,entry->command,&cmd)==NPRG2_OK){
             int hi=nprg2_executor_handler_slot(&s->executor,cmd.opcode,cmd.variant);
             if(hi>=0){qnn_prof_cycles[list][hi]+=p2-p1;qnn_prof_count[list][hi]++;}
+#ifdef QDS_LANE_CMDPROF
+            ((volatile uint32_t *)0xa7800000u)[entry->command]=(uint32_t)(p2-p1);
+#endif
 #if QDS_QNN_WAITATTR
             if(hi>=0 && done)qnn_cp_last_hi[done]=(uint8_t)hi;
 #endif
@@ -810,8 +813,9 @@ static int prepared_qnn_command(QdQnnListRun *run,const Nprg2QnnRunEntry *entry,
     return NPRG2_EXEC_OK;
 }
 #if QDS_QNN_LANES
-_Static_assert(QD_QNN_LANE_COUNT==3u && QD_QNN_LANE0_COUNT==QD_QNN_PRIMARY_MAIN_COUNT &&
-               QD_QNN_LANE1_COUNT+QD_QNN_LANE2_COUNT==QD_QNN_PRIMARY_WORKER_COUNT,"lane tables do not cover the run lists");
+_Static_assert(QD_QNN_LANE_COUNT==3u &&
+               QD_QNN_LANE0_COUNT+QD_QNN_LANE1_COUNT+QD_QNN_LANE2_COUNT+QD_QNN_LANES_DROPPED==QD_QNN_PRIMARY_COMMAND_COUNT,
+               "lane tables do not cover the program");
 #define QDS_LANE_STRIDE 8u
 static volatile uint32_t *const prepared_lane_progress=(volatile uint32_t *)0x30075000u;
 #ifndef QDS_LANE_JITTER
@@ -1065,7 +1069,11 @@ static int prepared_qnn_runlists(QdgGraph *g,QdPreparedState *s,uint32_t first,u
         return prepared_qnn_dma_finish(s,NPRG2_EXEC_CANCELLED);
     }
     if(run.error)return prepared_qnn_dma_finish(s,(int)run.error);
+#if QDS_QNN_LANES
+    if(completed!=QD_QNN_LANE0_COUNT)return prepared_qnn_dma_finish(s,NPRG2_EXEC_REJECTED);
+#else
     if(completed!=QD_QNN_PRIMARY_MAIN_COUNT)return prepared_qnn_dma_finish(s,NPRG2_EXEC_REJECTED);
+#endif
 #if QDS_QNN_LANES
     if(run.completed[1]!=QD_QNN_LANE1_COUNT || run.completed[2]!=QD_QNN_LANE2_COUNT)return prepared_qnn_dma_finish(s,NPRG2_EXEC_REJECTED);
 #else
