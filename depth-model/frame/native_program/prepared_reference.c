@@ -110,6 +110,7 @@ typedef struct {
 static uint32_t rd32(const uint8_t *p){return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
 static uint64_t rd64(const uint8_t *p){return (uint64_t)rd32(p)|((uint64_t)rd32(p+4)<<32);}
 static int32_t rdi16(const uint8_t *p){return (int16_t)(uint16_t)(p[0]|p[1]<<8);}
+static inline uint32_t rd16u(const uint8_t *p){return (uint32_t)p[0]|(uint32_t)p[1]<<8;}
 
 /* ------------------------------------------------------------------ scratch */
 static void *salloc(G *g, size_t bytes) {
@@ -195,8 +196,16 @@ static uint32_t memo_next[MEMO_LANES];
 typedef struct {uintptr_t base[7];uint32_t bytes[7],wr;uint64_t h;int valid;} MemoLimitsCache;
 static uint64_t memo_limits(const Nprg2ExecCall *c) {
     static MemoLimitsCache last[MEMO_LANES];
+#ifdef SETUP_FAST
+    /* Same request pool array as the last call on this lane: same table. */
+    static const void *last_pools[MEMO_LANES];
+#endif
     uint32_t lane=c->execution_lane<MEMO_LANES?c->execution_lane:0u;
     MemoLimitsCache *m=&last[lane];
+#ifdef SETUP_FAST
+    if(m->valid && c->preflighted && last_pools[lane]==(const void *)c->pools && m->wr==c->pool1_writable_bytes) return m->h;
+    if(c->preflighted) last_pools[lane]=(const void *)c->pools;
+#endif
     if(m->valid && m->wr==c->pool1_writable_bytes) {
         int same=1;
         for(int i=0;i<7;i++) same&=m->base[i]==(uintptr_t)c->pools[i].base && m->bytes[i]==c->pools[i].bytes;
@@ -265,10 +274,22 @@ static inline int32_t h16s(const uint8_t *p){return (int16_t)*(const u16a *)p;}
 #else
 #define DEC_HALF 0
 #endif
+#ifdef SETUP_FAST
+/* Every command clears G's header and each tensor: straight stores, not a memset call. */
+_Static_assert(sizeof(T)==120,"T layout");
+static inline void zero_t(T *t) {
+    uint64_t *q=(uint64_t *)t;
+    q[0]=0;q[1]=0;q[2]=0;q[3]=0;q[4]=0;q[5]=0;q[6]=0;q[7]=0;q[8]=0;q[9]=0;q[10]=0;q[11]=0;q[12]=0;q[13]=0;q[14]=0;
+}
+#endif
 static int decode(const Nprg2TensorView *v, T *t) {
     const uint8_t *r=v->geometry_record;
     if(!r) return 0;
+#ifdef SETUP_FAST
+    zero_t(t);
+#else
     memset(t,0,sizeof *t);
+#endif
     t->dtype=r[0];t->flags=r[1]&~(uint32_t)(F_BLOCKED|F_DIRECT);
 #if DEC_HALF
     if(!((uintptr_t)r&1u)) {
@@ -305,8 +326,32 @@ storage:
     }
     return 1;
 }
+#ifdef SETUP_FAST
+/* A preflighted call's references and tensors were all validated; same view as
+ * nprg2_bound_tensor_at without repeating its checks. */
+static inline void view_fast(const Nprg2ExecCall *c, uint32_t ref, Nprg2TensorView *o) {
+    const Nprg2Bound *b=c->bound;
+    const uint8_t *rf=b->refs.data+(size_t)ref*2u;
+    const uint32_t index=(uint32_t)rf[0]|(uint32_t)rf[1]<<8;
+    const uint8_t *r=b->tensor.data+(size_t)index*NPRG2_TENSOR_BYTES,*pay=r+3;
+    o->geometry=rd16u(r);o->storage_kind=r[2];o->pool=0;o->offset=0;o->blocks=NULL;o->block_count=0;o->slice_origin=0;
+    o->geometry_record=b->geometry.data+(size_t)o->geometry*NPRG2_GEOMETRY_BYTES;
+    if(o->storage_kind==1){o->pool=pay[0];o->offset=rd32(pay+1);}
+    else if(o->storage_kind==2) {
+        const uint32_t first=(uint32_t)pay[0]|(uint32_t)pay[1]<<8|(uint32_t)pay[2]<<16;
+        o->block_count=rd16u(pay+3);o->slice_origin=rd32(pay+5);o->blocks=c->program->expanded_blocks+first;
+    }
+}
+#endif
 static int input_at(G *g, uint32_t i, T *t) {
     uint32_t index;Nprg2TensorView v;
+#ifdef SETUP_FAST
+    if(g->call->preflighted && i<g->nin) {
+        view_fast(g->call,(uint32_t)g->call->command.input_first+i,&v);
+        if(!decode(&v,t)) FAIL(E_TENSOR);
+        return 0;
+    }
+#endif
     if(i>=g->nin || nprg2_exec_input(g->call,i,&index,&v)!=NPRG2_EXEC_OK || !decode(&v,t)) FAIL(E_TENSOR);
     return 0;
 }
@@ -4021,7 +4066,14 @@ static int setup_ex(G *g, const Nprg2ExecCall *c, int dry, int measure, const Np
                     uint8_t *scr, uint32_t scrb) {
     /* Everything but the decoded tensors and the fused epilogue's views (set
      * before use: decode() and fuse_decode() clear what they fill). */
+#ifdef SETUP_FAST
+    _Static_assert(offsetof(G,in)==0xc8,"G header");
+    {uint64_t *q=(uint64_t *)g;
+     q[0]=0;q[1]=0;q[2]=0;q[3]=0;q[4]=0;q[5]=0;q[6]=0;q[7]=0;q[8]=0;q[9]=0;q[10]=0;q[11]=0;q[12]=0;
+     q[13]=0;q[14]=0;q[15]=0;q[16]=0;q[17]=0;q[18]=0;q[19]=0;q[20]=0;q[21]=0;q[22]=0;q[23]=0;q[24]=0;}
+#else
     memset(g,0,offsetof(G,in));
+#endif
     g->measure_only=0;g->conv=NULL;g->wused=0;
     g->fx.kind=g->fx.dead=0;g->fx.mc=g->fx.mo=g->fx.rd=g->fx.sh=0;g->fx.eb=g->fx.bb=NULL;
     g->fx_ok=0;g->par_slots=0;g->chk_memo=NULL;g->chk_state=0;g->cm=NULL;g->lim=0;g->cm_ok=g->lim_ok=0;
@@ -4123,6 +4175,12 @@ static int setup_ex(G *g, const Nprg2ExecCall *c, int dry, int measure, const Np
     for(uint32_t i=0;i<g->nin && i<CACHED_INPUTS;i++)TRY(input_at(g,i,&g->in[i]));
     if(g->nout) {
         uint32_t index;Nprg2TensorView v;
+#ifdef SETUP_FAST
+        if(c->preflighted) {
+            view_fast(c,(uint32_t)k->output_first,&v);
+            if(!decode(&v,&g->out)) FAIL(E_TENSOR);
+        } else
+#endif
         if(nprg2_exec_output(c,0,&index,&v)!=NPRG2_EXEC_OK || !decode(&v,&g->out)) FAIL(E_TENSOR);
     } else memset(&g->out,0,sizeof g->out);
     return 0;

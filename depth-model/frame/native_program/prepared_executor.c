@@ -561,7 +561,22 @@ int nprg2_executor_run_preflighted_command_prepared(const Nprg2Executor *e,
        ix<full->command_first || ix-full->command_first>=full->command_count)
         return NPRG2_EXEC_ARGUMENT;
     Nprg2ExecCall call;
+#ifdef SETUP_FAST
+    /* Preflight validated this record: halfword loads, no re-validation. */
+    {
+        const uint8_t *r=full->bound->command.data+(size_t)ix*NPRG2_COMMAND_BYTES;
+        typedef uint16_t __attribute__((may_alias)) u16x;
+        if((uintptr_t)r&1u){if(nprg2_command_at(full->bound,ix,&call.command)!=NPRG2_OK)return NPRG2_EXEC_REJECTED;}
+        else {
+            const u16x *h=(const u16x *)r;Nprg2Command *c=&call.command;
+            c->sequence=h[0];c->opcode=r[2];c->variant=r[3];c->io_index=h[2];c->input_first=h[3];c->output_first=h[4];
+            c->vector_first=h[5];c->call_first=h[6];c->input_count=r[14];c->output_count=r[15];c->vector_count=r[16];
+            c->call_count=r[17];c->duplicate_pad=r[18];
+        }
+    }
+#else
     if(nprg2_command_at(full->bound,ix,&call.command)!=NPRG2_OK)return NPRG2_EXEC_REJECTED;
+#endif
     fill_call(full,ix,&call);call.preflighted=1;
     int hi=handler_index(e,call.command.opcode,call.command.variant);
     if(hi<0)return NPRG2_EXEC_UNSUPPORTED;
