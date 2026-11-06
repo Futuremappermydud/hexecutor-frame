@@ -1,0 +1,25 @@
+--- a/frame/native_program/test_prepared_full_model.c
++++ b/frame/native_program/test_prepared_full_model.c
+@@ -352,6 +352,7 @@
+         nprg2_sha256(out[k], bytes[k], sha);
+         for (int j = 0; j < 32; j++) snprintf(hex + 2 * j, 3, "%02x", sha[j]);
+         const char *want = env && !print ? ov[k] : expect[alt][k];
++        if (getenv("QD_DUMP")) { char dp[1024]; snprintf(dp, sizeof dp, "%s/out%d.raw", getenv("QD_DUMP"), k); FILE *df = fopen(dp, "wb"); CHECK(df); CHECK(fwrite(out[k], 1, bytes[k], df) == bytes[k]); fclose(df); }
+         if (print) { printf("%s %s output %d sha256 %s\n", s->model, what, k, hex); continue; }
+         if (strcmp(hex, want)) {
+             fprintf(stderr, "%s %s output %d sha256 %s, expected %s\n", s->model, what, k, hex, want);
+--- a/frame/native_program/prepared_reference.c
++++ b/frame/native_program/prepared_reference.c
+@@ -2580,6 +2580,12 @@
+ }
+ static inline int64_t requant_value(int64_t acc, int32_t bias, int sixteen, int32_t M, int32_t pre, int32_t post) {
+     int64_t a=acc+(int64_t)bias*(sixteen?256:1);
++#ifdef NPRG2_HW_BIAS_FIX
++    /* Experiment: cancel the silicon midpoint's +1/2 q unit with an offset the
++     * Fi bias word can express (u8: acc units; u16: whole bias units of 256). */
++    if(!sixteen) { if(pre>0) a-=(int64_t)1<<(pre-1); }
++    else if(post>18+1) a-=(int64_t)1<<(pre+post-19);
++#endif
+ #if NPRG2_HW_ROUNDING
+     if(sixteen && post>18) { /* q = floor(x*2^(e-8)) is a right shift here */
+         int64_t q=(a>>pre)>>(post-18);

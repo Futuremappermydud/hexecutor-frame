@@ -1,0 +1,122 @@
+"""Run every prepared command of one model on Frame and check both outputs.
+
+Each case runs once from zeroed mutable pools and then again without any pool
+reset, the way a persistent depth worker calls it. Both runs must reproduce the
+emulator output sha256 values; lease restoration and guards are checked on exit.
+"""
+
+# Direct CLI entry points use the same explicit package roots as the root task runner.
+import sys as _path_sys
+from pathlib import Path as _SourcePath
+for _source_root in _SourcePath(__file__).resolve().parents:
+    if (_source_root / "hexecutor/api.py").is_file():
+        _path_sys.path[:0] = [str(_source_root), str(_source_root / "depth-model/python"),
+                             str(_source_root / "depth-model/tools"),
+                             str(_source_root / "hexecutor/benchmarks")]
+        break
+from hexecutor.paths import workspace as _workspace
+PATHS = _workspace()
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import sys
+import numpy as np
+
+FRAME=(PATHS.native)
+sys.path.insert(0,str(FRAME))
+import depth_model.lowering.resident_image as resident_image
+from depth_model.adapters import ResidentDSP
+from verify_native_graph import cases,ensure_image,load_inputs
+
+
+def main():
+    ap=argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--model',choices=('primary','alternate'),required=True)
+    ap.add_argument('--case',action='append')
+    ap.add_argument('--repeat',type=int,default=2)
+    ap.add_argument('--engine',type=Path,required=True)
+    ap.add_argument('--bootstrap',type=Path,required=True)
+    ap.add_argument('--prepared-program',type=Path,required=True)
+    ap.add_argument('--report',type=Path,required=True)
+    ap.add_argument('--save-outputs',type=Path,help='save each case/run as a NumPy archive for precision comparisons')
+    ap.add_argument('--compare-outputs',type=Path,help='directory of exact --save-outputs archives')
+    ap.add_argument('--allow-inexact',action='store_true',help='allow output differences; requires --compare-outputs and still checks execution/lease guards')
+    ap.add_argument('--expect',choices=('emulator','hw'),default='emulator',
+                    help='hw: an NPRG2_HW_ROUNDING=1 engine, checked against the silicon-rounding oracle')
+    a=ap.parse_args()
+    if a.allow_inexact and not a.compare_outputs:ap.error('--allow-inexact requires --compare-outputs')
+    if a.save_outputs:a.save_outputs.mkdir(parents=True,exist_ok=True)
+    image=ensure_image(a.model)
+    commands=len(resident_image.unpack(image.read_bytes())['commands'])
+    constants=(PATHS.model_data / 'recovered')/a.model/'constants/constant_pool_5.bin'
+    names,todo=cases(a.model,a.case or ['smoke','random'],a.expect)
+    report={'purpose':__doc__,'model':a.model,'expect':a.expect,'allow_inexact':a.allow_inexact,'commands':commands,'runs':[],'passed':False,
+            'engine_sha256':hashlib.sha256(a.engine.read_bytes()).hexdigest(),
+            'bootstrap_sha256':hashlib.sha256(a.bootstrap.read_bytes()).hexdigest(),
+            'prepared_sha256':hashlib.sha256(a.prepared_program.read_bytes()).hexdigest()}
+    a.report.parent.mkdir(parents=True,exist_ok=True)
+    def save():a.report.write_text(json.dumps(report,indent=2)+'\n')
+    with ResidentDSP(image,constants,engine=a.engine,bootstrap=a.bootstrap,
+                     prepared_program=a.prepared_program) as dsp:
+        if not dsp.preserve_vtcm:raise ValueError('preserving bootstrap required')
+        for label,directory,expected in todo:
+            inputs=load_inputs(directory)
+            for p in (0,1,2,3,4,6):
+                if dsp.sizes[p]:dsp.mem[dsp.pools[p]:dsp.pools[p]+dsp.sizes[p]]=bytes(dsp.sizes[p])
+            for run in range(a.repeat):
+                outs=dsp.run(inputs)
+                archive=f'{a.model}-{label}-{run}.npz'
+                if a.save_outputs:np.savez(a.save_outputs/archive,**dict(zip(names,outs)))
+                hashes={n+'.raw':hashlib.sha256(outs[i].tobytes()).hexdigest() for i,n in enumerate(names)}
+                trace=dsp.last.get('native_direct_trace',[])
+                row={'case':label,'run':run,'pools_zeroed':run==0,**dsp.last,'output_sha256':hashes,
+                     'outputs_equal':hashes==expected,
+                     'variant_profile':sorted(dsp.profile,key=lambda v:-v['ms']),
+                     'handler_profile':dsp.handler_profile,'executor_profile':dsp.executor_profile,'parallel_profile':getattr(dsp,'parallel_profile',{})}
+                finite=True
+                if a.compare_outputs:
+                    row['output_error']={}
+                    with np.load(a.compare_outputs/archive,allow_pickle=False) as ref:
+                        for name,out in zip(names,outs):
+                            expected_out=ref[name]
+                            if hashlib.sha256(expected_out.tobytes()).hexdigest()!=expected[name+'.raw']:
+                                raise ValueError(f'{name}: comparison archive does not match the exact oracle')
+                            if out.shape!=expected_out.shape or out.dtype!=expected_out.dtype:
+                                raise ValueError(f'{name}: reference shape/dtype differs')
+                            delta=np.abs(out.astype(np.float64)-expected_out.astype(np.float64))
+                            valid=bool(np.isfinite(delta).all());finite &= valid
+                            row['output_error'][name]={'finite':valid,'max_abs':float(delta.max()) if valid else None,
+                                'mean_abs':float(delta.mean()) if valid else None,'different_fraction':float(np.mean(out!=expected_out))}
+                # The prepared reference engine reuses the conv phase slots:
+                # u8 convs in 0..3, u16 in 4..7, summed over thread parts.
+                phases=list(dsp.last.get('conv_phases_ms',{}).values())
+                if len(phases)==8:
+                    keys=('staging','mac','setup','output')
+                    row['near_conv_phases_ms']=dict(zip(keys,(phases[k]+phases[4+k] for k in range(4))))
+                    row['near_conv_phases_u8_ms']=dict(zip(keys,phases[:4]))
+                    row['near_conv_phases_u16_ms']=dict(zip(keys,phases[4:]))
+                row['passed']=(dsp.last.get('status')==0 and finite and (row['outputs_equal'] or a.allow_inexact) and
+                               dsp.last.get('native_prepared_program') is True and len(trace)==16 and
+                               trace[8]==commands and trace[9]==commands and
+                               all(dsp.last.get('native_'+f,{}).get('calls')==0 for f in ('1x1','3x3')))
+                report['runs'].append(row);save()
+                print(json.dumps({'case':label,'run':run,'passed':row['passed'],'outputs_equal':row['outputs_equal'],
+                                  'output_error':row.get('output_error'),
+                                  'dsp_ms':row.get('dsp_ms'),'total_seconds':row.get('total_seconds'),
+                                  'near_conv_phases_ms':row.get('near_conv_phases_ms'),
+                                  'top_variants_ms':{v['variant']:round(v['ms'],1) for v in row['variant_profile'][:6]},
+                                  'top_handlers_ms':{f"{h['opcode']}/{h['variant']}":[h['count'],round(h['run_ms'],1),round(h['validate_ms'],1)]
+                                                     for h in row['handler_profile'][:8]},
+                                  'executor_profile_ms':{k:(round(v,2) if isinstance(v,float) else v) for k,v in row['executor_profile'].items()}}),
+                      flush=True)
+    report['exit_errors']=dsp.exit_errors;report['vtcm_lease']=dsp.vtcm_lease
+    report['passed']=(bool(report['runs']) and all(r['passed'] for r in report['runs'])
+                      and not any(dsp.exit_errors) and dsp.vtcm_lease['phase']==2
+                      and not dsp.vtcm_lease['error'] and dsp.vtcm_lease['host_fingerprint_equal'])
+    save()
+    if not report['passed']:raise SystemExit('Prepared full model failed; see report')
+
+
+if __name__=='__main__':main()

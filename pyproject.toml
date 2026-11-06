@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "frame-spatial-development"
+version = "0.1.0"
+description = "Offline model and executor development tools; live inference is native C++"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[tool.setuptools]
+packages = ["hexecutor", "hexecutor.offline", "hexecutor.program", "depth_model", "depth_model.lowering", "depth_model.reference"]
+package-dir = {depth_model = "depth-model/python/depth_model"}
+include-package-data = false

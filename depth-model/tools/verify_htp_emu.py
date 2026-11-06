@@ -6,6 +6,19 @@ python3 tools/verify_htp_emu.py recovered/primary PROBES --report REPORT.json
 Uses the exported execution_order.json and kernel_calls.json; no SDK or trace
 memory is needed. An Emulator's address maps are reused between cases.
 """
+
+# Direct CLI entry points use the same explicit package roots as the root task runner.
+import sys as _path_sys
+from pathlib import Path as _SourcePath
+for _source_root in _SourcePath(__file__).resolve().parents:
+    if (_source_root / "hexecutor/api.py").is_file():
+        _path_sys.path[:0] = [str(_source_root), str(_source_root / "depth-model/python"),
+                             str(_source_root / "depth-model/tools"),
+                             str(_source_root / "hexecutor/benchmarks")]
+        break
+from hexecutor.paths import workspace as _workspace
+PATHS = _workspace()
+
 import argparse
 import hashlib
 import json
@@ -42,7 +55,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('recovered', type=Path)
     ap.add_argument('probes', type=Path)
-    ap.add_argument('--hashes', type=Path, default=Path(__file__).resolve().parents[1] / 'reference/simulator_output_hashes.json')
+    ap.add_argument('--hashes', type=Path, default=(PATHS.model_data / 'reference/simulator_output_hashes.json'))
     ap.add_argument('--cases', nargs='+')
     ap.add_argument('--report', required=True, type=Path)
     args = ap.parse_args()

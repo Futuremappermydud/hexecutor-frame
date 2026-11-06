@@ -1,1 +1,0 @@
-../../../docs/hexecutor/kernel-adapters.md

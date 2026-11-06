@@ -11,6 +11,19 @@
 
 All jobs in one run() share a container start. Research tool.
 """
+
+# Direct CLI entry points use the same explicit package roots as the root task runner.
+import sys as _path_sys
+from pathlib import Path as _SourcePath
+for _source_root in _SourcePath(__file__).resolve().parents:
+    if (_source_root / "hexecutor/api.py").is_file():
+        _path_sys.path[:0] = [str(_source_root), str(_source_root / "depth-model/python"),
+                             str(_source_root / "depth-model/tools"),
+                             str(_source_root / "hexecutor/benchmarks")]
+        break
+from hexecutor.paths import workspace as _workspace
+PATHS = _workspace()
+
 from pathlib import Path
 import shutil
 import subprocess
@@ -18,7 +31,7 @@ import tempfile
 
 from run_qnn_sim import IMAGE
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = (PATHS.model_data)
 
 
 class Job:
@@ -52,7 +65,7 @@ class Job:
 
 
 def run(jobs, sdk, keep=None):
-    work = Path(keep) if keep else Path(tempfile.mkdtemp(prefix='kcall-', dir=ROOT / 'sim' / 'build'))
+    work = Path(keep) if keep else Path(tempfile.mkdtemp(prefix='kcall-', dir=(PATHS.model_data / 'sim/build')))
     work.mkdir(parents=True, exist_ok=True)
     script = []
     for i, j in enumerate(jobs):
@@ -73,7 +86,7 @@ def run(jobs, sdk, keep=None):
         script.append(f'/k/kcall /sdk/lib/x86_64-linux-clang/libQnnHtp.so /w/job{i}/spec.txt > /w/job{i}/log 2>&1')
     subprocess.run(['docker', 'run', '--rm', '--platform', 'linux/amd64',
                     '-e', 'LD_LIBRARY_PATH=/sdk/lib/x86_64-linux-clang:/usr/lib/llvm-14/lib',
-                    '-v', f'{Path(sdk).resolve()}:/sdk:ro', '-v', f'{ROOT / "sim" / "build"}:/k:ro',
+                    '-v', f'{Path(sdk).resolve()}:/sdk:ro', '-v', f'{(PATHS.model_data / 'sim/build')}:/k:ro',
                     '-v', f'{work}:/w', IMAGE, 'bash', '-c', '; '.join(script)], check=True)
     results = []
     for i, j in enumerate(jobs):

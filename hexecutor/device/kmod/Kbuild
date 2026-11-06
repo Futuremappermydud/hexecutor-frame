@@ -1,0 +1,1 @@
+obj-m += cdsp_bw.o cdsp_mem.o cdsp_noc.o cdsp_nocclk.o

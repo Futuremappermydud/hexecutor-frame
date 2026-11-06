@@ -11,6 +11,19 @@ OUTPUT/writes.bin (every VTCM block changed by each op). Build the hook once:
 
 Inputs are a directory holding x.raw, y.raw, hidden.raw and t.raw (native).
 """
+
+# Direct CLI entry points use the same explicit package roots as the root task runner.
+import sys as _path_sys
+from pathlib import Path as _SourcePath
+for _source_root in _SourcePath(__file__).resolve().parents:
+    if (_source_root / "hexecutor/api.py").is_file():
+        _path_sys.path[:0] = [str(_source_root), str(_source_root / "depth-model/python"),
+                             str(_source_root / "depth-model/tools"),
+                             str(_source_root / "hexecutor/benchmarks")]
+        break
+from hexecutor.paths import workspace as _workspace
+PATHS = _workspace()
+
 import argparse
 from pathlib import Path
 import subprocess
@@ -19,7 +32,7 @@ import sim_trace
 
 from run_qnn_sim import IMAGE
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = (PATHS.model_data)
 
 
 def main():
@@ -58,7 +71,7 @@ def main():
     for k, v in env.items():
         cmd += ["-e", f"{k}={v}"]
     cmd += ["-v", f"{args.sdk.resolve()}:/sdk:ro", "-v", f"{ctx.parent}:/ctx:ro",
-            "-v", f"{ROOT / 'sim' / 'build'}:/hook:ro", "-v", f"{inputs}:/in:ro", "-v", f"{out}:/out",
+            "-v", f"{(PATHS.model_data / 'sim/build')}:/hook:ro", "-v", f"{inputs}:/in:ro", "-v", f"{out}:/out",
             IMAGE, f"/sdk/bin/{target}/qnn-net-run", "--backend", f"/sdk/lib/{target}/libQnnHtp.so",
             "--retrieve_context", f"/ctx/{ctx.name}", "--input_list", "/out/list.txt",
             "--use_native_input_files", "--use_native_output_files", "--output_dir", "/out",

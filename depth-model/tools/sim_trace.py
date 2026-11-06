@@ -20,6 +20,19 @@ Layouts (QNN/HTP/core/memory_layout.h, tens/tensor_definitions.h):
   F?? flat:       row-major over the padded maximum dimensions
 Needs NumPy (python3.13/3.14 here).
 """
+
+# Direct CLI entry points use the same explicit package roots as the root task runner.
+import sys as _path_sys
+from pathlib import Path as _SourcePath
+for _source_root in _SourcePath(__file__).resolve().parents:
+    if (_source_root / "hexecutor/api.py").is_file():
+        _path_sys.path[:0] = [str(_source_root), str(_source_root / "depth-model/python"),
+                             str(_source_root / "depth-model/tools"),
+                             str(_source_root / "hexecutor/benchmarks")]
+        break
+from hexecutor.paths import workspace as _workspace
+PATHS = _workspace()
+
 import gzip
 import json
 import struct
@@ -80,7 +93,7 @@ def map_entries(graph, rows):
         raise ValueError(f'mapped {len(out)} entries, trace has {len(fn_of)}')
     if next(main, None) is not None or next(pads, None) is not None:
         raise ValueError('trace did not consume every main-list operation')
-    known_path = Path(__file__).resolve().parents[1] / 'sim/qairt_2_50_functions.json'
+    known_path = (PATHS.model_data / 'sim/qairt_2_50_functions.json')
     if known_path.exists():
         known = json.loads(known_path.read_text())
         for key, node in out.items():

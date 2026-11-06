@@ -1,5 +1,0 @@
-obj-m += cdsp_bw.o cdsp_mem.o cdsp_noc.o cdsp_nocclk.o
-# The running kernel has BTF modules; without pahole, olddefconfig drops them,
-# which shrinks struct module. Restore the fields so the module loads.
-ccflags-y += -DCONFIG_DEBUG_INFO_BTF=1 -DCONFIG_DEBUG_INFO_BTF_MODULES=1
-# (build.sh also appends them to the tree's generated autoconf.h for the .mod.c)

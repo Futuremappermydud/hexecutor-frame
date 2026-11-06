@@ -1,0 +1,2792 @@
+diff --git a/depth-model/frame/build_resident_dsp.sh b/depth-model/frame/build_resident_dsp.sh
+index 0964076..f28d0e5 100644
+--- a/depth-model/frame/build_resident_dsp.sh
++++ b/depth-model/frame/build_resident_dsp.sh
+@@ -25,6 +25,8 @@ docker run --rm --platform linux/amd64 -v "$task_sdk_root:/sdk:ro" -v "$PWD/fram
+    -e QDS_PREPARED_REFERENCE="${QDS_PREPARED_REFERENCE:-0}" \
+    -e QDS_PREPARED_PROFILE="${QDS_PREPARED_PROFILE:-1}" \
+    -e QDS_PREPARED_FUSE="${QDS_PREPARED_FUSE:-0}" \
++   -e QDS_PREPARED_DMA_ASYNC="${QDS_PREPARED_DMA_ASYNC:-0}" \
++   -e QDS_PREPARED_DMA_VERIFY="${QDS_PREPARED_DMA_VERIFY:-0}" \
+    -e QDS_L2_CACHE="${QDS_L2_CACHE:-0}" \
+    -e QDS_PREPARED_THREADS="${QDS_PREPARED_THREADS:-1}" \
+    -e QDS_PREPARED_HMX="${QDS_PREPARED_HMX:-0}" \
+@@ -135,6 +137,12 @@ engine_flags="$engine_flags -DQDS_PREPARED_REFERENCE=$QDS_PREPARED_REFERENCE"
+ case "$QDS_PREPARED_PROFILE" in 0|1) ;; *) echo "QDS_PREPARED_PROFILE must be 0 or 1" >&2; exit 1;; esac
+ engine_flags="$engine_flags -DQDS_PREPARED_PROFILE=$QDS_PREPARED_PROFILE"
+ case "$QDS_PREPARED_FUSE" in 0|1) ;; *) echo "QDS_PREPARED_FUSE must be 0 or 1" >&2; exit 1;; esac
++case "$QDS_PREPARED_DMA_ASYNC" in 0|1) ;; *) echo "QDS_PREPARED_DMA_ASYNC must be 0 or 1" >&2; exit 1;; esac
++case "$QDS_PREPARED_DMA_VERIFY" in 0|1) ;; *) echo "QDS_PREPARED_DMA_VERIFY must be 0 or 1" >&2; exit 1;; esac
++if [ "$QDS_PREPARED_DMA_ASYNC" = 1 ] && { [ "$QDS_NATIVE_PREPARED" != 1 ] || [ "$QDS_PRESERVE_VTCM" != 1 ]; }; then
++  echo "QDS_PREPARED_DMA_ASYNC requires prepared execution and preserved VTCM" >&2; exit 1
++fi
++engine_flags="$engine_flags -DQDS_PREPARED_DMA_ASYNC=$QDS_PREPARED_DMA_ASYNC -DQDS_PREPARED_DMA_VERIFY=$QDS_PREPARED_DMA_VERIFY"
+ if [ "$QDS_PREPARED_FUSE" = 1 ] && [ "$QDS_PREPARED_REFERENCE" != 1 ]; then
+   echo "QDS_PREPARED_FUSE requires QDS_PREPARED_REFERENCE (the fast conv runs the fused epilogue)" >&2; exit 1
+ fi
+@@ -185,7 +193,7 @@ if [ "$QDS_NATIVE_DIRECT_RANGE" = 1 ]; then
+ fi
+ if [ "$QDS_NATIVE_PREPARED" = 1 ]; then
+   engine="${engine%.elf}-prepared.elf"
+-  native_src="$native_src native_program/nprg2_runtime.c native_program/prepared_executor.c native_program/prepared_native.c native_program/prepared_io.c native_program/prepared_runner.c native_program/prepared_fuse.c"
++  native_src="$native_src native_program/nprg2_runtime.c native_program/prepared_executor.c native_program/prepared_native.c native_program/prepared_io.c native_program/prepared_runner.c native_program/prepared_fuse.c native_program/prepared_dma_ring.c"
+ fi
+ if [ "$QDS_DIRECT_COMPACT_INPUT" != 0 ]; then engine="${engine%.elf}-compact-input.elf"; fi
+ if [ "$QDS_DIRECT_COMPACT_INPUT" = 2 ]; then engine="${engine%.elf}-aliases.elf"; fi
+diff --git a/depth-model/frame/native_program/prepared_async_dma.h b/depth-model/frame/native_program/prepared_async_dma.h
+new file mode 100644
+index 0000000..18efef1
+--- /dev/null
++++ b/depth-model/frame/native_program/prepared_async_dma.h
+@@ -0,0 +1,219 @@
++#ifndef NPRG2_PREPARED_ASYNC_DMA_H
++#define NPRG2_PREPARED_ASYNC_DMA_H
++
++#include "prepared_executor.h"
++#include "../qd_graph_dsp.h"
++
++#include <stdint.h>
++#include <stddef.h>
++
++#ifndef QDS_PREPARED_DMA_TIMEOUT_CYCLES
++#define QDS_PREPARED_DMA_TIMEOUT_CYCLES 50000000ull
++#endif
++
++typedef struct {
++    uint32_t probe_ok,pending,saved_dm2,bytes;
++    uint32_t probe_match,probe_target_restored,probe_dm2_restored;
++    uint32_t last_status,last_command,src,dst,last_mode;
++    uint32_t verified_bytes,mismatch_count,mismatch_offset,source_word,dest_word;
++    uint64_t starts,drains,probe_cycles;
++    Nprg2DmaRing ring;
++    uint32_t ring_tail_slot,ring_mode,ring_cap;
++} QdsPreparedDmaAsync;
++
++#ifdef __hexagon__
++#define QDS_DMA_ASYNC_DESC 0xf1808000u
++#define QDS_DMA_ASYNC_DUMMY (QDS_DMA_ASYNC_DESC+32u)
++#define QDS_DMA_ASYNC_RING_DUMMY (QDS_DMA_ASYNC_DESC+63u*32u)
++#define QDS_DMA_ASYNC_RING_BYTES (64u*32u)
++#define QDS_DMA_ASYNC_BYTES 128u
++#define QDS_DMA_ASYNC_SRC_LO 0xa0000000u
++#define QDS_DMA_ASYNC_SRC_HI 0xa8000000u
++#define QDS_DMA_ASYNC_DST_LO 0x31000000u
++#define QDS_DMA_ASYNC_DST_HI 0x31800000u
++#define QDS_DMA_ASYNC_DST_ACTIVE_HI 0x31780000u
++#define QDS_DMA_ASYNC_TEST_DST 0x31782000u
++
++static uint32_t qds_dma_async_dm_read(uint32_t index){
++    uint32_t v;__asm__ volatile("r1 = %1\n .word 0xa801c0a0\n %0 = r0":"=r"(v):"r"(index):"r0","r1","memory");return v;
++}
++static void qds_dma_async_dm_write(uint32_t index,uint32_t value){
++    __asm__ volatile("r1 = %0\n r0 = %1\n .word 0xa801c0c0"::"r"(index),"r"(value):"r0","r1","memory");
++}
++static int qds_dma_async_dm_restore(uint32_t value){
++    qds_dma_async_dm_write(2,value);return qds_dma_async_dm_read(2)==value;
++}
++static uint32_t qds_dma_async_poll(void){uint32_t s;__asm__ volatile("%0 = dmpoll":"=r"(s)::"memory");return s;}
++static uint64_t qds_dma_async_cycles(void){uint64_t c;__asm__ volatile("%0 = upcycle":"=r"(c));return c;}
++static uint64_t qds_dma_async_tlbr(uint32_t i){uint64_t e;__asm__ volatile("%0 = tlbr(%1)":"=r"(e):"r"(i):"memory");return e;}
++static uint32_t qds_dma_async_tlbp(uint32_t va,uint32_t asid){uint32_t i;__asm__ volatile("%0 = tlbp(%1)":"=r"(i):"r"((asid<<20)|(va>>12)):"memory");return i;}
++static void qds_dma_async_export(const QdsPreparedDmaAsync *s){
++    volatile uint32_t *d=(volatile uint32_t *)(uintptr_t)(0xf1800000u+QDS_DMA_VERIFY_DIAG_OFFSET);
++    d[0]=0x564d4441u;d[1]=1u;d[2]=(uint32_t)s->starts;d[3]=(uint32_t)s->drains;
++    d[4]=s->verified_bytes;d[5]=s->mismatch_count;d[6]=s->last_command;d[7]=s->bytes;
++    d[8]=s->mismatch_offset;d[9]=s->source_word;d[10]=s->dest_word;d[11]=s->src;
++    d[12]=s->dst;d[13]=s->last_status;d[14]=s->saved_dm2;d[15]=s->last_mode;
++    __asm__ volatile("barrier" ::: "memory");
++}
++
++/* The Frame DMA-v4 stream path consumes the existing CPU-JTLB translations.
++ * Verify both ends against the current ASID and rely on qdo_map/qdvtcm lease's
++ * already-validated contiguous windows; do not write a DMA JTLB or change ASID. */
++static int qds_dma_async_range_mapped(uintptr_t base,size_t bytes,uint32_t asid){
++    if(!bytes||base>UINT32_MAX||bytes>UINT32_MAX-base)return 0;
++    uintptr_t points[2]={base,(base+bytes-1u)&~(uintptr_t)0xfffu};
++    for(unsigned k=0;k<2;k++){
++        uint32_t va=(uint32_t)(points[k]&~(uintptr_t)0xfffu),ix=qds_dma_async_tlbp(va,asid);
++        if(ix&0x80000000u)return 0; /* Hexagon tlbp high bit means miss. */
++        uint64_t e=qds_dma_async_tlbr(ix&0x3ffu);if(!(e>>63))return 0;
++    }
++    return 1;
++}
++static int qds_dma_async_ranges_mapped(uintptr_t src,size_t bytes,uintptr_t dst){
++    uint32_t ssr;__asm__ volatile("%0 = ssr":"=r"(ssr));uint32_t asid=(ssr>>8)&127u;
++    return src>=QDS_DMA_ASYNC_SRC_LO&&src<=QDS_DMA_ASYNC_SRC_HI&&bytes<=QDS_DMA_ASYNC_SRC_HI-src&&
++           dst>=QDS_DMA_ASYNC_DST_LO&&dst<=QDS_DMA_ASYNC_DST_HI&&bytes<=QDS_DMA_ASYNC_DST_HI-dst&&
++           qds_dma_async_range_mapped(src,bytes,asid)&&qds_dma_async_range_mapped(dst,bytes,asid)&&
++           qds_dma_async_range_mapped(QDS_DMA_ASYNC_DESC,64u,asid);
++}
++static void qds_dma_async_desc_init(uintptr_t src,uintptr_t dst,size_t bytes,uint32_t mode){
++    volatile uint32_t *d=(volatile uint32_t *)(uintptr_t)QDS_DMA_ASYNC_DESC;
++    volatile uint32_t *tail=(volatile uint32_t *)(uintptr_t)QDS_DMA_ASYNC_DUMMY;
++    for(uint32_t i=0;i<8u;i++){d[i]=0;tail[i]=0;}
++    d[1]=((uint32_t)bytes&0xffffffu)|(1u<<24)|(1u<<28)|((mode&2u)?(1u<<29):0u);
++    d[2]=(uint32_t)src;d[3]=(uint32_t)dst;d[4]=9u;
++    d[5]=((uint32_t)bytes&0xffffffu)|(1u<<24);d[6]=((uint32_t)bytes&0xffffffu)<<8;
++}
++static void qds_dma_async_desc_init_at(uint32_t address,uintptr_t src,uintptr_t dst,size_t bytes,uint32_t mode){
++    volatile uint32_t *d=(volatile uint32_t *)(uintptr_t)address;
++    for(uint32_t i=0;i<8u;i++)d[i]=0;
++    d[1]=((uint32_t)bytes&0xffffffu)|(1u<<24)|(1u<<28)|((mode&2u)?(1u<<29):0u);
++    d[2]=(uint32_t)src;d[3]=(uint32_t)dst;d[4]=9u;
++    d[5]=((uint32_t)bytes&0xffffffu)|(1u<<24);d[6]=((uint32_t)bytes&0xffffffu)<<8;
++}
++/* One startup copy probe using the known Qwen sequence. Return 1 only after
++ * actual source bytes match, target bytes are restored, and DM2 is restored;
++ * return -1 if DMA may still own memory/state. */
++static int qds_prepared_dma_async_probe(QdsPreparedDmaAsync *s,const void *src,size_t src_bytes){
++    if(!s||!src||src_bytes<QDS_DMA_ASYNC_BYTES||((uintptr_t)src&127u)||
++       !qds_dma_async_ranges_mapped((uintptr_t)src,QDS_DMA_ASYNC_BYTES,QDS_DMA_ASYNC_TEST_DST))return 0;
++    uint32_t tid;__asm__ volatile("%0 = htid":"=r"(tid));if(tid!=0u)return 0;
++    uint32_t pre=qds_dma_async_poll();if((pre&3u)!=0u||*(volatile uint32_t *)(uintptr_t)(0xf1800000u+QDS_DMA_STATE_OFFSET)!=QDS_DMA_STATE_IDLE)return 0;
++    volatile uint8_t *dst=(volatile uint8_t *)(uintptr_t)QDS_DMA_ASYNC_TEST_DST;
++    const volatile uint8_t *source=(const volatile uint8_t *)src;uint32_t saved[32];
++    for(uint32_t i=0;i<32u;i++)saved[i]=((volatile uint32_t *)dst)[i];
++    uint32_t dm2=qds_dma_async_dm_read(2);s->saved_dm2=dm2;
++    qds_dma_async_dm_write(2,0x2e3u);if(qds_dma_async_dm_read(2)!=0x2e3u){
++        volatile uint32_t *state=(volatile uint32_t *)(uintptr_t)(0xf1800000u+QDS_DMA_STATE_OFFSET);
++        if(!qds_dma_async_dm_restore(dm2)){*state=QDS_DMA_STATE_PENDING_ERROR;s->pending=1;return -1;}return 0;
++    }
++    qds_dma_async_desc_init((uintptr_t)src,QDS_DMA_ASYNC_TEST_DST,QDS_DMA_ASYNC_BYTES,2u);
++    volatile uint32_t *desc=(volatile uint32_t *)(uintptr_t)QDS_DMA_ASYNC_DESC;
++    volatile uint32_t *tail=(volatile uint32_t *)(uintptr_t)QDS_DMA_ASYNC_DUMMY;
++    volatile uint32_t *state=(volatile uint32_t *)(uintptr_t)(0xf1800000u+QDS_DMA_STATE_OFFSET);
++    *state=QDS_DMA_STATE_INFLIGHT;uint64_t start=qds_dma_async_cycles();
++    __asm__ volatile("release(%0):at\n dmlink(%1,%0)"::"r"(desc),"r"(tail):"memory");
++    for(;;){
++        uint32_t status=qds_dma_async_poll();s->last_status=status;
++        if((desc[1]>>31)&&((status&3u)==0u))break;
++        if((status&3u)==2u){uint32_t ignored;__asm__ volatile("%0 = dmpause":"=r"(ignored)::"memory");status=qds_dma_async_poll();s->last_status=status;if((status&3u)==0u)break;}
++        if(qds_dma_async_cycles()-start>=QDS_PREPARED_DMA_TIMEOUT_CYCLES){
++            status=qds_dma_async_poll();s->last_status=status;s->probe_cycles=qds_dma_async_cycles()-start;
++            if((status&3u)==1u){s->pending=1;return -1;}
++            if((status&3u)==2u){uint32_t ignored;__asm__ volatile("%0 = dmpause":"=r"(ignored)::"memory");status=qds_dma_async_poll();s->last_status=status;if((status&3u)!=0u){s->pending=1;return -1;}}
++            break;
++        }
++    }
++    int match=1;for(uint32_t i=0;i<QDS_DMA_ASYNC_BYTES;i++)if(dst[i]!=source[i])match=0;
++    for(uint32_t i=0;i<32u;i++)((volatile uint32_t *)dst)[i]=saved[i];
++    __asm__ volatile("barrier":::"memory");int restored=1;
++    for(uint32_t i=0;i<32u;i++)if(((volatile uint32_t *)dst)[i]!=saved[i])restored=0;
++    int dm2_restored=qds_dma_async_dm_restore(dm2);
++    if(!dm2_restored){*state=QDS_DMA_STATE_PENDING_ERROR;s->pending=1;return -1;}
++    desc[1]&=0x7fffffffu;*state=QDS_DMA_STATE_IDLE;
++    s->probe_match=(uint32_t)match;s->probe_target_restored=(uint32_t)restored;s->probe_dm2_restored=1u;
++    s->probe_cycles=qds_dma_async_cycles()-start;
++    s->probe_ok=(uint32_t)(match&&restored);return (int)s->probe_ok;
++}
++
++/* QNN-style checkpointed descriptor queue. A Set snapshots the tail sequence
++ * in the portable scheduler; a Wait blocks only through that sequence. */
++static uint32_t qds_dma_ring_desc(uint32_t slot){return QDS_DMA_ASYNC_DESC+slot*32u;}
++static uint64_t qds_dma_ring_clock(void *ctx){(void)ctx;return qds_dma_async_cycles();}
++static void qds_dma_ring_relax(void *ctx){(void)ctx;__asm__ volatile("nop" ::: "memory");}
++static int qds_dma_ring_begin(void *ctx){
++    QdsPreparedDmaAsync *s=ctx;if(!s||!s->probe_ok||s->pending||s->ring_mode)return 0;
++    uint32_t tid;__asm__ volatile("%0 = htid":"=r"(tid));if(tid!=0u)return 0;
++    uint32_t status=qds_dma_async_poll();
++    volatile uint32_t *state=(volatile uint32_t *)(uintptr_t)(0xf1800000u+QDS_DMA_STATE_OFFSET);
++    if((status&3u)!=0u||*state!=QDS_DMA_STATE_IDLE)return 0;
++    uint32_t ssr;__asm__ volatile("%0 = ssr":"=r"(ssr));uint32_t asid=(ssr>>8)&127u;
++    if(!qds_dma_async_range_mapped(QDS_DMA_ASYNC_DESC,QDS_DMA_ASYNC_RING_BYTES,asid))return 0;
++    uint32_t dm2=qds_dma_async_dm_read(2);qds_dma_async_dm_write(2,0x2e3u);
++    if(qds_dma_async_dm_read(2)!=0x2e3u){
++        if(!qds_dma_async_dm_restore(dm2)){
++            *state=QDS_DMA_STATE_PENDING_ERROR;s->pending=1;s->ring_mode=1;s->ring.active=1;return -1;
++        }
++        return 0;
++    }
++    volatile uint32_t *dummy=(volatile uint32_t *)(uintptr_t)QDS_DMA_ASYNC_RING_DUMMY;
++    for(uint32_t i=0;i<8u;i++)dummy[i]=0;
++    s->saved_dm2=dm2;s->ring_tail_slot=63u;s->ring_mode=1u;s->pending=1u;
++    *state=QDS_DMA_STATE_INFLIGHT;__asm__ volatile("barrier" ::: "memory");return 1;
++}
++static int qds_dma_ring_issue(void *ctx,uint64_t sequence,uint32_t slot,void *dst,const void *src,size_t bytes){
++    QdsPreparedDmaAsync *s=ctx;(void)sequence;
++    if(!s||!s->ring_mode||!s->probe_ok||!bytes||slot>=NPRG2_DMA_RING_SLOTS||bytes>0x00ffff00u||
++       (((uintptr_t)dst|(uintptr_t)src|bytes)&127u)||
++       (uintptr_t)dst<QDS_DMA_ASYNC_DST_LO||(uintptr_t)dst>QDS_DMA_ASYNC_DST_ACTIVE_HI||
++       bytes>QDS_DMA_ASYNC_DST_ACTIVE_HI-(uintptr_t)dst||
++       !qds_dma_async_ranges_mapped((uintptr_t)src,bytes,(uintptr_t)dst))return 0;
++    uint32_t tid;__asm__ volatile("%0 = htid":"=r"(tid));if(tid!=0u)return 0;
++    uint32_t mode=QDS_PREPARED_DMA_MODE,cap=QDS_PREPARED_DMA_MAX_TRANSFERS;
++#if QDS_PREPARED_DMA_VERIFY || QDS_PREPARED_DMA_MAX_TRANSFERS > 0
++    const volatile uint32_t *control=(const volatile uint32_t *)(uintptr_t)0xf1803e80u;
++    if(control[0]==0x50414344u){cap=control[1];mode=control[2];}
++#endif
++    if(mode>3u)return 0;
++    if(cap&&s->starts>=cap)return 0;
++    if(mode&1u)dsp_clean_range(src,bytes);
++    uint32_t address=qds_dma_ring_desc(slot);
++    qds_dma_async_desc_init_at(address,(uintptr_t)src,(uintptr_t)dst,bytes,mode);
++    volatile uint32_t *desc=(volatile uint32_t *)(uintptr_t)address;
++    volatile uint32_t *tail=(volatile uint32_t *)(uintptr_t)qds_dma_ring_desc(s->ring_tail_slot);
++    __asm__ volatile("barrier\n release(%0):at\n dmlink(%1,%0)"::"r"(desc),"r"(tail):"memory");
++    s->ring_tail_slot=slot;s->bytes=(uint32_t)bytes;s->last_command=(uint32_t)sequence;
++    s->src=(uint32_t)(uintptr_t)src;s->dst=(uint32_t)(uintptr_t)dst;s->last_mode=mode;s->starts++;
++    qds_dma_async_export(s);return 1;
++}
++static int qds_dma_ring_done(void *ctx,uint64_t sequence,uint32_t slot){
++    QdsPreparedDmaAsync *s=ctx;(void)sequence;
++    if(!s||!s->ring_mode||slot>=NPRG2_DMA_RING_SLOTS)return -1;
++    volatile uint32_t *desc=(volatile uint32_t *)(uintptr_t)qds_dma_ring_desc(slot);
++    uint32_t status=qds_dma_async_poll();s->last_status=status;
++    if((status&3u)==2u){uint32_t ignored;__asm__ volatile("%0 = dmpause":"=r"(ignored)::"memory");status=qds_dma_async_poll();s->last_status=status;return (status&3u)==0u?-1:0;}
++    if(desc[1]>>31)return 1; /* this descriptor is complete even if a later one runs */
++    return 0;
++}
++static int qds_dma_ring_finish(void *ctx,int had_error){
++    QdsPreparedDmaAsync *s=ctx;if(!s||!s->ring_mode)return -1;
++    uint32_t status=qds_dma_async_poll();s->last_status=status;
++    if((status&3u)==1u)return 0;
++    if((status&3u)==2u){uint32_t ignored;__asm__ volatile("%0 = dmpause":"=r"(ignored)::"memory");status=qds_dma_async_poll();s->last_status=status;if((status&3u)!=0u)return 0;had_error=1;}
++    if(!qds_dma_async_dm_restore(s->saved_dm2)){
++        *(volatile uint32_t *)(uintptr_t)(0xf1800000u+QDS_DMA_STATE_OFFSET)=QDS_DMA_STATE_PENDING_ERROR;return 0;
++    }
++    *(volatile uint32_t *)(uintptr_t)(0xf1800000u+QDS_DMA_STATE_OFFSET)=QDS_DMA_STATE_IDLE;
++    s->ring_mode=0;s->pending=0;s->drains++;qds_dma_async_export(s);return had_error?-1:1;
++}
++static int qds_prepared_dma_ring_init(QdsPreparedDmaAsync *s){
++    static const Nprg2DmaRingOps ops={qds_dma_ring_begin,qds_dma_ring_issue,qds_dma_ring_done,
++        qds_dma_ring_finish,qds_dma_ring_clock,qds_dma_ring_relax};
++    return s&&nprg2_dma_ring_init(&s->ring,&ops,s,QDS_PREPARED_DMA_TIMEOUT_CYCLES);
++}
++#else
++static int qds_prepared_dma_async_probe(QdsPreparedDmaAsync *s,const void *src,size_t src_bytes){(void)s;(void)src;(void)src_bytes;return 0;}
++static int qds_prepared_dma_ring_init(QdsPreparedDmaAsync *s){(void)s;return 0;}
++#endif
++
++#endif
+diff --git a/depth-model/frame/native_program/prepared_dma_ring.c b/depth-model/frame/native_program/prepared_dma_ring.c
+new file mode 100644
+index 0000000..2a13d6f
+--- /dev/null
++++ b/depth-model/frame/native_program/prepared_dma_ring.c
+@@ -0,0 +1,96 @@
++#include "prepared_dma_ring.h"
++
++#include <string.h>
++
++static uint64_t ring_clock(Nprg2DmaRing *r){
++    return r->ops.clock?r->ops.clock(r->ctx):r->completed;
++}
++
++int nprg2_dma_ring_init(Nprg2DmaRing *r,const Nprg2DmaRingOps *ops,
++                        void *ctx,uint64_t timeout_ticks){
++    if(!r||!ops||!ops->begin||!ops->issue||!ops->done||!ops->finish||!ops->clock||!timeout_ticks)return 0;
++    memset(r,0,sizeof *r);r->ops=*ops;r->ctx=ctx;r->timeout_ticks=timeout_ticks;return 1;
++}
++
++int nprg2_dma_ring_reset(Nprg2DmaRing *r){
++    if(!r||r->active||r->issued!=r->completed)return 0;
++    Nprg2DmaRingOps ops=r->ops;void *ctx=r->ctx;uint64_t timeout=r->timeout_ticks;
++    memset(r,0,sizeof *r);r->ops=ops;r->ctx=ctx;r->timeout_ticks=timeout;return 1;
++}
++
++static int ring_advance(Nprg2DmaRing *r,uint64_t target){
++    while(r->completed<target){
++        uint64_t seq=r->completed+1u;uint32_t slot=(uint32_t)((seq-1u)%NPRG2_DMA_RING_SLOTS);
++        if(r->slot_sequence[slot]!=seq){r->failed=1;r->failures++;r->failed_sequence=(uint32_t)seq;return -1;}
++        int d=r->ops.done(r->ctx,seq,slot);
++        if(d<0){r->failed=1;r->failures++;r->failed_sequence=(uint32_t)seq;return -1;}
++        if(!d)return 0;
++        r->slot_sequence[slot]=0;r->completed=seq;r->completions++;
++    }
++    return 1;
++}
++
++static int ring_wait_sequence(Nprg2DmaRing *r,uint64_t target){
++    if(!r||target>r->issued)return -1;
++    if(target<=r->completed)return 1;
++    uint64_t start=ring_clock(r);
++    for(;;){
++        int a=ring_advance(r,target);if(a<0)return -1;
++        if(target<=r->completed)return 1;
++        uint64_t now=ring_clock(r);
++        if(now-start>=r->timeout_ticks){r->failed=1;r->failures++;r->failed_sequence=(uint32_t)(r->completed+1u);return 0;}
++        if(r->ops.relax)r->ops.relax(r->ctx);
++    }
++}
++
++int nprg2_dma_ring_enqueue(Nprg2DmaRing *r,void *dst,const void *src,size_t bytes){
++    if(!r||!dst||!src||!bytes||r->failed)return -1;
++    if(!r->active){
++        int b=r->ops.begin(r->ctx);if(b<=0){if(b<0){r->failed=1;r->failures++;}return b;}
++        r->active=1;r->starts++;
++    }
++    if(r->issued==UINT64_MAX){r->failed=1;r->failures++;return -1;}
++    while(r->issued-r->completed>=NPRG2_DMA_RING_SLOTS){
++        int w=ring_wait_sequence(r,r->completed+1u);if(w!=1)return -1;
++    }
++    uint64_t seq=r->issued+1u;uint32_t slot=(uint32_t)((seq-1u)%NPRG2_DMA_RING_SLOTS);
++    if(r->slot_sequence[slot]){r->failed=1;r->failures++;r->failed_sequence=(uint32_t)seq;return -1;}
++    int q=r->ops.issue(r->ctx,seq,slot,dst,src,bytes);
++    if(q<=0){
++        if(q<0){r->failed=1;r->failures++;r->failed_sequence=(uint32_t)seq;return -1;}
++        /* An ineligible next descriptor may use the CPU path after earlier
++         * queued writes complete; never let that copy race the queue. */
++        if(r->issued!=r->completed&&ring_wait_sequence(r,r->issued)!=1)return -1;
++        return 0;
++    }
++    r->slot_sequence[slot]=seq;r->issued=seq;return 1;
++}
++
++int nprg2_dma_ring_checkpoint_set(Nprg2DmaRing *r,uint32_t id){
++    if(!r||id==0||id>=NPRG2_DMA_RING_EVENTS||r->failed)return 0;
++    Nprg2DmaRingEvent *e=&r->event[id];
++    if(e->valid){e->generation++;if(!e->generation)e->generation=1u;}else{e->valid=1;e->generation=1u;}
++    e->sequence=r->issued;r->checkpoint_sets++;return 1;
++}
++
++int nprg2_dma_ring_checkpoint_wait(Nprg2DmaRing *r,uint32_t id){
++    if(!r||id==0||id>=NPRG2_DMA_RING_EVENTS||r->failed)return 0;
++    r->checkpoint_waits++;
++    /* A captured wait can legitimately precede the first set for a reused
++     * framework ID. With no current producer snapshot there is no DMA fence. */
++    if(!r->event[id].valid)return 1;
++    return ring_wait_sequence(r,r->event[id].sequence)==1;
++}
++
++int nprg2_dma_ring_drain_all(Nprg2DmaRing *r){
++    if(!r)return -1;
++    if(!r->active)return r->failed?-1:1;
++    int w=ring_wait_sequence(r,r->issued);
++    if(w==0)return 0;
++    int had_error=r->failed||w<0;
++    int f=r->ops.finish(r->ctx,had_error);
++    if(f==0)return 0;
++    r->active=0;r->drains++;
++    if(f<0||had_error){r->failed=1;r->failures++;return -1;}
++    return 1;
++}
+diff --git a/depth-model/frame/native_program/prepared_dma_ring.h b/depth-model/frame/native_program/prepared_dma_ring.h
+new file mode 100644
+index 0000000..a77a698
+--- /dev/null
++++ b/depth-model/frame/native_program/prepared_dma_ring.h
+@@ -0,0 +1,50 @@
++#ifndef NPRG2_PREPARED_DMA_RING_H
++#define NPRG2_PREPARED_DMA_RING_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#define NPRG2_DMA_RING_DESCRIPTORS 64u
++#define NPRG2_DMA_RING_SLOTS (NPRG2_DMA_RING_DESCRIPTORS-1u)
++#define NPRG2_DMA_RING_EVENTS 256u
++
++typedef struct {
++    int (*begin)(void *ctx);
++    int (*issue)(void *ctx,uint64_t sequence,uint32_t slot,
++                 void *dst,const void *src,size_t bytes);
++    /* 1 complete, 0 still in flight, -1 engine error and now idle. */
++    int (*done)(void *ctx,uint64_t sequence,uint32_t slot);
++    /* 1 safely released, 0 still owns resources, -1 released with error. */
++    int (*finish)(void *ctx,int had_error);
++    uint64_t (*clock)(void *ctx);
++    void (*relax)(void *ctx);
++} Nprg2DmaRingOps;
++
++typedef struct {
++    uint64_t sequence;
++    uint32_t generation;
++    uint8_t valid;
++} Nprg2DmaRingEvent;
++
++typedef struct {
++    Nprg2DmaRingOps ops;
++    void *ctx;
++    uint64_t timeout_ticks,issued,completed;
++    uint64_t slot_sequence[NPRG2_DMA_RING_SLOTS];
++    Nprg2DmaRingEvent event[NPRG2_DMA_RING_EVENTS];
++    uint64_t starts,completions,checkpoint_sets,checkpoint_waits,drains,failures;
++    uint32_t failed_sequence;
++    uint8_t active,failed;
++} Nprg2DmaRing;
++
++int nprg2_dma_ring_init(Nprg2DmaRing *ring,const Nprg2DmaRingOps *ops,
++                        void *ctx,uint64_t timeout_ticks);
++int nprg2_dma_ring_reset(Nprg2DmaRing *ring);
++int nprg2_dma_ring_enqueue(Nprg2DmaRing *ring,void *dst,const void *src,size_t bytes);
++int nprg2_dma_ring_checkpoint_set(Nprg2DmaRing *ring,uint32_t event_id);
++int nprg2_dma_ring_checkpoint_wait(Nprg2DmaRing *ring,uint32_t event_id);
++/* 1 drained successfully, 0 ownership remains in hardware, -1 drained with
++ * an error. A return of 0 requires retaining every mapping and descriptor. */
++int nprg2_dma_ring_drain_all(Nprg2DmaRing *ring);
++
++#endif
+diff --git a/depth-model/frame/native_program/prepared_executor.c b/depth-model/frame/native_program/prepared_executor.c
+index c612afc..6a25166 100644
+--- a/depth-model/frame/native_program/prepared_executor.c
++++ b/depth-model/frame/native_program/prepared_executor.c
+@@ -72,6 +72,7 @@ int nprg2_executor_register_scratch_region(Nprg2Executor *e,uint8_t op,uint8_t v
+     return NPRG2_EXEC_REGISTRY_FULL;
+ }
+ 
++int nprg2_executor_handler_slot(const Nprg2Executor *e,uint8_t op,uint8_t variant){return e?handler_index(e,op,variant):-1;}
+ int nprg2_executor_set_fuse(Nprg2Executor *e,uint8_t op,uint8_t variant,Nprg2ExecFuse fuse){
+     if(!e)return NPRG2_EXEC_ARGUMENT;int hi=handler_index(e,op,variant);if(hi<0)return NPRG2_EXEC_UNSUPPORTED;
+     e->handlers[hi].fuse=fuse;return NPRG2_EXEC_OK;
+@@ -106,10 +107,11 @@ static void fill_call(const Nprg2ExecRequest *r,uint32_t index,Nprg2ExecCall *ca
+     call->command_index=index;call->program=r->program;call->bound=r->bound;
+     call->pools=r->pools;call->pool1_writable_bytes=r->pool1_writable_bytes;
+     call->inputs=r->inputs;call->input_count=r->input_count;call->outputs=r->outputs;call->output_count=r->output_count;
+-    call->user=r->user;call->scratch=r->scratch;call->scratch_bytes=r->scratch_bytes;
++    call->user=r->user;call->weights_async=r->weights_async;call->scratch=r->scratch;call->scratch_bytes=r->scratch_bytes;
+     call->scratch_region[0]=(Nprg2ExecBuffer){(uint8_t *)r->scratch,r->scratch_bytes};
+     for(uint32_t k=1;k<NPRG2_EXEC_SCRATCH_REGIONS;k++)call->scratch_region[k]=r->extra_scratch[k-1u];
+-    call->preflighted=0;call->parallel=r->parallel;call->epilogue=NULL;call->epilogue_dead=0;
++    call->preflighted=0;call->execution_lane=r->execution_lane;
++    call->parallel=r->parallel;call->epilogue=NULL;call->epilogue_dead=0;
+ }
+ /* The plan pair this command is the conv of, for a request whose interval
+  * contains both commands; NULL otherwise. */
+@@ -151,6 +153,12 @@ static int no_graph_alias(const Nprg2Executor *e,const Nprg2ExecRequest *r,const
+ }
+ static int request_valid(const Nprg2Executor *e,const Nprg2ExecRequest *r){
+     if(!r||!r->program||!r->bound||!r->bound->ready)return 0;
++    if(r->weights_async){
++        const Nprg2WeightsAsync *a=r->weights_async;
++        if(a->command_count!=r->program->command_count||!a->timeout_cycles)return 0;
++        if(a->ring_mode){if(!a->ring||a->first_hazard)return 0;}
++        else if(!a->first_hazard||!a->start||!a->drain)return 0;
++    }
+     if(r->command_first>r->program->command_count||r->command_count>r->program->command_count-r->command_first)return 0;
+     if(!pools_match(r->program,r->pools))return 0;
+     if(!r->pool1_writable_bytes||r->pool1_writable_bytes>r->pools[1].bytes)return 0;
+@@ -201,7 +209,12 @@ static uint64_t request_signature(const Nprg2Executor *e,const Nprg2ExecRequest
+         h=sig_mix(h,b->hot_bytes);
+     }
+     for(unsigned i=0;i<7;i++){h=sig_mix(h,(uintptr_t)r->pools[i].base);h=sig_mix(h,r->pools[i].bytes);}
+-    h=sig_mix(h,r->pool1_writable_bytes);h=sig_mix(h,(uintptr_t)r->user);
++    h=sig_mix(h,r->pool1_writable_bytes);h=sig_mix(h,(uintptr_t)r->user);h=sig_mix(h,r->execution_lane);
++    if(r->weights_async){const Nprg2WeightsAsync *a=r->weights_async;
++        h=sig_mix(h,(uintptr_t)a);h=sig_mix(h,(uintptr_t)a->first_hazard);h=sig_mix(h,a->command_count);
++        h=sig_mix(h,(uintptr_t)a->start);h=sig_mix(h,(uintptr_t)a->drain);h=sig_mix(h,(uintptr_t)a->ring);h=sig_mix(h,a->ring_mode);
++        h=sig_mix(h,(uintptr_t)a->ctx);h=sig_mix(h,a->timeout_cycles);
++    }else h=sig_mix(h,0);
+     h=sig_mix(h,(uintptr_t)r->scratch);h=sig_mix(h,r->scratch_bytes);
+     for(unsigned k=0;k+1u<NPRG2_EXEC_SCRATCH_REGIONS;k++){h=sig_mix(h,(uintptr_t)r->extra_scratch[k].data);h=sig_mix(h,r->extra_scratch[k].bytes);}
+     h=sig_mix(h,(uintptr_t)r->inputs);h=sig_mix(h,r->input_count);h=sig_mix(h,(uintptr_t)r->outputs);h=sig_mix(h,r->output_count);
+@@ -216,6 +229,32 @@ static uint64_t request_signature(const Nprg2Executor *e,const Nprg2ExecRequest
+     }
+     return h|1u;
+ }
++int nprg2_exec_weights_async_try(const Nprg2ExecCall *c,void *dst,const void *src,size_t bytes){
++    if(!c||!c->weights_async||!c->weights_async->ring_mode||!c->weights_async->ring)return 0;
++    /* The platform descriptor ring has one owner: the master/list-zero lane. */
++    if(c->execution_lane!=0u)return 0;
++    Nprg2WeightsAsync *a=c->weights_async;
++    int queued=nprg2_dma_ring_enqueue(a->ring,dst,src,bytes);
++    if(queued>0){a->starts++;return 1;}
++    if(queued<0){a->failures++;return -1;}
++    a->cpu_fallbacks++;return 0;
++}
++int nprg2_exec_weights_dma_checkpoint_set(Nprg2WeightsAsync *a,uint32_t event_id){
++    if(!a||!a->ring_mode||!a->ring)return NPRG2_EXEC_ARGUMENT;
++    return nprg2_dma_ring_checkpoint_set(a->ring,event_id)?NPRG2_EXEC_OK:NPRG2_EXEC_HANDLER_ERROR;
++}
++int nprg2_exec_weights_dma_checkpoint_wait(Nprg2WeightsAsync *a,uint32_t event_id){
++    if(!a||!a->ring_mode||!a->ring)return NPRG2_EXEC_ARGUMENT;
++    return nprg2_dma_ring_checkpoint_wait(a->ring,event_id)?NPRG2_EXEC_OK:NPRG2_EXEC_HANDLER_ERROR;
++}
++int nprg2_exec_weights_dma_drain_all(Nprg2WeightsAsync *a){
++    if(!a||!a->ring_mode||!a->ring)return NPRG2_EXEC_ARGUMENT;
++    int d=nprg2_dma_ring_drain_all(a->ring);
++    if(!d){a->failures++;return NPRG2_EXEC_HANDLER_ERROR;}
++    a->drains++;
++    if(d<0){a->failures++;return NPRG2_EXEC_HANDLER_ERROR;}
++    return NPRG2_EXEC_OK;
++}
+ /* Digest of the contents every validator reads through the program and the
+  * bound tables (geometry, tensor, command, refs, vectors, calls, and the
+  * expanded block tables): lane sums over whole 128-byte chunks, then four
+@@ -473,6 +512,68 @@ int nprg2_executor_run(const Nprg2Executor *e,const Nprg2ExecRequest *r){
+     return NPRG2_EXEC_OK;
+ }
+ 
++int nprg2_executor_run_preflighted_command(const Nprg2Executor *e,
++                                           const Nprg2ExecRequest *full,
++                                           uint32_t ix,uint8_t execution_lane,
++                                           Nprg2Parallel *parallel_override,
++                                           void *scratch,uint32_t scratch_bytes,
++                                           void *near_scratch,uint32_t near_scratch_bytes) {
++    Nprg2ExecRequest prepared;
++    int rc=nprg2_executor_prepare_preflighted_request(e,full,execution_lane,
++        parallel_override,scratch,scratch_bytes,near_scratch,near_scratch_bytes,&prepared);
++    return rc?rc:nprg2_executor_run_preflighted_command_prepared(e,&prepared,ix);
++}
++
++int nprg2_executor_prepare_preflighted_request(const Nprg2Executor *e,
++                                               const Nprg2ExecRequest *full,
++                                               uint8_t execution_lane,
++                                               Nprg2Parallel *parallel_override,
++                                               void *scratch,uint32_t scratch_bytes,
++                                               void *near_scratch,uint32_t near_scratch_bytes,
++                                               Nprg2ExecRequest *prepared) {
++    if(!e || !full || !full->stats || full->fuse ||
++       !full->stats->runs_valid || !full->stats->strip_valid ||
++       full->stats->failed_command!=UINT32_MAX ||
++       full->stats->validated_commands!=full->command_count ||
++       !prepared ||
++       (scratch_bytes&&!scratch) || (near_scratch_bytes&&!near_scratch)) return NPRG2_EXEC_ARGUMENT;
++    Nprg2ExecRequest local=*full;
++    local.scratch=scratch;local.scratch_bytes=scratch_bytes;
++    local.extra_scratch[0]=(Nprg2ExecBuffer){near_scratch,near_scratch_bytes};
++    local.parallel=parallel_override;local.profile=NULL;local.execution_lane=execution_lane;
++    /* Check caller-owned per-list arenas separately from the immutable
++     * full-request preflight. The graph/pool mappings and command contents
++     * remain covered by that preflight. */
++    if(!request_valid(e,&local))return NPRG2_EXEC_ARGUMENT;
++    *prepared=local;
++    return NPRG2_EXEC_OK;
++}
++
++uint64_t (*nprg2_lane_clock)(void);
++uint64_t nprg2_lane_prehandler[2];
++int nprg2_executor_run_preflighted_command_prepared(const Nprg2Executor *e,
++                                                     const Nprg2ExecRequest *full,
++                                                     uint32_t ix) {
++    if(!e || !full || !full->stats || full->fuse ||
++       !full->stats->runs_valid || !full->stats->strip_valid ||
++       full->stats->failed_command!=UINT32_MAX ||
++       full->stats->validated_commands!=full->command_count ||
++       ix<full->command_first || ix-full->command_first>=full->command_count)
++        return NPRG2_EXEC_ARGUMENT;
++    Nprg2ExecCall call;
++    if(nprg2_command_at(full->bound,ix,&call.command)!=NPRG2_OK)return NPRG2_EXEC_REJECTED;
++    fill_call(full,ix,&call);call.preflighted=1;
++    int hi=handler_index(e,call.command.opcode,call.command.variant);
++    if(hi<0)return NPRG2_EXEC_UNSUPPORTED;
++    const Nprg2ExecHandler *h=&e->handlers[hi];select_scratch(&call,h);
++    if(h->scratch_bytes>UINT32_MAX-h->concurrent_worker_scratch_bytes ||
++       h->scratch_bytes+h->concurrent_worker_scratch_bytes>call.scratch_bytes)return NPRG2_EXEC_REJECTED;
++    if(full->cancelled && full->cancelled(full->cancel_ctx,ix))return NPRG2_EXEC_CANCELLED;
++    if(nprg2_lane_clock && full->execution_lane<2u)nprg2_lane_prehandler[full->execution_lane]+=nprg2_lane_clock();
++    if(h->no_effect)return NPRG2_EXEC_OK;
++    return h->run(&call,h->ctx)?NPRG2_EXEC_OK:NPRG2_EXEC_HANDLER_ERROR;
++}
++
+ static uint32_t dtype_bytes(uint8_t d){static const uint8_t sizes[8]={0,1,1,2,2,4,4,4};return d<8?sizes[d]:0;}
+ static uint32_t max_shape_bytes(const uint8_t *g){
+     if(!g||!(g[1]&1u))return 0;uint64_t count=1;
+@@ -499,6 +600,8 @@ int nprg2_exec_weights_run(const Nprg2ExecCall *c,void *ctx){
+     (void)ctx;if(!nprg2_exec_weights_validate(c,NULL))return 0;uint32_t si,di;Nprg2TensorView s,d;
+     if(nprg2_exec_input(c,0,&si,&s)||nprg2_exec_output(c,0,&di,&d))return 0;
+     uint32_t sb=max_shape_bytes(s.geometry_record),db=max_shape_bytes(d.geometry_record),n=sb<db?sb:db;
++    int queued=nprg2_exec_weights_async_try(c,c->pools[d.pool].base+d.offset,c->pools[s.pool].base+s.offset,n);
++    if(queued>0)return 1;if(queued<0)return 0;
+     qd_vcopy(c->pools[d.pool].base+d.offset,c->pools[s.pool].base+s.offset,n);return 1;
+ }
+ int nprg2_executor_register_weights(Nprg2Executor *e){
+@@ -508,6 +611,7 @@ int nprg2_executor_register_weights(Nprg2Executor *e){
+ }
+ 
+ /* ---------------------------------------------------------------- parallel */
++volatile uint32_t nprg2_par_kind;
+ uint32_t nprg2_parallel_parts(Nprg2Parallel *p, uint32_t want) {
+     if(!p || p->max_parts<2 || want<2) return 1;
+     if(p->ready && !p->ready(p->impl)) { p->not_ready++; return 1; }
+@@ -516,6 +620,7 @@ uint32_t nprg2_parallel_parts(Nprg2Parallel *p, uint32_t want) {
+ void nprg2_parallel_for(Nprg2Parallel *p, uint32_t kind, uint32_t parts, Nprg2ParallelFn fn, void *ctx) {
+     if(kind>=NPRG2_PAR_KINDS) kind=0;
+     if(parts<2 || !p) { fn(ctx,0,parts<1?1:parts); return; }
++    nprg2_par_kind=kind;
+     if(p->run) {
+         if(p->run(p->impl,parts,fn,ctx)) { p->jobs_parallel[kind]++; p->parts_run[kind]+=parts; return; }
+         p->declined++;
+diff --git a/depth-model/frame/native_program/prepared_executor.h b/depth-model/frame/native_program/prepared_executor.h
+index 9b71789..cd7e24a 100644
+--- a/depth-model/frame/native_program/prepared_executor.h
++++ b/depth-model/frame/native_program/prepared_executor.h
+@@ -3,6 +3,7 @@
+ 
+ #include "nprg2_runtime.h"
+ #include "prepared_fuse.h"
++#include "prepared_dma_ring.h"
+ 
+ #ifndef NPRG2_PAR_MAX_PARTS
+ #define NPRG2_PAR_MAX_PARTS 3u
+@@ -58,10 +59,30 @@ typedef struct Nprg2Parallel {
+     uint64_t not_ready, declined;
+ } Nprg2Parallel;
+ /* Parts the caller may use for a job of `want` natural parts (>= 1). */
++extern volatile uint32_t nprg2_par_kind; /* kind of the job being dispatched (diagnostics) */
+ uint32_t nprg2_parallel_parts(Nprg2Parallel *p, uint32_t want);
+ void nprg2_parallel_for(Nprg2Parallel *p, uint32_t kind, uint32_t parts, Nprg2ParallelFn fn, void *ctx);
+ 
+ typedef struct { uint8_t *data; uint32_t bytes; } Nprg2ExecBuffer;
++enum { NPRG2_DMA_DRAIN_HAZARD=1, NPRG2_DMA_DRAIN_CANCEL=2,
++       NPRG2_DMA_DRAIN_ERROR=3, NPRG2_DMA_DRAIN_END=4, NPRG2_DMA_DRAIN_NEXT_COPY=5 };
++typedef int (*Nprg2WeightsDmaStart)(void *ctx,uint32_t command_index,void *dst,
++                                   const void *src,size_t bytes,uint64_t timeout_cycles);
++typedef int (*Nprg2WeightsDmaDrain)(void *ctx,uint32_t reason,uint32_t command_index,
++                                   uint64_t timeout_cycles);
++typedef struct {
++    const uint32_t *first_hazard;
++    uint32_t command_count;
++    Nprg2DmaRing *ring;
++    Nprg2WeightsDmaStart start;
++    Nprg2WeightsDmaDrain drain;
++    void *ctx;
++    uint64_t timeout_cycles;
++    uint8_t pending,ring_mode;
++    uint32_t pending_command,pending_hazard;
++    uint64_t starts,drains,hazard_drains,cancel_drains,error_drains,end_drains,
++             next_copy_drains,cpu_fallbacks,failures;
++} Nprg2WeightsAsync;
+ /* Scratch regions. Each handler names the region it receives as
+  * call->scratch. Region 0 is the request's scratch/scratch_bytes; region k>0
+  * is request->extra_scratch[k-1]. A handler whose region is too small is
+@@ -82,6 +103,7 @@ struct Nprg2ExecCall {
+     const Nprg2ExecBuffer *outputs;
+     uint32_t output_count;
+     void *user;
++    Nprg2WeightsAsync *weights_async;
+     /* NULL = serial. Shared by every call of a request. */
+     Nprg2Parallel *parallel;
+     /* The region the executor selected for this handler. */
+@@ -95,6 +117,8 @@ struct Nprg2ExecCall {
+      * may skip a purely repeated dry-run of its own validator. Always 0 in
+      * validation calls. */
+     uint8_t preflighted;
++    /* Execution owner for handlers with per-thread mutable scratch/memos. */
++    uint8_t execution_lane;
+     /* Conv epilogue fusion (see prepared_fuse.h): set on the conv's call when
+      * the executor activated a pair for this request; the epilogue command's
+      * call, and whether the conv's raw output is dead (need not be stored).
+@@ -182,6 +206,7 @@ typedef struct {
+     const Nprg2ExecBuffer *outputs;
+     uint32_t output_count;
+     void *user;
++    Nprg2WeightsAsync *weights_async;
+     void *scratch;
+     uint32_t scratch_bytes;
+     /* Regions 1.. (zero bytes = absent). */
+@@ -207,6 +232,7 @@ typedef struct {
+      * bytes must re-derive them in its run callback (the elementwise handlers
+      * and the reference chain do). */
+     uint8_t reuse_preflight;
++    uint8_t execution_lane;
+ } Nprg2ExecRequest;
+ 
+ typedef struct {
+@@ -253,11 +279,42 @@ int nprg2_executor_preflight(const Nprg2Executor *executor,
+ /* Entire requested interval is validated before the first handler writes. No
+  * legacy fallback route exists. Handler scratch must be caller-owned. */
+ int nprg2_executor_run(const Nprg2Executor *executor, const Nprg2ExecRequest *request);
++/* Dispatch one command from a previously successful full-range preflight.
++ * The proof is read-only and remains valid while commands from independent
++ * QNN run lists execute concurrently. Caller supplies private scratch/near
++ * regions for each list; `request->fuse` must be NULL. */
++int nprg2_executor_run_preflighted_command(const Nprg2Executor *executor,
++                                            const Nprg2ExecRequest *full_request,
++                                            uint32_t command_index,
++                                            uint8_t execution_lane,
++                                            Nprg2Parallel *parallel_override,
++                                            void *scratch,uint32_t scratch_bytes,
++                                            void *near_scratch,uint32_t near_scratch_bytes);
++/* Prepare the immutable per-list request once after full preflight; subsequent
++ * commands dispatch directly without reconstructing or revalidating it. */
++int nprg2_executor_prepare_preflighted_request(const Nprg2Executor *executor,
++                                               const Nprg2ExecRequest *full_request,
++                                               uint8_t execution_lane,
++                                               Nprg2Parallel *parallel_override,
++                                               void *scratch,uint32_t scratch_bytes,
++                                               void *near_scratch,uint32_t near_scratch_bytes,
++                                               Nprg2ExecRequest *prepared_request);
++/* Diagnostic: per lane, sum of clock() at handler entry (caller subtracts entry times). */
++extern uint64_t (*nprg2_lane_clock)(void);
++extern uint64_t nprg2_lane_prehandler[2];
++int nprg2_executor_handler_slot(const Nprg2Executor *executor,uint8_t op,uint8_t variant);
++int nprg2_executor_run_preflighted_command_prepared(const Nprg2Executor *executor,
++                                                    const Nprg2ExecRequest *prepared_request,
++                                                    uint32_t command_index);
+ 
+ /* Implements the existing weights_to_vtcm CPU semantics for validated direct
+  * tensors: memmove(min(max-shape source bytes, max-shape destination bytes)). */
+ int nprg2_exec_weights_validate(const Nprg2ExecCall *call, void *ctx);
+ int nprg2_exec_weights_run(const Nprg2ExecCall *call, void *ctx);
++int nprg2_exec_weights_async_try(const Nprg2ExecCall *call,void *dst,const void *src,size_t bytes);
++int nprg2_exec_weights_dma_checkpoint_set(Nprg2WeightsAsync *async,uint32_t event_id);
++int nprg2_exec_weights_dma_checkpoint_wait(Nprg2WeightsAsync *async,uint32_t event_id);
++int nprg2_exec_weights_dma_drain_all(Nprg2WeightsAsync *async);
+ int nprg2_executor_register_weights(Nprg2Executor *executor);
+ 
+ #ifdef __cplusplus
+diff --git a/depth-model/frame/native_program/prepared_hmx_conv.inc b/depth-model/frame/native_program/prepared_hmx_conv.inc
+index fb23e56..eeb6384 100644
+--- a/depth-model/frame/native_program/prepared_hmx_conv.inc
++++ b/depth-model/frame/native_program/prepared_hmx_conv.inc
+@@ -641,7 +641,7 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
+     g->wused=0;
+     uint8_t *ws=walloc(g,need);
+     if(!ws){*err=E_MEMORY;return -1;}
+-    conv_path=5;
++    conv_path[g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u]=5;
+     if(g->fx.kind) g->fx_ok=1;
+     if(g->dry) return 1;
+ #ifdef SLIDE_LIMIT
+@@ -812,7 +812,7 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
+     g->wused=0;
+     uint8_t *ws=walloc(g,fixed+bsz+2048+(size_t)mt*per+2048);
+     if(!ws){*err=E_MEMORY;return -1;}
+-    conv_path=4;
++    conv_path[g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u]=4;
+     if(fused) g->fx_ok=1;
+ #ifdef CONV_SHAPES
+     if(!g->dry) fprintf(stderr,"NATCONV var=%u KB=%d NB=%d oh=%d ow=%d tiles=%d mt=%d fused=%d staged=%d bcopy=%d\n",g->variant,KB,NB,oh,ow,total,mt,fused,staged,bcopy);
+@@ -918,7 +918,8 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
+     const Nprg2ReferenceConv *c=g->conv;
+     uint64_t (*clock)(void)=c->phase && !g->dry?c->clock:NULL,t0=clock?clock():0,t1;
+ #if HMX_PROF==5
+-    if(clock && hmx_t_entry && hmx_t_entry<=t0) c->phase[3]+=t0-hmx_t_entry;
++    uint32_t lane=g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u;
++    if(clock && hmx_t_entry[lane] && hmx_t_entry[lane]<=t0) c->phase[3]+=t0-hmx_t_entry[lane];
+ #endif
+     if(!c->hmx || !c->near || ((uintptr_t)c->near&127u)) return 0;
+     /* A fused epilogue must cover exactly the region the conv writes. */
+@@ -1137,7 +1138,7 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
+     g->wused=0;
+     uint8_t *ws=walloc(g,fixed+bsz+(size_t)mt*per+2048);
+     if(!ws){*err=E_MEMORY;return -1;}
+-    conv_path=3;
++    conv_path[g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u]=3;
+     if(g->fx.kind) g->fx_ok=1;
+ #ifdef CONV_SHAPES
+     if(!g->dry) fprintf(stderr,"HMXCONV var=%u k=%dx%d ci=%d co=%d oh=%d ow=%d KB=%d NB=%d tiles=%d mt=%d packed=%d\n",
+@@ -1563,7 +1564,7 @@ static int hmx_native16(G *g, const T *xt, const T *wt, const T *ft, const T *o,
+     g->wused=0;
+     uint8_t *ws=walloc(g,fixed+(size_t)nbuf*mt*per+2048);
+     if(!ws){*err=E_MEMORY;return -1;}
+-    conv_path=5;
++    conv_path[g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u]=5;
+     if(g->dry) return 1;
+     uint8_t *base=(uint8_t *)(((uintptr_t)ws+2047)&~(uintptr_t)2047);
+     int32_t *fi=(int32_t *)base,*zero=(int32_t *)(base+(size_t)NB*256);
+diff --git a/depth-model/frame/native_program/prepared_reference.c b/depth-model/frame/native_program/prepared_reference.c
+index 28a16cf..0a05ae4 100644
+--- a/depth-model/frame/native_program/prepared_reference.c
++++ b/depth-model/frame/native_program/prepared_reference.c
+@@ -163,8 +163,9 @@ static int64_t dtmax(uint32_t dt) {return dt==DT_U8?255:dt==DT_U16?65535:dt==DT_
+ static int64_t s32(uint64_t v) {return (int64_t)(int32_t)(uint32_t)v;}
+ 
+ /* Per-command memos, keyed by (program, command index); two programs (the
+- * two models) are kept. Not thread-safe: reference commands run on the
+- * executor's thread.
++ * two models and two execution lanes are kept. Each lane owns its per-command
++ * cache; threaded run lists clone lane 0 after full preflight before lane 1
++ * starts, then each lane mutates only its own records.
+  * need: scratch need from the first dry pass, so later runs skip it. The dry
+  *   pass reads only geometry and the constant pool, so the need is a property
+  *   of the bound program; were it ever larger, salloc fails loudly.
+@@ -172,6 +173,7 @@ static int64_t s32(uint64_t v) {return (int64_t)(int32_t)(uint32_t)v;}
+  *   blocked_overlap: geometry and pool limits only) passed with epilogue kind
+  *   k, so later runs skip them. Pool bases/limits are part of the key. */
+ enum { MEMO_COMMANDS=8192, CHK_SLOTS=4 };
++enum { MEMO_LANES=2, MEMO_SLOTS=2 };
+ typedef struct {
+     const void *program;
+     uint64_t limits;
+@@ -186,36 +188,62 @@ typedef struct {
+ /* On the heap, not static: the resident engine's 1 MiB code region holds its
+  * static data too, and the per-command arrays are ~0.3 MB per Memo. Allocated
+  * on first use; if that fails, memo_for returns NULL (no memoisation). */
+-static Memo *memos[2];
+-static uint32_t memo_next;
++static Memo *memos[MEMO_LANES][MEMO_SLOTS];
++static uint32_t memo_next[MEMO_LANES];
+ /* The key is a hash of the pool table: remembered for the last table seen
+  * (compared field by field, cheaper than 15 64-bit multiplies per call). */
++typedef struct {uintptr_t base[7];uint32_t bytes[7],wr;uint64_t h;int valid;} MemoLimitsCache;
+ static uint64_t memo_limits(const Nprg2ExecCall *c) {
+-    static struct {uintptr_t base[7];uint32_t bytes[7],wr;uint64_t h;int valid;} last;
+-    if(last.valid && last.wr==c->pool1_writable_bytes) {
++    static MemoLimitsCache last[MEMO_LANES];
++    uint32_t lane=c->execution_lane<MEMO_LANES?c->execution_lane:0u;
++    MemoLimitsCache *m=&last[lane];
++    if(m->valid && m->wr==c->pool1_writable_bytes) {
+         int same=1;
+-        for(int i=0;i<7;i++) same&=last.base[i]==(uintptr_t)c->pools[i].base && last.bytes[i]==c->pools[i].bytes;
+-        if(same) return last.h;
++        for(int i=0;i<7;i++) same&=m->base[i]==(uintptr_t)c->pools[i].base && m->bytes[i]==c->pools[i].bytes;
++        if(same) return m->h;
+     }
+     uint64_t h=0xcbf29ce484222325ull;
+     for(int i=0;i<7;i++){h=(h^(uintptr_t)c->pools[i].base)*0x100000001b3ull;h=(h^c->pools[i].bytes)*0x100000001b3ull;}
+     h=(h^c->pool1_writable_bytes)*0x100000001b3ull;
+-    for(int i=0;i<7;i++){last.base[i]=(uintptr_t)c->pools[i].base;last.bytes[i]=c->pools[i].bytes;}
+-    last.wr=c->pool1_writable_bytes;last.h=h;last.valid=1;
++    for(int i=0;i<7;i++){m->base[i]=(uintptr_t)c->pools[i].base;m->bytes[i]=c->pools[i].bytes;}
++    m->wr=c->pool1_writable_bytes;m->h=h;m->valid=1;
+     return h;
+ }
+ static Memo *memo_for_lim(const Nprg2ExecCall *c, uint64_t lim) {
+     if(!c->program || c->command_index>=MEMO_COMMANDS) return NULL;
+-    for(int i=0;i<2;i++) if(memos[i] && memos[i]->program==c->program && memos[i]->limits==lim) return memos[i];
+-    uint32_t slot=memo_next++&1u;
+-    if(!memos[slot] && !(memos[slot]=malloc(sizeof(Memo)))) return NULL;
+-    Memo *m=memos[slot];
++    uint32_t lane=c->execution_lane<MEMO_LANES?c->execution_lane:0u;
++    for(int i=0;i<MEMO_SLOTS;i++) if(memos[lane][i] && memos[lane][i]->program==c->program && memos[lane][i]->limits==lim) return memos[lane][i];
++    uint32_t slot=memo_next[lane]++&(MEMO_SLOTS-1u);
++    if(!memos[lane][slot] && !(memos[lane][slot]=malloc(sizeof(Memo)))) return NULL;
++    Memo *m=memos[lane][slot];
+     m->program=c->program;m->limits=lim;
+     memset(m->need,0xff,sizeof m->need);memset(m->conv_checked,0,sizeof m->conv_checked);memset(m->chain,0,sizeof m->chain);memset(m->slide,0,sizeof m->slide);memset(m->chk,0,sizeof m->chk);
+     memset(m->fz,0,sizeof m->fz);
+     memset(m->dmv,0,sizeof m->dmv);
+     return m;
+ }
++int nprg2_exec_reference_clone_lane(uint8_t src,uint8_t dst) {
++    if(src>=MEMO_LANES || dst>=MEMO_LANES)return 0;
++    if(src==dst)return 1;
++    /* Seed the destination lane once per (program, limits): a lane that
++     * already holds that key keeps what it has learned since (the verdicts
++     * and constants of the commands only it executes). Overwriting it on
++     * every run made each of those commands revalidate on every run. */
++    uint32_t found=0;
++    for(uint32_t i=0;i<MEMO_SLOTS;i++) {
++        if(!memos[src][i])continue;
++        found++;
++        int have=0;
++        for(uint32_t j=0;j<MEMO_SLOTS;j++)
++            have|=memos[dst][j] && memos[dst][j]->program==memos[src][i]->program &&
++                  memos[dst][j]->limits==memos[src][i]->limits;
++        if(have)continue;
++        if(!memos[dst][i] && !(memos[dst][i]=malloc(sizeof(Memo))))return 0;
++        memcpy(memos[dst][i],memos[src][i],sizeof(Memo));
++        memo_next[dst]=memo_next[src];
++    }
++    return found!=0;
++}
+ static Memo *memo_for(const Nprg2ExecCall *c) {return memo_for_lim(c,memo_limits(c));}
+ /* The same, computed once per call (the hash of the pool table is not free). */
+ static uint64_t g_limits(G *g) {if(!g->lim_ok){g->lim=memo_limits(g->call);g->lim_ok=1;}return g->lim;}
+@@ -3273,9 +3301,9 @@ static void fuse_scalar(G *g, const Fuse *fx, const uint8_t *q, int32_t nc, int3
+     int32_t eo[4]={0,fx->oe.p[1]+y,fx->oe.p[2]+x0,0};
+     xfer_copy(g,&fx->oe,fx->eb,dims,eo,1);
+ }
+-static uint32_t conv_path;
+-static uint64_t hmx_t_entry; /* HMX_PROF step 5: clock at k_hmx_conv entry */
+-static uint64_t ref_t_entry; /* HMX_PROF step 9: clock at reference_run entry (conv handlers) */
++static uint32_t conv_path[MEMO_LANES];
++static uint64_t hmx_t_entry[MEMO_LANES]; /* HMX_PROF step 5: clock at k_hmx_conv entry */
++static uint64_t ref_t_entry[MEMO_LANES]; /* HMX_PROF step 9: clock at reference_run entry (conv handlers) */
+ #ifndef HMX_PROF
+ #define HMX_PROF 0
+ #endif
+@@ -3284,7 +3312,7 @@ static uint64_t ref_t_entry; /* HMX_PROF step 9: clock at reference_run entry (c
+  * 0 to use the reference convolution, or a negative error. */
+ static int fast_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int s2, int sixteen, int32_t co,
+                      int32_t oh, int32_t ow, int32_t *err) {
+-    *err=0;conv_path=0;g->fx_ok=0;
++    *err=0;conv_path[g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u]=0;g->fx_ok=0;
+     if(!g->conv) return 0;
+     int32_t H=wt->m[0],W=wt->m[1],I=wt->m[2],O=wt->m[3];
+     int packed=is_class(wt,"Xpb","xpb"),reverse=!s2 && wt->cls==('X'|'w'<<8|'b'<<16);
+@@ -3361,7 +3389,7 @@ static int fast_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, in
+             g->fx_ok=1;
+         }
+         if(!checked && ((*err=xfer_check(g,xt,dims,origin,0)) || (*err=xfer_check(g,o,on,oorigin,1)))) return -1;
+-        conv_path=2;
++        conv_path[g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u]=2;
+         if(g->dry) return 1;
+         const Nprg2ReferenceConv *c=g->conv;
+         if(!direct) {
+@@ -3390,7 +3418,7 @@ static int fast_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, in
+                                   mult,bias,M,pre,post,wsum,rqp);
+     A out={.n={1,oh,ow,co},.dt=sixteen?DT_U16:DT_U8,.p=r};
+     if((*err=t_write_region(g,o,&out,oorigin))) return -1;
+-    conv_path=1;
++    conv_path[g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u]=1;
+     return 1;
+ }
+ static void fast_conv_compute(G *g, const T *xt, const T *wt, const T *ft, int s2, int reverse, int packed, int sixteen,
+@@ -3852,9 +3880,10 @@ static int fuse_cached(G *g, const T *xt, const T *wt, const T *ft, const T *o)
+ }
+ static int k_hmx_conv(G *g) {
+     if(g->conv && g->conv->clock && g->conv->phase && !g->dry) {
+-        hmx_t_entry=g->conv->clock();
++        uint32_t lane=g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u;
++        hmx_t_entry[lane]=g->conv->clock();
+ #if HMX_PROF==9
+-        if(ref_t_entry && ref_t_entry<=hmx_t_entry) g->conv->phase[3]+=hmx_t_entry-ref_t_entry;
++        if(ref_t_entry[lane] && ref_t_entry[lane]<=hmx_t_entry[lane]) g->conv->phase[3]+=hmx_t_entry[lane]-ref_t_entry[lane];
+ #endif
+     }
+     CHECK(g->nin>=3 && g->nout==1,E_ARGS);
+@@ -3978,7 +4007,8 @@ static int variant_matches(uint32_t op, uint32_t variant) {
+  * only passing verdicts are stored, so a bad input is always re-checked and
+  * fails exactly as before. */
+ enum { SK_WORDS=27 };
+-static struct {uintptr_t key[SK_WORDS];int valid;uint32_t par_slots;uint64_t pool_bytes[7];} setup_ck;
++typedef struct {uintptr_t key[SK_WORDS];int valid;uint32_t par_slots;uint64_t pool_bytes[7];} SetupCache;
++static SetupCache setup_ck[MEMO_LANES];
+ 
+ /* scr/scrb: the scratch region this setup runs on (c->scratch unless the
+  * caller moves the command into the near region). */
+@@ -3991,6 +4021,8 @@ static int setup_ex(G *g, const Nprg2ExecCall *c, int dry, int measure, const Np
+     g->fx.kind=g->fx.dead=0;g->fx.mc=g->fx.mo=g->fx.rd=g->fx.sh=0;g->fx.eb=g->fx.bb=NULL;
+     g->fx_ok=0;g->par_slots=0;g->chk_memo=NULL;g->chk_state=0;g->cm=NULL;g->lim=0;g->cm_ok=g->lim_ok=0;
+     if(!c || !c->program || !c->bound || !c->pools) FAIL(E_ARGS);
++    uint32_t lane=c->execution_lane<MEMO_LANES?c->execution_lane:0u;
++    SetupCache *ck=&setup_ck[lane];
+     const Nprg2Command *k=&c->command;
+     if(!variant_matches(k->opcode,k->variant)) FAIL(E_ARGS);
+     g->call=c;g->dry=dry;g->measure_only=(uint8_t)measure;
+@@ -4007,11 +4039,11 @@ static int setup_ex(G *g, const Nprg2ExecCall *c, int dry, int measure, const Np
+         for(unsigned i=0;i<7;i++){key[n++]=(uintptr_t)c->pools[i].base;key[n++]=c->pools[i].bytes;}
+         while(n<SK_WORDS)key[n++]=0;
+         uintptr_t kd=0;
+-        for(unsigned i=0;i<SK_WORDS;i++) kd|=setup_ck.key[i]^key[i];
+-        if(setup_ck.valid && !kd) {
+-            ck_hit=1;g->par_slots=setup_ck.par_slots;
+-            for(unsigned i=0;i<7;i++) g->pool_bytes[i]=setup_ck.pool_bytes[i];
+-        } else memcpy(setup_ck.key,key,sizeof key),setup_ck.valid=0;
++        for(unsigned i=0;i<SK_WORDS;i++) kd|=ck->key[i]^key[i];
++        if(ck->valid && !kd) {
++            ck_hit=1;g->par_slots=ck->par_slots;
++            for(unsigned i=0;i<7;i++) g->pool_bytes[i]=ck->pool_bytes[i];
++        } else memcpy(ck->key,key,sizeof key),ck->valid=0;
+     }
+     if(!ck_hit && g->conv && g->conv->near) {
+         uintptr_t n=(uintptr_t)conv->near,ne=n+conv->near_bytes,w=(uintptr_t)conv->workspace;
+@@ -4063,9 +4095,9 @@ static int setup_ex(G *g, const Nprg2ExecCall *c, int dry, int measure, const Np
+         g->write_limit[i]=g->pool_bytes[i];
+     }
+     if(g->conv && !ck_hit) {   /* every check passed: remember the verdict (key stored above) */
+-        setup_ck.par_slots=g->par_slots;
+-        for(unsigned i=0;i<7;i++) setup_ck.pool_bytes[i]=g->pool_bytes[i];
+-        setup_ck.valid=1;
++        ck->par_slots=g->par_slots;
++        for(unsigned i=0;i<7;i++) ck->pool_bytes[i]=g->pool_bytes[i];
++        ck->valid=1;
+     }
+     if(c->pool1_writable_bytes<g->write_limit[1]) g->write_limit[1]=c->pool1_writable_bytes;
+     /* The constant pool is immutable model state. */
+@@ -4107,7 +4139,8 @@ int nprg2_exec_reference_run(const Nprg2ExecCall *c, void *ctx) {
+     G g;
+     const Nprg2ReferenceConv *pc=ctx;
+     uint64_t prof_t0=pc && pc->clock && pc->phase && c->command.opcode==QDR_HMX_CONV?pc->clock():0;
+-    ref_t_entry=prof_t0;
++    uint32_t lane=c->execution_lane<MEMO_LANES?c->execution_lane:0u;
++    ref_t_entry[lane]=prof_t0;
+ #if HMX_PROF==12
+     /* Two extra setup() calls back to back: the first sees whatever the
+      * previous command left in L1, the second is warm. Cold -> u8 output
+@@ -4122,7 +4155,7 @@ int nprg2_exec_reference_run(const Nprg2ExecCall *c, void *ctx) {
+         uint64_t d=prof_clock();
+         if(prof_t0){prof_phase[3]+=b-a;prof_phase[7]+=d-b;}
+         else {prof_phase[2]+=b-a;prof_phase[6]+=d-b;}  /* non-conv: u8/u16 setup slots */
+-        ref_t_entry=d;
++        ref_t_entry[lane]=d;
+     }
+ #endif
+ #if HMX_PROF==11
+@@ -4179,7 +4212,7 @@ int nprg2_exec_reference_scratch(const Nprg2ExecCall *c, uint32_t *bytes) {
+     return nprg2_exec_reference_conv_measure(c,NULL,bytes,NULL);
+ }
+ uint32_t nprg2_exec_reference_error_line(void) {return reference_error_line;}
+-uint32_t nprg2_exec_reference_conv_path(void) {return conv_path;}
++uint32_t nprg2_exec_reference_conv_path(void) {return conv_path[0];}
+ 
+ int nprg2_executor_register_reference(Nprg2Executor *e, uint8_t opcode, uint8_t variant) {
+     if(!e || !variant_matches(opcode,variant)) return NPRG2_EXEC_ARGUMENT;
+diff --git a/depth-model/frame/native_program/prepared_reference.h b/depth-model/frame/native_program/prepared_reference.h
+index eb6c106..15f403e 100644
+--- a/depth-model/frame/native_program/prepared_reference.h
++++ b/depth-model/frame/native_program/prepared_reference.h
+@@ -100,6 +100,9 @@ int nprg2_executor_register_reference_conv(Nprg2Executor *executor, Nprg2Referen
+  * command: call-scratch bytes, and workspace bytes (0 off the fast path). */
+ int nprg2_exec_reference_conv_measure(const Nprg2ExecCall *call, const Nprg2ReferenceConv *conv,
+                                       uint32_t *scratch_bytes, uint32_t *workspace_bytes);
++/* Duplicate the main preflight memo into an independent lane before threaded
++ * run lists start. Only the owner lane mutates each per-command memo afterward. */
++int nprg2_exec_reference_clone_lane(uint8_t source_lane,uint8_t destination_lane);
+ /* Path the most recently measured or run convolution took: 0 reference,
+  * 1 fast with the workspace only, 2 fast with near, 3 HMX (diagnostics only). */
+ uint32_t nprg2_exec_reference_conv_path(void);
+diff --git a/depth-model/frame/native_program/prepared_runner.c b/depth-model/frame/native_program/prepared_runner.c
+index 380d9dd..1d84a2f 100644
+--- a/depth-model/frame/native_program/prepared_runner.c
++++ b/depth-model/frame/native_program/prepared_runner.c
+@@ -72,7 +72,8 @@ static int runner_request(Nprg2PreparedRunner *r,uint32_t first,uint32_t count,u
+     if(!r||!r->ready||pool1_writable!=NPRG2_RUNNER_POOL1_ACTIVE_BYTES)return NPRG2_EXEC_ARGUMENT;
+     memset(q,0,sizeof *q);*q=(Nprg2ExecRequest){.program=&r->program,.bound=&r->bound,.pool1_writable_bytes=pool1_writable,
+         .inputs=inputs,.input_count=input_count,.outputs=outputs,.output_count=output_count,
+-        .user=user,.scratch=scratch,.scratch_bytes=scratch_bytes,.command_first=first,
++        .user=user,.weights_async=r->weights_async_ready?&r->weights_async:NULL,
++        .scratch=scratch,.scratch_bytes=scratch_bytes,.command_first=first,
+         .command_count=count,.cancelled=cancelled,.cancel_ctx=cancel_ctx,.stats=stats,
+         .profile=r->profile,.parallel=r->parallel,.reuse_preflight=r->reuse_preflight,.fuse=r->fuse};
+     memcpy(q->pools,r->pools,sizeof q->pools);
+@@ -85,6 +86,13 @@ int nprg2_runner_set_scratch_region(Nprg2PreparedRunner *r,uint8_t region,void *
+ int nprg2_runner_set_parallel(Nprg2PreparedRunner *r,Nprg2Parallel *parallel){
+     if(!r||!r->ready)return NPRG2_RUNNER_ARGUMENT;r->parallel=parallel;return NPRG2_RUNNER_OK;
+ }
++int nprg2_runner_set_weights_dma_ring(Nprg2PreparedRunner *r,Nprg2DmaRing *ring){
++    if(!r||!r->ready||!ring||ring->active||ring->issued!=ring->completed)return NPRG2_RUNNER_ARGUMENT;
++    memset(&r->weights_async,0,sizeof r->weights_async);
++    r->weights_async.command_count=r->program.command_count;r->weights_async.ring=ring;
++    r->weights_async.ring_mode=1u;r->weights_async.timeout_cycles=ring->timeout_ticks;
++    r->weights_async_ready=1u;return NPRG2_RUNNER_OK;
++}
+ int nprg2_runner_set_profile(Nprg2PreparedRunner *r,Nprg2ExecProfile *profile,int reuse_preflight){
+     if(!r||!r->ready)return NPRG2_RUNNER_ARGUMENT;r->profile=profile;r->reuse_preflight=reuse_preflight?1u:0u;return NPRG2_RUNNER_OK;
+ }
+@@ -108,4 +116,44 @@ int nprg2_runner_execute(Nprg2PreparedRunner *r,const Nprg2Executor *e,
+     return x?x:nprg2_executor_run(e,&q);
+ }
+ 
+-void nprg2_runner_close(Nprg2PreparedRunner *r){if(!r)return;nprg2_fuse_plan_free(&r->fuse_plan);close_restore(r);memset(r,0,sizeof *r);}
++int nprg2_runner_run_preflighted_command(Nprg2PreparedRunner *r,const Nprg2Executor *e,
++                         uint32_t first,uint32_t count,uint32_t pool1_writable,
++                         const Nprg2ExecBuffer *inputs,uint32_t input_count,
++                         const Nprg2ExecBuffer *outputs,uint32_t output_count,
++                         void *user,void *full_scratch,uint32_t full_scratch_bytes,
++                         Nprg2ExecStats *full_stats,uint32_t command_index,uint8_t execution_lane,
++                         Nprg2Parallel *parallel_override,
++                         void *list_scratch,uint32_t list_scratch_bytes,
++                         void *list_near,uint32_t list_near_bytes){
++    Nprg2ExecRequest q;
++    int x=nprg2_runner_prepare_preflighted_request(r,e,first,count,pool1_writable,
++        inputs,input_count,outputs,output_count,user,full_scratch,full_scratch_bytes,
++        full_stats,execution_lane,parallel_override,list_scratch,list_scratch_bytes,
++        list_near,list_near_bytes,&q);
++    return x?x:nprg2_executor_run_preflighted_command_prepared(e,&q,command_index);
++}
++
++int nprg2_runner_prepare_preflighted_request(Nprg2PreparedRunner *r,const Nprg2Executor *e,
++                         uint32_t first,uint32_t count,uint32_t pool1_writable,
++                         const Nprg2ExecBuffer *inputs,uint32_t input_count,
++                         const Nprg2ExecBuffer *outputs,uint32_t output_count,
++                         void *user,void *full_scratch,uint32_t full_scratch_bytes,
++                         Nprg2ExecStats *full_stats,uint8_t execution_lane,
++                         Nprg2Parallel *parallel_override,
++                         void *list_scratch,uint32_t list_scratch_bytes,
++                         void *list_near,uint32_t list_near_bytes,
++                         Nprg2ExecRequest *prepared){
++    if(!e||!prepared)return NPRG2_EXEC_ARGUMENT;Nprg2ExecRequest q;
++    int x=runner_request(r,first,count,pool1_writable,inputs,input_count,outputs,output_count,
++                         user,full_scratch,full_scratch_bytes,NULL,NULL,full_stats,&q);
++    if(x)return x;
++    q.profile=NULL;q.parallel=parallel_override;q.fuse=NULL;q.reuse_preflight=0;
++    return nprg2_executor_prepare_preflighted_request(e,&q,execution_lane,
++        parallel_override,list_scratch,list_scratch_bytes,list_near,list_near_bytes,prepared);
++}
++
++void nprg2_runner_close(Nprg2PreparedRunner *r){
++    if(!r)return;
++    if(r->weights_async.ring_mode&&r->weights_async.ring&&r->weights_async.ring->active)return;
++    nprg2_fuse_plan_free(&r->fuse_plan);close_restore(r);memset(r,0,sizeof *r);
++}
+diff --git a/depth-model/frame/native_program/prepared_runner.h b/depth-model/frame/native_program/prepared_runner.h
+index 8ec1ff1..dfb3ccc 100644
+--- a/depth-model/frame/native_program/prepared_runner.h
++++ b/depth-model/frame/native_program/prepared_runner.h
+@@ -24,6 +24,8 @@ typedef struct {
+     /* Optional profile and preflight reuse for every request (set after open). */
+     Nprg2ExecProfile *profile;
+     Nprg2Parallel *parallel;
++    Nprg2WeightsAsync weights_async;
++    uint8_t weights_async_ready;
+     uint8_t reuse_preflight;
+     /* Conv epilogue fusion plan (NULL = off), see nprg2_runner_build_fuse. */
+     Nprg2FusePlan fuse_plan;
+@@ -73,6 +75,33 @@ int nprg2_runner_execute(Nprg2PreparedRunner *runner,
+                          Nprg2ExecCancel cancelled,void *cancel_ctx,
+                          Nprg2ExecStats *stats);
+ 
++/* Executes one command after the caller has preflighted the full interval
++ * into `full_stats`. Intended for independent QNN lists that share one
++ * complete preflight but own distinct scratch and near regions. */
++int nprg2_runner_run_preflighted_command(Nprg2PreparedRunner *runner,
++                         const Nprg2Executor *executor,
++                         uint32_t full_first,uint32_t full_count,
++                         uint32_t pool1_writable_bytes,
++                         const Nprg2ExecBuffer *inputs,uint32_t input_count,
++                         const Nprg2ExecBuffer *outputs,uint32_t output_count,
++                         void *user,void *full_scratch,uint32_t full_scratch_bytes,
++                         Nprg2ExecStats *full_stats,uint32_t command_index,uint8_t execution_lane,
++                         Nprg2Parallel *parallel_override,
++                         void *list_scratch,uint32_t list_scratch_bytes,
++                         void *list_near,uint32_t list_near_bytes);
++int nprg2_runner_prepare_preflighted_request(Nprg2PreparedRunner *runner,
++                         const Nprg2Executor *executor,
++                         uint32_t full_first,uint32_t full_count,
++                         uint32_t pool1_writable_bytes,
++                         const Nprg2ExecBuffer *inputs,uint32_t input_count,
++                         const Nprg2ExecBuffer *outputs,uint32_t output_count,
++                         void *user,void *full_scratch,uint32_t full_scratch_bytes,
++                         Nprg2ExecStats *full_stats,uint8_t execution_lane,
++                         Nprg2Parallel *parallel_override,
++                         void *list_scratch,uint32_t list_scratch_bytes,
++                         void *list_near,uint32_t list_near_bytes,
++                         Nprg2ExecRequest *prepared_request);
++
+ /* Preflights the same runner request without any graph-pool writes. Use this
+  * before leasing/copying pool1 into VTCM; execute intentionally preflights
+  * again after the boundary operation. */
+@@ -93,6 +122,7 @@ int nprg2_runner_set_scratch_region(Nprg2PreparedRunner *runner,uint8_t region,
+ 
+ /* Parallel hook for every later request (NULL = serial). */
+ int nprg2_runner_set_parallel(Nprg2PreparedRunner *runner,Nprg2Parallel *parallel);
++int nprg2_runner_set_weights_dma_ring(Nprg2PreparedRunner *runner,Nprg2DmaRing *ring);
+ 
+ void nprg2_runner_close(Nprg2PreparedRunner *runner);
+ 
+diff --git a/depth-model/frame/native_program/test_prepared_dma_ring.c b/depth-model/frame/native_program/test_prepared_dma_ring.c
+new file mode 100644
+index 0000000..5c6cd70
+--- /dev/null
++++ b/depth-model/frame/native_program/test_prepared_dma_ring.c
+@@ -0,0 +1,106 @@
++#include "prepared_dma_ring.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define CHECK(x) do { if(!(x)){fprintf(stderr,"FAIL %s:%d: %s\n",__FILE__,__LINE__,#x);exit(1);} } while(0)
++
++typedef struct { uint64_t seq;uint8_t *dst;const uint8_t *src;size_t bytes;uint8_t queued,done; } MockDesc;
++typedef struct {
++    MockDesc d[NPRG2_DMA_RING_SLOTS];
++    uint64_t clock,release_through,error_seq;
++    uint32_t starts,finishes,reject_seq;
++    uint8_t active,hold,error;
++} MockDma;
++
++static int mock_begin(void *ctx){MockDma *m=ctx;CHECK(!m->active);m->active=1;m->starts++;return 1;}
++static int mock_issue(void *ctx,uint64_t seq,uint32_t slot,void *dst,const void *src,size_t bytes){
++    MockDma *m=ctx;MockDesc *d=&m->d[slot];CHECK(m->active&&!d->queued);if(seq==m->reject_seq)return 0;*d=(MockDesc){seq,dst,src,bytes,1,0};return 1;
++}
++static int mock_done(void *ctx,uint64_t seq,uint32_t slot){
++    MockDma *m=ctx;MockDesc *d=&m->d[slot];if(m->error)return -1;CHECK(m->active&&d->queued&&d->seq==seq);
++    if(m->error_seq==seq){m->error=1;m->active=0;return -1;}
++    if(m->hold&&seq>m->release_through)return 0;
++    memmove(d->dst,d->src,d->bytes);d->done=1;d->queued=0;return 1;
++}
++static int mock_finish(void *ctx,int had_error){
++    MockDma *m=ctx;m->finishes++;
++    if(had_error){for(uint32_t i=0;i<NPRG2_DMA_RING_SLOTS;i++)m->d[i].queued=0;m->active=0;return -1;}
++    for(uint32_t i=0;i<NPRG2_DMA_RING_SLOTS;i++)if(m->d[i].queued)return 0;
++    m->active=0;return 1;
++}
++static uint64_t mock_clock(void *ctx){return ((MockDma *)ctx)->clock;}
++static void mock_relax(void *ctx){((MockDma *)ctx)->clock++;}
++static const Nprg2DmaRingOps kOps={mock_begin,mock_issue,mock_done,mock_finish,mock_clock,mock_relax};
++static void init(Nprg2DmaRing *r,MockDma *m,uint64_t timeout){memset(m,0,sizeof *m);CHECK(nprg2_dma_ring_init(r,&kOps,m,timeout));}
++
++static void test_event_snapshot_and_id_reuse(void){
++    Nprg2DmaRing r;MockDma m;init(&r,&m,20);uint8_t src[5][4],dst[5][4];
++    CHECK(nprg2_dma_ring_checkpoint_wait(&r,19)); /* absent producer has no queued DMA to fence */
++    for(unsigned i=0;i<5;i++){memset(src[i],(int)(0x10+i),4);memset(dst[i],0,4);}
++    for(unsigned i=0;i<3;i++)CHECK(nprg2_dma_ring_enqueue(&r,dst[i],src[i],4)==1);
++    CHECK(nprg2_dma_ring_checkpoint_set(&r,7));uint32_t first_gen=r.event[7].generation;
++    for(unsigned i=3;i<5;i++)CHECK(nprg2_dma_ring_enqueue(&r,dst[i],src[i],4)==1);
++    CHECK(nprg2_dma_ring_checkpoint_wait(&r,7));
++    CHECK(r.completed==3);
++    for(unsigned i=0;i<3;i++)CHECK(!memcmp(dst[i],src[i],4));
++    for(unsigned i=3;i<5;i++)CHECK(dst[i][0]==0);
++    CHECK(nprg2_dma_ring_checkpoint_wait(&r,7)); /* repeated wait is idempotent */
++    CHECK(r.completed==3);
++    CHECK(nprg2_dma_ring_checkpoint_set(&r,7));
++    CHECK(r.event[7].generation==first_gen+1u&&r.event[7].sequence==5u);
++    CHECK(nprg2_dma_ring_checkpoint_wait(&r,7));CHECK(r.completed==5);
++    CHECK(nprg2_dma_ring_drain_all(&r)==1&&!m.active);
++    puts("PASS event snapshots fence only captured tail and reused IDs advance generation");
++}
++
++static void test_ring_wrap_and_fifo(void){
++    Nprg2DmaRing r;MockDma m;init(&r,&m,100);enum{N=150};uint8_t src[N][8],dst[N][8];
++    for(unsigned i=0;i<N;i++){memset(src[i],(int)i,sizeof src[i]);memset(dst[i],0,sizeof dst[i]);}
++    for(unsigned i=0;i<N;i++)CHECK(nprg2_dma_ring_enqueue(&r,dst[i],src[i],sizeof src[i])==1);
++    CHECK(nprg2_dma_ring_checkpoint_set(&r,23));CHECK(r.event[23].sequence==N);
++    CHECK(nprg2_dma_ring_checkpoint_wait(&r,23));CHECK(r.completed==N);
++    CHECK(nprg2_dma_ring_drain_all(&r)==1&&!m.active);
++    for(unsigned i=0;i<N;i++)CHECK(!memcmp(src[i],dst[i],sizeof src[i]));
++    CHECK(m.starts==1&&m.finishes==1);puts("PASS 63-slot FIFO wraps and reuses descriptors without losing sequence order");
++}
++
++static void test_error_drains_before_release(void){
++    Nprg2DmaRing r;MockDma m;init(&r,&m,20);uint8_t src[3][4]={{1},{2},{3}},dst[3][4]={{0}};
++    CHECK(nprg2_dma_ring_enqueue(&r,dst[0],src[0],4)==1);
++    CHECK(nprg2_dma_ring_enqueue(&r,dst[1],src[1],4)==1);
++    CHECK(nprg2_dma_ring_enqueue(&r,dst[2],src[2],4)==1);
++    CHECK(nprg2_dma_ring_checkpoint_set(&r,4));m.error_seq=2;
++    CHECK(!nprg2_dma_ring_checkpoint_wait(&r,4));
++    CHECK(nprg2_dma_ring_drain_all(&r)==-1&&!r.active&&!m.active&&m.finishes==1);
++    puts("PASS engine error is fatal, then drain_all releases the stopped engine");
++}
++
++static void test_timeout_retains_ownership_then_cancels(void){
++    Nprg2DmaRing r;MockDma m;init(&r,&m,3);uint8_t src[4]={1,2,3,4},dst[4]={0};m.hold=1;
++    CHECK(nprg2_dma_ring_enqueue(&r,dst,src,sizeof src)==1);
++    CHECK(nprg2_dma_ring_checkpoint_set(&r,12));CHECK(!nprg2_dma_ring_checkpoint_wait(&r,12));
++    CHECK(nprg2_dma_ring_drain_all(&r)==0&&r.active&&m.active);
++    m.hold=0;CHECK(nprg2_dma_ring_drain_all(&r)==-1&&!r.active&&!m.active);
++    puts("PASS timeout keeps ring/session owned; later cancellation drains before release");
++}
++
++static void test_unavailable_descriptor_drains_before_cpu_fallback(void){
++    Nprg2DmaRing r;MockDma m;init(&r,&m,20);uint8_t src[3][4]={{1},{2},{3}},dst[3][4]={{0}};
++    m.reject_seq=3;
++    CHECK(nprg2_dma_ring_enqueue(&r,dst[0],src[0],4)==1);
++    CHECK(nprg2_dma_ring_enqueue(&r,dst[1],src[1],4)==1);
++    CHECK(nprg2_dma_ring_enqueue(&r,dst[2],src[2],4)==0);
++    CHECK(r.completed==2&&!memcmp(dst[0],src[0],4)&&!memcmp(dst[1],src[1],4));
++    memcpy(dst[2],src[2],4); /* caller's CPU fallback now cannot race DMA */
++    CHECK(nprg2_dma_ring_drain_all(&r)==1&&!m.active);
++    CHECK(!memcmp(dst,src,sizeof src));
++    puts("PASS rejected descriptor drains earlier writes before CPU fallback");
++}
++
++int main(void){
++    test_event_snapshot_and_id_reuse();test_ring_wrap_and_fifo();
++    test_error_drains_before_release();test_timeout_retains_ownership_then_cancels();
++    test_unavailable_descriptor_drains_before_cpu_fallback();return 0;
++}
+diff --git a/depth-model/frame/native_program/test_prepared_full_model.c b/depth-model/frame/native_program/test_prepared_full_model.c
+index 943ee02..c582bb1 100644
+--- a/depth-model/frame/native_program/test_prepared_full_model.c
++++ b/depth-model/frame/native_program/test_prepared_full_model.c
+@@ -23,6 +23,8 @@
+ #include "prepared_sign.h"
+ #include "prepared_spill_fill.h"
+ #include "prepared_fuse.h"
++#include "prepared_dma_ring.h"
++#include "prepared_executor.h"
+ #include "../qd_graph.h"
+ 
+ #include <pthread.h>
+@@ -34,6 +36,36 @@
+ 
+ static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+ 
++typedef struct { uint64_t seq;void *dst;const void *src;size_t bytes;uint8_t queued; } MockDmaDesc;
++typedef struct { MockDmaDesc d[NPRG2_DMA_RING_SLOTS];uint64_t clock;uint8_t active;uint32_t issued,completed; } MockDma;
++static int mock_dma_begin(void *ctx){MockDma *m=ctx;if(m->active)return 0;m->active=1;return 1;}
++static int mock_dma_issue(void *ctx,uint64_t seq,uint32_t slot,void *dst,const void *src,size_t bytes){
++    MockDma *m=ctx;if(!m->active||slot>=NPRG2_DMA_RING_SLOTS||!bytes)return -1;
++    if((((uintptr_t)dst|(uintptr_t)src|bytes)&127u)!=0)return 0;
++    MockDmaDesc *d=&m->d[slot];if(d->queued)return -1;
++    *d=(MockDmaDesc){seq,dst,src,bytes,1};m->issued++;return 1;
++}
++static int mock_dma_done(void *ctx,uint64_t seq,uint32_t slot){
++    MockDma *m=ctx;if(!m->active||slot>=NPRG2_DMA_RING_SLOTS)return -1;
++    MockDmaDesc *d=&m->d[slot];if(!d->queued||d->seq!=seq)return -1;
++    memmove(d->dst,d->src,d->bytes);d->queued=0;m->completed++;return 1;
++}
++static int mock_dma_finish(void *ctx,int had_error){
++    MockDma *m=ctx;
++    if(had_error){for(uint32_t i=0;i<NPRG2_DMA_RING_SLOTS;i++)m->d[i].queued=0;m->active=0;return -1;}
++    for(uint32_t i=0;i<NPRG2_DMA_RING_SLOTS;i++)if(m->d[i].queued)return 0;
++    m->active=0;return 1;
++}
++static uint64_t mock_dma_clock(void *ctx){return ((MockDma *)ctx)->clock;}
++static void mock_dma_relax(void *ctx){((MockDma *)ctx)->clock++;}
++static const Nprg2DmaRingOps mock_dma_ops={mock_dma_begin,mock_dma_issue,mock_dma_done,
++    mock_dma_finish,mock_dma_clock,mock_dma_relax};
++static void mock_dma_init(Nprg2WeightsAsync *a,Nprg2DmaRing *r,MockDma *m,uint32_t commands){
++    memset(a,0,sizeof *a);memset(m,0,sizeof *m);
++    CHECK(nprg2_dma_ring_init(r,&mock_dma_ops,m,100000000u));
++    a->command_count=commands;a->ring=r;a->ring_mode=1;a->timeout_cycles=100000000u;
++}
++
+ static uint8_t *read_file(const char *path, uint32_t *n) {
+     FILE *f = fopen(path, "rb");
+     if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
+@@ -481,6 +513,243 @@ static void whole(Session *s) {
+     free(out[1]);
+ }
+ 
++/* Host-only QNN run-list replay: events are generated from the metadata-only
++ * x86 capture and carry command index, wait CP, done CP, and source list. */
++static void runlists(Session *s, const char *order) {
++    const char *path = getenv("QD_RUNLIST_EVENTS");
++    CHECK(path && *path);
++    uint32_t bytes = 0;
++    uint8_t *raw = read_file(path, &bytes);
++    CHECK(bytes >= 4);
++    uint32_t cp_count = rd32(raw);
++    CHECK(cp_count > 1 && cp_count <= 8192);
++    uint64_t need_bytes = 4ull + 4ull * cp_count + 24ull * s->program.command_count;
++    CHECK(need_bytes == bytes);
++    uint32_t *cp = calloc(cp_count, sizeof *cp);
++    CHECK(cp);
++    for (uint32_t i = 0; i < cp_count; i++) cp[i] = rd32(raw + 4u + i * 4u);
++    const uint8_t *events = raw + 4u + cp_count * 4u;
++    Nprg2WeightsAsync dma;Nprg2DmaRing ring;MockDma mock;
++    mock_dma_init(&dma,&ring,&mock,s->program.command_count);
++    pools_reset(s);
++    uint8_t *out[2] = {calloc(1, 163840), calloc(1, 655360)};
++    CHECK(out[0] && out[1]);
++    Nprg2ExecBuffer in[4], ob[2] = {{out[0], 163840}, {out[1], 655360}};
++    for (int k = 0; k < 4; k++) in[k] = (Nprg2ExecBuffer){s->inputs[k], s->input_bytes[k]};
++    for (uint32_t i = 0; i < s->program.command_count; i++) {
++        const uint8_t *ev = events + i * 24u;
++        uint32_t ix = rd32(ev), wait = rd32(ev + 4), done = rd32(ev + 8), lid = rd32(ev + 12);
++        uint32_t dma_event_id=rd32(ev+16),dma_event_kind=rd32(ev+20);
++        CHECK(ix < s->program.command_count && wait < cp_count && done < cp_count && lid < 2);
++        if (cp[wait] != 0) {
++            fprintf(stderr, "%s %s blocked at step=%lu command=%lu list=%lu wait=%lu value=%lu\n",
++                    s->model, order, (unsigned long)i, (unsigned long)ix, (unsigned long)lid,
++                    (unsigned long)wait, (unsigned long)cp[wait]);
++            exit(1);
++        }
++        if(dma_event_kind==2u)CHECK(nprg2_exec_weights_dma_checkpoint_wait(&dma,dma_event_id)==NPRG2_EXEC_OK);
++        Nprg2ExecStats st;
++        Nprg2ExecRequest r = request(s, in, ob, ix, 1, &st);
++        r.weights_async=&dma;
++        if (s->reference_only) r.scratch_bytes = s->need[ix];
++        int rc = nprg2_executor_run(&s->executor, &r);
++        if (rc != NPRG2_EXEC_OK || st.validated_commands != 1 || st.executed_commands != 1) {
++            Nprg2Command c = {0}; nprg2_command_at(&s->bound, ix, &c);
++            fprintf(stderr, "%s %s failed step=%lu command=%lu op=%u var=%u rc=%d line=%lu\n",
++                    s->model, order, (unsigned long)i, (unsigned long)ix, c.opcode, c.variant, rc,
++                    (unsigned long)nprg2_exec_reference_error_line());
++            exit(1);
++        }
++        if(dma_event_kind==1u)CHECK(nprg2_exec_weights_dma_checkpoint_set(&dma,dma_event_id)==NPRG2_EXEC_OK);
++        if (done) {
++            CHECK(cp[done] != 0);
++            cp[done]--;
++        }
++    }
++    CHECK(nprg2_exec_weights_dma_drain_all(&dma)==NPRG2_EXEC_OK);
++    for (uint32_t i = 0; i < cp_count; i++) CHECK(cp[i] == 0);
++    printf("PASS %s QNN %s run-list replay: %lu prepared commands, %lu CPU CPs and %lu DMA copies drained\n",
++           s->model, order, (unsigned long)s->program.command_count, (unsigned long)cp_count,
++           (unsigned long)mock.completed);
++    check_outputs(s, out, order);
++    free(out[0]); free(out[1]); free(cp); free(raw);
++}
++
++typedef struct { uint32_t command, wait_cp, done_cp, list, dma_event_id, dma_event_kind; } RunlistEvent;
++typedef struct {
++    pthread_mutex_t lock;
++    pthread_cond_t changed;
++    uint32_t *cp;
++    uint32_t cp_count;
++    int failed;
++    int preferred_list, other_started;
++    char failure[192];
++    Session *session;
++    Nprg2ExecBuffer *inputs, *outputs;
++    Nprg2ExecRequest lane_request[2];
++    Nprg2Parallel *worker_parallel;
++    Nprg2WeightsAsync *dma;
++    uint8_t *scratch[2];
++    uint8_t *near_scratch[2];
++} RunlistShared;
++typedef struct { RunlistShared *shared; RunlistEvent *events; uint32_t count, list; } RunlistThread;
++
++static void runlist_fail(RunlistShared *sh, const char *msg) {
++    pthread_mutex_lock(&sh->lock);
++    if (!sh->failed) { sh->failed = 1; snprintf(sh->failure, sizeof sh->failure, "%s", msg); }
++    pthread_cond_broadcast(&sh->changed);
++    pthread_mutex_unlock(&sh->lock);
++}
++static void *runlist_thread(void *arg) {
++    RunlistThread *t = (RunlistThread *)arg;
++    RunlistShared *sh = t->shared;
++    Session *s = sh->session;
++    pthread_mutex_lock(&sh->lock);
++    while (!sh->failed && (int)t->list != sh->preferred_list && !sh->other_started)
++        pthread_cond_wait(&sh->changed, &sh->lock);
++    pthread_mutex_unlock(&sh->lock);
++    for (uint32_t i = 0; i < t->count; i++) {
++        RunlistEvent *ev = &t->events[i];
++        pthread_mutex_lock(&sh->lock);
++        if ((int)t->list == sh->preferred_list && sh->cp[ev->wait_cp] != 0 && !sh->other_started) {
++            sh->other_started = 1;
++            pthread_cond_broadcast(&sh->changed);
++        }
++        while (!sh->failed && sh->cp[ev->wait_cp] != 0)
++            pthread_cond_wait(&sh->changed, &sh->lock);
++        int stop = sh->failed;
++        pthread_mutex_unlock(&sh->lock);
++        if (stop) return NULL;
++
++        if (t->list==0u && ev->dma_event_kind==2u &&
++            nprg2_exec_weights_dma_checkpoint_wait(sh->dma,ev->dma_event_id)!=NPRG2_EXEC_OK) {
++            runlist_fail(sh,"DMA checkpoint wait failed");return NULL;
++        }
++        int rc = nprg2_executor_run_preflighted_command_prepared(&s->executor,
++            &sh->lane_request[t->list],ev->command);
++        if (rc != NPRG2_EXEC_OK) {
++            char msg[192];
++            Nprg2Command c={0};nprg2_command_at(&s->bound,ev->command,&c);
++            snprintf(msg, sizeof msg, "list %lu command %lu op=%u var=%u failed rc=%d async=%lu fallback=%lu ringfail=%u issued=%lu completed=%lu line=%lu",
++                     (unsigned long)t->list, (unsigned long)ev->command,c.opcode,c.variant,rc,
++                     (unsigned long)sh->dma->starts,(unsigned long)sh->dma->cpu_fallbacks,
++                     sh->dma->ring->failed,(unsigned long)sh->dma->ring->issued,(unsigned long)sh->dma->ring->completed,
++                     (unsigned long)nprg2_exec_reference_error_line());
++            runlist_fail(sh, msg);
++            return NULL;
++        }
++        if(ev->dma_event_kind==1u &&
++           nprg2_exec_weights_dma_checkpoint_set(sh->dma,ev->dma_event_id)!=NPRG2_EXEC_OK) {
++            runlist_fail(sh,"DMA checkpoint set failed");return NULL;
++        }
++        pthread_mutex_lock(&sh->lock);
++        if (ev->done_cp && !sh->cp[ev->done_cp]) {
++            if (!sh->failed) {
++                sh->failed = 1;
++                snprintf(sh->failure, sizeof sh->failure, "list %lu command %lu underflowed CP %lu",
++                         (unsigned long)t->list, (unsigned long)ev->command, (unsigned long)ev->done_cp);
++            }
++        } else if (ev->done_cp) {
++            sh->cp[ev->done_cp]--;
++        }
++        pthread_cond_broadcast(&sh->changed);
++        int failed = sh->failed;
++        pthread_mutex_unlock(&sh->lock);
++        if (failed) return NULL;
++    }
++    pthread_mutex_lock(&sh->lock);
++    if ((int)t->list == sh->preferred_list && !sh->other_started) {
++        sh->other_started = 1;
++        pthread_cond_broadcast(&sh->changed);
++    }
++    pthread_mutex_unlock(&sh->lock);
++    return NULL;
++}
++
++static void runlists_parallel(Session *s, int preferred_list) {
++    CHECK(!s->fuse);
++    const char *path = getenv("QD_RUNLIST_EVENTS");
++    CHECK(path && *path);
++    uint32_t bytes = 0;
++    uint8_t *raw = read_file(path, &bytes);
++    CHECK(bytes >= 4);
++    uint32_t cp_count = rd32(raw);
++    CHECK(cp_count > 1 && cp_count <= 8192);
++    uint64_t need_bytes = 4ull + 4ull * cp_count + 24ull * s->program.command_count;
++    CHECK(need_bytes == bytes);
++    uint32_t *cp = calloc(cp_count, sizeof *cp);
++    RunlistEvent *events[2] = {calloc(s->program.command_count, sizeof(RunlistEvent)),
++                               calloc(s->program.command_count, sizeof(RunlistEvent))};
++    CHECK(cp && events[0] && events[1]);
++    for (uint32_t i = 0; i < cp_count; i++) cp[i] = rd32(raw + 4u + i * 4u);
++    uint32_t counts[2] = {0, 0};
++    const uint8_t *encoded = raw + 4u + cp_count * 4u;
++    for (uint32_t i = 0; i < s->program.command_count; i++) {
++        const uint8_t *p = encoded + i * 24u;
++        uint32_t lid = rd32(p + 12);
++        CHECK(lid < 2);
++        events[lid][counts[lid]++] = (RunlistEvent){rd32(p), rd32(p + 4), rd32(p + 8), lid,
++                                                    rd32(p + 16), rd32(p + 20)};
++    }
++    CHECK(counts[0] == 2668 && counts[1] == 2400);
++
++    /* Complete the normal whole-program preflight before either list starts. */
++    pools_reset(s);
++    Nprg2ExecBuffer out_buf[2] = {{calloc(1, 163840), 163840}, {calloc(1, 655360), 655360}};
++    CHECK(out_buf[0].data && out_buf[1].data);
++    Nprg2ExecBuffer in_buf[4];
++    for (int k = 0; k < 4; k++) in_buf[k] = (Nprg2ExecBuffer){s->inputs[k], s->input_bytes[k]};
++    Nprg2ExecStats preflight_stats;
++    Nprg2ExecRequest preflight = request(s, in_buf, out_buf, 0, s->program.command_count, &preflight_stats);
++    Nprg2WeightsAsync dma;Nprg2DmaRing ring;MockDma mock;
++    mock_dma_init(&dma,&ring,&mock,s->program.command_count);
++    preflight.weights_async=&dma;
++    preflight.parallel = NULL; preflight.fuse = NULL;
++    preflight.extra_scratch[0] = (Nprg2ExecBuffer){NULL, 0};
++    CHECK(nprg2_executor_preflight(&s->executor, &preflight) == NPRG2_EXEC_OK);
++    CHECK(preflight_stats.validated_commands == s->program.command_count);
++    uint32_t qweights=0;for(uint32_t wi=0;wi<s->program.command_count;wi++){Nprg2Command wc;if(!nprg2_command_at(&s->bound,wi,&wc)&&wc.opcode==QDR_WEIGHTS_TO_VTCM)qweights++;}
++    fprintf(stderr,"host DMA mock observed %u weights commands\n",qweights);
++    CHECK(nprg2_exec_reference_clone_lane(0, 1));
++    for (int p = 0; p < 7; p++)
++        CHECK(!s->pools[p].bytes || !memcmp(s->pools[p].base, s->initial[p], s->pools[p].bytes));
++
++    RunlistShared sh;
++    memset(&sh, 0, sizeof sh);
++    CHECK(!pthread_mutex_init(&sh.lock, NULL)); CHECK(!pthread_cond_init(&sh.changed, NULL));
++    sh.cp = cp; sh.cp_count = cp_count; sh.session = s; sh.inputs = in_buf; sh.outputs = out_buf;sh.dma=&dma;
++    memset(&g_par,0,sizeof g_par);g_par.max_parts=2;g_par.run=pt_run;
++    sh.worker_parallel=&g_par;
++    sh.preferred_list = preferred_list;
++    sh.scratch[0] = aligned_alloc(128, (s->scratch_bytes + 127u) & ~127u);
++    sh.scratch[1] = aligned_alloc(128, (s->scratch_bytes + 127u) & ~127u);
++    sh.near_scratch[0] = aligned_alloc(128, 0x8000u);
++    sh.near_scratch[1] = aligned_alloc(128, 0x8000u);
++    CHECK(sh.scratch[0] && sh.scratch[1] && sh.scratch[0] != sh.scratch[1] &&
++          sh.near_scratch[0] && sh.near_scratch[1] && sh.near_scratch[0] != sh.near_scratch[1]);
++    CHECK(nprg2_executor_prepare_preflighted_request(&s->executor,&preflight,0,NULL,
++        sh.scratch[0],s->scratch_bytes,sh.near_scratch[0],0x8000u,&sh.lane_request[0])==NPRG2_EXEC_OK);
++    CHECK(nprg2_executor_prepare_preflighted_request(&s->executor,&preflight,1,sh.worker_parallel,
++        sh.scratch[1],s->scratch_bytes,sh.near_scratch[1],0x8000u,&sh.lane_request[1])==NPRG2_EXEC_OK);
++    pthread_t th[2];
++    RunlistThread tasks[2] = {{&sh, events[0], counts[0], 0}, {&sh, events[1], counts[1], 1}};
++    CHECK(!pthread_create(&th[preferred_list], NULL, runlist_thread, &tasks[preferred_list]));
++    CHECK(!pthread_create(&th[1u-(uint32_t)preferred_list], NULL, runlist_thread, &tasks[1u-(uint32_t)preferred_list]));
++    CHECK(!pthread_join(th[0], NULL)); CHECK(!pthread_join(th[1], NULL));
++    if(nprg2_exec_weights_dma_drain_all(&dma)!=NPRG2_EXEC_OK)runlist_fail(&sh,"DMA drain failed after both lists joined");
++    if (sh.failed) { fprintf(stderr, "parallel QNN run-list failure: %s\n", sh.failure); exit(1); }
++    for (uint32_t i = 0; i < cp_count; i++) CHECK(cp[i] == 0);
++    printf("PASS %s concurrent QNN run lists (%s preferred): %lu main + %lu worker entries, %lu CPU CPs, %lu DMA starts/%lu fallback (%lu/%lu copies queued/completed)\n",
++           s->model, preferred_list ? "worker" : "main", (unsigned long)counts[0],
++           (unsigned long)counts[1], (unsigned long)cp_count,(unsigned long)dma.starts,(unsigned long)dma.cpu_fallbacks,
++           (unsigned long)mock.issued,(unsigned long)mock.completed);
++    check_outputs(s, (uint8_t *const[]){out_buf[0].data, out_buf[1].data}, "concurrent-runlists");
++    pthread_cond_destroy(&sh.changed); pthread_mutex_destroy(&sh.lock);
++    free(sh.scratch[0]); free(sh.scratch[1]); free(out_buf[0].data); free(out_buf[1].data);
++    free(sh.near_scratch[0]); free(sh.near_scratch[1]);
++    free(events[0]); free(events[1]); free(cp); free(raw);
++}
++
+ int main(int argc, char **argv) {
+     const char *model = argc > 1 ? argv[1] : "primary";
+     const char *mode = argc > 2 ? argv[2] : "reference";
+@@ -500,6 +769,12 @@ int main(int argc, char **argv) {
+     }
+     register_handlers(&s, mixed, fast);
+     census(&s);
++    if (!strcmp(what, "runlist-main") || !strcmp(what, "runlist-worker")) {
++        runlists(&s, !strcmp(what, "runlist-main") ? "main-first" : "worker-first");
++        return 0;
++    }
++    if (!strcmp(what, "runlists-parallel-main")) { runlists_parallel(&s, 0); return 0; }
++    if (!strcmp(what, "runlists-parallel-worker")) { runlists_parallel(&s, 1); return 0; }
+     if (strcmp(what, "whole")) lockstep(&s);
+     /* QD_REPEAT=n: n whole runs (pools reset each time), so state carried
+      * between runs (memoised per-command decisions, caches) is exercised. */
+diff --git a/depth-model/frame/qd_graph_dsp.c b/depth-model/frame/qd_graph_dsp.c
+index 0f9eca7..69d65db 100644
+--- a/depth-model/frame/qd_graph_dsp.c
++++ b/depth-model/frame/qd_graph_dsp.c
+@@ -173,6 +173,18 @@ static int send_work(uint32_t op,uint32_t sequence) {
+         while(work->done[t]!=gen)if(now_ns()>end)return 90;
+     __asm__ volatile("barrier":::"memory");return e?e:work->error;
+ }
++static uint32_t send_work_start(uint32_t op,uint32_t sequence) {
++    work->op=op;work->sequence=sequence;work->error=0;
++    uint32_t gen=work->generation+1;
++    __asm__ volatile("barrier":::"memory");work->generation=gen;
++    return gen;
++}
++static int send_work_wait(uint32_t gen,uint64_t timeout_ns) {
++    uint64_t end=now_ns()+timeout_ns;
++    for(uint32_t t=1;t<QDS_WORKER_SLOTS;t++)
++        while(work->done[t]!=gen)if(now_ns()>end)return 90;
++    __asm__ volatile("barrier":::"memory");return work->error;
++}
+ #if QDS_NATIVE_1X1
+ #include "native_adapter/qd_native_1x1_graph_bridge.h"
+ #endif
+@@ -459,33 +471,74 @@ static void status(uint32_t tid,uint32_t seq) {
+     volatile QdStatus *st=(volatile QdStatus *)(SERVICE+128)+tid;
+     st->error=st->rows=st->reserved=0;__asm__ volatile("barrier":::"memory");st->done_sequence=seq;
+ }
++#if QDS_PREPARED_THREADS>1 && (NPRG2_OVERLAP || NPRG2_QNN_RUNLISTS)
++/* Follower 2 remains parked on the master generation but services one
++ * independent nested job from the background QNN list when requested. */
++static int follower_subjob(uint32_t tid,uint32_t *seen) {
++#if QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM
++    if(tid>=2 && qnn_claim_serve(tid))return 1;
++#endif
++    if(tid==2 && work->sub_generation!=*seen) {
++        __asm__ volatile("barrier":::"memory");
++        uint32_t gen=work->sub_generation,parts=work->sub_parts;
++        if(parts>1)work->sub_fn(work->sub_ctx,1,parts);
++        __asm__ volatile("barrier":::"memory");work->sub_done=gen;*seen=gen;
++        return 1;
++    }
++    if(tid==3 && work->msub_generation!=*seen) {
++        __asm__ volatile("barrier":::"memory");
++        uint32_t gen=work->msub_generation,parts=work->msub_parts;
++        if(parts>1)work->msub_fn(work->msub_ctx,1,parts);
++        __asm__ volatile("barrier":::"memory");work->msub_done=gen;*seen=gen;
++        return 1;
++    }
++    return 0;
++}
++#endif
+ #if QDS_L2_CACHE && QDS_PREPARED_THREADS>1
+ /* op 5 (prepared_run, L2 mode): this follower runs here on its page-7 stack
+  * for the whole cache lease, touching no L2-TCM address; op 6 returns to the
+  * TCM stack, whose bytes the lease saved and restored. */
+ static void follower_leased(uint32_t tid) {
+     tid=qds_logical_tid(tid);
+-    uint32_t seen=work->generation;
++    uint32_t seen=work->generation,sub_seen=tid==3?work->msub_generation:work->sub_generation;
+     __asm__ volatile("barrier":::"memory");work->done[tid]=seen;
+     for(;;) {
+-        while(work->generation==seen)__asm__ volatile("pause(#32)");
++        while(work->generation==seen) {
++#if NPRG2_OVERLAP || NPRG2_QNN_RUNLISTS
++            if(!follower_subjob(tid,&sub_seen))
++#endif
++                __asm__ volatile("pause(#32)");
++        }
+         __asm__ volatile("barrier":::"memory");seen=work->generation;
+         uint32_t op=work->op;
+         if(op==6)return;
+         if(op==4 && tid<work->job_parts) {
+             work->job_started[tid]++;__asm__ volatile("barrier":::"memory");
++#if QDS_PART_TIMING
++            uint64_t pt0=now_ns();
++#endif
+             work->job_fn(work->job_ctx,tid,work->job_parts);
++#if QDS_PART_TIMING
++            if(nprg2_par_kind!=NPRG2_PAR_CONV)qd_part_cycles[tid]+=now_ns()-pt0;
++#endif
+             __asm__ volatile("barrier":::"memory");work->job_finished[tid]++;
+         }
++        if(op==8 && tid==1)work->job_fn(work->job_ctx,tid,work->job_parts);
+         __asm__ volatile("barrier":::"memory");work->done[tid]=seen;
+     }
+ }
+ #endif
+ static void follower(uint32_t tid) {
+     uint32_t logical=qds_logical_tid(tid);
+-    uint32_t seen=0;
++    uint32_t seen=0,sub_seen=logical==3?work->msub_generation:work->sub_generation;
+     for(;;) {
+-        while(work->generation==seen)__asm__ volatile("pause(#32)");
++        while(work->generation==seen) {
++#if NPRG2_OVERLAP || NPRG2_QNN_RUNLISTS
++            if(!follower_subjob(logical,&sub_seen))
++#endif
++                __asm__ volatile("pause(#32)");
++        }
+         __asm__ volatile("barrier":::"memory");seen=work->generation;
+         uint32_t op=work->op;
+ #if QDS_L2_CACHE && QDS_PREPARED_THREADS>1
+@@ -498,9 +551,16 @@ static void follower(uint32_t tid) {
+         if(op==2)status(tid,work->sequence);
+         if(op==4 && logical<work->job_parts) {
+             work->job_started[logical]++;__asm__ volatile("barrier":::"memory");
++#if QDS_PART_TIMING
++            uint64_t pt0=now_ns();
++#endif
+             work->job_fn(work->job_ctx,logical,work->job_parts);
++#if QDS_PART_TIMING
++            if(nprg2_par_kind!=NPRG2_PAR_CONV)qd_part_cycles[logical]+=now_ns()-pt0;
++#endif
+             __asm__ volatile("barrier":::"memory");work->job_finished[logical]++;
+         }
++        if(op==8 && logical==1)work->job_fn(work->job_ctx,logical,work->job_parts);
+         __asm__ volatile("barrier":::"memory");work->done[logical]=seen;
+         if(op==3)return;
+     }
+@@ -625,7 +685,7 @@ __attribute__((section(".text.resident_entry"))) void resident_entry(uint32_t ti
+     }
+ exit:
+ #if QDS_NATIVE_PREPARED
+-    if(prepared){nprg2_runner_close(&prepared->runner);free(prepared);}
++    if(prepared)prepared_state_dispose(prepared);
+ #endif
+     send_work(3,last);
+     uint32_t e=qdrc_power(0);if(e)result[1]=e;
+diff --git a/depth-model/frame/qd_graph_dsp.h b/depth-model/frame/qd_graph_dsp.h
+index 55ef69a..ea97642 100644
+--- a/depth-model/frame/qd_graph_dsp.h
++++ b/depth-model/frame/qd_graph_dsp.h
+@@ -37,6 +37,25 @@ static inline uint32_t qds_physical_tid(uint32_t logical) { return logical; }
+ #define QDS_HTID5_STACK_TOP    0xa70b0000u
+ #define QDS_HTID5_HVX_STATE    0xa70d0000u
+ #define QDS_HTID5_HVX_STATE_BYTES 0x1200u
++#ifndef QDS_PREPARED_DMA_ASYNC
++#define QDS_PREPARED_DMA_ASYNC 0
++#endif
++#ifndef QDS_PREPARED_DMA_VERIFY
++#define QDS_PREPARED_DMA_VERIFY 0
++#endif
++#ifndef QDS_PREPARED_DMA_MAX_TRANSFERS
++#define QDS_PREPARED_DMA_MAX_TRANSFERS 0u
++#endif
++#ifndef QDS_PREPARED_DMA_MODE
++#define QDS_PREPARED_DMA_MODE 0u
++#endif
++#define QDS_DMA_VERIFY_DIAG_OFFSET 1152u
++#define QDS_DMA_DESC_BASE 0xf1808000u
++#define QDS_DMA_STATE_OFFSET 0x3f00u
++#define QDS_DMA_STATE_IDLE 0u
++#define QDS_DMA_STATE_INFLIGHT 1u
++#define QDS_DMA_STATE_PENDING_ERROR 101u
++#define QDS_DMA_PENDING_ERROR 101u
+ #define QDS_OP_RUN 3u
+ typedef struct {
+     uint32_t magic,version,image,image_bytes,pool[7],pool_bytes[7];
+@@ -68,6 +87,12 @@ static uint32_t qds_config_valid(const QdsConfig *c) {
+     return 1;
+ }
+ typedef void (*QdsJobFn)(void *ctx,uint32_t part,uint32_t parts);
++#ifndef NPRG2_QNN_RUNLISTS
++#define NPRG2_QNN_RUNLISTS 0
++#endif
++#ifndef NPRG2_OVERLAP
++#define NPRG2_OVERLAP 0
++#endif
+ typedef struct {
+     volatile uint32_t generation,op,sequence,error,done[QDS_WORKER_SLOTS];
+     uint32_t arena,prepared_a;
+@@ -76,6 +101,14 @@ typedef struct {
+      * job_fn(job_ctx,tid,job_parts). job_started/finished count per follower
+      * (index tid) and let the host see a worker that never came back. */
+     QdsJobFn job_fn;void *job_ctx;volatile uint32_t job_parts,job_started[QDS_WORKER_SLOTS],job_finished[QDS_WORKER_SLOTS];
++    /* Dedicated follower-2 mailbox for a nested background list kernel
++     * (used with NPRG2_OVERLAP / NPRG2_QNN_RUNLISTS; idle otherwise). */
++    volatile uint32_t sub_generation,sub_done;
++    QdsJobFn sub_fn;void *sub_ctx;volatile uint32_t sub_parts;
++    /* Second mailbox, served by logical worker 3 (physical HT5): nested
++     * parts of the QNN main list (QDS_PREPARED_THREADS=4). */
++    volatile uint32_t msub_generation,msub_done;
++    QdsJobFn msub_fn;void *msub_ctx;volatile uint32_t msub_parts;
+ } QdsWork;
+ /* QdsWork owns 0x300f0000..0x300f0200; 0x300f0200.. is the prepared helper
+  * slots' (qd_graph_prepared.h). */
+diff --git a/depth-model/frame/qd_graph_prepared.h b/depth-model/frame/qd_graph_prepared.h
+index 889f50f..3d7a638 100644
+--- a/depth-model/frame/qd_graph_prepared.h
++++ b/depth-model/frame/qd_graph_prepared.h
+@@ -1,9 +1,34 @@
+ #ifndef QD_GRAPH_PREPARED_H
+ #define QD_GRAPH_PREPARED_H
+ #include "qd_prepared_config.h"
++#include "qd_graph_dsp.h"
+ #include "native_program/prepared_runner.h"
+ #include "native_program/prepared_native.h"
+ #include "native_program/prepared_io.h"
++#ifndef NPRG2_QNN_RUNLISTS
++#define NPRG2_QNN_RUNLISTS 0
++#endif
++#ifndef QDS_QNN_CLAIM
++#define QDS_QNN_CLAIM 0
++#endif
++#ifndef QDS_QNN_MAIN_PARTS
++#define QDS_QNN_MAIN_PARTS 2u /* THREADS=4: 1 disables the HT5 conv helper */
++#endif
++#ifndef QDS_QNN_WORKER_PARTS
++#define QDS_QNN_WORKER_PARTS 2u
++#endif
++#if QDS_PREPARED_DMA_ASYNC
++#include "native_program/prepared_async_dma.h"
++#if !QDS_PRESERVE_VTCM
++#error QDS_PREPARED_DMA_ASYNC requires the preserved VTCM lease
++#endif
++#if !NPRG2_QNN_RUNLISTS
++#error QDS_PREPARED_DMA_ASYNC requires the captured QNN checkpoint run lists
++#endif
++#endif
++#if NPRG2_QNN_RUNLISTS
++#include "native_program/qnn_runlist_primary.generated.h"
++#endif
+ #ifndef QDS_L2_CACHE
+ #define QDS_L2_CACHE 0
+ #endif
+@@ -38,7 +63,7 @@ static const volatile char qds_l2_engine_feature[] __attribute__((used))="QDL2EN
+  * reference kernel. Reference scratch peak is 983,168 bytes over both models.
+  * Profiles: per-variant cycles in g->stats, conv phases (staging, MAC,
+  * requant, output write) in g->dsp_conv_phase[0..3]. */
+-#define QDS_REFERENCE_SCRATCH_BYTES 0x100000u
++#define QDS_REFERENCE_SCRATCH_BYTES 0x193000u
+ #if QDS_L2_CACHE==1
+ /* Lower L2 half stays TCM through the lease: conv near as without L2. */
+ #define QDS_REFERENCE_NEAR 0x30078000u
+@@ -83,6 +108,9 @@ static const volatile char prepared_reference_feature[]="QD_PREPARED_REF_1";
+ #ifndef QDS_PREPARED_THREADS
+ #define QDS_PREPARED_THREADS 1
+ #endif
++#if NPRG2_QNN_RUNLISTS && (!QDS_PREPARED_REFERENCE || QDS_PREPARED_THREADS <= 1 || QDS_L2_CACHE != 1)
++#error NPRG2_QNN_RUNLISTS requires reference kernels, two prepared threads, and QDS_L2_CACHE=1
++#endif
+ #if QDS_L2_CACHE
+ /* Inside the lease no L2-TCM address is usable: page 7 (qd_l2_cache.h). */
+ #define QDS_PAR_L2_0 QDS_L2_PAR_0
+@@ -138,6 +166,13 @@ static uint32_t prepared_hmx_enter(void) {
+ }
+ static void prepared_hmx_leave(uint32_t saved) {__asm__ volatile("ssr=%0\n isync\n barrier"::"r"(saved):"memory");}
+ static uint64_t now_ns(void);
++#ifndef QDS_PART_TIMING
++#define QDS_PART_TIMING 0
++#endif
++#if QDS_PART_TIMING
++/* Diagnostic: per hardware thread, cycles inside op-4 job parts (each tid writes only its own). */
++static volatile uint64_t qd_part_cycles[4];
++#endif
+ static uint64_t prepared_hmx_clock(void) {return now_ns();}
+ static const Nprg2HmxOps prepared_hmx_ops={prepared_hmx_enter,prepared_hmx_leave,qd_hmx_wide,qd_hmx_finish,prepared_hmx_clock,
+     qd_hmx_wide_n,qd_hmx_native_n,qd_hmx_native16_n,
+@@ -159,6 +194,9 @@ typedef struct {
+     Nprg2ExecBuffer inputs[4],outputs[2];
+     Nprg2ExecStats stats;
+     Nprg2Parallel par;
++#if QDS_PREPARED_DMA_ASYNC
++    QdsPreparedDmaAsync dma_async;
++#endif
+ #if QDS_PREPARED_PROFILE
+     Nprg2ExecProfile profile;
+     uint64_t handler_run_cycles[NPRG2_EXEC_REGISTRY_CAPACITY],handler_run_count[NPRG2_EXEC_REGISTRY_CAPACITY],
+@@ -168,9 +206,33 @@ typedef struct {
+     Nprg2ReferenceConv conv;
+     Nprg2ReferenceChain chains[QDS_REFERENCE_CHAINS];
+     uint8_t *scratch;
++#if NPRG2_QNN_RUNLISTS
++    uint8_t *qnn_worker_mem;
++    Nprg2Parallel qnn_worker_parallel;
++#if QDS_PREPARED_THREADS==4
++    Nprg2Parallel qnn_main_parallel;
++#endif
++#endif
+ #endif
+ } QdPreparedState;
+ 
++/* A timed-out DMA retains its descriptor and mapping state through teardown. */
++static void prepared_state_dispose(QdPreparedState *s){
++    if(!s)return;
++    nprg2_runner_close(&s->runner);
++    if(s->runner.ready)return;
++#if QDS_PREPARED_DMA_ASYNC
++    if(s->dma_async.pending)return;
++#endif
++#if QDS_PREPARED_REFERENCE
++    free(s->scratch);
++#endif
++#if NPRG2_QNN_RUNLISTS && QDS_PREPARED_REFERENCE
++    free(s->qnn_worker_mem);
++#endif
++    free(s);
++}
++
+ #if QDS_PREPARED_REFERENCE
+ /* Chains the reference kernel under every specialized schema key, then
+  * registers it for every key still free. */
+@@ -259,7 +321,11 @@ static int prepared_par_run(void *impl,uint32_t parts,Nprg2ParallelFn fn,void *c
+     work->op=4;work->job_fn=fn;work->job_ctx=ctx;work->job_parts=parts;work->error=0;
+     uint32_t gen=work->generation+1;
+     __asm__ volatile("barrier":::"memory");work->generation=gen;
++#if QDS_PART_TIMING
++    uint64_t pt0=now_ns();fn(ctx,0,parts);if(nprg2_par_kind!=NPRG2_PAR_CONV)qd_part_cycles[0]+=now_ns()-pt0;
++#else
+     fn(ctx,0,parts);
++#endif
+     uint64_t end=now_ns()+400000000ull;
+     for(uint32_t t=1;t<QDS_WORKER_SLOTS;t++)
+         while(work->done[t]!=gen)
+@@ -269,6 +335,144 @@ static int prepared_par_run(void *impl,uint32_t parts,Nprg2ParallelFn fn,void *c
+ }
+ #endif
+ 
++#if NPRG2_QNN_RUNLISTS && QDS_PREPARED_THREADS>1
++/* The worker run list is owned by follower 1. Nested parts run on follower 1
++ * and follower 2 through QdsWork's independent subjob mailbox. */
++#if NPRG2_QNN_RUNLISTS && QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM
++/* Claim-based parts across both QNN lists (QDS_QNN_CLAIM=1). Every logical
++ * thread t has one private slot per owner lane o (slot[o][t]): only lane o
++ * writes gen/cancel/fn/ctx/part, only thread t writes taken/done. A part is
++ * run by exactly one party through a two-flag handshake:
++ *   helper: taken=gen; barrier; if cancel==gen skip, else run; done=gen
++ *   owner : cancel=gen; barrier; if taken!=gen run it itself (stolen)
++ *           else wait for done (and run it if the helper skipped).
++ * Owners post to their home helper (lane 0 -> HT5, lane 1 -> HT2), plus the
++ * other helper and the other list thread when those advertise idle. Every
++ * wait loop (checkpoint waits, part joins) serves incoming parts, so two
++ * owners waiting on each other always progress. Lives in the lower L2-TCM
++ * half (0x30074400, free between QdsWork and the checkpoint table). */
++typedef struct {
++    volatile uint32_t gen,cancel,taken,done,skipped;
++    Nprg2ParallelFn fn;void *ctx;volatile uint32_t part,parts;uint32_t pad[7];
++} QdsQnnSlot;
++typedef struct { QdsQnnSlot slot[2][4]; volatile uint32_t idle[4],magic; } QdsQnnClaim;
++#define QDS_QNN_CLAIM_MAGIC 0x514e434cu
++#define qnn_claim ((QdsQnnClaim *)0x30074400u)
++_Static_assert(0x30074400u+sizeof(QdsQnnClaim)<=0x30075000u,"QNN claim slots overlap the checkpoint table");
++typedef struct { uint32_t lane,n,who[3]; Nprg2Parallel *par; uint64_t stolen,helped; } QdsQnnLane;
++static QdsQnnLane qnn_lane[2];
++static int qnn_claim_serve(uint32_t self) {
++    /* Slots are live only between qnn_claim_reset and qnn_claim_close; any
++     * slot still unretired at close was cancelled by its owner (skip only). */
++    if(qnn_claim->magic!=QDS_QNN_CLAIM_MAGIC)return 0;
++    __asm__ volatile("barrier":::"memory");
++    for(uint32_t o=0;o<2;o++) {
++        QdsQnnSlot *sl=&qnn_claim->slot[o][self];
++        uint32_t g=sl->gen;
++        if(g==sl->done)continue;
++        __asm__ volatile("barrier":::"memory");
++        sl->taken=g;__asm__ volatile("barrier":::"memory");
++        if(sl->cancel==g){sl->skipped=g;__asm__ volatile("barrier":::"memory");sl->done=g;continue;}
++        if(self>=2)qnn_claim->idle[self]=0;
++        sl->fn(sl->ctx,sl->part,sl->parts);
++        __asm__ volatile("barrier":::"memory");sl->done=g;
++        if(self>=2)qnn_claim->idle[self]=1;
++        return 1;
++    }
++    return 0;
++}
++static void qnn_claim_reset(void) {
++    memset((void *)qnn_claim,0,sizeof(QdsQnnClaim));
++    for(uint32_t l=0;l<2;l++){qnn_lane[l].stolen=qnn_lane[l].helped=0;}
++    qnn_claim->idle[2]=qnn_claim->idle[3]=1;
++    __asm__ volatile("barrier":::"memory");qnn_claim->magic=QDS_QNN_CLAIM_MAGIC;
++    __asm__ volatile("barrier":::"memory");
++}
++static void qnn_claim_close(void) {
++    __asm__ volatile("barrier":::"memory");qnn_claim->magic=0;__asm__ volatile("barrier":::"memory");
++}
++static int qnn_claim_ready(void *impl) {
++    QdsQnnLane *L=impl;
++    if(prepared_par_fault || !prepared_par_lease_ok)return 0;
++    uint32_t home=L->lane?2u:3u,other=L->lane?3u:2u,peer=L->lane?0u:1u;
++    uint32_t cand[3]={home,other,peer},n=0;
++    for(uint32_t i=0;i<3;i++) {
++        QdsQnnSlot *sl=&qnn_claim->slot[L->lane][cand[i]];
++        if(sl->gen!=sl->done)continue;           /* previous part not retired yet */
++        if(i && !qnn_claim->idle[cand[i]])continue;
++        L->who[n++]=cand[i];
++    }
++    if(!n)return 0;
++    L->n=n;L->par->max_parts=1u+n;return 1;
++}
++static int qnn_claim_run(void *impl,uint32_t parts,Nprg2ParallelFn fn,void *ctx) {
++    QdsQnnLane *L=impl;
++    if(parts<2 || parts>1u+L->n)return 0;
++    uint32_t self=L->lane,np=parts-1u;QdsQnnSlot *sl[3];uint32_t g[3];
++    for(uint32_t i=0;i<np;i++) {
++        sl[i]=&qnn_claim->slot[L->lane][L->who[i]];
++        sl[i]->fn=fn;sl[i]->ctx=ctx;sl[i]->part=i+1u;sl[i]->parts=parts;
++        g[i]=sl[i]->done+1u;
++        __asm__ volatile("barrier":::"memory");sl[i]->gen=g[i];
++    }
++    fn(ctx,0,parts);
++    uint64_t end=now_ns()+400000000ull;
++    for(uint32_t i=0;i<np;i++) {
++        sl[i]->cancel=g[i];__asm__ volatile("barrier":::"memory");
++        if(sl[i]->taken!=g[i]){fn(ctx,i+1u,parts);L->stolen++;continue;}
++        while(sl[i]->done!=g[i]) {
++            if(!qnn_claim_serve(self)) {
++                if(now_ns()>end){prepared_par_fault=1;break;}
++                __asm__ volatile("pause(#8)");
++            }
++        }
++        __asm__ volatile("barrier":::"memory");
++        if(sl[i]->skipped==g[i]){fn(ctx,i+1u,parts);L->stolen++;}
++        else L->helped++;
++    }
++    __asm__ volatile("barrier":::"memory");
++    return 1;
++}
++#endif
++#if QDS_PREPARED_THREADS==4
++/* Main (conv) list helper: logical worker 3 (physical HT5) runs part 1 of a
++ * two-part job through QdsWork's msub mailbox while workers 1 and 2 own the
++ * worker list. Conv part 1 uses helper slot par_near[0], which no other
++ * run-list job touches. */
++static int prepared_qnn_main_parallel_run(void *impl,uint32_t parts,Nprg2ParallelFn fn,void *ctx) {
++    (void)impl;
++    if(parts!=2 || prepared_par_fault || !prepared_par_lease_ok)return 0;
++    work->msub_fn=fn;work->msub_ctx=ctx;work->msub_parts=parts;
++    uint32_t gen=work->msub_generation+1;
++    __asm__ volatile("barrier":::"memory");work->msub_generation=gen;
++    fn(ctx,0,parts);
++    uint64_t end=now_ns()+400000000ull;
++    while(work->msub_done!=gen) {
++        if(now_ns()>end)prepared_par_fault=1;
++        __asm__ volatile("pause(#32)");
++    }
++    __asm__ volatile("barrier":::"memory");return 1;
++}
++#endif
++static int prepared_qnn_worker_parallel_ready(void *impl) {
++    (void)impl;return !prepared_par_fault && prepared_par_lease_ok;
++}
++static int prepared_qnn_worker_parallel_run(void *impl,uint32_t parts,Nprg2ParallelFn fn,void *ctx) {
++    (void)impl;
++    if(parts!=2 || !prepared_qnn_worker_parallel_ready(NULL))return 0;
++    work->sub_fn=fn;work->sub_ctx=ctx;work->sub_parts=parts;
++    uint32_t gen=work->sub_generation+1;
++    __asm__ volatile("barrier":::"memory");work->sub_generation=gen;
++    fn(ctx,0,parts);
++    uint64_t end=now_ns()+400000000ull;
++    while(work->sub_done!=gen) {
++        if(now_ns()>end)prepared_par_fault=1;
++        __asm__ volatile("pause(#32)");
++    }
++    __asm__ volatile("barrier":::"memory");return 1;
++}
++#endif
++
+ static int prepared_cancel(void *ctx,uint32_t index) {
+     (void)ctx;
+ #if QDS_PREPARED_THREADS>1
+@@ -310,6 +514,14 @@ static QdPreparedState *prepared_open(QdgGraph *g,const QdsConfig *cfg,
+ #endif
+         0x3f000u,1);
+     if(e){free(s);return NULL;}
++#if QDS_PREPARED_DMA_ASYNC && defined(__hexagon__)
++    int dma_probe=qds_prepared_dma_async_probe(&s->dma_async,s->runner.pools[5].base,s->runner.pools[5].bytes);
++    if(dma_probe<0){prepared_state_dispose(s);return NULL;}
++    if(dma_probe>0 && (!qds_prepared_dma_ring_init(&s->dma_async) ||
++       nprg2_runner_set_weights_dma_ring(&s->runner,&s->dma_async.ring)!=NPRG2_RUNNER_OK)){
++        prepared_state_dispose(s);return NULL;
++    }
++#endif
+     nprg2_executor_init(&s->executor);
+     s->native=(Nprg2NativeConfig){.active_vtcm_bytes=QD_DIRECT_ACTIVE_BYTES,
+         .tables=(uint32_t *)0x30000000u,.table_bytes=QD_DIRECT_TABLE_BYTES,
+@@ -335,19 +547,40 @@ static QdPreparedState *prepared_open(QdgGraph *g,const QdsConfig *cfg,
+ #endif
+     s->conv.par_near_bytes=QDS_PAR_L2_BYTES;
+     s->par=(Nprg2Parallel){.max_parts=QDS_PREPARED_THREADS,.ready=prepared_par_ready,.run=prepared_par_run};
++#if NPRG2_QNN_RUNLISTS && QDS_PREPARED_THREADS>1
++    s->qnn_worker_parallel=(Nprg2Parallel){.max_parts=QDS_QNN_WORKER_PARTS,
++        .ready=prepared_qnn_worker_parallel_ready,.run=prepared_qnn_worker_parallel_run};
++#if QDS_PREPARED_THREADS==4
++    s->qnn_main_parallel=(Nprg2Parallel){.max_parts=QDS_QNN_MAIN_PARTS,
++        .ready=prepared_qnn_worker_parallel_ready,.run=prepared_qnn_main_parallel_run};
++#endif
++#if QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM
++    qnn_lane[0]=(QdsQnnLane){.lane=0,.par=&s->qnn_main_parallel};
++    qnn_lane[1]=(QdsQnnLane){.lane=1,.par=&s->qnn_worker_parallel};
++    s->qnn_main_parallel=(Nprg2Parallel){.max_parts=2,.ready=qnn_claim_ready,.run=qnn_claim_run,.impl=&qnn_lane[0]};
++    s->qnn_worker_parallel=(Nprg2Parallel){.max_parts=2,.ready=qnn_claim_ready,.run=qnn_claim_run,.impl=&qnn_lane[1]};
++#endif
++#endif
+     nprg2_runner_set_parallel(&s->runner,&s->par);
+ #endif
+     s->scratch=malloc(QDS_REFERENCE_SCRATCH_BYTES);
+-    if(!s->scratch || nprg2_executor_register_reference_conv(&s->executor,&s->conv,NULL) ||
++#if NPRG2_QNN_RUNLISTS
++    s->qnn_worker_mem=malloc(QDS_REFERENCE_SCRATCH_BYTES+QDS_REFERENCE_NEAR_BYTES);
++#endif
++    if(!s->scratch
++#if NPRG2_QNN_RUNLISTS
++       || !s->qnn_worker_mem
++#endif
++       || nprg2_executor_register_reference_conv(&s->executor,&s->conv,NULL) ||
+        nprg2_executor_register_weights(&s->executor) ||
+        nprg2_executor_register_core_safe_ops(&s->executor)) {
+-        free(s->scratch);nprg2_runner_close(&s->runner);free(s);return NULL;
++        prepared_state_dispose(s);return NULL;
+     }
+ #else
+     if(nprg2_executor_register_weights(&s->executor) ||
+        nprg2_executor_register_core_safe_ops(&s->executor) ||
+        nprg2_executor_register_native_conv(&s->executor,&s->native)) {
+-        nprg2_runner_close(&s->runner);free(s);return NULL;
++        prepared_state_dispose(s);return NULL;
+     }
+ #endif
+ #if QDS_PREPARED_ELEMENTWISE && QDS_PREPARED_REFERENCE
+@@ -355,22 +588,22 @@ static QdPreparedState *prepared_open(QdgGraph *g,const QdsConfig *cfg,
+        nprg2_runner_set_scratch_region(&s->runner,NPRG2_EXEC_SCRATCH_NEAR,
+                                        (void *)QDS_ELEMENTWISE_L2,QDS_ELEMENTWISE_L2_BYTES) ||
+        nprg2_executor_register_elementwise_region(&s->executor,NPRG2_EXEC_SCRATCH_NEAR)) {
+-        free(s->scratch);nprg2_runner_close(&s->runner);free(s);return NULL;
++        prepared_state_dispose(s);return NULL;
+     }
+ #elif QDS_PREPARED_ELEMENTWISE
+     if(NPRG2_ELEMENTWISE_SCRATCH_BYTES>0x8000u ||
+        nprg2_executor_register_elementwise(&s->executor)) {
+-        nprg2_runner_close(&s->runner);free(s);return NULL;
++        prepared_state_dispose(s);return NULL;
+     }
+ #endif
+ #if QDS_PREPARED_PREPROCESS
+     if(nprg2_executor_register_preprocess(&s->executor)) {
+-        nprg2_runner_close(&s->runner);free(s);return NULL;
++        prepared_state_dispose(s);return NULL;
+     }
+ #endif
+ #if QDS_PREPARED_REFERENCE
+     if(prepared_register_reference(s)) {
+-        free(s->scratch);nprg2_runner_close(&s->runner);free(s);return NULL;
++        prepared_state_dispose(s);return NULL;
+     }
+ #endif
+ #if QDS_PREPARED_FUSE
+@@ -382,6 +615,277 @@ static QdPreparedState *prepared_open(QdgGraph *g,const QdsConfig *cfg,
+     return s;
+ }
+ 
++#if NPRG2_QNN_RUNLISTS
++typedef struct {
++    QdgGraph *graph;
++    QdPreparedState *state;
++    Nprg2ExecRequest requests[2];
++    volatile uint32_t *checkpoints;
++    volatile uint32_t error;
++    volatile uint32_t completed[2];
++    volatile uint32_t excl_flag[2],excl_victim;
++#if QDS_PREPARED_PROFILE
++    uint64_t wait[2],wall[2],pre[2];
++#endif
++} QdQnnListRun;
++#if QDS_PREPARED_PROFILE
++/* Per-list handler time: list 0 into the handler profile directly after the
++ * join, list 1 accumulated here (no shared words between the two lists). */
++static uint64_t qnn_prof_cycles[2][NPRG2_EXEC_REGISTRY_CAPACITY];
++static uint32_t qnn_prof_count[2][NPRG2_EXEC_REGISTRY_CAPACITY];
++#ifndef QDS_QNN_WAITATTR
++#define QDS_QNN_WAITATTR 0
++#endif
++#if QDS_QNN_WAITATTR
++/* Diagnostic: a list's checkpoint-wait time charged to the handler of the
++ * command that last released that checkpoint. Exported (instead of worker
++ * busy) as handler validate_ms = main-list wait by worker producer. */
++static volatile uint8_t qnn_cp_last_hi[QD_QNN_PRIMARY_CHECKPOINT_COUNT];
++static uint64_t qnn_wait_attr[2][NPRG2_EXEC_REGISTRY_CAPACITY];
++#endif
++#endif
++#define QDS_QNN_WORKER_NEAR 0xa7060000u
++#define QDS_QNN_WORKER_SCRATCH 0xa7200000u
++_Static_assert(QDS_QNN_WORKER_SCRATCH+QDS_REFERENCE_SCRATCH_BYTES<=0xa8000000u,"QNN worker scratch leaves private page 7");
++static volatile uint32_t *const prepared_qnn_checkpoints=(volatile uint32_t *)0x30075000u;
++static int prepared_qnn_matches(const QdPreparedState *s,uint32_t first,uint32_t last) {
++    return s && first==0 && last==QD_QNN_PRIMARY_COMMAND_COUNT &&
++        s->runner.program.command_count==QD_QNN_PRIMARY_COMMAND_COUNT &&
++        !memcmp(s->runner.program.context_sha256,nprg2_qnn_primary_context_sha,32) &&
++        !s->runner.fuse && s->qnn_worker_mem;
++}
++#ifndef QDS_QNN_EXCLUSIVE
++#define QDS_QNN_EXCLUSIVE 0
++#endif
++static int prepared_qnn_command(QdQnnListRun *run,const Nprg2QnnRunEntry *entry,uint32_t list) {
++    uint32_t wait=entry->wait_cp,done=entry->done_cp;
++#if QDS_PREPARED_PROFILE
++    uint64_t p0=now_ns();
++#endif
++    if(wait>=QD_QNN_PRIMARY_CHECKPOINT_COUNT || done>=QD_QNN_PRIMARY_CHECKPOINT_COUNT ||
++       (done && nprg2_qnn_primary_cp_owner[done]!=list))return NPRG2_EXEC_REJECTED;
++    uint64_t wait_deadline=now_ns()+4000000000ull;
++    uint32_t spins=0;
++#if QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM
++    if(wait && run->checkpoints[wait]){qnn_claim->idle[list]=1;__asm__ volatile("barrier":::"memory");}
++#endif
++    while(wait && run->checkpoints[wait]) {
++#if QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM
++        if(qnn_claim_serve(list))continue;
++#endif
++        if((spins++&1023u)==0u) {
++            __asm__ volatile("barrier":::"memory");
++            if(run->error || resident_cancelled())return NPRG2_EXEC_CANCELLED;
++            if(now_ns()>wait_deadline)return NPRG2_EXEC_REJECTED;
++        }
++        __asm__ volatile("pause(#32)");
++    }
++    __asm__ volatile("barrier":::"memory");
++#if QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM
++    qnn_claim->idle[list]=0;__asm__ volatile("barrier":::"memory");
++    (void)qnn_claim_serve(list);   /* a part posted just before we left the wait */
++#endif
++    QdPreparedState *s=run->state;
++#if QDS_PREPARED_PROFILE
++    uint64_t p1=now_ns();run->wait[list]+=p1-p0;
++#if QDS_QNN_WAITATTR
++    if(wait)qnn_wait_attr[list][qnn_cp_last_hi[wait]]+=p1-p0;
++#endif
++#endif
++#if QDS_PREPARED_DMA_ASYNC
++    if(entry->dma_event_kind==2u && s->runner.weights_async_ready &&
++       nprg2_exec_weights_dma_checkpoint_wait(&s->runner.weights_async,entry->dma_event_id)!=NPRG2_EXEC_OK)
++        return NPRG2_EXEC_HANDLER_ERROR;
++#endif
++#if QDS_QNN_EXCLUSIVE
++    /* Diagnostic: lists still follow their checkpoints but never run handlers
++     * at the same time (Peterson lock, taken only after the wait). */
++    run->excl_flag[list]=1;__asm__ volatile("barrier":::"memory");
++    run->excl_victim=list;__asm__ volatile("barrier":::"memory");
++    while(run->excl_flag[list^1u] && run->excl_victim==list)__asm__ volatile("pause(#8)");
++    __asm__ volatile("barrier":::"memory");
++#if QDS_PREPARED_PROFILE
++    {uint64_t p1b=now_ns();run->wait[list]+=p1b-p1;p1=p1b;}
++#endif
++#endif
++#if QDS_PREPARED_PROFILE
++    {uint64_t pr=now_ns();nprg2_lane_prehandler[list]-=pr;run->pre[list]+=pr-p1;}
++#endif
++    int rc=nprg2_executor_run_preflighted_command_prepared(&s->executor,
++        &run->requests[list],entry->command);
++#if QDS_QNN_EXCLUSIVE
++    __asm__ volatile("barrier":::"memory");run->excl_flag[list]=0;__asm__ volatile("barrier":::"memory");
++#endif
++    if(rc)return rc;
++#if QDS_PREPARED_PROFILE
++    {
++        Nprg2Command cmd;uint64_t p2=now_ns();
++        if(nprg2_command_at(run->requests[list].bound,entry->command,&cmd)==NPRG2_OK){
++            int hi=nprg2_executor_handler_slot(&s->executor,cmd.opcode,cmd.variant);
++            if(hi>=0){qnn_prof_cycles[list][hi]+=p2-p1;qnn_prof_count[list][hi]++;}
++#if QDS_QNN_WAITATTR
++            if(hi>=0 && done)qnn_cp_last_hi[done]=(uint8_t)hi;
++#endif
++        }
++    }
++#endif
++#if QDS_PREPARED_DMA_ASYNC
++    if(entry->dma_event_kind==1u && s->runner.weights_async_ready &&
++       nprg2_exec_weights_dma_checkpoint_set(&s->runner.weights_async,entry->dma_event_id)!=NPRG2_EXEC_OK)
++        return NPRG2_EXEC_HANDLER_ERROR;
++#endif
++    run->completed[list]++;
++    if(done) {
++        if(!run->checkpoints[done])return NPRG2_EXEC_REJECTED;
++        __asm__ volatile("barrier":::"memory");
++        run->checkpoints[done]--;
++        __asm__ volatile("barrier":::"memory");
++    }
++    return NPRG2_EXEC_OK;
++}
++static void prepared_qnn_worker_list(void *opaque,uint32_t tid,uint32_t parts) {
++    QdQnnListRun *run=opaque;
++    if(tid!=1 || parts<2)return;
++#if QDS_PREPARED_PROFILE
++    uint64_t w0=now_ns();
++#endif
++    for(uint32_t i=0;i<QD_QNN_PRIMARY_WORKER_COUNT;i++) {
++        int rc=prepared_qnn_command(run,&nprg2_qnn_primary_worker[i],1);
++        if(rc){run->error=(uint32_t)rc;__asm__ volatile("barrier":::"memory");return;}
++    }
++#if QDS_PREPARED_PROFILE
++    run->wall[1]=now_ns()-w0;
++#endif
++}
++static int prepared_qnn_dma_finish(QdPreparedState *s,int status){
++#if QDS_PREPARED_DMA_ASYNC
++    if(s&&s->runner.weights_async_ready &&
++       nprg2_exec_weights_dma_drain_all(&s->runner.weights_async)!=NPRG2_EXEC_OK)
++        return NPRG2_EXEC_HANDLER_ERROR;
++#else
++    (void)s;
++#endif
++    return status;
++}
++static int prepared_qnn_runlists(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t last) {
++    if(!prepared_qnn_matches(s,first,last))return -1;
++    QdQnnListRun run={.graph=g,.state=s,.checkpoints=prepared_qnn_checkpoints};
++    if(nprg2_runner_prepare_preflighted_request(&s->runner,&s->executor,0,
++        QD_QNN_PRIMARY_COMMAND_COUNT,QD_DIRECT_ACTIVE_BYTES,s->inputs,4,s->outputs,2,
++        g,s->scratch,QDS_REFERENCE_SCRATCH_BYTES,&s->stats,0,
++#if QDS_PREPARED_THREADS==4
++        &s->qnn_main_parallel,
++#else
++        NULL,
++#endif
++        s->scratch,QDS_REFERENCE_SCRATCH_BYTES,s->runner.extra_scratch[0].data,
++        s->runner.extra_scratch[0].bytes,&run.requests[0]) ||
++       nprg2_runner_prepare_preflighted_request(&s->runner,&s->executor,0,
++        QD_QNN_PRIMARY_COMMAND_COUNT,QD_DIRECT_ACTIVE_BYTES,s->inputs,4,s->outputs,2,
++        g,s->scratch,QDS_REFERENCE_SCRATCH_BYTES,&s->stats,1,&s->qnn_worker_parallel,
++        (void *)QDS_QNN_WORKER_SCRATCH,QDS_REFERENCE_SCRATCH_BYTES,
++        (void *)QDS_QNN_WORKER_NEAR,QDS_REFERENCE_NEAR_BYTES,&run.requests[1]))
++        return NPRG2_EXEC_ARGUMENT;
++    for(uint32_t i=0;i<QD_QNN_PRIMARY_CHECKPOINT_COUNT;i++)run.checkpoints[i]=nprg2_qnn_primary_cp_initial[i];
++#if QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM
++    qnn_claim_reset();
++#endif
++    {Nprg2Parallel *wp=&s->qnn_worker_parallel;
++     memset(wp->jobs_parallel,0,sizeof wp->jobs_parallel);memset(wp->jobs_serial,0,sizeof wp->jobs_serial);
++     memset(wp->parts_run,0,sizeof wp->parts_run);wp->not_ready=wp->declined=0;}
++#if QDS_PREPARED_THREADS==4
++    {Nprg2Parallel *mp=&s->qnn_main_parallel;
++     memset(mp->jobs_parallel,0,sizeof mp->jobs_parallel);memset(mp->jobs_serial,0,sizeof mp->jobs_serial);
++     memset(mp->parts_run,0,sizeof mp->parts_run);mp->not_ready=mp->declined=0;}
++#endif
++#if QDS_PREPARED_PROFILE
++    memset(qnn_prof_cycles,0,sizeof qnn_prof_cycles);memset(qnn_prof_count,0,sizeof qnn_prof_count);
++#if QDS_QNN_WAITATTR
++    memset(qnn_wait_attr,0,sizeof qnn_wait_attr);
++#endif
++    nprg2_lane_clock=now_ns;nprg2_lane_prehandler[0]=nprg2_lane_prehandler[1]=0;
++    uint64_t m0=now_ns();
++#endif
++    __asm__ volatile("barrier":::"memory");
++    work->job_fn=prepared_qnn_worker_list;work->job_ctx=&run;work->job_parts=2;
++    uint32_t generation=send_work_start(8,0);
++    uint32_t completed=0;
++    for(uint32_t i=0;i<QD_QNN_PRIMARY_MAIN_COUNT;i++) {
++        int rc=prepared_qnn_command(&run,&nprg2_qnn_primary_main[i],0);
++        if(rc){run.error=(uint32_t)rc;break;}
++        completed++;
++    }
++#if QDS_PREPARED_PROFILE
++    run.wall[0]=now_ns()-m0;
++#endif
++    int join=send_work_wait(generation,4000000000ull);
++#if QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM
++    qnn_claim_close();
++#endif
++#if QDS_PREPARED_PROFILE
++    if(!join){
++        /* run_ms/dispatch_ms = main wall/wait, validate_ms = worker wait;
++         * handler run_ms = main, validate_ms = worker; count = main | worker<<32. */
++        s->profile.run_cycles=run.wall[0];s->profile.dispatch_cycles=run.wait[0];
++        s->profile.validate_cycles=run.wait[1];
++        for(uint32_t k=0;k<NPRG2_EXEC_REGISTRY_CAPACITY;k++){
++            s->handler_run_cycles[k]=qnn_prof_cycles[0][k];s->handler_validate_cycles[k]=qnn_prof_cycles[1][k];
++#if QDS_QNN_WAITATTR
++            s->handler_validate_cycles[k]=qnn_wait_attr[0][k];
++            s->handler_run_cycles[k]=qnn_wait_attr[1][k];
++#endif
++            s->handler_run_count[k]=(uint64_t)qnn_prof_count[0][k]|(uint64_t)qnn_prof_count[1][k]<<32;
++        }
++        ((volatile uint32_t *)(SERVICE+1024u))[3]=(uint32_t)run.wall[1];
++        /* preflight_ms = worker-lane executor overhead before handler entry;
++         * trace[10] = main-lane overhead (pcycles), trace[14] = worker DMA-wait+other pre (pcycles). */
++        s->profile.preflight_cycles=nprg2_lane_prehandler[1];
++        ((volatile uint32_t *)(SERVICE+1024u))[10]=(uint32_t)nprg2_lane_prehandler[0];
++        ((volatile uint32_t *)(SERVICE+1024u))[14]=(uint32_t)run.pre[1];
++    }
++#endif
++#if QDS_PREPARED_THREADS>1
++    /* The main list runs unsplit; report the worker lane's split counters. */
++    {Nprg2Parallel *wp=&s->qnn_worker_parallel;
++     memcpy(s->par.jobs_parallel,wp->jobs_parallel,sizeof wp->jobs_parallel);
++     memcpy(s->par.jobs_serial,wp->jobs_serial,sizeof wp->jobs_serial);
++     memcpy(s->par.parts_run,wp->parts_run,sizeof wp->parts_run);
++     s->par.not_ready=wp->not_ready;s->par.declined=wp->declined;}
++#if QDS_PREPARED_THREADS==4
++    /* Conv kind comes from the main lane (the worker lane runs no conv). */
++    {Nprg2Parallel *mp=&s->qnn_main_parallel;
++     s->par.jobs_parallel[NPRG2_PAR_CONV]=mp->jobs_parallel[NPRG2_PAR_CONV];
++     s->par.jobs_serial[NPRG2_PAR_CONV]=mp->jobs_serial[NPRG2_PAR_CONV];
++     s->par.parts_run[NPRG2_PAR_CONV]=mp->parts_run[NPRG2_PAR_CONV];
++     s->par.not_ready+=mp->not_ready;s->par.declined+=mp->declined;}
++#endif
++#if QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM
++    /* Claim mode: not_ready = parts the main lane ran itself (stolen back or
++     * skipped), declined = the worker lane's; trace[12] = helped parts main | worker<<16. */
++    s->par.not_ready=qnn_lane[0].stolen;s->par.declined=qnn_lane[1].stolen;
++    ((volatile uint32_t *)(SERVICE+1024u))[12]=(uint32_t)(qnn_lane[0].helped|qnn_lane[1].helped<<16);
++#endif
++#endif
++    if(join) {
++        run.error=NPRG2_EXEC_CANCELLED;prepared_par_fault=1;
++        __asm__ volatile("barrier":::"memory");
++        /* Retain this stack/context, the lease and code until both workers
++         * acknowledge. A permanently stalled worker requires host recovery. */
++        for(uint32_t t=1;t<QDS_WORKER_SLOTS;t++)
++            while(work->done[t]!=generation)__asm__ volatile("pause(#32)");
++        return prepared_qnn_dma_finish(s,NPRG2_EXEC_CANCELLED);
++    }
++    if(run.error)return prepared_qnn_dma_finish(s,(int)run.error);
++    if(completed!=QD_QNN_PRIMARY_MAIN_COUNT)return prepared_qnn_dma_finish(s,NPRG2_EXEC_REJECTED);
++    for(uint32_t i=0;i<QD_QNN_PRIMARY_CHECKPOINT_COUNT;i++)
++        if(run.checkpoints[i])return prepared_qnn_dma_finish(s,NPRG2_EXEC_REJECTED);
++    s->stats.executed_commands=QD_QNN_PRIMARY_COMMAND_COUNT;
++    volatile uint32_t *trace=(volatile uint32_t *)(SERVICE+1024u);
++    trace[6]=run.completed[0];trace[7]=run.completed[1];trace[11]=1;
++    return prepared_qnn_dma_finish(s,NPRG2_EXEC_OK);
++}
++#endif
++
+ /* VTCM in, execute, VTCM out. In L2 mode this runs on the C7 DDR stack
+  * with L2 as cache, so it must not touch any 0x30xxxxxx address. */
+ /* QDS_POOL1_NOCOPY: pool 1 holds only activations and per-run weight copies
+@@ -403,8 +907,23 @@ static int prepared_active(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_
+ #endif
+     g->dsp_read_cycles+=now_ns()-t;trace[1]=2;
+     qdrc_invalidate_native();g->resident_key=0;
+-    int e=nprg2_runner_execute(&s->runner,&s->executor,first,last-first,QD_DIRECT_ACTIVE_BYTES,
++    int e;
++#if NPRG2_QNN_RUNLISTS
++    e=prepared_qnn_runlists(g,s,first,last);
++    if(e==-1){
++#if QDS_PREPARED_DMA_ASYNC
++        uint8_t dma_ready=s->runner.weights_async_ready;s->runner.weights_async_ready=0;
++#endif
++        e=nprg2_runner_execute(&s->runner,&s->executor,first,last-first,QD_DIRECT_ACTIVE_BYTES,
++            s->inputs,4,s->outputs,2,g,scratch,scratch_bytes,prepared_cancel,NULL,&s->stats);
++#if QDS_PREPARED_DMA_ASYNC
++        s->runner.weights_async_ready=dma_ready;
++#endif
++    }
++#else
++    e=nprg2_runner_execute(&s->runner,&s->executor,first,last-first,QD_DIRECT_ACTIVE_BYTES,
+         s->inputs,4,s->outputs,2,g,scratch,scratch_bytes,prepared_cancel,NULL,&s->stats);
++#endif
+     qdrc_invalidate_native();g->resident_key=0;
+     if(e)return e;
+     t=now_ns();
+@@ -444,6 +963,9 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
+     volatile uint32_t *trace=(volatile uint32_t *)(SERVICE+1024u);
+     for(uint32_t q=0;q<16;q++)trace[q]=0;
+     trace[0]=0x31525051u;trace[2]=((volatile uint32_t *)SERVICE)[2];g->error_detail=0;
++#if QDS_PART_TIMING
++    qd_part_cycles[0]=qd_part_cycles[1]=qd_part_cycles[2]=0;
++#endif
+ #if QDS_L2_CACHE
+     trace[12]=(uint32_t)qds_l2_engine_feature[0];
+ #endif
+@@ -451,6 +973,13 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
+        !native_1x1_hmx_owned() || !native_1x1_workers_idle())return QDG_ERR_UNSUPPORTED;
+ #if QDS_PREPARED_THREADS>1
+     prepared_par_lease_ok=1;
++#endif
++#if QDS_PREPARED_DMA_ASYNC
++    if(s->runner.weights_async_ready){
++        s->dma_async.starts=s->dma_async.drains=0;
++        s->dma_async.verified_bytes=s->dma_async.mismatch_count=0;
++        if(!nprg2_dma_ring_reset(&s->dma_async.ring))return QDG_ERR_UNSUPPORTED;
++    }
+ #endif
+     trace[6]=s->runner.l2_hot_bytes;trace[7]=s->runner.l2_expanded_bytes;
+     trace[10]=(uint32_t)(uintptr_t)s->runner.l2_hot;
+@@ -485,6 +1014,11 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
+     int e=nprg2_runner_preflight(&s->runner,&s->executor,first,last-first,QD_DIRECT_ACTIVE_BYTES,
+         s->inputs,4,s->outputs,2,g,scratch,scratch_bytes,&s->stats);
+     if(e)goto failed;
++#if NPRG2_QNN_RUNLISTS
++    if(prepared_qnn_matches(s,first,last) && !nprg2_exec_reference_clone_lane(0,1)) {
++        e=NPRG2_EXEC_ARGUMENT;goto failed;
++    }
++#endif
+     trace[1]=1;
+ #if QDS_L2_CACHE
+     /* Metadata was written by scalar code with L2 as TCM; publish it. */
+@@ -517,6 +1051,9 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
+     prepared_par_lease_ok=0;
+ #endif
+     if(e)goto failed;
++#if QDS_PART_TIMING
++    trace[3]=(uint32_t)qd_part_cycles[0];trace[10]=(uint32_t)qd_part_cycles[1];trace[14]=(uint32_t)qd_part_cycles[2];
++#endif
+     trace[8]=s->stats.executed_commands;trace[9]=s->stats.validated_commands;
+ #if defined(NPRG2_APPROX_COST_VOLUME_STEP) && NPRG2_APPROX_COST_VOLUME_STEP > 1
+     trace[6]=s->stats.approx_cost_volume_commands;
+diff --git a/depth-model/sim/qnn_trace_hook.cpp b/depth-model/sim/qnn_trace_hook.cpp
+index 73192a0..29c22cf 100644
+--- a/depth-model/sim/qnn_trace_hook.cpp
++++ b/depth-model/sim/qnn_trace_hook.cpp
+@@ -48,6 +48,9 @@ FILE *trace_log, *writes;
+ uintptr_t lib_base;
+ uint32_t seq;
+ std::map<ExecEntry *, uint32_t> lists;
++FILE *list_dump;
++bool capture_only;
++std::atomic<uint32_t> captured_lists{0};
+ struct TensorDump { uint32_t slot, tid, bytes; };
+ std::map<std::pair<uint32_t, uint32_t>, std::vector<TensorDump>> tensor_dumps;
+ FILE *tensor_log;
+@@ -58,6 +61,8 @@ void init_locked() {
+     done = true;
+     if (const char *p = getenv("QD_TRACE_LOG")) trace_log = fopen(p, "w");
+     if (const char *p = getenv("QD_WRITES")) writes = fopen(p, "wb");
++    if (const char *p = getenv("QD_LIST_DUMP")) list_dump = fopen(p, "w");
++    capture_only = getenv("QD_CAPTURE_ONLY") != nullptr;
+     if (const char *p = getenv("QD_TENSOR_CONFIG")) {
+         FILE *f = fopen(p, "r");
+         uint32_t l, i, s, t, n;
+@@ -133,6 +138,20 @@ void wrap_list(ExecEntry *list, unsigned count) {
+     if (it != lists.end()) return;
+     uint32_t id = lists.size();
+     lists[list] = id;
++    captured_lists.store((uint32_t)lists.size(), std::memory_order_release);
++    if (list_dump) {
++        fprintf(list_dump, "# QD_RUNLIST_METADATA_CAPTURE_V1 list %u base=%p count=%u entry_bytes=%zu\n", id, (void *)list, count, sizeof(ExecEntry));
++        for (unsigned i = 0; i < count; ++i) {
++            uintptr_t fn = lib_base && (uintptr_t)list[i].fn >= lib_base ? (uintptr_t)list[i].fn-lib_base : (uintptr_t)list[i].fn;
++            uint32_t wait_value = list[i].wait ? (uint32_t)*list[i].wait : 0xffffffffu;
++            uint32_t done_value = list[i].done ? (uint32_t)*list[i].done : 0xffffffffu;
++            fprintf(list_dump,
++                    "%u %u %#lx %p %p %p %#x %#x\n",
++                    id, i, (unsigned long)fn, list[i].op, (void *)list[i].wait, (void *)list[i].done,
++                    wait_value, done_value);
++        }
++        fflush(list_dump);
++    }
+     unsigned n = 0;
+     for (unsigned i = 0; i < count; ++i) {
+         if (list[i].fn == trampoline) continue;
+@@ -152,6 +171,13 @@ void wrap_list(ExecEntry *list, unsigned count) {
+                            uint64_t, uint64_t, uint64_t, uint64_t);                                \
+         static Fn orig = (Fn)dlsym(RTLD_NEXT, #name);                                              \
+         wrap_list(list, count);                                                                    \
++        if (capture_only) {                                                                        \
++            if (captured_lists.load(std::memory_order_acquire) >= 2) {                             \
++                if (list_dump) fflush(list_dump);                                                  \
++                _exit(0);                                                                          \
++            }                                                                                      \
++            return 0;                                                                              \
++        }                                                                                          \
+         return orig(a1, a2, list, count, a5, a6, s1, s2, s3, s4, s5, s6);                          \
+     }
+ FORWARD(continue_execution_fast)
+diff --git a/depth-model/tools/qnn_runlist_capture.py b/depth-model/tools/qnn_runlist_capture.py
+new file mode 100644
+index 0000000..1efb223
+--- /dev/null
++++ b/depth-model/tools/qnn_runlist_capture.py
+@@ -0,0 +1,276 @@
++#!/usr/bin/env python3
++"""Convert the QNN hook's preprocessed ExecEntry capture into a graph-keyed plan.
++
++The output preserves the two independently ordered lists and their real shared
++checkpoint slots.  It is a provenance/host-model artifact; it does not execute
++QNN operations or infer dependencies from tensor edges.
++"""
++import argparse
++import hashlib
++import json
++import re
++import struct
++from collections import Counter
++from pathlib import Path
++
++DMA_EVENT_NONE = 0xFFFF
++DMA_KIND_NONE = 0
++DMA_KIND_SET = 1
++DMA_KIND_WAIT = 2
++
++
++def parse_capture(path):
++    headers, rows = {}, []
++    def ptr(text):
++        return 0 if text == "(nil)" else int(text, 16)
++    for line in Path(path).read_text().splitlines():
++        if not line.strip():
++            continue
++        if line.startswith("# QD_RUNLIST_METADATA_CAPTURE_V1"):
++            m = re.search(r"list (\d+) base=(0x[0-9a-fA-F]+) count=(\d+) entry_bytes=(\d+)", line)
++            if not m:
++                raise ValueError(f"malformed capture header: {line}")
++            lid, base, count, size = int(m[1]), int(m[2], 16), int(m[3]), int(m[4])
++            if lid in headers or size != 32:
++                raise ValueError(f"duplicate/invalid run list header: {line}")
++            headers[lid] = {"base": base, "count": count, "entry_bytes": size}
++            continue
++        f = line.split()
++        if len(f) != 8:
++            raise ValueError(f"malformed entry: {line}")
++        rows.append({"list": int(f[0]), "index": int(f[1]), "function": int(f[2], 16),
++                     "op_ptr": ptr(f[3]), "wait_ptr": ptr(f[4]),
++                     "done_ptr": ptr(f[5]), "wait_value": int(f[6], 16),
++                     "done_value": int(f[7], 16)})
++    if set(headers) != {0, 1}:
++        raise ValueError(f"expected both preprocessed lists 0 and 1, got {sorted(headers)}")
++    cp_bases = {r["wait_ptr"] for r in rows} | {r["done_ptr"] for r in rows}
++    cp_base = min(cp_bases)
++    if any(p < cp_base or (p - cp_base) % 4 for p in cp_bases):
++        raise ValueError("checkpoint pointer is outside/alignment-invalid for captured table")
++    for lid, h in headers.items():
++        n = [r for r in rows if r["list"] == lid]
++        if len(n) != h["count"] or sorted(r["index"] for r in n) != list(range(h["count"])):
++            raise ValueError(f"list {lid} has a count/index gap")
++    return headers, rows, cp_base
++
++
++def build(graph, capture):
++    headers, rows, cp_base = parse_capture(capture)
++    by_key = {(r["list"], r["index"]): r for r in rows}
++    graph_nodes = graph["nodes"]
++    main_nodes = iter(n for n in graph_nodes if n["flags"] in (0, 2))
++    worker_nodes = iter(n for n in graph_nodes if n["flags"] in (4, 6))
++    pad_nodes = iter(n for n in graph_nodes if n["flags"] == 6)
++    lists = []
++    cp_values = {}
++    done_producers = Counter()
++    done_by_list = [Counter(), Counter()]
++    for lid in (0, 1):
++        entries = []
++        for idx in range(headers[lid]["count"]):
++            raw = by_key[lid, idx]
++            node = None
++            if lid == 0:
++                if raw["function"] == 0xebc680:  # QNN 2.50 InputSlicePad executor stub
++                    # The serialized node is a worker op; this main-list slot is
++                    # an executor-only no-op with cp0 wait/done pointers.
++                    node = next(pad_nodes, None)
++                else:
++                    node = next(main_nodes, None)
++            else:
++                node = next(worker_nodes, None)
++            wait_cp = (raw["wait_ptr"] - cp_base) // 4
++            done_cp = (raw["done_ptr"] - cp_base) // 4
++            for cp, value in ((wait_cp, raw["wait_value"]), (done_cp, raw["done_value"])):
++                old = cp_values.setdefault(cp, value)
++                if old != value:
++                    raise ValueError(f"checkpoint {cp} has inconsistent captured initial values")
++            if node is not None and node["flags"] != 6 or lid == 1:
++                if done_cp:
++                    done_producers[done_cp] += 1
++                    done_by_list[lid][done_cp] += 1
++            if node is not None and not (lid == 0 and raw["function"] == 0xebc680):
++                cps = node.get("checkpoints", [])
++                expected = (cps[0], cps[1]) if len(cps) == 2 else ((0, cps[0]) if len(cps) == 1 else None)
++                if expected is not None and expected != (wait_cp, done_cp):
++                    raise ValueError(f"graph/capture checkpoint mismatch for node {node['sequence']}")
++            dma_type = node.get("type_name") if node else None
++            if dma_type in ("@DmaCheckpointSet", "@DmaCheckpointWait"):
++                words = node.get("framework_words", [])
++                if len(words) != 1 or not 0 < words[0] < DMA_EVENT_NONE:
++                    raise ValueError(f"invalid DMA checkpoint payload at node {node['sequence']}")
++                if lid != 0 or node.get("flags") not in (0, 2):
++                    raise ValueError(f"DMA checkpoint node {node['sequence']} is not on the main list")
++                dma_event_id = words[0]
++                dma_event_kind = DMA_KIND_SET if dma_type == "@DmaCheckpointSet" else DMA_KIND_WAIT
++            else:
++                dma_event_id = DMA_EVENT_NONE
++                dma_event_kind = DMA_KIND_NONE
++            entries.append({"index": idx, "node_sequence": node["sequence"] if node else None,
++                            "flags": node["flags"] if node else None,
++                            "function_offset": raw["function"], "wait_cp": wait_cp,
++                            "done_cp": done_cp, "wait_value": raw["wait_value"],
++                            "done_value": raw["done_value"],
++                            "dma_event_id": dma_event_id,
++                            "dma_event_kind": dma_event_kind,
++                            "dma_type": dma_type,
++                            "synthetic_main_stub": lid == 0 and raw["function"] == 0xebc680})
++        lists.append({"id": lid, "entry_count": len(entries), "entries": entries})
++    if next(main_nodes, None) is not None or next(worker_nodes, None) is not None or next(pad_nodes, None) is not None:
++        raise ValueError("captured run lists did not consume the graph's executable nodes")
++    for cp, count in done_producers.items():
++        if cp_values.get(cp) != count:
++            raise ValueError(f"checkpoint {cp}: initial count {cp_values.get(cp)} != producer entries {count}")
++        if done_by_list[0][cp] and done_by_list[1][cp]:
++            raise ValueError(f"checkpoint {cp} has producers on both lists; split counters would race")
++    if cp_values.get(0) != 0:
++        raise ValueError("checkpoint zero sentinel is not initialized to zero")
++    cp_count = max(cp_values) + 1
++    cp_owner = [255 if i == 0 else (0 if done_by_list[0][i] else 1 if done_by_list[1][i] else 255)
++                for i in range(cp_count)]
++    return {"format": "QD_QNN_RUNLIST_PLAN_V1",
++            "context_sha256": graph["context_sha256"],
++            "capture_sha256": hashlib.sha256(Path(capture).read_bytes()).hexdigest(),
++            "checkpoint_slots": cp_count,
++            "checkpoint_initial_values": [cp_values.get(i, 0) for i in range(cp_count)],
++            "checkpoint_owner": cp_owner,
++            "lists": lists,
++            "semantics": {"wait_ready_when": "checkpoint[wait_cp] == 0",
++                          "done_after_completion": "decrement done_cp after handler completion; release waiters on zero",
++                          "dma_checkpoints": "separate from ExecEntry wait/done CPs; event ID is framework_words[0] on @DmaCheckpointSet/Wait",
++                          "cp0": "sentinel; main synthetic stubs carry cp0/cp0 and have no graph effect"}}
++
++
++def validate_schedule(plan, worker_first=False):
++    """Host-only ready-list scheduler model; returns completed graph nodes."""
++    counters = plan["checkpoint_initial_values"][:]
++    cursors = [0, 0]
++    lists = plan["lists"]
++    done = []
++    while cursors[0] < len(lists[0]["entries"]) or cursors[1] < len(lists[1]["entries"]):
++        order = (1, 0) if worker_first else (0, 1)
++        selected = None
++        for lid in order:
++            if cursors[lid] >= len(lists[lid]["entries"]):
++                continue
++            e = lists[lid]["entries"][cursors[lid]]
++            if counters[e["wait_cp"]] == 0:
++                selected = lid, e
++                break
++        if selected is None:
++            raise ValueError(f"deadlock: list cursors={cursors}, nonzero checkpoints=" +
++                             str([(i, v) for i, v in enumerate(counters) if v]))
++        lid, e = selected
++        cp = e["done_cp"]
++        if cp:
++            if counters[cp] == 0:
++                raise ValueError(f"checkpoint {cp} underflow at list {lid} entry {e['index']}")
++            counters[cp] -= 1
++        cursors[lid] += 1
++        done.append((lid, e["index"], e.get("command_index"), e["node_sequence"]))
++    if any(counters):
++        raise ValueError(f"schedule ended with live checkpoints: {[i for i,v in enumerate(counters) if v]}")
++    return done
++
++
++def emit_header(plan, path):
++    """Emit a C table suitable for a strict context-SHA-gated runtime path."""
++    path.parent.mkdir(parents=True, exist_ok=True)
++    prefix = "nprg2_qnn_primary"
++    lines = ["/* Generated by tools/qnn_runlist_capture.py; do not hand edit. */",
++             "#ifndef NPRG2_QNN_PRIMARY_RUNLIST_GENERATED_H",
++             "#define NPRG2_QNN_PRIMARY_RUNLIST_GENERATED_H",
++             "#include <stdint.h>",
++             "typedef struct { uint16_t command, wait_cp, done_cp, dma_event_id; uint8_t dma_event_kind; } Nprg2QnnRunEntry;",
++             f"#define QD_QNN_PRIMARY_CONTEXT_SHA256 \"{plan['context_sha256']}\"",
++             f"#define QD_QNN_PRIMARY_CAPTURE_SHA256 \"{plan['capture_sha256']}\"",
++             f"#define QD_QNN_PRIMARY_COMMAND_COUNT {sum(x['entry_count'] for x in plan['lists'])}u",
++             f"#define QD_QNN_PRIMARY_CHECKPOINT_COUNT {plan['checkpoint_slots']}u"]
++    context = bytes.fromhex(plan["context_sha256"])
++    lines.append(f"static const uint8_t {prefix}_context_sha[32] = {{")
++    lines.append("    " + ", ".join(f"0x{x:02x}" for x in context) + ",")
++    lines.append("};")
++    cp = plan["checkpoint_initial_values"]
++    lines.append(f"static const uint8_t {prefix}_cp_initial[QD_QNN_PRIMARY_CHECKPOINT_COUNT] = {{")
++    for i in range(0, len(cp), 24):
++        lines.append("    " + ", ".join(str(x) for x in cp[i:i+24]) + ",")
++    lines.append("};")
++    owner = plan["checkpoint_owner"]
++    lines.append(f"static const uint8_t {prefix}_cp_owner[QD_QNN_PRIMARY_CHECKPOINT_COUNT] = {{")
++    for i in range(0, len(owner), 24):
++        lines.append("    " + ", ".join(str(x) for x in owner[i:i+24]) + ",")
++    lines.append("};")
++    for group, suffix in zip(plan["lists"], ("main", "worker")):
++        lines.append(f"#define QD_QNN_PRIMARY_{suffix.upper()}_COUNT {group['entry_count']}u")
++        lines.append(f"static const Nprg2QnnRunEntry {prefix}_{suffix}[QD_QNN_PRIMARY_{suffix.upper()}_COUNT] = {{")
++        for e in group["entries"]:
++            lines.append(f"    {{{e['command_index']}, {e['wait_cp']}, {e['done_cp']}, {e['dma_event_id']}, {e['dma_event_kind']}}},")
++        lines.append("};")
++    lines.extend(["#endif", ""])
++    path.write_text("\n".join(lines))
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("graph", type=Path)
++    ap.add_argument("capture", type=Path)
++    ap.add_argument("execution_order", type=Path,
++                    help="recovered execution_order.json, which gives prepared command indices")
++    ap.add_argument("trace", type=Path,
++                    help="trace.log from the same QNN context, used to map duplicate entries to command indices")
++    ap.add_argument("output", type=Path)
++    ap.add_argument("--events-main-first", type=Path)
++    ap.add_argument("--events-worker-first", type=Path)
++    ap.add_argument("--emit-header", type=Path)
++    a = ap.parse_args()
++    graph = json.loads(a.graph.read_text())
++    plan = build(graph, a.capture)
++    order = json.loads(a.execution_order.read_text())
++    trace_rows = []
++    for line in a.trace.read_text().splitlines():
++        if not line.strip() or line.startswith("#"):
++            continue
++        f = line.split()
++        trace_rows.append((int(f[1]), int(f[2])))
++    if order.get("context_sha256") != graph["context_sha256"] or len(order["nodes"]) != len(trace_rows):
++        raise SystemExit("execution order / trace does not match the source graph")
++    entry_by_key = {(lid, e["index"]): e for group in plan["lists"] for lid in (group["id"],)
++                    for e in group["entries"]}
++    for command_index, ((lid, entry_index), sequence) in enumerate(zip(trace_rows, order["nodes"])):
++        e = entry_by_key.get((lid, entry_index))
++        if e is None or e["node_sequence"] != sequence:
++            raise SystemExit(f"trace-to-command mismatch at command {command_index}: {(lid, entry_index)} / {sequence}")
++        e["command_index"] = command_index
++    if any("command_index" not in e for group in plan["lists"] for e in group["entries"]):
++        raise SystemExit("not every captured run-list entry maps to a prepared command")
++    main_first = validate_schedule(plan, False)
++    worker_first = validate_schedule(plan, True)
++    if Counter(x[2] for x in main_first) != Counter(x[2] for x in worker_first):
++        raise SystemExit("the two ready-list schedules cover different graph nodes")
++    a.output.parent.mkdir(parents=True, exist_ok=True)
++    plan["host_model_orders"] = {
++        "main_first": [x[2] for x in main_first],
++        "worker_first": [x[2] for x in worker_first],
++    }
++    for path, events in ((a.events_main_first, main_first), (a.events_worker_first, worker_first)):
++        if path is not None:
++            path.parent.mkdir(parents=True, exist_ok=True)
++            with path.open("wb") as f:
++                f.write(struct.pack("<I", plan["checkpoint_slots"]))
++                for value in plan["checkpoint_initial_values"]:
++                    f.write(struct.pack("<I", value))
++                for lid, entry_ix, command_ix, _seq in events:
++                    e = entry_by_key[lid, entry_ix]
++                    f.write(struct.pack("<IIIIII", command_ix, e["wait_cp"], e["done_cp"], lid,
++                                        e["dma_event_id"], e["dma_event_kind"]))
++    a.output.write_text(json.dumps(plan, indent=2) + "\n")
++    if a.emit_header is not None:
++        emit_header(plan, a.emit_header)
++    print(f"wrote {a.output}: lists=" + ",".join(str(x["entry_count"]) for x in plan["lists"]) +
++          f", checkpoints={plan['checkpoint_slots']}, commands={len(main_first)}, "
++          f"main-first={len(main_first)} and worker-first={len(worker_first)} complete")
++
++
++if __name__ == "__main__":
++    main()
