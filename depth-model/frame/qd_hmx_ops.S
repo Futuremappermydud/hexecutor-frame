@@ -246,3 +246,31 @@ qd_hmx_slide3p_n:
     { p0 = cmp.gt(r5,#0) }
     { if (p0) jump 1b }
     { jumpr r31 }
+/* qd_hmx_nativep_n reading its A tiles in place: 1x1, one load per tile from a
+ * pointer table (a[t*KB+k], 2048-aligned). r0=a, r1=B, r2=Fi, r3=out, r4=KB, r5=mt. */
+    .globl qd_hmx_nativep1_n
+qd_hmx_nativep1_n:
+    { r7 = #3; r6 = #4096; r14 = add(r2,#257) }
+    { r15 = #2047; r28 = #1023 }
+    { mxclracc }
+    { bias = mxmem2(r14) }
+    { bias = mxmem2(r2) }
+2:
+    { mxclracc }
+    { r8 = r4; r14 = r1 }
+3:
+    { r13 = memw(r0++#4); r8 = add(r8,#-1) }
+    { activation.ub = mxmem(r13,r15):deep:cm
+      weight.b = mxmem(r14,r28) }
+    { r14 = add(r14,#1024); p0 = cmp.gt(r8,#0) }
+    { if (p0) jump 3b }
+    { r10 = memw(r3++#4); r9 = #0 }
+    { cvt.ub = acc(r7) }
+    { mxmem(r10,r9):cm = cvt }
+    { r10 = add(r10,#2048) }
+    { cvt.ub = acc(r6) }
+    { mxmem(r10,r9):cm = cvt }
+    { r5 = add(r5,#-1) }
+    { p0 = cmp.gt(r5,#0) }
+    { if (p0) jump 2b }
+    { jumpr r31 }

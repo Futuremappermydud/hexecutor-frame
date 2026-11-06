@@ -1206,11 +1206,52 @@ static int plane_native_run(const NativePlan *Q, const Nprg2ReferenceConv *c, ui
             }
             if(++bx==bw){bx=0;by++;}
         }
+#if BLK_HVX && defined(ONE_INPLACE)
+        /* 1x1 over present, 2048-aligned input blocks: HMX reads them where they are. */
+        const uint8_t **ap=(const uint8_t **)A;
+        int inplace=Q->one && xtab && c->hmx->nativep1_n;
+        if(inplace) {
+            const uint32_t nbw=(uint32_t)J.xnbw,nbd=(uint32_t)J.xnbd,kn=(uint32_t)KB;
+            ap=(const uint8_t **)xtab; /* the 1x1 path has no row table: this near space is free */
+            for(int32_t t=0;t<J.mt && inplace;t++) {
+                const uint32_t i0=(((uint32_t)(J.R0+tyx[2*t]))*nbw+(uint32_t)(J.C0+tyx[2*t+1]))*nbd+xt->slice;
+                for(uint32_t k=0;k<kn;k++) {
+                    const uint32_t ix=i0+(ktab[k]>>16);
+                    const uint32_t ee=ix<xt->nblocks?xt->blocks[ix]:0,pl=ee&127u;
+                    const uint8_t *b=pl && pool[pl]?pool[pl]+(ee&~127u):NULL;
+                    if(!b || ((uintptr_t)b&2047u)){inplace=0;break;}
+                    ap[(size_t)t*kn+k]=b;
+                }
+            }
+        }
+        if(inplace) {
+            typedef uint32_t W32I __attribute__((vector_size(128)));
+            __asm__ volatile("barrier":::"memory");
+            {W32I v=*(volatile W32I *)base;__asm__ volatile(""::"r"(v[0]):"memory");}
+            HVX_Vector sentinel=Q6_V_vsplat_R(-1);
+            for(uint32_t i=0;i<2048;i+=128)*(HVX_Vector *)(completion+i)=sentinel;
+            __asm__ volatile("barrier":::"memory");
+            if(clock){t1=clock();c->phase[0]+=t1-t0;t0=t1;}
+            for(int32_t j=0;j<NB;j++)
+                c->hmx->nativep1_n((const void *const *)ap,(void *)(wbase+(size_t)j*KB*1024),fi+j*128,(void *const *)(outp+(size_t)j*J.mt),(uint32_t)KB,(uint32_t)J.mt);
+            c->hmx->finish(zero,completion);
+            uint64_t end=c->hmx->clock?c->hmx->clock()+1000000000ull:0;
+            for(uint64_t spin=0;;spin++) {
+                W32I v=*(volatile W32I *)completion;
+                if(v[0]==0) break;
+                if(c->hmx->clock?c->hmx->clock()>end:spin>100000000ull){e=1;break;}
+            }
+            __asm__ volatile("barrier":::"memory");
+            if(clock){t1=clock();c->phase[1]+=t1-t0;t0=t1;}
+        } else
+#endif
+        {
         if(parts>1 && !(Q->one && (int64_t)J.mt*KB<NAT_SERIAL_BELOW)) nprg2_parallel_for(par,NPRG2_PAR_CONV,parts,nat_prep_part,&J);
         else nat_prep_part(&J,0,1);
         if(clock){t1=clock();c->phase[0]+=t1-t0;t0=t1;}
         e=nat_mac(&J,fi,zero,completion,outp);
         if(clock){t1=clock();c->phase[1]+=t1-t0;t0=t1;}
+        }
         if(e) break;
         PlaneJob P={.C=C,.out=pout,.mh=mh,.Mq=Mq,.mt=J.mt,.NB=NB,.shift=0,.rows=Q->oh&7,
                     .partial_from=(Q->oh&7)?((Q->oh+7)/8-1)*bw-m0:J.mt};
