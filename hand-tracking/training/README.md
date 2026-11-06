@@ -15,6 +15,6 @@ occlusion recovery, temporal stability, and latency before integrating a model.
 Put shared DSP execution changes in `../../hexecutor/`, and application
 integration changes in `../../runtime/`.
 
-As validated replacements become available, remove unused legacy assets and
-references from the current tree. Original references remain in Git history.
+Legacy raw model artifacts have been removed from Git history and remain local
+and ignored. Keep future checkpoints and dataset captures out of source control.
 This directory is a development boundary, not an implemented training pipeline.

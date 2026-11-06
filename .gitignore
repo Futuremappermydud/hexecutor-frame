@@ -1,23 +1,87 @@
-# Local model collections and hand-model binaries (previously ignored).
-/model-assets/
-/hand-tracking/models/
-
-# DSP build products and scratch captures.
-/depth-model/.work/
-/hexecutor/frame/build/
-/hexecutor/frame/native_kernels/full_provider_v75_decoded.asm
-__pycache__/
+# Model weights, compiled models, tensor dumps, and exported graph data.
+# These files remain local and must be supplied separately in a fresh clone.
+*.bin
+*.blob
+*.pt
+*.pth
+*.ptl
+*.pte
+*.ckpt
+*.safetensors
+*.onnx
+*.onnx.data
+*.tflite
+*.pb
+*.fb
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.qdrx
+*.nprg
+*.qnn
+*.raw
+*.u8
+*.u16
+*.f16
+*.f32
+*.pool1
+*.epcpu
+*.ppcpu
+*.ncpfx
+*.mpfx
+*.s2pf
+*.zip
+*.gz
+*.elf
+*.so
+*.o
+*.a
+*.spv
 *.pyc
+*.pgm
+*.asm
+*.dis
+*.disasm.txt
+*.qnn.json
+*.htp-strings.json
+*.generated.h
+*.ok
+
+# Local artifact directories (trailing slash keeps compatibility symlinks tracked).
+.work/
+__pycache__/
+build/
+captures/
+checkpoints/
+datasets/
+dist/
+experiments/
+fixtures/
+model-assets/
+models/
+quest-models/
+recovered/
+runs/
+
+# Exported model metadata and unpacked validation packages.
+/depth-model/metadata/
+/depth-model/portable/check/
+# Address-named memory dumps from earlier captures.
+/depth-model/[0-9]*
+
+# Captured arrays and generated model-specific C headers.
+*_actual_data.h
+*_fixture_data.h
+*_input_data.h
+*_partial_oracle.h
+space_to_depth_cases.h
+
+# Host scratch products and caches.
+/runtime/artifacts/
+/runtime/bin/
+/runtime/scratch/
 *.log
 .DS_Store
-
-# Local runtime recordings and generated datasets.
-/runtime/experiments/
-
-# Model development artifacts; keep recipes and evaluation code in Git.
-/depth-model/training/checkpoints/
-/depth-model/training/datasets/
-/depth-model/training/runs/
-/hand-tracking/training/checkpoints/
-/hand-tracking/training/datasets/
-/hand-tracking/training/runs/
+*.swp
+*~

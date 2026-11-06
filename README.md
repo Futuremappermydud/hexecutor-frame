@@ -1,12 +1,12 @@
 # Frame Spatial Runtime
 
-Monorepo for the Steam Frame spatial runtime, Hexagon DSP execution, and recovered perception models.
+Monorepo for the Steam Frame spatial runtime, Hexagon DSP execution, and perception model development.
 
 | Directory | Contents |
 | --- | --- |
 | [runtime/](runtime/README.md) | C++ spatial app, camera capture, Vulkan/OpenXR rendering, depth integration, and room reconstruction. |
 | [hexecutor/](hexecutor/README.md) | Hexecutor: Hexagon HVX/HMX DSP executor, kernels, transport, and bring-up tools. |
-| [depth-model/](depth-model/README.md) | Stereo depth models, recovered graphs, CPU reference, simulator, and model tools. |
+| [depth-model/](depth-model/README.md) | Depth training, CPU reference, simulator, and model tooling. Model artifacts stay local. |
 | [hand-tracking/](hand-tracking/README.md) | Local hand-model assets and executor compatibility research. |
 | research/ | Original investigation and handoff documents. |
 
@@ -25,8 +25,12 @@ Model tools run from `depth-model/`. Compatibility links preserve the historical
 `depth-model/frame` layout and provide model resources under `hexecutor/` for
 scripts that locate resources relative to their resolved file path. Keep these
 links when packaging or syncing these components. The app deployment script
-deploys the app from `runtime/`; the existing remote DSP package paths remain
-valid and can still be selected with `FRAME_DEPTH_PACKAGE`.
+deploys the app from `runtime/`. Configure the installed DSP package location
+with `FRAME_DEPTH_PACKAGE`, and the Python executable with `FRAME_DEPTH_PYTHON`.
+The default package paths now use the generic `depth-model` directory name;
+existing installations must use that layout or set the overrides.
+The learned inference backend defaults to `prepared-qnn`; `prepared` remains
+available. The hybrid Python inference path has been removed.
 
 ## Model development
 
@@ -40,25 +44,30 @@ explicit input/output contracts and their own provenance, configuration, and
 validation results. Existing depth-specific DSP code may need adaptation for a
 replacement model.
 
-The intended migration is to replace legacy model dependencies and remove
-obsolete assets and references from the current tree once replacements are
-validated. Preserving the original Git history retains historical material in
-past commits. Fine-tuning or distillation alone does not establish that a
-replacement has independent provenance; record its actual dependencies.
+Keep the provenance and dependencies of future models explicit in their training
+recipes. Renaming code and removing distributed weights does not change model
+provenance. External source URLs and required license notices retain their
+original attribution.
 
 ## Git history and migration
 
-The `monorepo/hexecutor` branch joins the original `model-tsdf` runtime tip and
-the `frame-speed-20261105` spatial-stuff tip through relocation commits followed
-by a two-parent merge commit.
-Original commits, authors, timestamps, and commit IDs are unchanged. The old
-paths exist in those commits; use `git log --follow -- <new-path>` to trace a
-file across the move. The other spatial-stuff branches are retained locally
-under `refs/remotes/spatial-stuff/`. The original spatial-stuff checkout and
-its linked worktrees remain available.
+The `monorepo/hexecutor` branch combines the spatial app and DSP histories.
+History was subsequently rewritten with `git-filter-repo` to use generic
+component/API names and remove model weights, recovered graphs, compiled model
+contexts, captured pools, embedded model arrays, and distribution archives
+across every local branch and imported branch ref. Commit IDs changed; authors,
+timestamps, and the surviving source history remain. Imported branches remain
+under `refs/remotes/spatial-stuff/` with sanitized names and history.
+The original spatial-stuff checkout and its linked worktrees are separate and
+were not rewritten. A pre-cleanup recovery snapshot is stored outside this repo.
 
 Working edits from both checkouts are preserved as uncommitted changes at
 their new paths. Local datasets, build products, and hand-model binaries remain
 on disk and are ignored. They are not automatically included in a fresh clone.
 The hand-tracking directory currently contains research and local assets;
 it does not yet implement a live hand-tracking pipeline.
+
+Run `python3 tools/model_artifact_policy.py` to audit the current index, or add
+`--history` to audit paths across all refs. The shared policy also detects large
+C array initializers during history filtering, so captured weights stored in
+headers are excluded alongside binary files. See [artifact setup](depth-model/ARTIFACTS.md).
