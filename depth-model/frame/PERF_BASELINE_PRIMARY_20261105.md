@@ -575,7 +575,9 @@ The candidate source is still in `/tmp/frame-speed-runlist/depth-model`, **not m
 
 **First gated lanes build: `eng-l3.elf`, 12.672 ms warm median, down from 14.598 ms and 42.014 ms originally (3.32×); see the update below for the current best.** 54 of 54 runs byte-exact on all 27 cases, no worker exit errors. Accuracy against Model carries over from section 11.1 unchanged, because the outputs are identical. Still no real-stereo validation, and 12.672 ms is still above the 10.5 ms target and Model's 9.7 ms.
 
-**Current best: `eng-r0.elf`, built from the main tree, 10.949 ms warm median (3.84× from 42.014 ms), 54/54 byte-exact on all 27 cases, no worker exit errors; jitter build `r0j` 54/54.** See 13.5e. Still above the 10.5 ms target and Model's 9.7 ms, and still no real-stereo validation.
+**Current best: `eng-l8.elf`, 9.681 ms warm median (4.34× from 42.014 ms), 54/54 byte-exact on all 27 cases, no worker exit errors; jitter `l8j` 54/54; adversarial serial orders `advl` and `advr` 54/54 each.** Past the 10.5 ms target. Roughly level with Model's 9.71 ms host time, and above its 8.8 ms DSP time; the Frame figure is DSP time. Still no real-stereo validation. See `MEMORY_LAYOUT.md`.
+
+**Earlier stage: `eng-r0.elf`, 10.949 ms (3.84×), 54/54; jitter `r0j` 54/54.** See 13.5e.
 
 **Earlier stage: `eng-l7a.elf`, 11.438 ms (3.67×), 54/54; jitter `l7aj` 14.151 ms, 54/54.** Smoke pairs of the steps after `l5c`, 3 rounds of 6 runs each:
 
@@ -796,7 +798,8 @@ About 0.6 ms outside the lists comes on top. So memory reuse and ordering appear
 Source: the main working tree, **uncommitted** (merged from `/tmp/frame-speed-runlist/depth-model`, which is now stale). Snapshots in `build/ab/planes-20261105/`: `source-l3p.tar.gz` (the `l3` code), `source-l4.tar.gz` (later, including the signature check). The generated header `native_program/qnn_lanes_primary.generated.h` belongs to the last generator run, so regenerate it to rebuild a specific schedule.
 
 - `eng-l3.elf` SHA-256 `3f9046a4e9fba5cb49e41fd6b7e7f0abb4ea079610329f62ef2e94e532efcccd`; gate `l3-all27.json`, jitter `l3j-all27.json`.
-- Current best: `eng-r0.elf` SHA-256 `c02034d6fc1c168376a7af2e48e8a306301a694dc10fdbc632d6e03d37c2d7de`; gate `r0-all27.json`, jitter `r0j-all27.json`; source `source-r0.tar.gz` and the main working tree; build with `bench/lanes/build_best.sh`.
+- Current best: `eng-l8.elf`; gate `l8-all27.json`, jitter `l8j-all27.json`, serial orders `advl-all27.json`, `advr-all27.json`; build with `bench/lanes/build_best.sh` after generating the lane header with the options in that script.
+- Earlier: `eng-r0.elf` SHA-256 `c02034d6fc1c168376a7af2e48e8a306301a694dc10fdbc632d6e03d37c2d7de`; gate `r0-all27.json`, jitter `r0j-all27.json`; source `source-r0.tar.gz`.
 - Earlier: `eng-l7a.elf` SHA-256 `f66a7c8e8b593f61088219ddc208e5099f3d23c3e2f0853ba1a8be1be70f1076`; gate `l7a-all27.json`, jitter `l7aj-all27.json`; source `source-l7a.tar.gz`. Generator flags: `--workers 2 --costs cmdcost2.json --drop 1/10 --move 26/8,3/1,4/28,4/27 --cpu-weights 4/28,4/27 --free-main --main-steal-us 6`. Build flags add `-DQDS_L2_SIG=1 -DPLANE_SAT=1 -DSLIDE_TRIM=1 -DWEIGHTS_MEMO=1 -DWEIGHTS_CPU_BELOW=2048`.
 - Previous best: `eng-l5c.elf`, gate `l5c-all27.json`, jitter `l5cj-all27.json`, source `source-l5c.tar.gz`.
 - `tools/lanes/`: generator, replay scripts, measured costs, device profiler. Generator flags for `l4a`: `--workers 2 --costs cmdcost.json --drop 1/10 --move 26/8,3/1`; add `--free-main` for `l4c`.

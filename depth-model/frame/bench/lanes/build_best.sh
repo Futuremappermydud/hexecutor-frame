@@ -3,7 +3,7 @@
 # Output: frame/build/ab/planes-20261105/{eng,boot}-NAME.elf. Regenerate native_program/qnn_lanes_primary.generated.h
 # with gen_qnn_lanes.py and the options in LANE_OPTS when the program or the schedule policy changes.
 # LANE_OPTS: --workers 2 --costs bench/lanes/cmdcost-l7.json --drop 1/10 --move 26/8,3/1,4/28,4/27,4/29
-#            --cpu-weights 4/28,4/27,4/29 --free-main --main-steal-us 6
+#            --cpu-weights 4/28,4/27,4/29 --free-main --main-steal-us 6 --active block
 set -eu
 cd "$(dirname "$0")/../../.."
 F="-DNPRG2_PLANES=1+-DQDS_POOL1_NOCOPY=1+-DONE_INPLACE=1+-DQDS_VTCM_SINGLE_PAGE=1+-DSLIDE_INPLACE_ALL=1+-DSETUP_FAST=1+-DCHAIN_LUT=1+-DEW_MEMO=1"

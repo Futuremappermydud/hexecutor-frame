@@ -30,7 +30,9 @@ ap.add_argument('--main-steal-us', type=float, default=0, help='main runs ready 
 ap.add_argument('--search', type=int, default=0, help='randomized priority search: this many trials, keep the best modeled end')
 ap.add_argument('--cpu-weights', default='', help='op/var list of weight copies built with WEIGHTS_CPU_BELOW: they never use the DMA queue')
 ap.add_argument('--serial', action='store_true', help='profiling only: every command waits for the previous, so each runs alone with all helpers free')
+ap.add_argument('--serial-order', default='index', choices=('index', 'latest', 'random'), help='with --serial: which topological order to chain; latest and random stress footprints on the device')
 ap.add_argument('--true-flow', action='store_true', help='model only: drop memory-reuse ordering')
+ap.add_argument('--active', choices=('off','block','row'), default='off', help='footprints from dims and padding instead of the whole block table')
 ap.add_argument('--no-dma-edges', action='store_true', help='model only: leave out the DMA landing edges')
 ap.add_argument('--strict', action='store_true', help='also enforce conflicts QNN lists leave unordered (they race in QNN too)')
 a = ap.parse_args()
@@ -70,10 +72,35 @@ GRAN = 128
 DT = {'uint8': 1, 'int8': 1, 'uint16': 2, 'int16': 2, 'int32': 4, 'uint32': 4, 'float32': 4, 'float16': 2, 'int32_quantized': 4}
 tf = prog['tensor_features']
 def span(pool, off, n): return {(pool, g) for g in range(off // GRAN, (off + max(n, 1) - 1) // GRAN + 1)}
+ACTIVE_FALLBACK = Counter()
+def active_blocks(t, st):
+    # index = ((b*nbh + H/8)*nbw + W/cw)*nbd + slice + D/32; a row is 256 bytes in any block format
+    sh = t.get('shape'); blocks = st['blocks']
+    if not sh: ACTIVE_FALLBACK['no shape'] += 1; return None
+    d, m, q = sh['dimensions'], sh['max_dimensions'], sh['padding']
+    cw = 4 if t['dtype'] in ('uint16', 'int16') else 8
+    nbh, nbw, nbd = (m[1] + 7) // 8, (m[2] + cw - 1) // cw, (m[3] + 31) // 32
+    sl = st.get('slice_origin', 0); out = set()
+    for b in range(q[0], q[0] + d[0]):
+        for H in range(q[1], q[1] + d[1]):
+            for wb in range(q[2] // cw, (q[2] + d[2] - 1) // cw + 1):
+                for zb in range(q[3] // 32, (q[3] + d[3] - 1) // 32 + 1):
+                    ix = ((b * nbh + H // 8) * nbw + wb) * nbd + sl + zb
+                    if ix < 0 or ix >= len(blocks): ACTIVE_FALLBACK['out of table'] += 1; return None
+                    p, o = blocks[ix]
+                    if a.active == 'row':
+                        rg = (o + (H % 8) * 256) // GRAN
+                        out |= {(p, rg), (p, rg + 1)}
+                    else:
+                        out |= span(p, o, 2048)
+    return out
 def foot(ti):
     t = tf[ti]; st = t.get('storage')
     if st is None: return {('T', ti)}
     if 'blocks' in st:
+        if a.active != 'off':
+            r = active_blocks(t, st)
+            if r is not None: return r
         r = set()
         for p, o in st['blocks']: r |= span(p, o, 2048)
         return r
@@ -105,7 +132,7 @@ for i in range(N):
     for g in R[i]: readers.setdefault(g, set()).add(i)
     for g in W[i]: writers.setdefault(g, set()).add(i)
     preds[i].discard(i)
-print('conflict pairs', sum(len(p) for p in preds))
+print('conflict pairs', sum(len(p) for p in preds), 'active fallbacks', dict(ACTIVE_FALLBACK))
 
 # --- QNN happens-before (vector clocks over the two lists and their checkpoints)
 cpprod = {}
@@ -246,12 +273,14 @@ if a.serial:
     d_ = [0] * N
     for u in range(N):
         for v in succ[u]: d_[v] += 1
-    q_ = [i for i in range(N) if d_[i] == 0]; heapq.heapify(q_); order_s = []
+    rng_s = random.Random(17); pri_s = [rng_s.random() for _ in range(N)]
+    key_s = (lambda i: i) if a.serial_order == 'index' else (lambda i: -i) if a.serial_order == 'latest' else (lambda i: pri_s[i])
+    q_ = [(key_s(i), i) for i in range(N) if d_[i] == 0]; heapq.heapify(q_); order_s = []
     while q_:
-        u = heapq.heappop(q_); order_s.append(u)
+        u = heapq.heappop(q_)[1]; order_s.append(u)
         for v in succ[u]:
             d_[v] -= 1
-            if d_[v] == 0: heapq.heappush(q_, v)
+            if d_[v] == 0: heapq.heappush(q_, (key_s(v), v))
     assert len(order_s) == N
     kept = [i for i in order_s if i not in dropped_cmds]
     for x, y in zip(kept, kept[1:]): add(x, y)
