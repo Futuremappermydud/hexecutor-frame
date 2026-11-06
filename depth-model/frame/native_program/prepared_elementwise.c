@@ -323,7 +323,8 @@ typedef struct {
 enum { EW_MEMO_COMMANDS=8192, EW_MEMO_SLOTS=1024 };
 static EwMemo *ew_slab;
 static uint16_t *ew_ix;     /* by command index: slab index + 1 */
-static uint32_t ew_used;
+/* Worker lists run concurrently: each allocates from its own half of the slab. */
+static uint32_t ew_used[3];
 static const void *ew_program;
 static uint8_t *ew_pool_tab[7];
 void nprg2_exec_elementwise_memo_begin(const Nprg2Program *program,const Nprg2Pool *pools) {
@@ -334,22 +335,25 @@ void nprg2_exec_elementwise_memo_begin(const Nprg2Program *program,const Nprg2Po
     int same=ew_program==(const void *)program;
     for (unsigned i=0;same && i<7;i++) same=ew_pool_tab[i]==pools[i].base;
     if (same) return;
-    memset(ew_ix,0,sizeof(uint16_t)*EW_MEMO_COMMANDS);ew_used=0;
+    memset(ew_ix,0,sizeof(uint16_t)*EW_MEMO_COMMANDS);ew_used[0]=ew_used[1]=ew_used[2]=0;
     ew_program=program;
     for (unsigned i=0;i<7;i++) ew_pool_tab[i]=pools[i].base;
 }
 static inline EwMemo *ew_hit(const Nprg2ExecCall *c) {
-    if (!c->preflighted || c->execution_lane!=1u || !ew_ix || c->command_index>=EW_MEMO_COMMANDS ||
+    if (!c->preflighted || !c->execution_lane || c->execution_lane>2u || !ew_ix || c->command_index>=EW_MEMO_COMMANDS ||
         c->program!=ew_program) return NULL;
     uint32_t ix=ew_ix[c->command_index];
     return ix?&ew_slab[ix-1u]:NULL;
 }
 static inline EwMemo *ew_new(const Nprg2ExecCall *c) {
-    if (!c->preflighted || c->execution_lane!=1u || !ew_ix || c->command_index>=EW_MEMO_COMMANDS ||
-        c->program!=ew_program || ew_used>=EW_MEMO_SLOTS) return NULL;
-    return &ew_slab[ew_used];
+    if (!c->preflighted || !c->execution_lane || c->execution_lane>2u || !ew_ix || c->command_index>=EW_MEMO_COMMANDS ||
+        c->program!=ew_program || ew_used[c->execution_lane]>=EW_MEMO_SLOTS/2u) return NULL;
+    return &ew_slab[(c->execution_lane-1u)*(EW_MEMO_SLOTS/2u)+ew_used[c->execution_lane]];
 }
-static inline void ew_commit(const Nprg2ExecCall *c) {ew_ix[c->command_index]=(uint16_t)(++ew_used);}
+static inline void ew_commit(const Nprg2ExecCall *c) {
+    uint32_t l=c->execution_lane;ew_used[l]++;
+    ew_ix[c->command_index]=(uint16_t)((l-1u)*(EW_MEMO_SLOTS/2u)+ew_used[l]);
+}
 #endif
 static int add_run(const Nprg2ExecCall *c,void *ctx) {
     (void)ctx;QdBlockedU8 a,b,o;QdAddU8Params p;

@@ -476,7 +476,11 @@ static void status(uint32_t tid,uint32_t seq) {
  * independent nested job from the background QNN list when requested. */
 static int follower_subjob(uint32_t tid,uint32_t *seen) {
 #if QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM
+#if QDS_QNN_LANES
+    if(tid>=1 && qnn_claim_serve(tid))return 1;
+#else
     if(tid>=2 && qnn_claim_serve(tid))return 1;
+#endif
 #endif
     if(tid==2 && work->sub_generation!=*seen) {
         __asm__ volatile("barrier":::"memory");
@@ -524,7 +528,11 @@ static void follower_leased(uint32_t tid) {
 #endif
             __asm__ volatile("barrier":::"memory");work->job_finished[tid]++;
         }
+#if QDS_QNN_LANES
+        if(op==8 && (tid==1||tid==2))work->job_fn(work->job_ctx,tid,work->job_parts);
+#else
         if(op==8 && tid==1)work->job_fn(work->job_ctx,tid,work->job_parts);
+#endif
         __asm__ volatile("barrier":::"memory");work->done[tid]=seen;
     }
 }
@@ -560,7 +568,11 @@ static void follower(uint32_t tid) {
 #endif
             __asm__ volatile("barrier":::"memory");work->job_finished[logical]++;
         }
+#if QDS_QNN_LANES
+        if(op==8 && (logical==1||logical==2))work->job_fn(work->job_ctx,logical,work->job_parts);
+#else
         if(op==8 && logical==1)work->job_fn(work->job_ctx,logical,work->job_parts);
+#endif
         __asm__ volatile("barrier":::"memory");work->done[logical]=seen;
         if(op==3)return;
     }

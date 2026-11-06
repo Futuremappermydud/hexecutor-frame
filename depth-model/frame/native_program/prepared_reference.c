@@ -174,7 +174,7 @@ static int64_t s32(uint64_t v) {return (int64_t)(int32_t)(uint32_t)v;}
  *   blocked_overlap: geometry and pool limits only) passed with epilogue kind
  *   k, so later runs skip them. Pool bases/limits are part of the key. */
 enum { MEMO_COMMANDS=8192, CHK_SLOTS=4 };
-enum { MEMO_LANES=2, MEMO_SLOTS=2 };
+enum { MEMO_LANES=3, MEMO_SLOTS=2 };
 typedef struct {
     const void *program;
     uint64_t limits;

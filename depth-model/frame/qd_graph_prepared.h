@@ -28,6 +28,15 @@
 #endif
 #if NPRG2_QNN_RUNLISTS
 #include "native_program/qnn_runlist_primary.generated.h"
+/* QDS_QNN_LANES=1: main (HT0) plus two worker lists (HT1, HT2) generated from the
+ * dependency graph by bench/lanes/gen_qnn_lanes.py; each list publishes a progress
+ * count and each entry waits for the counts it depends on. */
+#ifndef QDS_QNN_LANES
+#define QDS_QNN_LANES 0
+#endif
+#if QDS_QNN_LANES
+#include "native_program/qnn_lanes_primary.generated.h"
+#endif
 #endif
 #ifndef QDS_L2_CACHE
 #define QDS_L2_CACHE 0
@@ -214,6 +223,9 @@ typedef struct {
 #if NPRG2_QNN_RUNLISTS
     uint8_t *qnn_worker_mem;
     Nprg2Parallel qnn_worker_parallel;
+#if QDS_QNN_LANES
+    Nprg2Parallel qnn_worker2_parallel;
+#endif
 #if QDS_PREPARED_THREADS==4
     Nprg2Parallel qnn_main_parallel;
 #endif
@@ -360,36 +372,48 @@ typedef struct {
     volatile uint32_t gen,cancel,taken,done,skipped;
     Nprg2ParallelFn fn;void *ctx;volatile uint32_t part,parts;uint32_t pad[7];
 } QdsQnnSlot;
-typedef struct { QdsQnnSlot slot[2][4]; volatile uint32_t idle[4],magic; } QdsQnnClaim;
+#define QDS_QNN_OWNERS 3u
+typedef struct { QdsQnnSlot slot[QDS_QNN_OWNERS][4]; volatile uint32_t idle[4],magic; } QdsQnnClaim;
 #define QDS_QNN_CLAIM_MAGIC 0x514e434cu
 #define qnn_claim ((QdsQnnClaim *)0x30074400u)
 _Static_assert(0x30074400u+sizeof(QdsQnnClaim)<=0x30075000u,"QNN claim slots overlap the checkpoint table");
 typedef struct { uint32_t lane,n,who[3]; Nprg2Parallel *par; uint64_t stolen,helped; } QdsQnnLane;
-static QdsQnnLane qnn_lane[2];
+static QdsQnnLane qnn_lane[QDS_QNN_OWNERS];
 static int qnn_claim_serve(uint32_t self) {
     /* Slots are live only between qnn_claim_reset and qnn_claim_close; any
      * slot still unretired at close was cancelled by its owner (skip only). */
     if(qnn_claim->magic!=QDS_QNN_CLAIM_MAGIC)return 0;
     __asm__ volatile("barrier":::"memory");
-    for(uint32_t o=0;o<2;o++) {
+    for(uint32_t o=0;o<QDS_QNN_OWNERS;o++) {
         QdsQnnSlot *sl=&qnn_claim->slot[o][self];
         uint32_t g=sl->gen;
         if(g==sl->done)continue;
         __asm__ volatile("barrier":::"memory");
         sl->taken=g;__asm__ volatile("barrier":::"memory");
         if(sl->cancel==g){sl->skipped=g;__asm__ volatile("barrier":::"memory");sl->done=g;continue;}
+#if QDS_QNN_LANES
+        {uint32_t was=qnn_claim->idle[self];qnn_claim->idle[self]=0;
+         sl->fn(sl->ctx,sl->part,sl->parts);
+         __asm__ volatile("barrier":::"memory");sl->done=g;
+         qnn_claim->idle[self]=was;}
+#else
         if(self>=2)qnn_claim->idle[self]=0;
         sl->fn(sl->ctx,sl->part,sl->parts);
         __asm__ volatile("barrier":::"memory");sl->done=g;
         if(self>=2)qnn_claim->idle[self]=1;
+#endif
         return 1;
     }
     return 0;
 }
 static void qnn_claim_reset(void) {
     memset((void *)qnn_claim,0,sizeof(QdsQnnClaim));
-    for(uint32_t l=0;l<2;l++){qnn_lane[l].stolen=qnn_lane[l].helped=0;}
+    for(uint32_t l=0;l<QDS_QNN_OWNERS;l++){qnn_lane[l].stolen=qnn_lane[l].helped=0;}
+#if QDS_QNN_LANES
+    qnn_claim->idle[3]=1;   /* threads 0..2 own lists and advertise while they wait */
+#else
     qnn_claim->idle[2]=qnn_claim->idle[3]=1;
+#endif
     __asm__ volatile("barrier":::"memory");qnn_claim->magic=QDS_QNN_CLAIM_MAGIC;
     __asm__ volatile("barrier":::"memory");
 }
@@ -399,12 +423,23 @@ static void qnn_claim_close(void) {
 static int qnn_claim_ready(void *impl) {
     QdsQnnLane *L=impl;
     if(prepared_par_fault || !prepared_par_lease_ok)return 0;
+#if QDS_QNN_LANES
+    /* HT5 is the only pure helper: main posts to it unconditionally, the worker
+     * lists only when it is idle. Any list thread that is waiting takes parts. */
+    static const uint8_t cands[3][3]={{3,2,1},{3,2,0},{3,1,0}};
+    const uint8_t *cand=cands[L->lane];uint32_t n=0;
+    for(uint32_t i=0;i<3;i++) {
+        QdsQnnSlot *sl=&qnn_claim->slot[L->lane][cand[i]];
+        if(sl->gen!=sl->done)continue;           /* previous part not retired yet */
+        if((i||L->lane) && !qnn_claim->idle[cand[i]])continue;
+#else
     uint32_t home=L->lane?2u:3u,other=L->lane?3u:2u,peer=L->lane?0u:1u;
     uint32_t cand[3]={home,other,peer},n=0;
     for(uint32_t i=0;i<3;i++) {
         QdsQnnSlot *sl=&qnn_claim->slot[L->lane][cand[i]];
         if(sl->gen!=sl->done)continue;           /* previous part not retired yet */
         if(i && !qnn_claim->idle[cand[i]])continue;
+#endif
         L->who[n++]=cand[i];
     }
     if(!n)return 0;
@@ -564,6 +599,10 @@ static QdPreparedState *prepared_open(QdgGraph *g,const QdsConfig *cfg,
     qnn_lane[1]=(QdsQnnLane){.lane=1,.par=&s->qnn_worker_parallel};
     s->qnn_main_parallel=(Nprg2Parallel){.max_parts=2,.ready=qnn_claim_ready,.run=qnn_claim_run,.impl=&qnn_lane[0]};
     s->qnn_worker_parallel=(Nprg2Parallel){.max_parts=2,.ready=qnn_claim_ready,.run=qnn_claim_run,.impl=&qnn_lane[1]};
+#if QDS_QNN_LANES
+    qnn_lane[2]=(QdsQnnLane){.lane=2,.par=&s->qnn_worker2_parallel};
+    s->qnn_worker2_parallel=(Nprg2Parallel){.max_parts=2,.ready=qnn_claim_ready,.run=qnn_claim_run,.impl=&qnn_lane[2]};
+#endif
 #endif
 #endif
     nprg2_runner_set_parallel(&s->runner,&s->par);
@@ -624,20 +663,20 @@ static QdPreparedState *prepared_open(QdgGraph *g,const QdsConfig *cfg,
 typedef struct {
     QdgGraph *graph;
     QdPreparedState *state;
-    Nprg2ExecRequest requests[2];
+    Nprg2ExecRequest requests[3];
     volatile uint32_t *checkpoints;
     volatile uint32_t error;
-    volatile uint32_t completed[2];
+    volatile uint32_t completed[3];
     volatile uint32_t excl_flag[2],excl_victim;
 #if QDS_PREPARED_PROFILE
-    uint64_t wait[2],wall[2],pre[2];
+    uint64_t wait[3],wall[3],pre[3];
 #endif
 } QdQnnListRun;
 #if QDS_PREPARED_PROFILE
 /* Per-list handler time: list 0 into the handler profile directly after the
  * join, list 1 accumulated here (no shared words between the two lists). */
-static uint64_t qnn_prof_cycles[2][NPRG2_EXEC_REGISTRY_CAPACITY];
-static uint32_t qnn_prof_count[2][NPRG2_EXEC_REGISTRY_CAPACITY];
+static uint64_t qnn_prof_cycles[3][NPRG2_EXEC_REGISTRY_CAPACITY];
+static uint32_t qnn_prof_count[3][NPRG2_EXEC_REGISTRY_CAPACITY];
 #if QDS_REF_SPLIT_PROF
 extern uint64_t nprg2_ref_split[2][48][80][3];
 #endif
@@ -654,6 +693,12 @@ static uint64_t qnn_wait_attr[2][NPRG2_EXEC_REGISTRY_CAPACITY];
 #endif
 #define QDS_QNN_WORKER_NEAR 0xa7060000u
 #define QDS_QNN_WORKER_SCRATCH 0xa7200000u
+#define QDS_QNN_WORKER2_NEAR 0xa7070000u
+#define QDS_QNN_WORKER2_SCRATCH 0xa7400000u
+_Static_assert(QDS_QNN_WORKER_NEAR+QDS_REFERENCE_NEAR_BYTES<=QDS_QNN_WORKER2_NEAR,"second worker near overlaps the first");
+_Static_assert(QDS_QNN_WORKER2_NEAR+QDS_REFERENCE_NEAR_BYTES<=QDS_HTID5_STACK_BOTTOM,"second worker near overlaps the HT5 stack");
+_Static_assert(QDS_QNN_WORKER_SCRATCH+QDS_REFERENCE_SCRATCH_BYTES<=QDS_QNN_WORKER2_SCRATCH,"second worker scratch overlaps the first");
+_Static_assert(QDS_QNN_WORKER2_SCRATCH+QDS_REFERENCE_SCRATCH_BYTES<=0xa8000000u,"second worker scratch leaves private page 7");
 _Static_assert(QDS_QNN_WORKER_SCRATCH+QDS_REFERENCE_SCRATCH_BYTES<=0xa8000000u,"QNN worker scratch leaves private page 7");
 static volatile uint32_t *const prepared_qnn_checkpoints=(volatile uint32_t *)0x30075000u;
 static int prepared_qnn_matches(const QdPreparedState *s,uint32_t first,uint32_t last) {
@@ -689,7 +734,7 @@ static int prepared_qnn_command(QdQnnListRun *run,const Nprg2QnnRunEntry *entry,
         __asm__ volatile("pause(#32)");
     }
     __asm__ volatile("barrier":::"memory");
-#if QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM
+#if QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM && !QDS_QNN_LANES
     qnn_claim->idle[list]=0;__asm__ volatile("barrier":::"memory");
     (void)qnn_claim_serve(list);   /* a part posted just before we left the wait */
 #endif
@@ -764,8 +809,73 @@ static int prepared_qnn_command(QdQnnListRun *run,const Nprg2QnnRunEntry *entry,
     }
     return NPRG2_EXEC_OK;
 }
+#if QDS_QNN_LANES
+_Static_assert(QD_QNN_LANE_COUNT==3u && QD_QNN_LANE0_COUNT==QD_QNN_PRIMARY_MAIN_COUNT &&
+               QD_QNN_LANE1_COUNT+QD_QNN_LANE2_COUNT==QD_QNN_PRIMARY_WORKER_COUNT,"lane tables do not cover the run lists");
+#define QDS_LANE_STRIDE 8u
+static volatile uint32_t *const prepared_lane_progress=(volatile uint32_t *)0x30075000u;
+#ifndef QDS_LANE_JITTER
+#define QDS_LANE_JITTER 0
+#endif
+static int prepared_lane_step(QdQnnListRun *run,const Nprg2QnnLaneEntry *e,uint32_t list,uint32_t i,uint32_t *rng) {
+    volatile uint32_t *a=&prepared_lane_progress[((list+1u)%3u)*QDS_LANE_STRIDE],*b=&prepared_lane_progress[((list+2u)%3u)*QDS_LANE_STRIDE];
+    uint32_t wa=e->wait[0],wb=e->wait[1];
+#if QDS_LANE_JITTER
+    /* Stress build: random pauses move every command relative to the other lists. */
+    *rng=*rng*1664525u+1013904223u;
+    if(((*rng>>24)&3u)==0u)for(uint32_t k=(*rng>>8)&QDS_LANE_JITTER;k;k--)__asm__ volatile("pause(#64)");
+#else
+    (void)rng;
+#endif
+    if(*a<wa || *b<wb) {
+#if QDS_PREPARED_PROFILE
+        uint64_t p0=now_ns();
+#endif
+        uint64_t deadline=now_ns()+4000000000ull;uint32_t spins=0;
+        qnn_claim->idle[list]=1;__asm__ volatile("barrier":::"memory");
+        while(*a<wa || *b<wb) {
+            if(qnn_claim_serve(list))continue;
+            if((spins++&1023u)==0u) {
+                __asm__ volatile("barrier":::"memory");
+                if(run->error || resident_cancelled()){qnn_claim->idle[list]=0;return NPRG2_EXEC_CANCELLED;}
+                if(now_ns()>deadline){qnn_claim->idle[list]=0;return NPRG2_EXEC_REJECTED;}
+            }
+            __asm__ volatile("pause(#32)");
+        }
+        qnn_claim->idle[list]=0;__asm__ volatile("barrier":::"memory");
+        (void)qnn_claim_serve(list);   /* a part posted just before we left the wait */
+#if QDS_PREPARED_PROFILE
+        run->wait[list]+=now_ns()-p0;
+#endif
+    }
+    __asm__ volatile("barrier":::"memory");
+    Nprg2QnnRunEntry t={e->command,0,0,e->dma_event_id,e->dma_event_kind};
+    int rc=prepared_qnn_command(run,&t,list);
+    if(rc)return rc;
+    __asm__ volatile("barrier":::"memory");
+    prepared_lane_progress[list*QDS_LANE_STRIDE]=i+1u;
+    __asm__ volatile("barrier":::"memory");
+    return NPRG2_EXEC_OK;
+}
+#endif
 static void prepared_qnn_worker_list(void *opaque,uint32_t tid,uint32_t parts) {
     QdQnnListRun *run=opaque;
+#if QDS_QNN_LANES
+    if((tid!=1 && tid!=2) || parts<2)return;
+#if QDS_PREPARED_PROFILE
+    uint64_t w0=now_ns();
+#endif
+    const Nprg2QnnLaneEntry *list=tid==1?nprg2_qnn_lane1:nprg2_qnn_lane2;
+    uint32_t count=tid==1?QD_QNN_LANE1_COUNT:QD_QNN_LANE2_COUNT,rng=0x9e3779b9u*tid;
+    for(uint32_t i=0;i<count;i++) {
+        int rc=prepared_lane_step(run,&list[i],tid,i,&rng);
+        if(rc){run->error=(uint32_t)rc;__asm__ volatile("barrier":::"memory");return;}
+    }
+    qnn_claim->idle[tid]=1;__asm__ volatile("barrier":::"memory");
+#if QDS_PREPARED_PROFILE
+    run->wall[tid]=now_ns()-w0;
+#endif
+#else
     if(tid!=1 || parts<2)return;
 #if QDS_PREPARED_PROFILE
     uint64_t w0=now_ns();
@@ -776,6 +886,7 @@ static void prepared_qnn_worker_list(void *opaque,uint32_t tid,uint32_t parts) {
     }
 #if QDS_PREPARED_PROFILE
     run->wall[1]=now_ns()-w0;
+#endif
 #endif
 }
 static int prepared_qnn_dma_finish(QdPreparedState *s,int status){
@@ -807,7 +918,20 @@ static int prepared_qnn_runlists(QdgGraph *g,QdPreparedState *s,uint32_t first,u
         (void *)QDS_QNN_WORKER_SCRATCH,QDS_REFERENCE_SCRATCH_BYTES,
         (void *)QDS_QNN_WORKER_NEAR,QDS_REFERENCE_NEAR_BYTES,&run.requests[1]))
         return NPRG2_EXEC_ARGUMENT;
+#if QDS_QNN_LANES
+    if(nprg2_runner_prepare_preflighted_request(&s->runner,&s->executor,0,
+        QD_QNN_PRIMARY_COMMAND_COUNT,QD_DIRECT_ACTIVE_BYTES,s->inputs,4,s->outputs,2,
+        g,s->scratch,QDS_REFERENCE_SCRATCH_BYTES,&s->stats,2,&s->qnn_worker2_parallel,
+        (void *)QDS_QNN_WORKER2_SCRATCH,QDS_REFERENCE_SCRATCH_BYTES,
+        (void *)QDS_QNN_WORKER2_NEAR,QDS_REFERENCE_NEAR_BYTES,&run.requests[2]))
+        return NPRG2_EXEC_ARGUMENT;
+    for(uint32_t i=0;i<3u;i++)prepared_lane_progress[i*QDS_LANE_STRIDE]=0;
+    {Nprg2Parallel *wp=&s->qnn_worker2_parallel;
+     memset(wp->jobs_parallel,0,sizeof wp->jobs_parallel);memset(wp->jobs_serial,0,sizeof wp->jobs_serial);
+     memset(wp->parts_run,0,sizeof wp->parts_run);wp->not_ready=wp->declined=0;}
+#else
     for(uint32_t i=0;i<QD_QNN_PRIMARY_CHECKPOINT_COUNT;i++)run.checkpoints[i]=nprg2_qnn_primary_cp_initial[i];
+#endif
 #if QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM
     qnn_claim_reset();
 #endif
@@ -834,13 +958,34 @@ static int prepared_qnn_runlists(QdgGraph *g,QdPreparedState *s,uint32_t first,u
     work->job_fn=prepared_qnn_worker_list;work->job_ctx=&run;work->job_parts=2;
     uint32_t generation=send_work_start(8,0);
     uint32_t completed=0;
+#if QDS_QNN_LANES
+    {uint32_t rng=0x2545f491u;
+     for(uint32_t i=0;i<QD_QNN_LANE0_COUNT;i++) {
+        int rc=prepared_lane_step(&run,&nprg2_qnn_lane0[i],0,i,&rng);
+        if(rc){run.error=(uint32_t)rc;__asm__ volatile("barrier":::"memory");break;}
+        completed++;
+     }}
+#else
     for(uint32_t i=0;i<QD_QNN_PRIMARY_MAIN_COUNT;i++) {
         int rc=prepared_qnn_command(&run,&nprg2_qnn_primary_main[i],0);
         if(rc){run.error=(uint32_t)rc;break;}
         completed++;
     }
+#endif
 #if QDS_PREPARED_PROFILE
     run.wall[0]=now_ns()-m0;
+#endif
+#if QDS_QNN_LANES
+    /* Main keeps taking parts until the worker lists finish. */
+    {uint64_t end=now_ns()+4000000000ull;
+     qnn_claim->idle[0]=1;__asm__ volatile("barrier":::"memory");
+     for(;;) {
+        uint32_t all=1;
+        for(uint32_t t=1;t<QDS_WORKER_SLOTS;t++)if(work->done[t]!=generation)all=0;
+        if(all || now_ns()>end)break;
+        if(!qnn_claim_serve(0))__asm__ volatile("pause(#16)");
+     }
+     qnn_claim->idle[0]=0;__asm__ volatile("barrier":::"memory");}
 #endif
     int join=send_work_wait(generation,4000000000ull);
 #if QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM
@@ -853,7 +998,7 @@ static int prepared_qnn_runlists(QdgGraph *g,QdPreparedState *s,uint32_t first,u
         s->profile.run_cycles=run.wall[0];s->profile.dispatch_cycles=run.wait[0];
         s->profile.validate_cycles=run.wait[1];
         for(uint32_t k=0;k<NPRG2_EXEC_REGISTRY_CAPACITY;k++){
-            s->handler_run_cycles[k]=qnn_prof_cycles[0][k];s->handler_validate_cycles[k]=qnn_prof_cycles[1][k];
+            s->handler_run_cycles[k]=qnn_prof_cycles[0][k];s->handler_validate_cycles[k]=qnn_prof_cycles[1][k]+qnn_prof_cycles[2][k];
 #if QDS_QNN_WAITATTR
             s->handler_validate_cycles[k]=qnn_wait_attr[0][k];
             s->handler_run_cycles[k]=qnn_wait_attr[1][k];
@@ -868,12 +1013,18 @@ static int prepared_qnn_runlists(QdgGraph *g,QdPreparedState *s,uint32_t first,u
                  s->handler_run_count[k]|=0;
              }}
 #endif
-            s->handler_run_count[k]=(uint64_t)qnn_prof_count[0][k]|(uint64_t)qnn_prof_count[1][k]<<32;
+            s->handler_run_count[k]=(uint64_t)qnn_prof_count[0][k]|(uint64_t)(qnn_prof_count[1][k]+qnn_prof_count[2][k])<<32;
         }
         ((volatile uint32_t *)(SERVICE+1024u))[3]=(uint32_t)run.wall[1];
         /* preflight_ms = worker-lane executor overhead before handler entry;
          * trace[10] = main-lane overhead (pcycles), trace[14] = worker DMA-wait+other pre (pcycles). */
+#if QDS_QNN_LANES
+        s->profile.preflight_cycles=run.wall[2];   /* lane 2 wall (preflight_ms) */
+        s->profile.validate_cycles=run.wait[1]+run.wait[2]; /* both worker lanes' wait */
+        ((volatile uint32_t *)(SERVICE+1024u))[3]=(uint32_t)run.wall[1];
+#else
         s->profile.preflight_cycles=nprg2_lane_prehandler[1];
+#endif
         ((volatile uint32_t *)(SERVICE+1024u))[10]=(uint32_t)nprg2_lane_prehandler[0];
         ((volatile uint32_t *)(SERVICE+1024u))[14]=(uint32_t)run.pre[1];
     }
@@ -885,6 +1036,10 @@ static int prepared_qnn_runlists(QdgGraph *g,QdPreparedState *s,uint32_t first,u
      memcpy(s->par.jobs_serial,wp->jobs_serial,sizeof wp->jobs_serial);
      memcpy(s->par.parts_run,wp->parts_run,sizeof wp->parts_run);
      s->par.not_ready=wp->not_ready;s->par.declined=wp->declined;}
+#if QDS_QNN_LANES
+    {Nprg2Parallel *wp=&s->qnn_worker2_parallel;
+     for(uint32_t k=0;k<NPRG2_PAR_KINDS;k++){s->par.jobs_parallel[k]+=wp->jobs_parallel[k];s->par.jobs_serial[k]+=wp->jobs_serial[k];s->par.parts_run[k]+=wp->parts_run[k];}}
+#endif
 #if QDS_PREPARED_THREADS==4
     /* Conv kind comes from the main lane (the worker lane runs no conv). */
     {Nprg2Parallel *mp=&s->qnn_main_parallel;
@@ -911,11 +1066,15 @@ static int prepared_qnn_runlists(QdgGraph *g,QdPreparedState *s,uint32_t first,u
     }
     if(run.error)return prepared_qnn_dma_finish(s,(int)run.error);
     if(completed!=QD_QNN_PRIMARY_MAIN_COUNT)return prepared_qnn_dma_finish(s,NPRG2_EXEC_REJECTED);
+#if QDS_QNN_LANES
+    if(run.completed[1]!=QD_QNN_LANE1_COUNT || run.completed[2]!=QD_QNN_LANE2_COUNT)return prepared_qnn_dma_finish(s,NPRG2_EXEC_REJECTED);
+#else
     for(uint32_t i=0;i<QD_QNN_PRIMARY_CHECKPOINT_COUNT;i++)
         if(run.checkpoints[i])return prepared_qnn_dma_finish(s,NPRG2_EXEC_REJECTED);
+#endif
     s->stats.executed_commands=QD_QNN_PRIMARY_COMMAND_COUNT;
     volatile uint32_t *trace=(volatile uint32_t *)(SERVICE+1024u);
-    trace[6]=run.completed[0];trace[7]=run.completed[1];trace[11]=1;
+    trace[6]=run.completed[0];trace[7]=run.completed[1]+run.completed[2];trace[11]=1;
     return prepared_qnn_dma_finish(s,NPRG2_EXEC_OK);
 }
 #endif
@@ -1098,6 +1257,11 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
     if(prepared_qnn_matches(s,first,last) && !nprg2_exec_reference_clone_lane(0,1)) {
         e=NPRG2_EXEC_ARGUMENT;goto failed;
     }
+#if QDS_QNN_LANES
+    if(prepared_qnn_matches(s,first,last) && !nprg2_exec_reference_clone_lane(0,2)) {
+        e=NPRG2_EXEC_ARGUMENT;goto failed;
+    }
+#endif
 #if NPRG2_PLANES && !defined(NO_CONV_PLANS)
     if(prepared_qnn_matches(s,first,last)) {
         Nprg2ExecRequest q;

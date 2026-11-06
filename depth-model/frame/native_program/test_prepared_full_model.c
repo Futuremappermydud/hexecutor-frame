@@ -513,6 +513,115 @@ static void whole(Session *s) {
     free(out[1]);
 }
 
+/* QD_WRITESET=path: after each replayed command, diff the mutable pools against a
+ * shadow and log the 2 KiB blocks it really changed plus a hash of the new bytes. */
+static uint8_t *ws_shadow[7];
+static FILE *ws_file;
+static void ws_begin(Session *s) {
+    const char *p = getenv("QD_WRITESET");
+    if (!p) return;
+    ws_file = fopen(p, "w"); CHECK(ws_file);
+    for (int i = 0; i < 7; i++) if (s->pools[i].bytes) {
+        if (!ws_shadow[i]) ws_shadow[i] = malloc(s->pools[i].bytes);
+        memcpy(ws_shadow[i], s->pools[i].base, s->pools[i].bytes);
+    }
+}
+static void ws_step(Session *s, uint32_t step, uint32_t ix) {
+    if (!ws_file) return;
+    uint64_t h = 14695981039346656037ull; int any = 0;
+    uint32_t wg = getenv("QD_GRAN") ? atoi(getenv("QD_GRAN")) : 2048;
+    fprintf(ws_file, "%u %u", step, ix);
+    for (int i = 0; i < 7; i++) {
+        if (!s->pools[i].bytes) continue;
+        uint32_t n = s->pools[i].bytes; int64_t lastb = -1;
+        for (uint32_t o = 0; o < n; o += 64) {
+            uint32_t c = n - o < 64 ? n - o : 64;
+            if (!memcmp(s->pools[i].base + o, ws_shadow[i] + o, c)) continue;
+            for (uint32_t k = 0; k < c; k++) if (s->pools[i].base[o + k] != ws_shadow[i][o + k])
+                h = (h ^ (uint64_t)(((uint64_t)i << 40) | ((uint64_t)(o + k) << 8) | s->pools[i].base[o + k])) * 1099511628211ull;
+            if ((int64_t)(o / wg) != lastb) { fprintf(ws_file, " %d:%u", i, o / wg); lastb = o / wg; }
+            memcpy(ws_shadow[i] + o, s->pools[i].base + o, c); any = 1;
+        }
+    }
+    fprintf(ws_file, " #%016llx\n", (unsigned long long)(any ? h : 0));
+}
+static void ws_end(void) { if (ws_file) { fclose(ws_file); ws_file = NULL; } }
+
+/* QD_READSET=spec: for each command, rerun it with every 2 KiB block outside its declared
+ * footprint flipped; a changed result means an undeclared read. Bisects to the blocks.
+ * spec lines: "cmd pool:block pool:block ..." (declared reads and writes). Result on stdout. */
+static uint8_t *rs_spec[8192]; /* per command, per pool-block bitmap index */
+static uint32_t rs_base[8], rs_total, rs_gran = 2048;
+static uint8_t *rs_save[7], *rs_good[7];
+static void rs_load(Session *s, const char *path) {
+    rs_total = 0;
+    if (getenv("QD_GRAN")) rs_gran = atoi(getenv("QD_GRAN"));
+    for (int i = 0; i < 7; i++) { rs_base[i] = rs_total; rs_total += (s->pools[i].bytes + rs_gran - 1u) / rs_gran; }
+    FILE *f = fopen(path, "r"); CHECK(f);
+    static char line[1 << 20];
+    while (fgets(line, sizeof line, f)) {
+        char *p = line; uint32_t ix = strtoul(p, &p, 10);
+        CHECK(ix < 8192); rs_spec[ix] = calloc(rs_total, 1);
+        while (*p == ' ') {
+            uint32_t pool = strtoul(p + 1, &p, 10); CHECK(*p == ':');
+            uint32_t b = strtoul(p + 1, &p, 10);
+            if (pool < 7 && rs_base[pool] + b < rs_total) rs_spec[ix][rs_base[pool] + b] = 1;
+        }
+    }
+    fclose(f);
+    for (int i = 0; i < 7; i++) if (s->pools[i].bytes) { rs_save[i] = malloc(s->pools[i].bytes); rs_good[i] = malloc(s->pools[i].bytes); }
+}
+static void rs_copy(Session *s, uint8_t **d, int to_pool) {
+    for (int i = 0; i < 7; i++) if (s->pools[i].bytes && i != 5) {
+        if (to_pool) memcpy(s->pools[i].base, d[i], s->pools[i].bytes); else memcpy(d[i], s->pools[i].base, s->pools[i].bytes);
+    }
+}
+static void rs_flip(Session *s, uint32_t idx) {
+    for (int i = 6; i >= 0; i--) if (s->pools[i].bytes && idx >= rs_base[i]) {
+        uint32_t o = (idx - rs_base[i]) * rs_gran, n = s->pools[i].bytes - o < rs_gran ? s->pools[i].bytes - o : rs_gran;
+        for (uint32_t k = 0; k < n; k++) s->pools[i].base[o + k] ^= 0x5a;
+        return;
+    }
+}
+/* Run with the listed blocks flipped; 1 if every block the good run wrote still matches. */
+static int rs_try(Session *s, Nprg2ExecBuffer *in, Nprg2ExecBuffer *ob, uint32_t ix, const uint32_t *list, uint32_t n) {
+    rs_copy(s, rs_save, 1);
+    for (uint32_t i = 0; i < n; i++) rs_flip(s, list[i]);
+    Nprg2ExecStats st; Nprg2ExecRequest r = request(s, in, ob, ix, 1, &st);
+    if (s->reference_only) r.scratch_bytes = s->need[ix];
+    if (nprg2_executor_run(&s->executor, &r) != NPRG2_EXEC_OK) return 0;
+    const uint8_t *sp = rs_spec[ix];
+    for (int i = 0; i < 7; i++) if (s->pools[i].bytes && i != 5) {
+        for (uint32_t b = 0; b * rs_gran < s->pools[i].bytes; b++) {
+            if (!sp[rs_base[i] + b]) continue;   /* flipped or untouched: only declared blocks are results */
+            uint32_t o = b * rs_gran, m = s->pools[i].bytes - o < rs_gran ? s->pools[i].bytes - o : rs_gran;
+            if (memcmp(s->pools[i].base + o, rs_good[i] + o, m)) return 0;
+        }
+    }
+    return 1;
+}
+static void rs_step(Session *s, Nprg2ExecBuffer *in, Nprg2ExecBuffer *ob, uint32_t ix) {
+    /* Called after the good run: rs_save holds the state before it. */
+    rs_copy(s, rs_good, 0);
+    uint32_t *list = malloc(sizeof(uint32_t) * rs_total), n = 0;
+    for (uint32_t b = 0; b < rs_total; b++) if (!rs_spec[ix][b] && !(b >= rs_base[5] && b < rs_base[6])) list[n++] = b;
+    if (!rs_try(s, in, ob, ix, list, n)) {
+        printf("HIDDEN cmd=%u", ix);
+        /* Bisect: repeatedly find the first single block that matters. */
+        uint32_t lo = 0, hi = n, found = 0;
+        while (lo < hi && found < 24) {
+            uint32_t a = lo, b = hi;
+            if (rs_try(s, in, ob, ix, list + a, b - a)) break;
+            while (b - a > 1) { uint32_t m = a + (b - a) / 2; if (!rs_try(s, in, ob, ix, list + a, m - a)) b = m; else a = m; }
+            for (int i = 6; i >= 0; i--) if (s->pools[i].bytes && list[a] >= rs_base[i]) { printf(" %d:%u", i, list[a] - rs_base[i]); break; }
+            found++; lo = a + 1;
+        }
+        printf("\n");
+    }
+    free(list);
+    rs_copy(s, rs_good, 1);
+}
+
 /* Host-only QNN run-list replay: events are generated from the metadata-only
  * x86 capture and carry command index, wait CP, done CP, and source list. */
 static void runlists(Session *s, const char *order) {
@@ -536,6 +645,7 @@ static void runlists(Session *s, const char *order) {
     CHECK(out[0] && out[1]);
     Nprg2ExecBuffer in[4], ob[2] = {{out[0], 163840}, {out[1], 655360}};
     for (int k = 0; k < 4; k++) in[k] = (Nprg2ExecBuffer){s->inputs[k], s->input_bytes[k]};
+    ws_begin(s);
     for (uint32_t i = 0; i < s->program.command_count; i++) {
         const uint8_t *ev = events + i * 24u;
         uint32_t ix = rd32(ev), wait = rd32(ev + 4), done = rd32(ev + 8), lid = rd32(ev + 12);
@@ -549,6 +659,7 @@ static void runlists(Session *s, const char *order) {
         }
         if(dma_event_kind==2u)CHECK(nprg2_exec_weights_dma_checkpoint_wait(&dma,dma_event_id)==NPRG2_EXEC_OK);
         Nprg2ExecStats st;
+        if (getenv("QD_READSET")) { if (!rs_total) rs_load(s, getenv("QD_READSET")); rs_copy(s, rs_save, 0); }
         Nprg2ExecRequest r = request(s, in, ob, ix, 1, &st);
         r.weights_async=&dma;
         if (s->reference_only) r.scratch_bytes = s->need[ix];
@@ -560,12 +671,15 @@ static void runlists(Session *s, const char *order) {
                     (unsigned long)nprg2_exec_reference_error_line());
             exit(1);
         }
+        ws_step(s, i, ix);
+        if (rs_total && rs_spec[ix]) rs_step(s, in, ob, ix);
         if(dma_event_kind==1u)CHECK(nprg2_exec_weights_dma_checkpoint_set(&dma,dma_event_id)==NPRG2_EXEC_OK);
         if (done) {
             CHECK(cp[done] != 0);
             cp[done]--;
         }
     }
+    ws_end();
     CHECK(nprg2_exec_weights_dma_drain_all(&dma)==NPRG2_EXEC_OK);
     for (uint32_t i = 0; i < cp_count; i++) CHECK(cp[i] == 0);
     printf("PASS %s QNN %s run-list replay: %lu prepared commands, %lu CPU CPs and %lu DMA copies drained\n",

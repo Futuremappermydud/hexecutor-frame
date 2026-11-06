@@ -550,7 +550,7 @@ int nprg2_executor_prepare_preflighted_request(const Nprg2Executor *e,
 }
 
 uint64_t (*nprg2_lane_clock)(void);
-uint64_t nprg2_lane_prehandler[2];
+uint64_t nprg2_lane_prehandler[3];
 int nprg2_executor_run_preflighted_command_prepared(const Nprg2Executor *e,
                                                      const Nprg2ExecRequest *full,
                                                      uint32_t ix) {
@@ -584,7 +584,7 @@ int nprg2_executor_run_preflighted_command_prepared(const Nprg2Executor *e,
     if(h->scratch_bytes>UINT32_MAX-h->concurrent_worker_scratch_bytes ||
        h->scratch_bytes+h->concurrent_worker_scratch_bytes>call.scratch_bytes)return NPRG2_EXEC_REJECTED;
     if(full->cancelled && full->cancelled(full->cancel_ctx,ix))return NPRG2_EXEC_CANCELLED;
-    if(nprg2_lane_clock && full->execution_lane<2u)nprg2_lane_prehandler[full->execution_lane]+=nprg2_lane_clock();
+    if(nprg2_lane_clock && full->execution_lane<3u)nprg2_lane_prehandler[full->execution_lane]+=nprg2_lane_clock();
     if(h->no_effect)return NPRG2_EXEC_OK;
     return h->run(&call,h->ctx)?NPRG2_EXEC_OK:NPRG2_EXEC_HANDLER_ERROR;
 }

@@ -301,7 +301,7 @@ int nprg2_executor_prepare_preflighted_request(const Nprg2Executor *executor,
                                                Nprg2ExecRequest *prepared_request);
 /* Diagnostic: per lane, sum of clock() at handler entry (caller subtracts entry times). */
 extern uint64_t (*nprg2_lane_clock)(void);
-extern uint64_t nprg2_lane_prehandler[2];
+extern uint64_t nprg2_lane_prehandler[3];
 int nprg2_executor_handler_slot(const Nprg2Executor *executor,uint8_t op,uint8_t variant);
 int nprg2_executor_run_preflighted_command_prepared(const Nprg2Executor *executor,
                                                     const Nprg2ExecRequest *prepared_request,
