@@ -4405,7 +4405,11 @@ int nprg2_exec_reference_plan_begin(const Nprg2ExecRequest *r, const Nprg2Refere
  * outside what the planes represent (the normal path then decides). */
 static int plan_fi(const uint8_t *ft, const int8_t *wbase, int32_t NB, int32_t KB, int32_t zp, uint32_t wstride, uint32_t wrows,
                    uint8_t *base, uint8_t *mh) {
+#ifdef PLANE_SAT
+    const int64_t bound=(int64_t)KB*32*255*128,lim64=(int64_t)INT32_MAX-bound-(239LL<<15);
+#else
     const int64_t bound=(int64_t)KB*32*255*128,lim64=(int64_t)INT32_MAX-bound-(1<<19);
+#endif
     if(lim64<=0) return 0;
     const HVX_Vector ones=Q6_V_vsplat_R(0x01010101),m1023=Q6_V_vsplat_R(1023),m31=Q6_V_vsplat_R(31),c1024=Q6_V_vsplat_R(1024),
                      c20=Q6_V_vsplat_R(20),c24=Q6_V_vsplat_R(24),c16=Q6_V_vsplat_R(16),c12=Q6_V_vsplat_R(1<<12),c7=Q6_V_vsplat_R(7),
@@ -4428,8 +4432,14 @@ static int plan_fi(const uint8_t *ft, const int8_t *wbase, int32_t NB, int32_t K
         bad=Q6_Q_or_QQ(bad,Q6_Q_vcmp_gt_VwVw(Q6_Vw_vabs_Vw_sat(off),lim));
         const HVX_Vector Mv=Q6_Vw_vadd_VwVw(c1024,Q6_V_vand_VV(mv,m1023));
         d[0]=Q6_Vw_vasl_VwR(Q6_Vw_vsub_VwVw(c24,pv),10);d[1]=off;
+#ifdef PLANE_SAT
+        /* As plane_fi_put: high plane offset 239, multiplier stored doubled. */
+        d[2]=Q6_Vw_vasl_VwR(Q6_Vw_vsub_VwVw(c16,pv),10);d[3]=Q6_Vw_vadd_VwVw(off,Q6_Vw_vasl_VwVw(Q6_V_vsplat_R(239<<8),pv));
+        {const HVX_Vector mh1=Q6_Vh_vpacke_VwVw(Mv,Mv);((HVX_Vector *)mh)[j]=Q6_Vh_vadd_VhVh(mh1,mh1);}
+#else
         d[2]=Q6_Vw_vasl_VwR(Q6_Vw_vsub_VwVw(c16,pv),10);d[3]=Q6_Vw_vadd_VwVw(off,Q6_Vw_vasl_VwVw(c12,pv));
         ((HVX_Vector *)mh)[j]=Q6_Vh_vpacke_VwVw(Mv,Mv);
+#endif
     }
     d[0]=Q6_V_vsplat_R(0x404000);d[1]=zero;
     HVX_Vector flag __attribute__((aligned(128)))=Q6_V_vand_QR(bad,0x01010101u);
