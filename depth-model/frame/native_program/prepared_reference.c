@@ -4197,7 +4197,11 @@ static int nprg2_exec_reference_run_inner(const Nprg2ExecCall *c, void *ctx) {
      * memory), so its executor-validated run skips the repeated dry pass too. */
     if((!has_near || c->epilogue) && c->preflighted) {
         if(setup(&g,c,0,0,ctx)) return 0;
-        return run_kernel(&g)==0;
+        {int rr_=run_kernel(&g)==0;
+#ifdef V33_PROF
+         if(v33_mark && pc && pc->clock && pc->phase){pc->phase[7]+=pc->clock()-v33_mark;v33_mark=0;}
+#endif
+         return rr_;}
     }
     /* One memo/limits lookup per call: handed to the final setup so the
      * kernel's gmemo() does not repeat it (setup_ex resets them). */
@@ -4226,11 +4230,19 @@ static int nprg2_exec_reference_run_inner(const Nprg2ExecCall *c, void *ctx) {
         }
         return ok;
 #else
-        return run_kernel(&g)==0;
+        {int rr_=run_kernel(&g)==0;
+#ifdef V33_PROF
+         if(v33_mark && pc && pc->clock && pc->phase){pc->phase[7]+=pc->clock()-v33_mark;v33_mark=0;}
+#endif
+         return rr_;}
 #endif
     }
     if(setup(&g,c,0,0,ctx)) return 0;
-    return run_kernel(&g)==0;
+    {int rr_=run_kernel(&g)==0;
+#ifdef V33_PROF
+     if(v33_mark && pc && pc->clock && pc->phase){pc->phase[7]+=pc->clock()-v33_mark;v33_mark=0;}
+#endif
+     return rr_;}
 }
 int nprg2_exec_reference_conv_measure(const Nprg2ExecCall *c, const Nprg2ReferenceConv *conv,
                                       uint32_t *scratch_bytes, uint32_t *workspace_bytes) {

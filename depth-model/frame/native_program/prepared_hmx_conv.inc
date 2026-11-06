@@ -38,6 +38,10 @@
 #ifndef NPRG2_PLANES
 #define NPRG2_PLANES 0
 #endif
+/* Fewer output blocks than this: merged on the calling thread, no helper dispatch. */
+#ifndef PLANE_SERIAL_BELOW
+#define PLANE_SERIAL_BELOW 0
+#endif
 #if NPRG2_PLANES && NPRG2_HW_ROUNDING
 #error NPRG2_PLANES is the emulator-rounding path
 #endif
@@ -729,6 +733,9 @@ static int nat_mac(const NatJob *J, int32_t *fi, int32_t *zero, uint8_t *complet
 #ifdef SLIDE_LIMIT
 static uint32_t slide_used;
 #endif
+#ifdef V33_PROF
+static uint64_t v33_mark;
+#endif
 #if BLK_HVX
 /* Staging-free 3x3 stride 1 (qd_hmx_slide3_n): the window of output block
  * (by, bx) is input rows 8by+7.., columns 8bx+7.. of the command's input view
@@ -798,7 +805,14 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
     /* bisect: copy each strip's 3 input block rows into one contiguous
      * workspace window (pads zero-filled), so every Rt delta is the small
      * positive row stride, as in the silicon QNN probe (xwb1022). */
+#if NPRG2_PLANES && !defined(SLIDE_FULL_STAGE)
+    /* Column-channel group i: blocks 2i, 2i+1, 2i+2. Only the last row of the
+     * first and the first row of the third are read, so a group's third block is
+     * the next group's first, and the deltas stay the small positive 2048. */
+    const size_t sbytes=((size_t)2*ncol*cbs+1)*2048;
+#else
     const size_t sbytes=(size_t)3*ncol*cbs*2048;
+#endif
 #else
     const size_t sbytes=0;
 #endif
@@ -817,6 +831,11 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
     printf("SLIDE cmd %u cbs=%d NB=%d oh=%d ow=%d staged=%d\n",(unsigned)g->call->command_index,(int)cbs,(int)NB,(int)oh,(int)ow,staged);
 #endif
     uint64_t (*clock)(void)=c->phase?c->clock:NULL,t0=clock?clock():0,t1;
+#ifdef V33_PROF
+    const int v33=g->variant==33;
+    if(clock && v33){uint32_t l_=g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u;if(ref_t_entry[l_] && ref_t_entry[l_]<=t0)c->phase[4]+=t0-ref_t_entry[l_];}
+    uint64_t v33_t0=t0;
+#endif
 #ifdef SETUP_PROF
     if(clock && hmx_prof_mark && hmx_prof_mark<=t0) c->phase[7]+=t0-hmx_prof_mark;
 #endif
@@ -861,7 +880,48 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
     if(clock){t1=clock();c->phase[HMX_SETUP_SLOT]+=t1-t0;t0=t1;}
 #endif
     uint32_t saved=c->hmx->enter?c->hmx->enter():0;
+#if NPRG2_PLANES && !defined(SLIDE_FULL_STAGE)
+    {
+        /* The window addresses are the same for every strip. */
+        uint32_t *r=rec;
+        for(int32_t i=0;i<ncol*cbs;i++,r+=4) {
+            const uint32_t a=(uint32_t)(uintptr_t)S+(uint32_t)i*4096u;
+            r[0]=a|0x740u;r[1]=2048u|0x71fu;r[2]=(a+2048u)|0x140u;r[3]=2048u|0x71fu;
+        }
+    }
+    const uint32_t xnbw32=(uint32_t)xnbw,xnbd32=(uint32_t)xnbd,xcount=xt->nblocks,xslice=xt->slice;
+    const uint32_t *xblk=xt->blocks;
+    uint8_t *const *xpools=g->pool;
+#endif
     for(int32_t by=0;by<bh;by++) {
+#if NPRG2_PLANES && !defined(SLIDE_FULL_STAGE)
+        {
+            HVX_Vector *dv=(HVX_Vector *)S;const HVX_Vector zv=Q6_V_vzero();
+            const int32_t Rb=R0+by;
+            for(int32_t cc=0;cc<ncol;cc++) {
+                const int32_t wb=C0+cc;
+                /* block table entries of rows Rb, Rb+1, Rb+2 at this column, 32-bit */
+                int live=Rb>=0 && wb>=0 && wb<(int32_t)xnbw32;
+                const uint32_t i0=live?(((uint32_t)Rb*xnbw32+(uint32_t)wb)*xnbd32)+xslice:0,dr=xnbw32*xnbd32;
+                for(int32_t cb=0;cb<cbs;cb++,dv+=32) {
+                    const uint32_t ia=i0+(uint32_t)cb,ib=ia+dr,id=ib+dr;
+                    const uint32_t ea=live&&ia<xcount?xblk[ia]:0,eb=live&&ib<xcount?xblk[ib]:0,ed=live&&id<xcount?xblk[id]:0;
+                    const uint32_t pa=ea&127u,pb=eb&127u,pd=ed&127u;
+                    const HVX_Vector *sa=pa&&xpools[pa]?(const HVX_Vector *)(xpools[pa]+(ea&~127u)):NULL,
+                                     *sb=pb&&xpools[pb]?(const HVX_Vector *)(xpools[pb]+(eb&~127u)):NULL,
+                                     *sd=pd&&xpools[pd]?(const HVX_Vector *)(xpools[pd]+(ed&~127u)):NULL;
+                    if(sa){HVX_Vector v0=sa[14],v1=sa[15];dv[14]=v0;dv[15]=v1;} else {dv[14]=zv;dv[15]=zv;}
+                    if(sb) {
+#pragma unroll
+                        for(int i=0;i<16;i++) dv[16+i]=sb[i];
+                    } else for(int i=0;i<16;i++) dv[16+i]=zv;
+                    if(sd){HVX_Vector v0=sd[0],v1=sd[1];dv[32]=v0;dv[33]=v1;} else {dv[32]=zv;dv[33]=zv;}
+                }
+            }
+        }
+        __asm__ volatile("barrier":::"memory");
+        {typedef uint32_t W32 __attribute__((vector_size(128)));W32 v=*(volatile W32 *)(S+sbytes-2048);__asm__ volatile(""::"r"(v[0]):"memory");}
+#else
         for(int32_t cc=0;cc<ncol;cc++)for(int32_t cb=0;cb<cbs;cb++) {
             uint32_t *r=rec+((size_t)cc*cbs+cb)*4;
             const uint8_t *a=hmx_row(g->pool,xt,(int64_t)(R0+by)*8,C0+cc,xnbw,xnbd,cb),
@@ -891,6 +951,7 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
 #ifdef SLIDE_STAGE
         __asm__ volatile("barrier":::"memory");
         {typedef uint32_t W32 __attribute__((vector_size(128)));W32 v=*(volatile W32 *)(S+sbytes-2048);__asm__ volatile(""::"r"(v[0]):"memory");}
+#endif
 #endif
         SP(4);
         for(int32_t j=0;j<NB;j++) {
@@ -941,6 +1002,9 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
         __asm__ volatile("barrier":::"memory");
     }
     if(c->hmx->leave) c->hmx->leave(saved);
+#ifdef V33_PROF
+    uint64_t v33_t1=clock?clock():0;if(clock && v33)c->phase[5]+=v33_t1-v33_t0;
+#endif
     SP(5);
     if(clock){t1=clock();c->phase[1]+=t1-t0;t0=t1;}
     if(e){*err=E_RANGE;return -1;}
@@ -958,9 +1022,12 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
         }
         PlaneJob P={.C=C,.out=pout,.mh=n+o_mh,.Mq=Mq,.mt=total,.NB=NB,.bw=bw,.ncol=ncol,.shift=1,
                     .rows=oh&7,.partial_from=(oh&7)?(bh-1)*bw:total};
-        uint32_t parts=nprg2_parallel_parts(g->call->parallel,NPRG2_PAR_MAX_PARTS);
+        uint32_t parts=total*NB<PLANE_SERIAL_BELOW?1u:nprg2_parallel_parts(g->call->parallel,NPRG2_PAR_MAX_PARTS);
         if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,plane_part,&P);
         else plane_part(&P,0,1);
+#ifdef V33_PROF
+        if(clock && v33){uint64_t e_=clock();c->phase[6]+=e_-v33_t1;v33_mark=e_;}
+#endif
         SP(7);
         if(clock){t1=clock();c->phase[3]+=t1-t0;t0=t1;}
     }
@@ -1126,7 +1193,7 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
         {
             PlaneJob P={.C=C,.out=pout,.mh=n+o_mh,.Mq=Mq,.mt=J.mt,.NB=NB,.shift=0,.rows=oh&7,
                         .partial_from=(oh&7)?((oh+7)/8-1)*bw-m0:J.mt};
-            if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,plane_part,&P);
+            if(parts>1 && J.mt*NB>=PLANE_SERIAL_BELOW) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,plane_part,&P);
             else plane_part(&P,0,1);
             if(clock){t1=clock();c->phase[3]+=t1-t0;t0=t1;}
         }
@@ -1879,7 +1946,7 @@ static int hmx_native16(G *g, const T *xt, const T *wt, const T *ft, const T *o,
     }
 #endif
     for(int b=0;b<nbuf;b++) J[b].stage=stage;
-#if defined(SLIDE_PROF) || defined(SETUP_PROF)
+#if defined(SLIDE_PROF) || defined(SETUP_PROF) || defined(V33_PROF)
     uint64_t (*clock)(void)=NULL,t0=0,t1;
 #else
     uint64_t (*clock)(void)=c->phase?c->clock:NULL,t0=clock?clock():0,t1;
