@@ -17,12 +17,20 @@ int main(void) {
     memcpy(command,original,sizeof command);command[6]=1;
     assert(qds_initial_command_valid(command,3));
     command[4]=command[5];assert(qds_initial_command_valid(command,3));
-    uint32_t arrivals[3]={0,0,0};
-    assert(!qds_entry_all_arrived(arrivals,0));
-    arrivals[0]=1;assert(!qds_entry_all_arrived(arrivals,1));
-    arrivals[1]=1;assert(!qds_entry_all_arrived(arrivals,1));
-    arrivals[2]=2;assert(!qds_entry_all_arrived(arrivals,1));
-    arrivals[2]=1;assert(qds_entry_all_arrived(arrivals,1));
-    assert(!qds_entry_all_arrived(arrivals,2));
+    uint32_t arrivals[4]={0,0,0,0};
+    assert(!qds_entry_all_arrived(arrivals,0,3));
+    assert(!qds_entry_all_arrived(arrivals,1,0));
+    assert(!qds_entry_all_arrived(arrivals,1,5));
+    arrivals[0]=1;assert(!qds_entry_all_arrived(arrivals,1,3));
+    arrivals[1]=1;assert(!qds_entry_all_arrived(arrivals,1,3));
+    arrivals[2]=2;assert(!qds_entry_all_arrived(arrivals,1,3));
+    arrivals[2]=1;assert(qds_entry_all_arrived(arrivals,1,3));
+    /* The third stock worker gate is independent of the fourth worker slot. */
+    assert(!qds_entry_all_arrived(arrivals,1,4));
+    arrivals[3]=1;assert(qds_entry_all_arrived(arrivals,1,4));
+    assert(!qds_entry_all_arrived(arrivals,2,3));
+    arrivals[0]=arrivals[1]=arrivals[2]=2;
+    assert(!qds_entry_all_arrived(arrivals,2,4));
+    arrivals[3]=2;assert(qds_entry_all_arrived(arrivals,2,4));
     return 0;
 }

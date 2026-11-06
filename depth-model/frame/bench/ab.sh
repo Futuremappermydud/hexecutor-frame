@@ -45,6 +45,8 @@ flags() {
     hw) echo "$(base) QDS_PREPARED_THREADS=3 QDS_PREPARED_FUSE=1 QDS_PREPARED_HMX=1 QDS_EXTRA_CFLAGS=-DNPRG2_HW_ROUNDING=1";;
     l2hmx) echo "$(base) QDS_PREPARED_THREADS=3 QDS_PREPARED_FUSE=1 QDS_PREPARED_HMX=1 QDS_L2_CACHE=1";;
     l2hw) echo "$(base) QDS_PREPARED_THREADS=3 QDS_PREPARED_FUSE=1 QDS_PREPARED_HMX=1 QDS_L2_CACHE=1 QDS_EXTRA_CFLAGS=-DNPRG2_HW_ROUNDING=1+-DNPRG2_SLIDE3=1+-DQDS_POOL1_NOCOPY=1";;
+    l2fast) echo "$(base) QDS_PREPARED_THREADS=3 QDS_PREPARED_FUSE=1 QDS_PREPARED_HMX=1 QDS_L2_CACHE=1 QDS_EXTRA_CFLAGS=-DNPRG2_HW_ROUNDING=1+-DNPRG2_SLIDE3=1+-DQDS_POOL1_NOCOPY=1+-O3+-ffast-math";;
+    l2fast4) echo "$(base) QDS_PREPARED_THREADS=4 QDS_PREPARED_FUSE=1 QDS_PREPARED_HMX=1 QDS_L2_CACHE=1 QDS_EXTRA_CFLAGS=-DNPRG2_HW_ROUNDING=1+-DNPRG2_SLIDE3=1+-DQDS_POOL1_NOCOPY=1+-O3+-ffast-math";;
     l2hw0) echo "$(base) QDS_PREPARED_THREADS=3 QDS_PREPARED_FUSE=1 QDS_PREPARED_HMX=1 QDS_L2_CACHE=1 QDS_EXTRA_CFLAGS=-DNPRG2_HW_ROUNDING=1";;
     l2) echo "$(base) QDS_L2_CACHE=5";;
     l2fuse) echo "$(base) QDS_L2_CACHE=5 QDS_PREPARED_FUSE=1";;
@@ -90,10 +92,13 @@ for n in $names; do
     ssh "$REMOTE" "cd $RDIR && $PY frame/bench/verify_prepared_full_model.py --model $m $cases --repeat $REPEAT $common \
         --prepared-program frame/native_program/examples/$m-v2.nprg --report $R/${n}_$m.json $expect" \
       | python3 -c 'import sys,json
+seen=0; passed=True
 for l in sys.stdin:
   try: d=json.loads(l)
   except Exception: print(l,end=""); continue
-  print(" ",d["case"],d["run"],"passed" if d["passed"] else "FAILED","%.1f ms"%d["dsp_ms"])' || {
+  seen+=1; passed=passed and d["passed"]
+  print(" ",d["case"],d["run"],"passed" if d["passed"] else "FAILED","%.1f ms"%d["dsp_ms"])
+sys.exit(0 if seen and passed else 1)' || {
         rsync -r "$REMOTE:$RDIR/$R/" "$OUT/" >/dev/null 2>&1 || true; echo "$n $m FAILED" >&2; exit 1; }
   done
 done

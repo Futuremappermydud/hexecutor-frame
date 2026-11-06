@@ -5,6 +5,7 @@
 #include "prepared_reference.h"
 #include "prepared_vcopy.h"
 #include "prepared_exact_math.h"
+#include "prepared_cost_volume_approx.h"
 
 #include <math.h>
 #include <stddef.h>
@@ -162,8 +163,9 @@ static int64_t dtmax(uint32_t dt) {return dt==DT_U8?255:dt==DT_U16?65535:dt==DT_
 static int64_t s32(uint64_t v) {return (int64_t)(int32_t)(uint32_t)v;}
 
 /* Per-command memos, keyed by (program, command index); two programs (the
- * two models) are kept. Not thread-safe: reference commands run on the
- * executor's thread.
+ * two models and two execution lanes are kept. Each lane owns its per-command
+ * cache; threaded run lists clone lane 0 after full preflight before lane 1
+ * starts, then each lane mutates only its own records.
  * need: scratch need from the first dry pass, so later runs skip it. The dry
  *   pass reads only geometry and the constant pool, so the need is a property
  *   of the bound program; were it ever larger, salloc fails loudly.
@@ -171,6 +173,7 @@ static int64_t s32(uint64_t v) {return (int64_t)(int32_t)(uint32_t)v;}
  *   blocked_overlap: geometry and pool limits only) passed with epilogue kind
  *   k, so later runs skip them. Pool bases/limits are part of the key. */
 enum { MEMO_COMMANDS=8192, CHK_SLOTS=4 };
+enum { MEMO_LANES=2, MEMO_SLOTS=2 };
 typedef struct {
     const void *program;
     uint64_t limits;
@@ -185,35 +188,61 @@ typedef struct {
 /* On the heap, not static: the resident engine's 1 MiB code region holds its
  * static data too, and the per-command arrays are ~0.3 MB per Memo. Allocated
  * on first use; if that fails, memo_for returns NULL (no memoisation). */
-static Memo *memos[2];
-static uint32_t memo_next;
+static Memo *memos[MEMO_LANES][MEMO_SLOTS];
+static uint32_t memo_next[MEMO_LANES];
 /* The key is a hash of the pool table: remembered for the last table seen
  * (compared field by field, cheaper than 15 64-bit multiplies per call). */
+typedef struct {uintptr_t base[7];uint32_t bytes[7],wr;uint64_t h;int valid;} MemoLimitsCache;
 static uint64_t memo_limits(const Nprg2ExecCall *c) {
-    static struct {uintptr_t base[7];uint32_t bytes[7],wr;uint64_t h;int valid;} last;
-    if(last.valid && last.wr==c->pool1_writable_bytes) {
+    static MemoLimitsCache last[MEMO_LANES];
+    uint32_t lane=c->execution_lane<MEMO_LANES?c->execution_lane:0u;
+    MemoLimitsCache *m=&last[lane];
+    if(m->valid && m->wr==c->pool1_writable_bytes) {
         int same=1;
-        for(int i=0;i<7;i++) same&=last.base[i]==(uintptr_t)c->pools[i].base && last.bytes[i]==c->pools[i].bytes;
-        if(same) return last.h;
+        for(int i=0;i<7;i++) same&=m->base[i]==(uintptr_t)c->pools[i].base && m->bytes[i]==c->pools[i].bytes;
+        if(same) return m->h;
     }
     uint64_t h=0xcbf29ce484222325ull;
     for(int i=0;i<7;i++){h=(h^(uintptr_t)c->pools[i].base)*0x100000001b3ull;h=(h^c->pools[i].bytes)*0x100000001b3ull;}
     h=(h^c->pool1_writable_bytes)*0x100000001b3ull;
-    for(int i=0;i<7;i++){last.base[i]=(uintptr_t)c->pools[i].base;last.bytes[i]=c->pools[i].bytes;}
-    last.wr=c->pool1_writable_bytes;last.h=h;last.valid=1;
+    for(int i=0;i<7;i++){m->base[i]=(uintptr_t)c->pools[i].base;m->bytes[i]=c->pools[i].bytes;}
+    m->wr=c->pool1_writable_bytes;m->h=h;m->valid=1;
     return h;
 }
 static Memo *memo_for_lim(const Nprg2ExecCall *c, uint64_t lim) {
     if(!c->program || c->command_index>=MEMO_COMMANDS) return NULL;
-    for(int i=0;i<2;i++) if(memos[i] && memos[i]->program==c->program && memos[i]->limits==lim) return memos[i];
-    uint32_t slot=memo_next++&1u;
-    if(!memos[slot] && !(memos[slot]=malloc(sizeof(Memo)))) return NULL;
-    Memo *m=memos[slot];
+    uint32_t lane=c->execution_lane<MEMO_LANES?c->execution_lane:0u;
+    for(int i=0;i<MEMO_SLOTS;i++) if(memos[lane][i] && memos[lane][i]->program==c->program && memos[lane][i]->limits==lim) return memos[lane][i];
+    uint32_t slot=memo_next[lane]++&(MEMO_SLOTS-1u);
+    if(!memos[lane][slot] && !(memos[lane][slot]=malloc(sizeof(Memo)))) return NULL;
+    Memo *m=memos[lane][slot];
     m->program=c->program;m->limits=lim;
     memset(m->need,0xff,sizeof m->need);memset(m->conv_checked,0,sizeof m->conv_checked);memset(m->chain,0,sizeof m->chain);memset(m->slide,0,sizeof m->slide);memset(m->chk,0,sizeof m->chk);
     memset(m->fz,0,sizeof m->fz);
     memset(m->dmv,0,sizeof m->dmv);
     return m;
+}
+int nprg2_exec_reference_clone_lane(uint8_t src,uint8_t dst) {
+    if(src>=MEMO_LANES || dst>=MEMO_LANES)return 0;
+    if(src==dst)return 1;
+    /* Seed the destination lane once per (program, limits): a lane that
+     * already holds that key keeps what it has learned since (the verdicts
+     * and constants of the commands only it executes). Overwriting it on
+     * every run made each of those commands revalidate on every run. */
+    uint32_t found=0;
+    for(uint32_t i=0;i<MEMO_SLOTS;i++) {
+        if(!memos[src][i])continue;
+        found++;
+        int have=0;
+        for(uint32_t j=0;j<MEMO_SLOTS;j++)
+            have|=memos[dst][j] && memos[dst][j]->program==memos[src][i]->program &&
+                  memos[dst][j]->limits==memos[src][i]->limits;
+        if(have)continue;
+        if(!memos[dst][i] && !(memos[dst][i]=malloc(sizeof(Memo))))return 0;
+        memcpy(memos[dst][i],memos[src][i],sizeof(Memo));
+        memo_next[dst]=memo_next[src];
+    }
+    return found!=0;
 }
 static Memo *memo_for(const Nprg2ExecCall *c) {return memo_for_lim(c,memo_limits(c));}
 /* The same, computed once per call (the hash of the pool table is not free). */
@@ -816,7 +845,7 @@ static int ew_strips(G *g, const T *it, const T *ot, uint32_t ies, uint32_t oes,
     uint64_t elems=(uint64_t)it->d[0]*it->d[1]*it->d[2]*(uint64_t)D;
     uint32_t parts=1;
     if(elems>=PAR_STRIP_MIN_ELEMS && room/3>=per+256+128 && strip_disjoint(g,it,ot))
-        parts=nprg2_parallel_parts(g->call->parallel,3);
+        parts=nprg2_parallel_parts(g->call->parallel,NPRG2_PAR_MAX_PARTS);
     StripJob J={g,it,ot,fn,ctx,ies,oes,D,0,0,buf,(room/parts)&~(size_t)127,0};
     J.cw=(int32_t)(J.room/(per+256));
     if(J.cw<1){parts=1;J.room=room&~(size_t)127;J.cw=(int32_t)(J.room/(per+256));}
@@ -1056,7 +1085,7 @@ static int k_weights_to_vtcm(G *g) {
         /* DDR loads are latency bound: split big copies at dst vector
          * boundaries over the helper threads (each part is a plain qd_vcopy_deep). */
         if(DYN_OFF){qd_vcopy(J.d,J.s,n);return 0;}
-        if(n>=WCOPY_PAR_MIN) J.parts=nprg2_parallel_parts(g->call->parallel,3);
+        if(n>=WCOPY_PAR_MIN) J.parts=nprg2_parallel_parts(g->call->parallel,NPRG2_PAR_MAX_PARTS);
         if(J.parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_DM,J.parts,wcopy_part,&J);
         else qd_vcopy_deep(J.d,J.s,n);
     }
@@ -1595,13 +1624,83 @@ static int concat_fast(G *g, int axis) {
     DM_COUNT(7,count4(n));
     return 0;
 }
+#if BLK_HVX && (NPRG2_APPROX_COST_VOLUME_STEP == 4 || NPRG2_APPROX_COST_VOLUME_STEP == 8)
+static HVX_Vector approx_cost_volume_weighted_half(HVX_Vector a,HVX_Vector b,uint32_t wa,uint32_t wb,uint32_t shift) {
+    HVX_VectorPair w=Q6_Wuw_vmpy_VuhRuh(a,wa|(wa<<16));
+    w=Q6_Wuw_vmpyacc_WuwVuhRuh(w,b,wb|(wb<<16));
+    return Q6_Vuh_vasr_VuwVuwR_rnd_sat(Q6_V_hi_W(w),Q6_V_lo_W(w),shift);
+}
+static HVX_Vector approx_cost_volume_weighted_vec(HVX_Vector a,HVX_Vector b,uint32_t wa,uint32_t wb,uint32_t shift) {
+    HVX_VectorPair ah=Q6_Wuh_vunpack_Vub(a),bh=Q6_Wuh_vunpack_Vub(b);
+    HVX_Vector lo=approx_cost_volume_weighted_half(Q6_V_lo_W(ah),Q6_V_lo_W(bh),wa,wb,shift);
+    HVX_Vector hi=approx_cost_volume_weighted_half(Q6_V_hi_W(ah),Q6_V_hi_W(bh),wa,wb,shift);
+    return Q6_Vub_vpack_VhVh_sat(hi,lo);
+}
+#endif
+static int approx_cost_volume_interpolate(G *g,int axis) {
+#if NPRG2_APPROX_COST_VOLUME_STEP == 2 || NPRG2_APPROX_COST_VOLUME_STEP == 4 || NPRG2_APPROX_COST_VOLUME_STEP == 8
+    if(!g || !g->call || !nprg2_approx_cv_primary_program(g->call->program) ||
+       g->op!=QDR_CONCAT || axis!=1 || g->nin!=81 ||
+       g->out.dtype!=DT_U8 || !(g->out.flags&F_SHAPE) ||
+       g->out.d[0]!=1 || g->out.d[1]!=80 || g->out.d[2]!=64 || g->out.d[3]!=64)
+        return 0;
+    CHECK((g->out.flags&F_DIRECT) && !g->out.crouton,E_TENSOR);
+    for(int d=0;d<4;d++) CHECK(g->out.p[d]==0 && g->out.m[d]==g->out.d[d],E_SHAPE);
+    CHECK(g->out.pool<7 && g->pool[g->out.pool],E_RANGE);
+    const uint32_t plane_bytes=64u*64u,total_bytes=80u*plane_bytes;
+    CHECK(g->out.offset<=g->write_limit[g->out.pool] &&
+          total_bytes<=g->write_limit[g->out.pool]-g->out.offset,E_RANGE);
+    if(!g->dry){
+        uint8_t *base=g->pool[g->out.pool]+g->out.offset;
+#if NPRG2_APPROX_COST_VOLUME_STEP == 2
+        for(uint32_t plane=1;plane<79;plane+=2){
+            const uint8_t *left=base+(plane-1u)*plane_bytes;
+            const uint8_t *right=base+(plane+1u)*plane_bytes;
+            uint8_t *middle=base+plane*plane_bytes;
+#if BLK_HVX
+            for(uint32_t i=0;i<plane_bytes;i+=128)
+                *(HVX_UVector *)(middle+i)=Q6_Vub_vavg_VubVub_rnd(*(const HVX_UVector *)(left+i),*(const HVX_UVector *)(right+i));
+#else
+            for(uint32_t i=0;i<plane_bytes;i++) middle[i]=(uint8_t)(((uint16_t)left[i]+right[i]+1u)>>1);
+#endif
+        }
+#else
+        for(uint32_t left_plane=0;left_plane<79;left_plane+=NPRG2_APPROX_COST_VOLUME_STEP){
+            uint32_t right_plane=left_plane+NPRG2_APPROX_COST_VOLUME_STEP;
+            if(right_plane>79u)right_plane=79u;
+            uint32_t span=right_plane-left_plane;
+            const uint8_t *left=base+left_plane*plane_bytes;
+            const uint8_t *right=base+right_plane*plane_bytes;
+            for(uint32_t plane=left_plane+1u;plane<right_plane;plane++){
+                uint32_t weight_right=plane-left_plane,weight_left=span-weight_right;
+                uint8_t *middle=base+plane*plane_bytes;
+#if BLK_HVX
+                if(span==NPRG2_APPROX_COST_VOLUME_STEP){
+                    uint32_t shift=NPRG2_APPROX_COST_VOLUME_STEP==4?2u:3u;
+                    for(uint32_t i=0;i<plane_bytes;i+=128u)
+                        *(HVX_UVector *)(middle+i)=approx_cost_volume_weighted_vec(
+                            *(const HVX_UVector *)(left+i),*(const HVX_UVector *)(right+i),
+                            weight_left,weight_right,shift);
+                } else
+#endif
+                for(uint32_t i=0;i<plane_bytes;i++)
+                    middle[i]=(uint8_t)(((uint32_t)left[i]*weight_left+(uint32_t)right[i]*weight_right+span/2u)/span);
+            }
+        }
+#endif
+    }
+#else
+    (void)g;(void)axis;
+#endif
+    return 0;
+}
 static int k_concat(G *g) {
     CHECK(g->nin>=2 && g->nout>=1,E_ARGS);
     int64_t axis;
     CHECK(!sv_or_scalar(in(g,0),&axis),E_ARGS);
     if(axis<0)axis+=4;
     CHECK(axis>=0 && axis<4,E_ARGS);
-    {int fr=concat_fast(g,(int)axis);DMPATH(g,"concat",fr);if(fr>=0)return fr;}
+    {int fr=concat_fast(g,(int)axis);DMPATH(g,"concat",fr);if(fr>=0){if(fr)return fr;return approx_cost_volume_interpolate(g,(int)axis);}}
     int32_t n[4];uint32_t dt=0;
     for(uint32_t i=1;i<g->nin;i++) {
         T t;TRY(input_at(g,i,&t));
@@ -1623,7 +1722,8 @@ static int k_concat(G *g) {
         if(!g->dry)for(size_t o=0;o<outer;o++)qd_vcopy((uint8_t *)r.p+o*inner*n[axis]+at,(uint8_t *)part.p+o*chunk,chunk);
         at+=chunk;
     }
-    return t_write(g,out0(g),&r);
+    TRY(t_write(g,out0(g),&r));
+    return approx_cost_volume_interpolate(g,(int)axis);
 }
 static int k_gather(G *g) {
     CHECK(g->nin==4,E_ARGS);
@@ -2496,19 +2596,24 @@ static void requant_params(const int32_t *mult, int32_t co, int sixteen, int32_t
 #ifndef NPRG2_HW_ROUNDING
 #define NPRG2_HW_ROUNDING 0
 #endif
+/* Independent u16 rounding for accuracy/performance ablations. */
+#ifndef NPRG2_HW_ROUNDING_U16
+#define NPRG2_HW_ROUNDING_U16 NPRG2_HW_ROUNDING
+#endif
 static inline int64_t rq_round(int sixteen, int32_t M, int32_t post) {
     int64_t r=(int64_t)1<<(post-1);
 #if NPRG2_HW_ROUNDING
     if(!sixteen) r+=M>>1;
-    else if(post<=18) r+=M>>(19-post);
-#else
-    (void)sixteen;(void)M;
 #endif
+#if NPRG2_HW_ROUNDING_U16
+    if(sixteen && post<=18) r+=M>>(19-post);
+#endif
+    (void)sixteen;(void)M;
     return r;
 }
 static inline int64_t requant_value(int64_t acc, int32_t bias, int sixteen, int32_t M, int32_t pre, int32_t post) {
     int64_t a=acc+(int64_t)bias*(sixteen?256:1);
-#if NPRG2_HW_ROUNDING
+#if NPRG2_HW_ROUNDING_U16
     if(sixteen && post>18) { /* q = floor(x*2^(e-8)) is a right shift here */
         int64_t q=(a>>pre)>>(post-18);
         return clip64(((2*q+1)*M+((int64_t)1<<18))>>19,0,65535);
@@ -3201,9 +3306,9 @@ static void fuse_scalar(G *g, const Fuse *fx, const uint8_t *q, int32_t nc, int3
     int32_t eo[4]={0,fx->oe.p[1]+y,fx->oe.p[2]+x0,0};
     xfer_copy(g,&fx->oe,fx->eb,dims,eo,1);
 }
-static uint32_t conv_path;
-static uint64_t hmx_t_entry; /* HMX_PROF step 5: clock at k_hmx_conv entry */
-static uint64_t ref_t_entry; /* HMX_PROF step 9: clock at reference_run entry (conv handlers) */
+static uint32_t conv_path[MEMO_LANES];
+static uint64_t hmx_t_entry[MEMO_LANES]; /* HMX_PROF step 5: clock at k_hmx_conv entry */
+static uint64_t ref_t_entry[MEMO_LANES]; /* HMX_PROF step 9: clock at reference_run entry (conv handlers) */
 #ifndef HMX_PROF
 #define HMX_PROF 0
 #endif
@@ -3212,7 +3317,7 @@ static uint64_t ref_t_entry; /* HMX_PROF step 9: clock at reference_run entry (c
  * 0 to use the reference convolution, or a negative error. */
 static int fast_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int s2, int sixteen, int32_t co,
                      int32_t oh, int32_t ow, int32_t *err) {
-    *err=0;conv_path=0;g->fx_ok=0;
+    *err=0;conv_path[g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u]=0;g->fx_ok=0;
     if(!g->conv) return 0;
     int32_t H=wt->m[0],W=wt->m[1],I=wt->m[2],O=wt->m[3];
     int packed=is_class(wt,"Xpb","xpb"),reverse=!s2 && wt->cls==('X'|'w'<<8|'b'<<16);
@@ -3231,7 +3336,7 @@ static int fast_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, in
         int r=hmx_conv(g,xt,wt,ft,o,packed,reverse,s2,co,oh,ow,err);
         if(r) return r;
     }
-#if NPRG2_HW_ROUNDING && BLK_HVX && !defined(NPRG2_NO_HMX16)
+#if NPRG2_HW_ROUNDING_U16 && BLK_HVX && !defined(NPRG2_NO_HMX16)
     else if(!s2) {
         int r=hmx_native16(g,xt,wt,ft,o,packed,reverse,co,oh,ow,err);
         if(r) return r;
@@ -3289,7 +3394,7 @@ static int fast_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, in
             g->fx_ok=1;
         }
         if(!checked && ((*err=xfer_check(g,xt,dims,origin,0)) || (*err=xfer_check(g,o,on,oorigin,1)))) return -1;
-        conv_path=2;
+        conv_path[g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u]=2;
         if(g->dry) return 1;
         const Nprg2ReferenceConv *c=g->conv;
         if(!direct) {
@@ -3318,7 +3423,7 @@ static int fast_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, in
                                   mult,bias,M,pre,post,wsum,rqp);
     A out={.n={1,oh,ow,co},.dt=sixteen?DT_U16:DT_U8,.p=r};
     if((*err=t_write_region(g,o,&out,oorigin))) return -1;
-    conv_path=1;
+    conv_path[g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u]=1;
     return 1;
 }
 static void fast_conv_compute(G *g, const T *xt, const T *wt, const T *ft, int s2, int reverse, int packed, int sixteen,
@@ -3415,7 +3520,7 @@ typedef struct {
     const uint32_t *wp, *xoff, *segend;
     const int32_t *rqp;
     const int8_t *wbase;
-    uint64_t hph[2][4]; /* helper parts' phase cycles, added to phase after the join */
+    uint64_t hph[3][4]; /* helper parts' phase cycles, added to phase after the join */
 } NearJob;
 /* Output rows [oh*part/parts, oh*(part+1)/parts) over every column chunk.
  * Part 0 runs in the command's own near region (its plan p); parts 1.. in the
@@ -3624,7 +3729,8 @@ static void near_compute(G *g, const T *xt, const T *wt, const T *ft, const T *o
 #endif
     if(parts>1) {
         nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,near_part,&J);
-        if(c->phase) for(int k=0;k<4;k++) c->phase[(sixteen?4:0)+k]+=J.hph[0][k]+J.hph[1][k];
+        if(c->phase) for(int k=0;k<4;k++)
+            c->phase[(sixteen?4:0)+k]+=J.hph[0][k]+J.hph[1][k]+J.hph[2][k];
     } else near_rows(&J,0);
 }
 
@@ -3779,9 +3885,10 @@ static int fuse_cached(G *g, const T *xt, const T *wt, const T *ft, const T *o) 
 }
 static int k_hmx_conv(G *g) {
     if(g->conv && g->conv->clock && g->conv->phase && !g->dry) {
-        hmx_t_entry=g->conv->clock();
+        uint32_t lane=g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u;
+        hmx_t_entry[lane]=g->conv->clock();
 #if HMX_PROF==9
-        if(ref_t_entry && ref_t_entry<=hmx_t_entry) g->conv->phase[3]+=hmx_t_entry-ref_t_entry;
+        if(ref_t_entry[lane] && ref_t_entry[lane]<=hmx_t_entry[lane]) g->conv->phase[3]+=hmx_t_entry[lane]-ref_t_entry[lane];
 #endif
     }
     CHECK(g->nin>=3 && g->nout==1,E_ARGS);
@@ -3904,8 +4011,9 @@ static int variant_matches(uint32_t op, uint32_t variant) {
  * identical inputs (conv memory layout, call scratch, pool table, ceiling);
  * only passing verdicts are stored, so a bad input is always re-checked and
  * fails exactly as before. */
-enum { SK_WORDS=26 };
-static struct {uintptr_t key[SK_WORDS];int valid;uint32_t par_slots;uint64_t pool_bytes[7];} setup_ck;
+enum { SK_WORDS=27 };
+typedef struct {uintptr_t key[SK_WORDS];int valid;uint32_t par_slots;uint64_t pool_bytes[7];} SetupCache;
+static SetupCache setup_ck[MEMO_LANES];
 
 /* scr/scrb: the scratch region this setup runs on (c->scratch unless the
  * caller moves the command into the near region). */
@@ -3918,6 +4026,8 @@ static int setup_ex(G *g, const Nprg2ExecCall *c, int dry, int measure, const Np
     g->fx.kind=g->fx.dead=0;g->fx.mc=g->fx.mo=g->fx.rd=g->fx.sh=0;g->fx.eb=g->fx.bb=NULL;
     g->fx_ok=0;g->par_slots=0;g->chk_memo=NULL;g->chk_state=0;g->cm=NULL;g->lim=0;g->cm_ok=g->lim_ok=0;
     if(!c || !c->program || !c->bound || !c->pools) FAIL(E_ARGS);
+    uint32_t lane=c->execution_lane<MEMO_LANES?c->execution_lane:0u;
+    SetupCache *ck=&setup_ck[lane];
     const Nprg2Command *k=&c->command;
     if(!variant_matches(k->opcode,k->variant)) FAIL(E_ARGS);
     g->call=c;g->dry=dry;g->measure_only=(uint8_t)measure;
@@ -3928,16 +4038,17 @@ static int setup_ex(G *g, const Nprg2ExecCall *c, int dry, int measure, const Np
     if(g->conv) {
         uintptr_t key[SK_WORDS];unsigned n=0;
         key[n++]=(uintptr_t)conv->near;key[n++]=conv->near_bytes;key[n++]=(uintptr_t)conv->workspace;key[n++]=conv->workspace_bytes;
-        key[n++]=(uintptr_t)conv->par_near[0];key[n++]=(uintptr_t)conv->par_near[1];key[n++]=conv->par_near_bytes;
+        key[n++]=(uintptr_t)conv->par_near[0];key[n++]=(uintptr_t)conv->par_near[1];
+        key[n++]=(uintptr_t)conv->par_near[2];key[n++]=conv->par_near_bytes;
         key[n++]=(uintptr_t)scr;key[n++]=scrb;key[n++]=c->pool1_writable_bytes;
         for(unsigned i=0;i<7;i++){key[n++]=(uintptr_t)c->pools[i].base;key[n++]=c->pools[i].bytes;}
         while(n<SK_WORDS)key[n++]=0;
         uintptr_t kd=0;
-        for(unsigned i=0;i<SK_WORDS;i++) kd|=setup_ck.key[i]^key[i];
-        if(setup_ck.valid && !kd) {
-            ck_hit=1;g->par_slots=setup_ck.par_slots;
-            for(unsigned i=0;i<7;i++) g->pool_bytes[i]=setup_ck.pool_bytes[i];
-        } else memcpy(setup_ck.key,key,sizeof key),setup_ck.valid=0;
+        for(unsigned i=0;i<SK_WORDS;i++) kd|=ck->key[i]^key[i];
+        if(ck->valid && !kd) {
+            ck_hit=1;g->par_slots=ck->par_slots;
+            for(unsigned i=0;i<7;i++) g->pool_bytes[i]=ck->pool_bytes[i];
+        } else memcpy(ck->key,key,sizeof key),ck->valid=0;
     }
     if(!ck_hit && g->conv && g->conv->near) {
         uintptr_t n=(uintptr_t)conv->near,ne=n+conv->near_bytes,w=(uintptr_t)conv->workspace;
@@ -3957,7 +4068,7 @@ static int setup_ex(G *g, const Nprg2ExecCall *c, int dry, int measure, const Np
     /* Helper near slots: 128-byte aligned, disjoint from every pool, the
      * workspace, the call scratch, near and each other, else unused. */
     if(!ck_hit && g->conv && g->conv->near && g->conv->par_near_bytes) {
-        for(unsigned s=0;s<2;s++) {
+        for(unsigned s=0;s<3;s++) {
             uintptr_t a=(uintptr_t)conv->par_near[s],e=a+conv->par_near_bytes;
             int ok=a && !(a&127u) && e>a;
             for(unsigned i=0;ok && i<7;i++)
@@ -3965,7 +4076,10 @@ static int setup_ex(G *g, const Nprg2ExecCall *c, int dry, int measure, const Np
             if(ok && a<(uintptr_t)conv->workspace+conv->workspace_bytes && (uintptr_t)conv->workspace<e) ok=0;
             if(ok && a<(uintptr_t)conv->near+conv->near_bytes && (uintptr_t)conv->near<e) ok=0;
             if(ok && scr && scrb && a<(uintptr_t)scr+scrb && (uintptr_t)scr<e) ok=0;
-            if(ok && s && a<(uintptr_t)conv->par_near[0]+conv->par_near_bytes && (uintptr_t)conv->par_near[0]<e) ok=0;
+            for(unsigned j=0;ok && j<s;j++) {
+                uintptr_t b=(uintptr_t)conv->par_near[j],be=b+conv->par_near_bytes;
+                if(b && be>b && a<be && b<e) ok=0;
+            }
             if(!ok) break;
             g->par_slots++;
         }
@@ -3986,9 +4100,9 @@ static int setup_ex(G *g, const Nprg2ExecCall *c, int dry, int measure, const Np
         g->write_limit[i]=g->pool_bytes[i];
     }
     if(g->conv && !ck_hit) {   /* every check passed: remember the verdict (key stored above) */
-        setup_ck.par_slots=g->par_slots;
-        for(unsigned i=0;i<7;i++) setup_ck.pool_bytes[i]=g->pool_bytes[i];
-        setup_ck.valid=1;
+        ck->par_slots=g->par_slots;
+        for(unsigned i=0;i<7;i++) ck->pool_bytes[i]=g->pool_bytes[i];
+        ck->valid=1;
     }
     if(c->pool1_writable_bytes<g->write_limit[1]) g->write_limit[1]=c->pool1_writable_bytes;
     /* The constant pool is immutable model state. */
@@ -4026,11 +4140,24 @@ int nprg2_exec_reference_validate(const Nprg2ExecCall *c, void *ctx) {
 #if HMX_PROF==11
 static int nprg2_exec_reference_run_inner(const Nprg2ExecCall *c, void *ctx);
 #endif
+#ifndef QDS_REF_SPLIT_PROF
+#define QDS_REF_SPLIT_PROF 0
+#endif
+#if QDS_REF_SPLIT_PROF
+/* Diagnostic: per lane, opcode, variant: [0] setup_ex, [1] run_kernel,
+ * [2] entry -> setup (memo lookups) cycles, near-region path only. */
+uint64_t nprg2_ref_split[2][48][80][3];
+static uint64_t ref_t_entry_raw[2];
+#endif
 int nprg2_exec_reference_run(const Nprg2ExecCall *c, void *ctx) {
     G g;
     const Nprg2ReferenceConv *pc=ctx;
     uint64_t prof_t0=pc && pc->clock && pc->phase && c->command.opcode==QDR_HMX_CONV?pc->clock():0;
-    ref_t_entry=prof_t0;
+    uint32_t lane=c->execution_lane<MEMO_LANES?c->execution_lane:0u;
+    ref_t_entry[lane]=prof_t0;
+#if QDS_REF_SPLIT_PROF
+    ref_t_entry_raw[lane&1u]=nprg2_lane_clock?nprg2_lane_clock():0;
+#endif
 #if HMX_PROF==12
     /* Two extra setup() calls back to back: the first sees whatever the
      * previous command left in L1, the second is warm. Cold -> u8 output
@@ -4045,7 +4172,7 @@ int nprg2_exec_reference_run(const Nprg2ExecCall *c, void *ctx) {
         uint64_t d=prof_clock();
         if(prof_t0){prof_phase[3]+=b-a;prof_phase[7]+=d-b;}
         else {prof_phase[2]+=b-a;prof_phase[6]+=d-b;}  /* non-conv: u8/u16 setup slots */
-        ref_t_entry=d;
+        ref_t_entry[lane]=d;
     }
 #endif
 #if HMX_PROF==11
@@ -4083,9 +4210,24 @@ static int nprg2_exec_reference_run_inner(const Nprg2ExecCall *c, void *ctx) {
         if(memo && g.used<0xffffffffu) *memo=(uint32_t)g.used;
     }
     if(has_near && g.used && !((uintptr_t)nr->data&63u) && g.used+64u<=nr->bytes) {
+#if QDS_REF_SPLIT_PROF
+        uint64_t sp0=nprg2_lane_clock?nprg2_lane_clock():0;
+#endif
         if(setup_ex(&g,c,0,0,ctx,nr->data,nr->bytes)) return 0;
         if(has_near){g.lim=mlim;g.lim_ok=1;g.cm=mm;g.cm_ok=1;}
+#if QDS_REF_SPLIT_PROF
+        uint64_t sp1=nprg2_lane_clock?nprg2_lane_clock():0;
+        int ok=run_kernel(&g)==0;
+        if(sp0 && c->command.opcode<48u && c->command.variant<80u){
+            uint64_t sp2=nprg2_lane_clock();uint32_t l=lane&1u;
+            nprg2_ref_split[l][c->command.opcode][c->command.variant][0]+=sp1-sp0;
+            nprg2_ref_split[l][c->command.opcode][c->command.variant][1]+=sp2-sp1;
+            nprg2_ref_split[l][c->command.opcode][c->command.variant][2]+=sp0-ref_t_entry_raw[l];
+        }
+        return ok;
+#else
         return run_kernel(&g)==0;
+#endif
     }
     if(setup(&g,c,0,0,ctx)) return 0;
     return run_kernel(&g)==0;
@@ -4102,7 +4244,7 @@ int nprg2_exec_reference_scratch(const Nprg2ExecCall *c, uint32_t *bytes) {
     return nprg2_exec_reference_conv_measure(c,NULL,bytes,NULL);
 }
 uint32_t nprg2_exec_reference_error_line(void) {return reference_error_line;}
-uint32_t nprg2_exec_reference_conv_path(void) {return conv_path;}
+uint32_t nprg2_exec_reference_conv_path(void) {return conv_path[0];}
 
 int nprg2_executor_register_reference(Nprg2Executor *e, uint8_t opcode, uint8_t variant) {
     if(!e || !variant_matches(opcode,variant)) return NPRG2_EXEC_ARGUMENT;

@@ -60,7 +60,7 @@ typedef struct {
      * whose output rows can be split uses them with call->parallel (see
      * nprg2_parallel_parts); without them, or when a slot is not usable or
      * too small for the command, it runs on the calling thread. */
-    uint8_t *par_near[2]; uint32_t par_near_bytes;
+    uint8_t *par_near[3]; uint32_t par_near_bytes;
     /* Optional: exact HMX for eligible u8 convs (prepared_hmx_conv.inc).
      * The workspace must then be VTCM, and so must the weights' pool. */
     const struct Nprg2HmxOps *hmx;
@@ -100,6 +100,9 @@ int nprg2_executor_register_reference_conv(Nprg2Executor *executor, Nprg2Referen
  * command: call-scratch bytes, and workspace bytes (0 off the fast path). */
 int nprg2_exec_reference_conv_measure(const Nprg2ExecCall *call, const Nprg2ReferenceConv *conv,
                                       uint32_t *scratch_bytes, uint32_t *workspace_bytes);
+/* Duplicate the main preflight memo into an independent lane before threaded
+ * run lists start. Only the owner lane mutates each per-command memo afterward. */
+int nprg2_exec_reference_clone_lane(uint8_t source_lane,uint8_t destination_lane);
 /* Path the most recently measured or run convolution took: 0 reference,
  * 1 fast with the workspace only, 2 fast with near, 3 HMX (diagnostics only). */
 uint32_t nprg2_exec_reference_conv_path(void);

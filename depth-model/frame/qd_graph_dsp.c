@@ -169,8 +169,21 @@ static int send_work(uint32_t op,uint32_t sequence) {
     __asm__ volatile("barrier":::"memory");work->generation=gen;
     uint32_t e=op==1?qdrc_execute(&work->conv,(uint8_t *)work->arena,0,work->prepared_a):0;
     uint64_t end=now_ns()+4000000000ull;
-    while(work->done[1]!=gen || work->done[2]!=gen)if(now_ns()>end)return 90;
+    for(uint32_t t=1;t<QDS_WORKER_SLOTS;t++)
+        while(work->done[t]!=gen)if(now_ns()>end)return 90;
     __asm__ volatile("barrier":::"memory");return e?e:work->error;
+}
+static uint32_t send_work_start(uint32_t op,uint32_t sequence) {
+    work->op=op;work->sequence=sequence;work->error=0;
+    uint32_t gen=work->generation+1;
+    __asm__ volatile("barrier":::"memory");work->generation=gen;
+    return gen;
+}
+static int send_work_wait(uint32_t gen,uint64_t timeout_ns) {
+    uint64_t end=now_ns()+timeout_ns;
+    for(uint32_t t=1;t<QDS_WORKER_SLOTS;t++)
+        while(work->done[t]!=gen)if(now_ns()>end)return 90;
+    __asm__ volatile("barrier":::"memory");return work->error;
 }
 #if QDS_NATIVE_1X1
 #include "native_adapter/qd_native_1x1_graph_bridge.h"
@@ -458,47 +471,97 @@ static void status(uint32_t tid,uint32_t seq) {
     volatile QdStatus *st=(volatile QdStatus *)(SERVICE+128)+tid;
     st->error=st->rows=st->reserved=0;__asm__ volatile("barrier":::"memory");st->done_sequence=seq;
 }
+#if QDS_PREPARED_THREADS>1 && (NPRG2_OVERLAP || NPRG2_QNN_RUNLISTS)
+/* Follower 2 remains parked on the master generation but services one
+ * independent nested job from the background QNN list when requested. */
+static int follower_subjob(uint32_t tid,uint32_t *seen) {
+#if QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM
+    if(tid>=2 && qnn_claim_serve(tid))return 1;
+#endif
+    if(tid==2 && work->sub_generation!=*seen) {
+        __asm__ volatile("barrier":::"memory");
+        uint32_t gen=work->sub_generation,parts=work->sub_parts;
+        if(parts>1)work->sub_fn(work->sub_ctx,1,parts);
+        __asm__ volatile("barrier":::"memory");work->sub_done=gen;*seen=gen;
+        return 1;
+    }
+    if(tid==3 && work->msub_generation!=*seen) {
+        __asm__ volatile("barrier":::"memory");
+        uint32_t gen=work->msub_generation,parts=work->msub_parts;
+        if(parts>1)work->msub_fn(work->msub_ctx,1,parts);
+        __asm__ volatile("barrier":::"memory");work->msub_done=gen;*seen=gen;
+        return 1;
+    }
+    return 0;
+}
+#endif
 #if QDS_L2_CACHE && QDS_PREPARED_THREADS>1
 /* op 5 (prepared_run, L2 mode): this follower runs here on its page-7 stack
  * for the whole cache lease, touching no L2-TCM address; op 6 returns to the
  * TCM stack, whose bytes the lease saved and restored. */
 static void follower_leased(uint32_t tid) {
-    uint32_t seen=work->generation;
+    tid=qds_logical_tid(tid);
+    uint32_t seen=work->generation,sub_seen=tid==3?work->msub_generation:work->sub_generation;
     __asm__ volatile("barrier":::"memory");work->done[tid]=seen;
     for(;;) {
-        while(work->generation==seen)__asm__ volatile("pause(#32)");
+        while(work->generation==seen) {
+#if NPRG2_OVERLAP || NPRG2_QNN_RUNLISTS
+            if(!follower_subjob(tid,&sub_seen))
+#endif
+                __asm__ volatile("pause(#32)");
+        }
         __asm__ volatile("barrier":::"memory");seen=work->generation;
         uint32_t op=work->op;
         if(op==6)return;
         if(op==4 && tid<work->job_parts) {
             work->job_started[tid]++;__asm__ volatile("barrier":::"memory");
+#if QDS_PART_TIMING
+            uint64_t pt0=now_ns();
+#endif
             work->job_fn(work->job_ctx,tid,work->job_parts);
+#if QDS_PART_TIMING
+            if(nprg2_par_kind!=NPRG2_PAR_CONV)qd_part_cycles[tid]+=now_ns()-pt0;
+#endif
             __asm__ volatile("barrier":::"memory");work->job_finished[tid]++;
         }
+        if(op==8 && tid==1)work->job_fn(work->job_ctx,tid,work->job_parts);
         __asm__ volatile("barrier":::"memory");work->done[tid]=seen;
     }
 }
 #endif
 static void follower(uint32_t tid) {
-    uint32_t seen=0;
+    uint32_t logical=qds_logical_tid(tid);
+    uint32_t seen=0,sub_seen=logical==3?work->msub_generation:work->sub_generation;
     for(;;) {
-        while(work->generation==seen)__asm__ volatile("pause(#32)");
+        while(work->generation==seen) {
+#if NPRG2_OVERLAP || NPRG2_QNN_RUNLISTS
+            if(!follower_subjob(logical,&sub_seen))
+#endif
+                __asm__ volatile("pause(#32)");
+        }
         __asm__ volatile("barrier":::"memory");seen=work->generation;
         uint32_t op=work->op;
 #if QDS_L2_CACHE && QDS_PREPARED_THREADS>1
-        if(op==5 && tid && tid<3) {
-            qds_on_stack(follower_leased,tid,QDS_L2_FSTACK(tid)+0x10000u);
+        if(op==5 && logical && logical<QDS_WORKER_SLOTS) {
+            qds_on_stack(follower_leased,logical,QDS_L2_FSTACK(logical)+0x10000u);
             __asm__ volatile("barrier":::"memory");seen=work->generation; /* op 6 */
         }
 #endif
-        if(op==1){uint32_t e=qdrc_execute(&work->conv,(uint8_t *)work->arena,tid,work->prepared_a);if(e)work->error=e;}
+        if(op==1){uint32_t e=qdrc_execute(&work->conv,(uint8_t *)work->arena,logical,work->prepared_a);if(e)work->error=e;}
         if(op==2)status(tid,work->sequence);
-        if(op==4 && tid<work->job_parts) {
-            work->job_started[tid]++;__asm__ volatile("barrier":::"memory");
-            work->job_fn(work->job_ctx,tid,work->job_parts);
-            __asm__ volatile("barrier":::"memory");work->job_finished[tid]++;
+        if(op==4 && logical<work->job_parts) {
+            work->job_started[logical]++;__asm__ volatile("barrier":::"memory");
+#if QDS_PART_TIMING
+            uint64_t pt0=now_ns();
+#endif
+            work->job_fn(work->job_ctx,logical,work->job_parts);
+#if QDS_PART_TIMING
+            if(nprg2_par_kind!=NPRG2_PAR_CONV)qd_part_cycles[logical]+=now_ns()-pt0;
+#endif
+            __asm__ volatile("barrier":::"memory");work->job_finished[logical]++;
         }
-        __asm__ volatile("barrier":::"memory");work->done[tid]=seen;
+        if(op==8 && logical==1)work->job_fn(work->job_ctx,logical,work->job_parts);
+        __asm__ volatile("barrier":::"memory");work->done[logical]=seen;
         if(op==3)return;
     }
 }
@@ -622,7 +685,7 @@ __attribute__((section(".text.resident_entry"))) void resident_entry(uint32_t ti
     }
 exit:
 #if QDS_NATIVE_PREPARED
-    if(prepared){nprg2_runner_close(&prepared->runner);free(prepared);}
+    if(prepared)prepared_state_dispose(prepared);
 #endif
     send_work(3,last);
     uint32_t e=qdrc_power(0);if(e)result[1]=e;

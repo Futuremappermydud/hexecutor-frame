@@ -24,6 +24,8 @@ typedef struct {
     /* Optional profile and preflight reuse for every request (set after open). */
     Nprg2ExecProfile *profile;
     Nprg2Parallel *parallel;
+    Nprg2WeightsAsync weights_async;
+    uint8_t weights_async_ready;
     uint8_t reuse_preflight;
     /* Conv epilogue fusion plan (NULL = off), see nprg2_runner_build_fuse. */
     Nprg2FusePlan fuse_plan;
@@ -73,6 +75,33 @@ int nprg2_runner_execute(Nprg2PreparedRunner *runner,
                          Nprg2ExecCancel cancelled,void *cancel_ctx,
                          Nprg2ExecStats *stats);
 
+/* Executes one command after the caller has preflighted the full interval
+ * into `full_stats`. Intended for independent QNN lists that share one
+ * complete preflight but own distinct scratch and near regions. */
+int nprg2_runner_run_preflighted_command(Nprg2PreparedRunner *runner,
+                         const Nprg2Executor *executor,
+                         uint32_t full_first,uint32_t full_count,
+                         uint32_t pool1_writable_bytes,
+                         const Nprg2ExecBuffer *inputs,uint32_t input_count,
+                         const Nprg2ExecBuffer *outputs,uint32_t output_count,
+                         void *user,void *full_scratch,uint32_t full_scratch_bytes,
+                         Nprg2ExecStats *full_stats,uint32_t command_index,uint8_t execution_lane,
+                         Nprg2Parallel *parallel_override,
+                         void *list_scratch,uint32_t list_scratch_bytes,
+                         void *list_near,uint32_t list_near_bytes);
+int nprg2_runner_prepare_preflighted_request(Nprg2PreparedRunner *runner,
+                         const Nprg2Executor *executor,
+                         uint32_t full_first,uint32_t full_count,
+                         uint32_t pool1_writable_bytes,
+                         const Nprg2ExecBuffer *inputs,uint32_t input_count,
+                         const Nprg2ExecBuffer *outputs,uint32_t output_count,
+                         void *user,void *full_scratch,uint32_t full_scratch_bytes,
+                         Nprg2ExecStats *full_stats,uint8_t execution_lane,
+                         Nprg2Parallel *parallel_override,
+                         void *list_scratch,uint32_t list_scratch_bytes,
+                         void *list_near,uint32_t list_near_bytes,
+                         Nprg2ExecRequest *prepared_request);
+
 /* Preflights the same runner request without any graph-pool writes. Use this
  * before leasing/copying pool1 into VTCM; execute intentionally preflights
  * again after the boundary operation. */
@@ -93,6 +122,7 @@ int nprg2_runner_set_scratch_region(Nprg2PreparedRunner *runner,uint8_t region,
 
 /* Parallel hook for every later request (NULL = serial). */
 int nprg2_runner_set_parallel(Nprg2PreparedRunner *runner,Nprg2Parallel *parallel);
+int nprg2_runner_set_weights_dma_ring(Nprg2PreparedRunner *runner,Nprg2DmaRing *ring);
 
 void nprg2_runner_close(Nprg2PreparedRunner *runner);
 

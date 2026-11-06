@@ -33,6 +33,7 @@ class ResidentDSP:
         self.bootstrap=Path(bootstrap) if bootstrap else FRAME/'build/qd_graph_boot.elf'
         features=self.bootstrap.read_bytes().find(b'QDBOOT01\x01\x00\x00\x00')
         self.preserve_vtcm=features>=0
+        self.worker_tids=(0,1,2,5) if b'QDTHRD51\x01\x00\x00\x00' in self.bootstrap.read_bytes() else (0,1,2)
         self.l2_cache=b'QDL2BOOT02' in self.bootstrap.read_bytes()
         if self.l2_cache != (b'QDL2ENGN03' in self.engine.read_bytes()):
             raise ValueError('L2 cache bootstrap and engine features differ')
@@ -52,7 +53,8 @@ class ResidentDSP:
         # Before the engine writes anything: stale CDSP translations have
         # resolved chunks of this window to foreign memory.
         require_clean_map()
-        self.transport=FrameTransport(FRAME/'build/qd_loader.elf',self.bootstrap,120)
+        self.transport=FrameTransport(FRAME/'build/qd_loader.elf',self.bootstrap,120,
+                                      worker_tids=self.worker_tids)
         self.transport.__enter__()
         try:
             if int(Path('/sys/module/cdsp_mem/parameters/size_mb').read_text())!=128:raise ValueError('requires a private 128 MB cdsp_mem allocation')
@@ -90,9 +92,16 @@ class ResidentDSP:
                 # 0x07050000..0x07058000, conv near 0x07060000..0x07068000, metadata
                 # from 0x07100000.
                 # Threads: helper slots 0x07070000..0x07077e00, follower lease
-                # stacks 0x07080000..0x070a0000.
+                # stacks 0x07080000..0x070c0000 (third follower is htid5).
                 self.guards.extend(((112<<20,128),((112<<20)+0x40000,128),((112<<20)+0x58000,128),((112<<20)+0x68000,128),
-                                    ((112<<20)+0x78000,128),((112<<20)+0xa0000,128)))
+                                    ((112<<20)+0x78000,128)))
+                if len(self.worker_tids)==4:
+                    # a70c0000 is the third helper's first byte. Guard its
+                    # trailing boundary only; writing a guard at +0xc0000
+                    # would overwrite the helper scratch before every run.
+                    self.guards.append(((112<<20)+0xc3e00,128))
+                else:
+                    self.guards.append(((112<<20)+0xa0000,128))
             for off,n in self.guards:self.mem[off:off+n]=b'\xa5'*n
             t=self.transport;t.arena[:32768]=bytes(32768)
             config=[MAGIC,1,image,len(self.image),*self.pools,*self.sizes,*self.inputs,*self.input_bytes,
@@ -208,16 +217,17 @@ class ResidentDSP:
 
     @staticmethod
     def _read_parallel_profile(arena):
-        """Thread record of a QDS_PREPARED_THREADS=3 engine (arena 24640), else {}.
+        """Thread record of a prepared parallel engine (arena 24640), else {}.
         parts_run counts all executed parts; started/finished are per follower and
         must be equal after a run (a worker that never left its part shows as started>finished)."""
-        r=struct.unpack_from('<16Q',arena,24640)
+        r=struct.unpack_from('<18Q',arena,24640)
         if r[0]!=0x100000000|0x54505451:return {}
         k=('conv','ew','dm')
         return {'max_parts':int(r[1]&0xffffffff),'fault':int(r[1]>>32),'not_ready':int(r[2]),'declined':int(r[3]),
                 'jobs_parallel':dict(zip(k,map(int,r[4:7]))),'jobs_serial':dict(zip(k,map(int,r[7:10]))),
                 'parts_run':dict(zip(k,map(int,r[10:13]))),
-                'started':[int(r[13]&0xffffffff),int(r[13]>>32)],'finished':[int(r[14]&0xffffffff),int(r[14]>>32)]}
+                'started':[int(r[13]&0xffffffff),int(r[13]>>32),int(r[15])],
+                'finished':[int(r[14]&0xffffffff),int(r[14]>>32),int(r[16])]}
 
     @staticmethod
     def _read_handler_profile(arena):
@@ -249,6 +259,12 @@ class ResidentDSP:
     def close(self):
         try:
             if self.transport:
+                if 5 in self.transport.worker_tids:
+                    worker_errors=self.transport._four_worker_status_errors()
+                    if worker_errors:
+                        self.transport.retain_session(
+                            f'four-worker bootstrap failed before clean htid5 return: {worker_errors}')
+                        raise RuntimeError('four-worker bootstrap did not prove firmware callback restoration')
                 started=self.transport.persistent or self.transport.job_active or bool(self.transport.calls)
                 try:self.transport.stop_persistent()
                 except BaseException:
@@ -275,8 +291,12 @@ class ResidentDSP:
                     if (hx,hs)!=target:
                         self.transport.retain_session('VTCM snapshot fingerprint differs from host calculation')
                         raise RuntimeError('VTCM snapshot fingerprint mismatch')
-            self.exit_errors=[struct.unpack_from('<I',self.transport.arena,128+16*i+4)[0] for i in range(3)] if self.transport and self.transport.arena is not None else []
-            if any(self.exit_errors):raise RuntimeError(f'resident bootstrap/stack check failed: {self.exit_errors}')
+            self.exit_errors=[struct.unpack_from('<I',self.transport.arena,128+16*i+4)[0]
+                              for i in self.transport.worker_tids] if self.transport and self.transport.arena is not None else []
+            if any(self.exit_errors):
+                if self.transport and 5 in self.transport.worker_tids:
+                    self.transport.retain_session(f'four-worker bootstrap/stack errors: {self.exit_errors}')
+                raise RuntimeError(f'resident bootstrap/stack check failed: {self.exit_errors}')
             if self.mem:
                 self.check_guards()
                 if hasattr(self,'pools') and self.mem[self.pools[5]:self.pools[5]+len(self.constants)]!=self.constants:

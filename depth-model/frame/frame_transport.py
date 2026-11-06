@@ -77,12 +77,16 @@ def load_callback(path, base=CODE_BASE, size=CODE_BYTES):
 class FrameTransport:
     """`callback` is the fixed loader page; `payload` is the kernel it invalidates
     from the I-cache and jumps to, so payloads may change between sessions."""
-    def __init__(self, callback, payload, timeout=120, raise_clock=True, use_hmx=False):
+    def __init__(self, callback, payload, timeout=120, raise_clock=True, use_hmx=False,
+                 worker_tids=(0, 1, 2)):
         self.code, self.callback_sha256 = load_callback(callback)
         self.payload, self.payload_sha256 = load_callback(payload, PAYLOAD_BASE, PAYLOAD_BYTES)
         self.timeout = timeout
         self.raise_clock = raise_clock
         self.use_hmx=use_hmx
+        self.worker_tids=tuple(int(t) for t in worker_tids)
+        if not self.worker_tids or len(set(self.worker_tids))!=len(self.worker_tids) or any(t<0 or t>5 for t in self.worker_tids):
+            raise ValueError('invalid physical CDSP worker ids')
         self.hmx_calls=0
         self.hmx_phase_cycles=[0]*4
         from fast_depth import native_library
@@ -180,7 +184,7 @@ class FrameTransport:
 
     def workers_done(self):
         return all(STATUS.unpack_from(self.arena, STATUS_OFFSET + i * STATUS.size)[0] == self.sequence
-                   for i in range(3))
+                   for i in self.worker_tids)
 
     def __enter__(self):
         try:
@@ -327,14 +331,31 @@ class FrameTransport:
         # CTRL reaches 3 while workers may still be inside the payload, so only
         # these markers show that no worker is executing payload code.
         return all(STATUS.unpack_from(self.arena, STATUS_OFFSET + i * STATUS.size)[3] == EXITED
-                   for i in range(3))
+                   for i in self.worker_tids)
+
+    def _four_worker_status_errors(self):
+        """A failed four-worker bootstrap may have left firmware op0 changed.
+
+        In that state, releasing the callback or its arena is unsafe even when
+        every worker published an exit marker. Keep the session intact for
+        explicit recovery instead of treating status publication as proof that
+        firmware state was restored.
+        """
+        if self.arena is None or 5 not in self.worker_tids:
+            return []
+        errors = []
+        for tid in self.worker_tids:
+            sequence, error, _, _ = STATUS.unpack_from(self.arena, STATUS_OFFSET + tid * STATUS.size)
+            if sequence == self.sequence and error:
+                errors.append((tid, error))
+        return errors
 
     def _persistent_done(self):
         if self.workers_done():
             return True
         if self.workers_exited():
             markers = [STATUS.unpack_from(self.arena, STATUS_OFFSET + i * STATUS.size)
-                       for i in range(3)]
+                       for i in self.worker_tids]
             command = struct.unpack_from('<9I', self.arena, 0)
             control = (self.get(CTRL), self.get(CTRL + 4), self.get(CTRL + 8))
             raise RuntimeError(f'DSP workers exited before command {self.sequence}: '
@@ -457,6 +478,15 @@ class FrameTransport:
                 self.lock.close(); self.lock = None
 
     def _close(self):
+        # A four-worker bootstrap can temporarily change firmware's generic
+        # callback selector while bringing htid5 online. If any worker reports
+        # bootstrap/stack/restore failure, do not send EXIT, release CTRL, or
+        # restore callback memory: the selector may still be in its temporary
+        # state, or htid5 may have arrived late.
+        boot_errors = self._four_worker_status_errors()
+        if boot_errors:
+            self.retain_session(f'four-worker bootstrap did not restore cleanly: {boot_errors}')
+
         # Do not send an EXIT or touch session memory if control is active but
         # this host has no owned dispatch in progress.
         if self.mem is not None and not self.job_active and not self._retain_reason:
@@ -470,6 +500,8 @@ class FrameTransport:
             except TimeoutError:
                 # job_active stays set, so nothing below restores code or gaze.
                 print('Persistent DSP workers did not exit. Callback/arena retained; eye client was not restarted.', flush=True)
+                if 5 in self.worker_tids:
+                    self.retain_session('four-worker callback/arena retained after worker shutdown timeout')
                 self._stuck = True
         if self.arena is not None and self.registered and self.get(WORK+24)==CODE_BASE:
             axim=struct.unpack_from('<I',self.arena,256)[0]
@@ -518,6 +550,8 @@ class FrameTransport:
                 safe = True
             except TimeoutError:
                 print('DSP workers have not quiesced. Callback/arena retained; eye client was not restarted.', flush=True)
+                if 5 in self.worker_tids:
+                    self.retain_session('four-worker callback/arena retained while htid5 may still be active')
         if self.mem is not None and self.installed and safe and self._control() == (1, 0, 1):
             if self.registered:
                 self.put(WORK + 24, 0)

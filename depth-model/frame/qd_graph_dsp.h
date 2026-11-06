@@ -17,6 +17,45 @@
 #define QDS_PROFILE 16384u
 /* Prepared per-handler profile, see prepared_export_profile (qd_graph_prepared.h). */
 #define QDS_PROFILE2 20480u
+#ifndef QDS_PREPARED_THREADS
+#define QDS_PREPARED_THREADS 1
+#endif
+/* The existing callback wakes physical hthreads 0, 1, and 2. In the opt-in
+ * four-worker experiment htid5 is explicitly resumed by the master; htid3 is
+ * the firmware manager and htid4 owns CPU/IPCC servicing. Keep engine work
+ * indices dense even though the fourth physical id is sparse. */
+#if QDS_PREPARED_THREADS == 4
+#define QDS_WORKER_SLOTS 4u
+static inline uint32_t qds_logical_tid(uint32_t tid) { return tid==5u?3u:tid; }
+static inline uint32_t qds_physical_tid(uint32_t logical) { return logical==3u?5u:logical; }
+#else
+#define QDS_WORKER_SLOTS 3u
+static inline uint32_t qds_logical_tid(uint32_t tid) { return tid; }
+static inline uint32_t qds_physical_tid(uint32_t logical) { return logical; }
+#endif
+#define QDS_HTID5_STACK_BOTTOM 0xa70a0000u
+#define QDS_HTID5_STACK_TOP    0xa70b0000u
+#define QDS_HTID5_HVX_STATE    0xa70d0000u
+#define QDS_HTID5_HVX_STATE_BYTES 0x1200u
+#ifndef QDS_PREPARED_DMA_ASYNC
+#define QDS_PREPARED_DMA_ASYNC 0
+#endif
+#ifndef QDS_PREPARED_DMA_VERIFY
+#define QDS_PREPARED_DMA_VERIFY 0
+#endif
+#ifndef QDS_PREPARED_DMA_MAX_TRANSFERS
+#define QDS_PREPARED_DMA_MAX_TRANSFERS 0u
+#endif
+#ifndef QDS_PREPARED_DMA_MODE
+#define QDS_PREPARED_DMA_MODE 0u
+#endif
+#define QDS_DMA_VERIFY_DIAG_OFFSET 1152u
+#define QDS_DMA_DESC_BASE 0xf1808000u
+#define QDS_DMA_STATE_OFFSET 0x3f00u
+#define QDS_DMA_STATE_IDLE 0u
+#define QDS_DMA_STATE_INFLIGHT 1u
+#define QDS_DMA_STATE_PENDING_ERROR 101u
+#define QDS_DMA_PENDING_ERROR 101u
 #define QDS_OP_RUN 3u
 typedef struct {
     uint32_t magic,version,image,image_bytes,pool[7],pool_bytes[7];
@@ -48,14 +87,28 @@ static uint32_t qds_config_valid(const QdsConfig *c) {
     return 1;
 }
 typedef void (*QdsJobFn)(void *ctx,uint32_t part,uint32_t parts);
+#ifndef NPRG2_QNN_RUNLISTS
+#define NPRG2_QNN_RUNLISTS 0
+#endif
+#ifndef NPRG2_OVERLAP
+#define NPRG2_OVERLAP 0
+#endif
 typedef struct {
-    volatile uint32_t generation,op,sequence,error,done[3];
+    volatile uint32_t generation,op,sequence,error,done[QDS_WORKER_SLOTS];
     uint32_t arena,prepared_a;
     QdConv conv;
     /* op 4 (prepared threads): followers with tid < job_parts run
      * job_fn(job_ctx,tid,job_parts). job_started/finished count per follower
      * (index tid) and let the host see a worker that never came back. */
-    QdsJobFn job_fn;void *job_ctx;volatile uint32_t job_parts,job_started[3],job_finished[3];
+    QdsJobFn job_fn;void *job_ctx;volatile uint32_t job_parts,job_started[QDS_WORKER_SLOTS],job_finished[QDS_WORKER_SLOTS];
+    /* Dedicated follower-2 mailbox for a nested background list kernel
+     * (used with NPRG2_OVERLAP / NPRG2_QNN_RUNLISTS; idle otherwise). */
+    volatile uint32_t sub_generation,sub_done;
+    QdsJobFn sub_fn;void *sub_ctx;volatile uint32_t sub_parts;
+    /* Second mailbox, served by logical worker 3 (physical HT5): nested
+     * parts of the QNN main list (QDS_PREPARED_THREADS=4). */
+    volatile uint32_t msub_generation,msub_done;
+    QdsJobFn msub_fn;void *msub_ctx;volatile uint32_t msub_parts;
 } QdsWork;
 /* QdsWork owns 0x300f0000..0x300f0200; 0x300f0200.. is the prepared helper
  * slots' (qd_graph_prepared.h). */

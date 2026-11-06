@@ -1,5 +1,6 @@
 #include "prepared_executor.h"
 #include "prepared_vcopy.h"
+#include "prepared_cost_volume_approx.h"
 
 #include <limits.h>
 #include <stddef.h>
@@ -16,6 +17,33 @@ static int handler_index(const Nprg2Executor *e,uint8_t op,uint8_t variant){
         const Nprg2ExecHandler *h=&e->handlers[at];if(!h->used)return -1;if(h->opcode==op&&h->variant==variant)return (int)at;
     }
     return -1;
+}
+
+static int approx_cv_skip(const Nprg2ExecRequest *r,uint16_t sequence){
+#if NPRG2_APPROX_COST_VOLUME_STEP == 2 || NPRG2_APPROX_COST_VOLUME_STEP == 4 || NPRG2_APPROX_COST_VOLUME_STEP == 8
+    if(r && nprg2_approx_cv_primary_program(r->program)){
+        return nprg2_approx_cv_primary_skip_seq(sequence);
+    }
+#else
+    (void)r;(void)sequence;
+#endif
+    return 0;
+}
+static int approx_cv_concat_target(const Nprg2ExecRequest *r,const Nprg2Command *command){
+#if NPRG2_APPROX_COST_VOLUME_STEP == 2 || NPRG2_APPROX_COST_VOLUME_STEP == 4 || NPRG2_APPROX_COST_VOLUME_STEP == 8
+    if(!r || !command || command->opcode!=QDR_CONCAT || command->output_count!=1 ||
+       !nprg2_approx_cv_primary_program(r->program))return 0;
+    Nprg2ExecCall call={0};Nprg2TensorView view;uint32_t tensor_index;
+    call.program=r->program;call.bound=r->bound;call.command=*command;
+    if(nprg2_exec_output(&call,0,&tensor_index,&view)!=NPRG2_EXEC_OK || !view.geometry_record)return 0;
+    const uint8_t *g=view.geometry_record;
+    return g[0]==1u && (int16_t)(g[6]|(uint16_t)g[7]<<8)==1 &&
+           (int16_t)(g[8]|(uint16_t)g[9]<<8)==80 &&
+           (int16_t)(g[10]|(uint16_t)g[11]<<8)==64 &&
+           (int16_t)(g[12]|(uint16_t)g[13]<<8)==64;
+#else
+    (void)r;(void)command;return 0;
+#endif
 }
 
 int nprg2_executor_register(Nprg2Executor *e,uint8_t op,uint8_t variant,
@@ -44,6 +72,7 @@ int nprg2_executor_register_scratch_region(Nprg2Executor *e,uint8_t op,uint8_t v
     return NPRG2_EXEC_REGISTRY_FULL;
 }
 
+int nprg2_executor_handler_slot(const Nprg2Executor *e,uint8_t op,uint8_t variant){return e?handler_index(e,op,variant):-1;}
 int nprg2_executor_set_fuse(Nprg2Executor *e,uint8_t op,uint8_t variant,Nprg2ExecFuse fuse){
     if(!e)return NPRG2_EXEC_ARGUMENT;int hi=handler_index(e,op,variant);if(hi<0)return NPRG2_EXEC_UNSUPPORTED;
     e->handlers[hi].fuse=fuse;return NPRG2_EXEC_OK;
@@ -78,10 +107,11 @@ static void fill_call(const Nprg2ExecRequest *r,uint32_t index,Nprg2ExecCall *ca
     call->command_index=index;call->program=r->program;call->bound=r->bound;
     call->pools=r->pools;call->pool1_writable_bytes=r->pool1_writable_bytes;
     call->inputs=r->inputs;call->input_count=r->input_count;call->outputs=r->outputs;call->output_count=r->output_count;
-    call->user=r->user;call->scratch=r->scratch;call->scratch_bytes=r->scratch_bytes;
+    call->user=r->user;call->weights_async=r->weights_async;call->scratch=r->scratch;call->scratch_bytes=r->scratch_bytes;
     call->scratch_region[0]=(Nprg2ExecBuffer){(uint8_t *)r->scratch,r->scratch_bytes};
     for(uint32_t k=1;k<NPRG2_EXEC_SCRATCH_REGIONS;k++)call->scratch_region[k]=r->extra_scratch[k-1u];
-    call->preflighted=0;call->parallel=r->parallel;call->epilogue=NULL;call->epilogue_dead=0;
+    call->preflighted=0;call->execution_lane=r->execution_lane;
+    call->parallel=r->parallel;call->epilogue=NULL;call->epilogue_dead=0;
 }
 /* The plan pair this command is the conv of, for a request whose interval
  * contains both commands; NULL otherwise. */
@@ -123,6 +153,12 @@ static int no_graph_alias(const Nprg2Executor *e,const Nprg2ExecRequest *r,const
 }
 static int request_valid(const Nprg2Executor *e,const Nprg2ExecRequest *r){
     if(!r||!r->program||!r->bound||!r->bound->ready)return 0;
+    if(r->weights_async){
+        const Nprg2WeightsAsync *a=r->weights_async;
+        if(a->command_count!=r->program->command_count||!a->timeout_cycles)return 0;
+        if(a->ring_mode){if(!a->ring||a->first_hazard)return 0;}
+        else if(!a->first_hazard||!a->start||!a->drain)return 0;
+    }
     if(r->command_first>r->program->command_count||r->command_count>r->program->command_count-r->command_first)return 0;
     if(!pools_match(r->program,r->pools))return 0;
     if(!r->pool1_writable_bytes||r->pool1_writable_bytes>r->pools[1].bytes)return 0;
@@ -173,7 +209,12 @@ static uint64_t request_signature(const Nprg2Executor *e,const Nprg2ExecRequest 
         h=sig_mix(h,b->hot_bytes);
     }
     for(unsigned i=0;i<7;i++){h=sig_mix(h,(uintptr_t)r->pools[i].base);h=sig_mix(h,r->pools[i].bytes);}
-    h=sig_mix(h,r->pool1_writable_bytes);h=sig_mix(h,(uintptr_t)r->user);
+    h=sig_mix(h,r->pool1_writable_bytes);h=sig_mix(h,(uintptr_t)r->user);h=sig_mix(h,r->execution_lane);
+    if(r->weights_async){const Nprg2WeightsAsync *a=r->weights_async;
+        h=sig_mix(h,(uintptr_t)a);h=sig_mix(h,(uintptr_t)a->first_hazard);h=sig_mix(h,a->command_count);
+        h=sig_mix(h,(uintptr_t)a->start);h=sig_mix(h,(uintptr_t)a->drain);h=sig_mix(h,(uintptr_t)a->ring);h=sig_mix(h,a->ring_mode);
+        h=sig_mix(h,(uintptr_t)a->ctx);h=sig_mix(h,a->timeout_cycles);
+    }else h=sig_mix(h,0);
     h=sig_mix(h,(uintptr_t)r->scratch);h=sig_mix(h,r->scratch_bytes);
     for(unsigned k=0;k+1u<NPRG2_EXEC_SCRATCH_REGIONS;k++){h=sig_mix(h,(uintptr_t)r->extra_scratch[k].data);h=sig_mix(h,r->extra_scratch[k].bytes);}
     h=sig_mix(h,(uintptr_t)r->inputs);h=sig_mix(h,r->input_count);h=sig_mix(h,(uintptr_t)r->outputs);h=sig_mix(h,r->output_count);
@@ -187,6 +228,32 @@ static uint64_t request_signature(const Nprg2Executor *e,const Nprg2ExecRequest 
         h=sig_mix(h,((uint64_t)x->scratch_bytes<<32)|x->concurrent_worker_scratch_bytes);
     }
     return h|1u;
+}
+int nprg2_exec_weights_async_try(const Nprg2ExecCall *c,void *dst,const void *src,size_t bytes){
+    if(!c||!c->weights_async||!c->weights_async->ring_mode||!c->weights_async->ring)return 0;
+    /* The platform descriptor ring has one owner: the master/list-zero lane. */
+    if(c->execution_lane!=0u)return 0;
+    Nprg2WeightsAsync *a=c->weights_async;
+    int queued=nprg2_dma_ring_enqueue(a->ring,dst,src,bytes);
+    if(queued>0){a->starts++;return 1;}
+    if(queued<0){a->failures++;return -1;}
+    a->cpu_fallbacks++;return 0;
+}
+int nprg2_exec_weights_dma_checkpoint_set(Nprg2WeightsAsync *a,uint32_t event_id){
+    if(!a||!a->ring_mode||!a->ring)return NPRG2_EXEC_ARGUMENT;
+    return nprg2_dma_ring_checkpoint_set(a->ring,event_id)?NPRG2_EXEC_OK:NPRG2_EXEC_HANDLER_ERROR;
+}
+int nprg2_exec_weights_dma_checkpoint_wait(Nprg2WeightsAsync *a,uint32_t event_id){
+    if(!a||!a->ring_mode||!a->ring)return NPRG2_EXEC_ARGUMENT;
+    return nprg2_dma_ring_checkpoint_wait(a->ring,event_id)?NPRG2_EXEC_OK:NPRG2_EXEC_HANDLER_ERROR;
+}
+int nprg2_exec_weights_dma_drain_all(Nprg2WeightsAsync *a){
+    if(!a||!a->ring_mode||!a->ring)return NPRG2_EXEC_ARGUMENT;
+    int d=nprg2_dma_ring_drain_all(a->ring);
+    if(!d){a->failures++;return NPRG2_EXEC_HANDLER_ERROR;}
+    a->drains++;
+    if(d<0){a->failures++;return NPRG2_EXEC_HANDLER_ERROR;}
+    return NPRG2_EXEC_OK;
 }
 /* Digest of the contents every validator reads through the program and the
  * bound tables (geometry, tensor, command, refs, vectors, calls, and the
@@ -335,6 +402,11 @@ static int run_list(const Nprg2Executor *e,const Nprg2ExecRequest *r,Nprg2ExecSt
         s->executed_commands=ix-first;
         if(nprg2_command_at(r->bound,ix,&call.command)!=NPRG2_OK)return NPRG2_EXEC_REJECTED;
         if(r->cancelled&&r->cancelled(r->cancel_ctx,ix)){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_CANCELLED;}
+        if(approx_cv_skip(r,call.command.sequence)){
+            s->approx_cost_volume_commands++;
+            if(call.command.opcode==QDR_HMX_CONV)s->approx_cost_volume_conv_planes++;
+            continue;
+        }
         const uint32_t hi=rec->hi;const Nprg2ExecHandler *h=&e->handlers[hi];
         if(rec->fl&NPRG2_RUN_SKIP){   /* done by the conv's fused output step */
             if(pr&&pr->handler_run_count)pr->handler_run_count[hi]++;
@@ -356,6 +428,7 @@ static int run_list(const Nprg2Executor *e,const Nprg2ExecRequest *r,Nprg2ExecSt
         uint64_t t0=pr?pr->clock():0;
         if(pr)pr->dispatch_cycles+=t0-prev;
         if(!h->run(&call,h->ctx)){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_HANDLER_ERROR;}
+        if(approx_cv_concat_target(r,&call.command))s->approx_cost_volume_interpolated_planes=NPRG2_APPROX_CV_INTERPOLATED_PLANES;
         if(pr){
             prev=pr->clock();uint64_t d=prev-t0;pr->run_cycles+=d;
             if(timed){pr->variant_cycles[v]+=d;pr->variant_count[v]++;}
@@ -385,6 +458,7 @@ int nprg2_executor_run(const Nprg2Executor *e,const Nprg2ExecRequest *r){
         if(r->stats)r->stats->digest_fresh=0;
     }
     Nprg2ExecStats *s=r->stats?r->stats:&nostats;
+    s->approx_cost_volume_commands=0;s->approx_cost_volume_conv_planes=0;s->approx_cost_volume_interpolated_planes=0;
     const int strip=r->stats&&s->strip_valid;
     if(strip&&pr&&pr->handler_run_count)for(uint32_t k=0;k<NPRG2_EXEC_REGISTRY_CAPACITY;k++)pr->handler_run_count[k]+=s->stripped_by_slot[k];
     uint64_t prev=pr?pr->clock():0;
@@ -394,6 +468,11 @@ int nprg2_executor_run(const Nprg2Executor *e,const Nprg2ExecRequest *r){
         if(strip&&!(s->effect_bits[ix>>5]>>(ix&31u)&1u)){s->executed_commands++;continue;}
         if(nprg2_command_at(r->bound,ix,&call.command)!=NPRG2_OK)return NPRG2_EXEC_REJECTED;
         if(r->cancelled&&r->cancelled(r->cancel_ctx,ix)){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_CANCELLED;}
+        if(approx_cv_skip(r,call.command.sequence)){
+            s->approx_cost_volume_commands++;
+            if(call.command.opcode==QDR_HMX_CONV)s->approx_cost_volume_conv_planes++;
+            s->executed_commands++;continue;
+        }
         int hi=handler_index(e,call.command.opcode,call.command.variant);if(hi<0)return NPRG2_EXEC_UNSUPPORTED;
         const Nprg2ExecHandler *h=&e->handlers[hi];
         {
@@ -420,6 +499,7 @@ int nprg2_executor_run(const Nprg2Executor *e,const Nprg2ExecRequest *r){
         uint64_t t0=pr?pr->clock():0;
         if(pr)pr->dispatch_cycles+=t0-prev;
         if(!h->run(&call,h->ctx)){s->failed_command=ix;s->failed_opcode=call.command.opcode;s->failed_variant=call.command.variant;return NPRG2_EXEC_HANDLER_ERROR;}
+        if(approx_cv_concat_target(r,&call.command))s->approx_cost_volume_interpolated_planes=NPRG2_APPROX_CV_INTERPOLATED_PLANES;
         if(pr){
             prev=pr->clock();uint64_t d=prev-t0;pr->run_cycles+=d;
             if(timed){pr->variant_cycles[v]+=d;pr->variant_count[v]++;}
@@ -430,6 +510,68 @@ int nprg2_executor_run(const Nprg2Executor *e,const Nprg2ExecRequest *r){
     }
     if(pr)pr->dispatch_cycles+=pr->clock()-prev;
     return NPRG2_EXEC_OK;
+}
+
+int nprg2_executor_run_preflighted_command(const Nprg2Executor *e,
+                                           const Nprg2ExecRequest *full,
+                                           uint32_t ix,uint8_t execution_lane,
+                                           Nprg2Parallel *parallel_override,
+                                           void *scratch,uint32_t scratch_bytes,
+                                           void *near_scratch,uint32_t near_scratch_bytes) {
+    Nprg2ExecRequest prepared;
+    int rc=nprg2_executor_prepare_preflighted_request(e,full,execution_lane,
+        parallel_override,scratch,scratch_bytes,near_scratch,near_scratch_bytes,&prepared);
+    return rc?rc:nprg2_executor_run_preflighted_command_prepared(e,&prepared,ix);
+}
+
+int nprg2_executor_prepare_preflighted_request(const Nprg2Executor *e,
+                                               const Nprg2ExecRequest *full,
+                                               uint8_t execution_lane,
+                                               Nprg2Parallel *parallel_override,
+                                               void *scratch,uint32_t scratch_bytes,
+                                               void *near_scratch,uint32_t near_scratch_bytes,
+                                               Nprg2ExecRequest *prepared) {
+    if(!e || !full || !full->stats || full->fuse ||
+       !full->stats->runs_valid || !full->stats->strip_valid ||
+       full->stats->failed_command!=UINT32_MAX ||
+       full->stats->validated_commands!=full->command_count ||
+       !prepared ||
+       (scratch_bytes&&!scratch) || (near_scratch_bytes&&!near_scratch)) return NPRG2_EXEC_ARGUMENT;
+    Nprg2ExecRequest local=*full;
+    local.scratch=scratch;local.scratch_bytes=scratch_bytes;
+    local.extra_scratch[0]=(Nprg2ExecBuffer){near_scratch,near_scratch_bytes};
+    local.parallel=parallel_override;local.profile=NULL;local.execution_lane=execution_lane;
+    /* Check caller-owned per-list arenas separately from the immutable
+     * full-request preflight. The graph/pool mappings and command contents
+     * remain covered by that preflight. */
+    if(!request_valid(e,&local))return NPRG2_EXEC_ARGUMENT;
+    *prepared=local;
+    return NPRG2_EXEC_OK;
+}
+
+uint64_t (*nprg2_lane_clock)(void);
+uint64_t nprg2_lane_prehandler[2];
+int nprg2_executor_run_preflighted_command_prepared(const Nprg2Executor *e,
+                                                     const Nprg2ExecRequest *full,
+                                                     uint32_t ix) {
+    if(!e || !full || !full->stats || full->fuse ||
+       !full->stats->runs_valid || !full->stats->strip_valid ||
+       full->stats->failed_command!=UINT32_MAX ||
+       full->stats->validated_commands!=full->command_count ||
+       ix<full->command_first || ix-full->command_first>=full->command_count)
+        return NPRG2_EXEC_ARGUMENT;
+    Nprg2ExecCall call;
+    if(nprg2_command_at(full->bound,ix,&call.command)!=NPRG2_OK)return NPRG2_EXEC_REJECTED;
+    fill_call(full,ix,&call);call.preflighted=1;
+    int hi=handler_index(e,call.command.opcode,call.command.variant);
+    if(hi<0)return NPRG2_EXEC_UNSUPPORTED;
+    const Nprg2ExecHandler *h=&e->handlers[hi];select_scratch(&call,h);
+    if(h->scratch_bytes>UINT32_MAX-h->concurrent_worker_scratch_bytes ||
+       h->scratch_bytes+h->concurrent_worker_scratch_bytes>call.scratch_bytes)return NPRG2_EXEC_REJECTED;
+    if(full->cancelled && full->cancelled(full->cancel_ctx,ix))return NPRG2_EXEC_CANCELLED;
+    if(nprg2_lane_clock && full->execution_lane<2u)nprg2_lane_prehandler[full->execution_lane]+=nprg2_lane_clock();
+    if(h->no_effect)return NPRG2_EXEC_OK;
+    return h->run(&call,h->ctx)?NPRG2_EXEC_OK:NPRG2_EXEC_HANDLER_ERROR;
 }
 
 static uint32_t dtype_bytes(uint8_t d){static const uint8_t sizes[8]={0,1,1,2,2,4,4,4};return d<8?sizes[d]:0;}
@@ -458,6 +600,8 @@ int nprg2_exec_weights_run(const Nprg2ExecCall *c,void *ctx){
     (void)ctx;if(!nprg2_exec_weights_validate(c,NULL))return 0;uint32_t si,di;Nprg2TensorView s,d;
     if(nprg2_exec_input(c,0,&si,&s)||nprg2_exec_output(c,0,&di,&d))return 0;
     uint32_t sb=max_shape_bytes(s.geometry_record),db=max_shape_bytes(d.geometry_record),n=sb<db?sb:db;
+    int queued=nprg2_exec_weights_async_try(c,c->pools[d.pool].base+d.offset,c->pools[s.pool].base+s.offset,n);
+    if(queued>0)return 1;if(queued<0)return 0;
     qd_vcopy(c->pools[d.pool].base+d.offset,c->pools[s.pool].base+s.offset,n);return 1;
 }
 int nprg2_executor_register_weights(Nprg2Executor *e){
@@ -467,6 +611,7 @@ int nprg2_executor_register_weights(Nprg2Executor *e){
 }
 
 /* ---------------------------------------------------------------- parallel */
+volatile uint32_t nprg2_par_kind;
 uint32_t nprg2_parallel_parts(Nprg2Parallel *p, uint32_t want) {
     if(!p || p->max_parts<2 || want<2) return 1;
     if(p->ready && !p->ready(p->impl)) { p->not_ready++; return 1; }
@@ -475,6 +620,7 @@ uint32_t nprg2_parallel_parts(Nprg2Parallel *p, uint32_t want) {
 void nprg2_parallel_for(Nprg2Parallel *p, uint32_t kind, uint32_t parts, Nprg2ParallelFn fn, void *ctx) {
     if(kind>=NPRG2_PAR_KINDS) kind=0;
     if(parts<2 || !p) { fn(ctx,0,parts<1?1:parts); return; }
+    nprg2_par_kind=kind;
     if(p->run) {
         if(p->run(p->impl,parts,fn,ctx)) { p->jobs_parallel[kind]++; p->parts_run[kind]+=parts; return; }
         p->declined++;

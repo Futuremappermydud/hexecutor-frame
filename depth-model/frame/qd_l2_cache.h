@@ -36,9 +36,14 @@
 #define QDS_L2_HOT_BYTES   0x3a000u
 #define QDS_L2_STACK_BASE  0x3003c000u
 #define QDS_L2_STACK_TOP   0x3004c000u
+#if QDS_PREPARED_THREADS==4
+#define QDS_L2_FSTACK(tid) ((tid)==3u?0xa70b0000u:(0x3004c000u+((tid)-1u)*0x10000u))
+#else
 #define QDS_L2_FSTACK(tid) (0x3004c000u+((tid)-1u)*0x10000u)
+#endif
 #define QDS_L2_PAR_0       0x3006c000u
 #define QDS_L2_PAR_1       0x30070000u
+#define QDS_L2_PAR_2       0xa70c0000u
 #define QDS_L2_LIVE_SKIP   0x3003c000u
 #define QDS_L2_LIVE_SKIP_END 0x3006c000u
 #define QDS_L2_WORK_SKIP   0x30074000u
@@ -52,7 +57,12 @@
  * lease stacks (64 KiB each, bottom 128 B guarded by the engine) on page 7. */
 #define QDS_L2_PAR_0       0xa7070000u
 #define QDS_L2_PAR_1       0xa7074000u
+#if QDS_PREPARED_THREADS==4
+#define QDS_L2_FSTACK(tid) ((tid)==3u?0xa70b0000u:(0xa7080000u+((tid)-1u)*0x10000u))
+#else
 #define QDS_L2_FSTACK(tid) (0xa7080000u+((tid)-1u)*0x10000u)
+#endif
+#define QDS_L2_PAR_2       0xa70c0000u
 #endif
 #define QDS_L2_BACKUP      0xf1c00000u
 #define QDS_L2_TCM         0x30000000u

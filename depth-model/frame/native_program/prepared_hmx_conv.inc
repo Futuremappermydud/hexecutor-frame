@@ -178,14 +178,21 @@ static void hmx_tile(const HmxJob *J, int32_t t, int32_t k) {
     if(J->xtab && x+32<=J->ow && P+32<=total) {
         int32_t col0=xt->p[2]+x+(int32_t)kx,s=col0&7;
         uint8_t *const *row=J->xtab+(uint32_t)((((y+(int32_t)ky)*J->xnwb)+(col0>>3)-J->xwb0)*J->cbs+(int32_t)cb);
-        HVX_Vector V[10],zero=Q6_V_vzero();
-        for(int i=0;i<5;i++) {
-            const uint8_t *b=i<4 || s?row[i*J->cbs]:NULL;
-            V[2*i]=b?((const HVX_Vector *)b)[0]:zero;V[2*i+1]=b?((const HVX_Vector *)b)[1]:zero;
-        }
+        /* Stream vectors: dynamic indexing of V[10] materialized a 1280-byte
+         * array on the stack in the V75 build. Keep only adjacent vectors. */
+        HVX_Vector zero=Q6_V_vzero();
+        const int first=s>>2,sh=(s&3)*32;
+        const uint8_t *bp=row[(first>>1)*J->cbs];
+        HVX_Vector cur=bp?((const HVX_Vector *)bp)[first&1]:zero;
         for(int q=0;q<8;q++) {
-            int i=q+(s>>2),sh=(s&3)*32;
-            HVX_Vector v=sh?Q6_V_valign_VVR(V[i+1],V[i],sh):V[i];
+            HVX_Vector v=cur;
+            if(sh || q<7) {
+                int i=first+q+1;
+                const uint8_t *next=row[(i>>1)*J->cbs];
+                HVX_Vector hi=next?((const HVX_Vector *)next)[i&1]:zero;
+                if(sh) v=Q6_V_valign_VVR(hi,cur,sh);
+                cur=hi;
+            }
             HVX_VectorPair w=Q6_W_vshuff_VVR(v,zero,-1);
             ((HVX_Vector *)dst)[2*q]=Q6_Vh_vshuff_Vh(Q6_V_lo_W(w));
             ((HVX_Vector *)dst)[2*q+1]=Q6_Vh_vshuff_Vh(Q6_V_hi_W(w));
@@ -641,7 +648,7 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
     g->wused=0;
     uint8_t *ws=walloc(g,need);
     if(!ws){*err=E_MEMORY;return -1;}
-    conv_path=5;
+    conv_path[g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u]=5;
     if(g->fx.kind) g->fx_ok=1;
     if(g->dry) return 1;
 #ifdef SLIDE_LIMIT
@@ -748,7 +755,7 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
         int32_t y=0,x=0;
         for(int32_t t=0;t<total;t++){tyx[2*t]=y;tyx[2*t+1]=x;if(++x==bw){x=0;y++;}}
         NatJob J={.g=g,.xt=xt,.o=o,.fx=g->fx.kind?&g->fx:NULL,.KB=KB,.NB=NB,.cbs=cbs,.bw=bw,.mt=total,.C=C,.tyx=tyx};
-        uint32_t parts=nprg2_parallel_parts(g->call->parallel,3);
+        uint32_t parts=nprg2_parallel_parts(g->call->parallel,NPRG2_PAR_MAX_PARTS);
         if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,nat_fx_part,&J);
         else nat_fx_part(&J,0,1);
         if(clock){t1=clock();c->phase[3]+=t1-t0;t0=t1;}
@@ -812,7 +819,7 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
     g->wused=0;
     uint8_t *ws=walloc(g,fixed+bsz+2048+(size_t)mt*per+2048);
     if(!ws){*err=E_MEMORY;return -1;}
-    conv_path=4;
+    conv_path[g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u]=4;
     if(fused) g->fx_ok=1;
 #ifdef CONV_SHAPES
     if(!g->dry) fprintf(stderr,"NATCONV var=%u KB=%d NB=%d oh=%d ow=%d tiles=%d mt=%d fused=%d staged=%d bcopy=%d\n",g->variant,KB,NB,oh,ow,total,mt,fused,staged,bcopy);
@@ -842,7 +849,7 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
     NatJob J={.g=g,.xt=xt,.o=o,.fx=fused?&g->fx:NULL,.KB=KB,.NB=NB,.cbs=cbs,.bw=bw,.xwb0=xwb0,.xnwb=xnwb,
               .ktab=ktab,.xtab=xtab,.A=A,.C=staged?C:NULL,.tyx=tyx,.pre=pre,.Mq=Mq,.corr=corr,.B=(const uint8_t *)wbase,
               .one=one,.R0=xt->p[1]>>3,.C0=xt->p[2]>>3,.xnbw=((int64_t)xt->m[2]+7)/8,.xnbd=((int64_t)xt->m[3]+31)/32};
-    uint32_t parts=nprg2_parallel_parts(g->call->parallel,3);
+    uint32_t parts=nprg2_parallel_parts(g->call->parallel,NPRG2_PAR_MAX_PARTS);
     uint32_t saved=c->hmx->enter?c->hmx->enter():0;
     int e=0;
     int32_t by=0,bx=0;
@@ -918,7 +925,8 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     const Nprg2ReferenceConv *c=g->conv;
     uint64_t (*clock)(void)=c->phase && !g->dry?c->clock:NULL,t0=clock?clock():0,t1;
 #if HMX_PROF==5
-    if(clock && hmx_t_entry && hmx_t_entry<=t0) c->phase[3]+=t0-hmx_t_entry;
+    uint32_t lane=g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u;
+    if(clock && hmx_t_entry[lane] && hmx_t_entry[lane]<=t0) c->phase[3]+=t0-hmx_t_entry[lane];
 #endif
     if(!c->hmx || !c->near || ((uintptr_t)c->near&127u)) return 0;
     /* A fused epilogue must cover exactly the region the conv writes. */
@@ -1137,7 +1145,7 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     g->wused=0;
     uint8_t *ws=walloc(g,fixed+bsz+(size_t)mt*per+2048);
     if(!ws){*err=E_MEMORY;return -1;}
-    conv_path=3;
+    conv_path[g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u]=3;
     if(g->fx.kind) g->fx_ok=1;
 #ifdef CONV_SHAPES
     if(!g->dry) fprintf(stderr,"HMXCONV var=%u k=%dx%d ci=%d co=%d oh=%d ow=%d KB=%d NB=%d tiles=%d mt=%d packed=%d\n",
@@ -1188,7 +1196,7 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
               .ktab=ktab,.corr=corr,.pre=pre,.Mq=Mq,.multv=(const uint8_t *)mv,.rndv=(const uint8_t *)rv,.fx=g->fx.kind?&g->fx:NULL,
               .xnbw=((int64_t)xt->m[2]+7)/8,.xnbd=((int64_t)xt->m[3]+31)/32,
               .onbw=((int64_t)o->m[2]+7)/8,.onbd=((int64_t)o->m[3]+31)/32};
-    uint32_t parts=nprg2_parallel_parts(g->call->parallel,3);
+    uint32_t parts=nprg2_parallel_parts(g->call->parallel,NPRG2_PAR_MAX_PARTS);
     uint32_t saved=c->hmx->enter?c->hmx->enter():0;
     int e=0;
     J.tyx=(int32_t *)(n+o_tyx);
@@ -1235,7 +1243,7 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     return 1;
 }
 
-#if NPRG2_HW_ROUNDING && BLK_HVX
+#if NPRG2_HW_ROUNDING_U16 && BLK_HVX
 /* ---------------------------------------------------- native u16 x int8 HMX
  * u16 convs (zp 0, stride 1) on HMX with cvt.uh:2x1, exact against the
  * silicon-rounding reference (HMX_NATIVE_ROUNDING.md: x = (acc>>8) + bias,
@@ -1563,7 +1571,7 @@ static int hmx_native16(G *g, const T *xt, const T *wt, const T *ft, const T *o,
     g->wused=0;
     uint8_t *ws=walloc(g,fixed+(size_t)nbuf*mt*per+2048);
     if(!ws){*err=E_MEMORY;return -1;}
-    conv_path=5;
+    conv_path[g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u]=5;
     if(g->dry) return 1;
     uint8_t *base=(uint8_t *)(((uintptr_t)ws+2047)&~(uintptr_t)2047);
     int32_t *fi=(int32_t *)base,*zero=(int32_t *)(base+(size_t)NB*256);
@@ -1607,7 +1615,7 @@ static int hmx_native16(G *g, const T *xt, const T *wt, const T *ft, const T *o,
 #endif
     for(int b=0;b<nbuf;b++) J[b].stage=stage;
     uint64_t (*clock)(void)=c->phase?c->clock:NULL,t0=clock?clock():0,t1;
-    uint32_t parts=nprg2_parallel_parts(g->call->parallel,3);
+    uint32_t parts=nprg2_parallel_parts(g->call->parallel,NPRG2_PAR_MAX_PARTS);
     uint32_t saved=h->enter?h->enter():0;
     int e=0;
     const int32_t nch=(total+mt-1)/mt;

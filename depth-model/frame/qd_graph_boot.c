@@ -22,13 +22,28 @@ static const char qds_l2_boot_feature[] __attribute__((used))="QDL2BOOT02";
 static const uint8_t qds_boot_features[12] __attribute__((used)) = {'Q','D','B','O','O','T','0','1',1,0,0,0};
 #endif
 #define ARENA 0xf1800000u
+#define QDS_SYNC_ERROR 7u
+#if QDS_PREPARED_THREADS==4
+#define QDS_FIRMWARE_WORK 0xf0b12000u
+#define QDS_FIRMWARE_WAIT3 (1u<<19)
+#define QDS_FIRMWARE_WAIT5 (1u<<21)
+static uint32_t qds_mode(void){uint32_t v;__asm__ volatile("%0=modectl":"=r"(v));return v;}
+extern uint32_t qds_hvx_context_enter(uint32_t save_area);
+extern void qds_hvx_context_leave(uint32_t save_area,uint32_t saved_ssr);
+#endif
 #ifndef QDS_ENTRY_GUARD
 #define QDS_ENTRY_GUARD 0
 #endif
-#if QDS_ENTRY_GUARD
+#if QDS_ENTRY_GUARD || QDS_PREPARED_THREADS==4
 #include "qd_graph_entry.h"
+#endif
+#if QDS_ENTRY_GUARD
 static const uint8_t qds_entry_features[12] __attribute__((used)) =
     {'Q','D','E','N','T','R','Y','1',1,0,0,0};
+#endif
+#if QDS_PREPARED_THREADS==4
+static const uint8_t qds_thread5_feature[12] __attribute__((used)) =
+    {'Q','D','T','H','R','D','5','1',1,0,0,0};
 #endif
 static uint64_t cycles(void){uint64_t c;__asm__ volatile("%0=upcycle":"=r"(c));return c;}
 #if QDS_PRESERVE_VTCM
@@ -64,7 +79,13 @@ static uint32_t qds_lease_on_stack(void (*entry)(uint32_t)) {
 }
 #endif
 __attribute__((section(".text.entry"))) void payload(void) {
-    uint32_t tid;__asm__ volatile("%0=htid":"=r"(tid));if(tid>=3)return;
+    uint32_t tid;__asm__ volatile("%0=htid":"=r"(tid));
+#if QDS_PREPARED_THREADS==4
+    if(tid>2 && tid!=5)return;
+#else
+    if(tid>=3)return;
+#endif
+    uint32_t logical=qds_logical_tid(tid);
     volatile uint32_t *a=(volatile uint32_t *)ARENA,*sync=(volatile uint32_t *)(ARENA+3584);
     QdoMap *map=(QdoMap *)(ARENA+QDO_STATE);
     const QdsConfig *cfg=(const QdsConfig *)(ARENA+QDS_CONFIG);
@@ -87,7 +108,7 @@ __attribute__((section(".text.entry"))) void payload(void) {
     /* Do not borrow memory for a callback that did not launch all three
      * workers. Arrival slots are generation-tagged and written only by their
      * own worker; the master never clears a follower's published arrival. */
-    sync[8+tid]=entry_sequence;
+    sync[8+logical]=entry_sequence;
     __asm__ volatile("barrier":::"memory");
 #endif
 #if QDS_PRESERVE_VTCM
@@ -97,11 +118,36 @@ __attribute__((section(".text.entry"))) void payload(void) {
     _Static_assert(sizeof(QdVtcmLease)<=128,"VTCM lease metadata overlaps timings");
 #endif
     if(tid==0) {
-        sync[0]=0;sync[1]=sync[2]=sync[3]=0;
+        sync[0]=0;
+        for(uint32_t i=1;i<=7;i++)sync[i]=0;
         uint32_t err=cfg->magic!=QDS_MAGIC || cfg->version!=1 || !cfg->code_bytes || cfg->code_bytes>0x100000;
 #if QDS_ENTRY_GUARD
         uint64_t arrival_deadline=cycles()+2000000000u;
-        while(!err && !qds_entry_all_arrived(sync+8,entry_sequence))
+#if QDS_PREPARED_THREADS==4
+        /* Wait for the three stock FLOPS callbacks first. Then temporarily
+         * select generic op0, which dispatches directly to the registered
+         * callback without touching the built-in FLOPS table/count. */
+        while(!err && !qds_entry_all_arrived(sync+8,entry_sequence,3u))
+            if(cycles()>arrival_deadline)err=10;
+        if(!err) {
+            volatile uint32_t *work=(volatile uint32_t *)QDS_FIRMWARE_WORK;
+            uint32_t saved=work[0];
+            while(!err && (qds_mode()&(QDS_FIRMWARE_WAIT3|QDS_FIRMWARE_WAIT5))!=
+                           (QDS_FIRMWARE_WAIT3|QDS_FIRMWARE_WAIT5))
+                if(cycles()>arrival_deadline)err=11;
+            if(!err && (saved!=4u || *(volatile uint32_t *)0xf1647084u==2u))err=11;
+            if(!err) {
+                sync[6]=saved;
+                work[0]=0u;
+                __asm__ volatile("barrier\n resume(%0)"::"r"(0x20u):"memory");
+                while(!err && sync[11]!=entry_sequence)
+                    if(cycles()>arrival_deadline)err=12;
+                /* On timeout, retain op0; HT5 may still arrive late. */
+                if(!err) {work[0]=saved;__asm__ volatile("barrier":::"memory");sync[5]=1u;}
+            }
+        }
+#endif
+        while(!err && !qds_entry_all_arrived(sync+8,entry_sequence,QDS_WORKER_SLOTS))
             if(cycles()>arrival_deadline)err=10;
 #endif
         if(!err)err=qdo_map(map);
@@ -132,25 +178,41 @@ __attribute__((section(".text.entry"))) void payload(void) {
             }
             __asm__ volatile("isync":::"memory");
         }
-        sync[4]=err;
+        sync[QDS_SYNC_ERROR]=err;
         __asm__ volatile("barrier":::"memory");sync[0]=a[2];
     } else {
         uint64_t end=cycles()+2000000000u;
         while(sync[0]!=a[2])if(cycles()>end)return;
     }
     __asm__ volatile("barrier":::"memory");
-    if(!sync[4]) {
+    if(!sync[QDS_SYNC_ERROR]) {
         /* L2 mode too: the engine switches worker 0 to a DDR stack only
          * inside its cache lease (qd_l2_cache.h). */
-        volatile uint32_t *guard=(volatile uint32_t *)(0x30080000u+tid*0x10000u);
+        volatile uint32_t *guard;
+#if QDS_PREPARED_THREADS==4
+        if(logical==3)guard=(volatile uint32_t *)QDS_HTID5_STACK_BOTTOM;
+        else
+#endif
+            guard=(volatile uint32_t *)(0x30080000u+logical*0x10000u);
         for(uint32_t i=0;i<32;i++)guard[i]=0x7154c9a3u;
-        qds_on_stack((void (*)(uint32_t))QDO_BASE,tid,0x30090000u+tid*0x10000u);
-        for(uint32_t i=0;i<32;i++)if(guard[i]!=0x7154c9a3u)sync[4]=9;
+#if QDS_PREPARED_THREADS==4
+        if(logical==3) {
+            uint32_t saved_ssr=0;
+            if(qds_mode()&QDS_FIRMWARE_WAIT3) {
+                saved_ssr=qds_hvx_context_enter(QDS_HTID5_HVX_STATE);
+                qds_on_stack((void (*)(uint32_t))QDO_BASE,tid,QDS_HTID5_STACK_TOP);
+                qds_hvx_context_leave(QDS_HTID5_HVX_STATE,saved_ssr);
+            } else sync[QDS_SYNC_ERROR]=14;
+        } else
+#endif
+            qds_on_stack((void (*)(uint32_t))QDO_BASE,tid,0x30090000u+logical*0x10000u);
+        for(uint32_t i=0;i<32;i++)if(guard[i]!=0x7154c9a3u)sync[QDS_SYNC_ERROR]=9;
     }
-    __asm__ volatile("barrier":::"memory");sync[1+tid]=1;
+    __asm__ volatile("barrier":::"memory");sync[1+logical]=1;
     if(tid==0) {
         uint64_t end=cycles()+2000000000u;
-        while(!sync[2] || !sync[3])if(cycles()>end){sync[4]=8;return;}
+        for(uint32_t i=2;i<=QDS_WORKER_SLOTS;i++)
+            while(!sync[i])if(cycles()>end){sync[QDS_SYNC_ERROR]=8;return;}
         uint32_t err=0;
 #if QDS_PRESERVE_VTCM
         if(lease->phase==1) {
@@ -159,20 +221,37 @@ __attribute__((section(".text.entry"))) void payload(void) {
             if(!err)err=qds_lease_on_stack(qds_restore_vtcm);
             timing[1]=cycles()-started;
             uint32_t ce=clock_restore(lease_clocks);if(!err)err=ce;
-            if(err){sync[4]=64+err;}
+            if(err){sync[QDS_SYNC_ERROR]=64+err;}
         } else if(lease->magic==QDVT_MAGIC && lease->phase!=2) {
-            err=QDVT_BAD_STATE;sync[4]=64+err;
+            err=QDVT_BAD_STATE;sync[QDS_SYNC_ERROR]=64+err;
         }
 #endif
 #if QDS_AXIM_RUN
-        {uint32_t ce=clock_restore(lease_clocks);if(ce && !err){err=ce;sync[4]=64+ce;}}
+        {uint32_t ce=clock_restore(lease_clocks);if(ce && !err){err=ce;sync[QDS_SYNC_ERROR]=64+ce;}}
 #endif
         /* A failed memory restore retains the private mapping and snapshot
          * for host-directed recovery. All workers still quiesce normally. */
-        if(!err){err=qdo_unmap(map);if(err)sync[4]=err;}
+        if(!err){err=qdo_unmap(map);if(err)sync[QDS_SYNC_ERROR]=err;}
         __asm__ volatile("barrier":::"memory");sync[0]=0xffffffffu;
     } else while(sync[0]!=0xffffffffu) {}
     volatile QdStatus *st=(volatile QdStatus *)(ARENA+QD_STATUS_OFFSET)+tid;
-    st->error=sync[4];st->rows=0;st->reserved=QDC_EXITED;
+#if QDS_PREPARED_THREADS==4
+    if(tid==0 && sync[5]) {
+        uint64_t end=cycles()+2000000000u;
+        while(st[5].done_sequence!=a[2] ||
+              (qds_mode()&(QDS_FIRMWARE_WAIT3|QDS_FIRMWARE_WAIT5))!=
+              (QDS_FIRMWARE_WAIT3|QDS_FIRMWARE_WAIT5))
+            if(cycles()>end){sync[QDS_SYNC_ERROR]=13;break;}
+        /* Do not restore op4 unless both callback completion and firmware
+         * return-to-WAIT are proven. A failed proof requires host retention. */
+        if(st[5].done_sequence==a[2] &&
+           (qds_mode()&(QDS_FIRMWARE_WAIT3|QDS_FIRMWARE_WAIT5))==
+           (QDS_FIRMWARE_WAIT3|QDS_FIRMWARE_WAIT5)) {
+            *(volatile uint32_t *)QDS_FIRMWARE_WORK=sync[6];
+            __asm__ volatile("barrier":::"memory");
+        }
+    }
+#endif
+    st->error=sync[QDS_SYNC_ERROR];st->rows=0;st->reserved=QDC_EXITED;
     __asm__ volatile("barrier":::"memory");st->done_sequence=a[2];
 }

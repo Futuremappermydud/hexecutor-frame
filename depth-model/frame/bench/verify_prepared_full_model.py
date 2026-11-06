@@ -9,6 +9,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import numpy as np
 
 FRAME=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(FRAME))
@@ -26,14 +27,19 @@ def main():
     ap.add_argument('--bootstrap',type=Path,required=True)
     ap.add_argument('--prepared-program',type=Path,required=True)
     ap.add_argument('--report',type=Path,required=True)
+    ap.add_argument('--save-outputs',type=Path,help='save each case/run as a NumPy archive for precision comparisons')
+    ap.add_argument('--compare-outputs',type=Path,help='directory of exact --save-outputs archives')
+    ap.add_argument('--allow-inexact',action='store_true',help='allow output differences; requires --compare-outputs and still checks execution/lease guards')
     ap.add_argument('--expect',choices=('emulator','hw'),default='emulator',
                     help='hw: an NPRG2_HW_ROUNDING=1 engine, checked against the silicon-rounding oracle')
     a=ap.parse_args()
+    if a.allow_inexact and not a.compare_outputs:ap.error('--allow-inexact requires --compare-outputs')
+    if a.save_outputs:a.save_outputs.mkdir(parents=True,exist_ok=True)
     image=ensure_image(a.model)
     commands=len(resident_image.unpack(image.read_bytes())['commands'])
     constants=FRAME.parent/'recovered'/a.model/'constants/constant_pool_5.bin'
     names,todo=cases(a.model,a.case or ['smoke','random'],a.expect)
-    report={'purpose':__doc__,'model':a.model,'expect':a.expect,'commands':commands,'runs':[],'passed':False,
+    report={'purpose':__doc__,'model':a.model,'expect':a.expect,'allow_inexact':a.allow_inexact,'commands':commands,'runs':[],'passed':False,
             'engine_sha256':hashlib.sha256(a.engine.read_bytes()).hexdigest(),
             'bootstrap_sha256':hashlib.sha256(a.bootstrap.read_bytes()).hexdigest(),
             'prepared_sha256':hashlib.sha256(a.prepared_program.read_bytes()).hexdigest()}
@@ -48,12 +54,28 @@ def main():
                 if dsp.sizes[p]:dsp.mem[dsp.pools[p]:dsp.pools[p]+dsp.sizes[p]]=bytes(dsp.sizes[p])
             for run in range(a.repeat):
                 outs=dsp.run(inputs)
+                archive=f'{a.model}-{label}-{run}.npz'
+                if a.save_outputs:np.savez(a.save_outputs/archive,**dict(zip(names,outs)))
                 hashes={n+'.raw':hashlib.sha256(outs[i].tobytes()).hexdigest() for i,n in enumerate(names)}
                 trace=dsp.last.get('native_direct_trace',[])
                 row={'case':label,'run':run,'pools_zeroed':run==0,**dsp.last,'output_sha256':hashes,
                      'outputs_equal':hashes==expected,
                      'variant_profile':sorted(dsp.profile,key=lambda v:-v['ms']),
                      'handler_profile':dsp.handler_profile,'executor_profile':dsp.executor_profile,'parallel_profile':getattr(dsp,'parallel_profile',{})}
+                finite=True
+                if a.compare_outputs:
+                    row['output_error']={}
+                    with np.load(a.compare_outputs/archive,allow_pickle=False) as ref:
+                        for name,out in zip(names,outs):
+                            expected_out=ref[name]
+                            if hashlib.sha256(expected_out.tobytes()).hexdigest()!=expected[name+'.raw']:
+                                raise ValueError(f'{name}: comparison archive does not match the exact oracle')
+                            if out.shape!=expected_out.shape or out.dtype!=expected_out.dtype:
+                                raise ValueError(f'{name}: reference shape/dtype differs')
+                            delta=np.abs(out.astype(np.float64)-expected_out.astype(np.float64))
+                            valid=bool(np.isfinite(delta).all());finite &= valid
+                            row['output_error'][name]={'finite':valid,'max_abs':float(delta.max()) if valid else None,
+                                'mean_abs':float(delta.mean()) if valid else None,'different_fraction':float(np.mean(out!=expected_out))}
                 # The prepared reference engine reuses the conv phase slots:
                 # u8 convs in 0..3, u16 in 4..7, summed over thread parts.
                 phases=list(dsp.last.get('conv_phases_ms',{}).values())
@@ -62,12 +84,13 @@ def main():
                     row['near_conv_phases_ms']=dict(zip(keys,(phases[k]+phases[4+k] for k in range(4))))
                     row['near_conv_phases_u8_ms']=dict(zip(keys,phases[:4]))
                     row['near_conv_phases_u16_ms']=dict(zip(keys,phases[4:]))
-                row['passed']=(dsp.last.get('status')==0 and row['outputs_equal'] and
+                row['passed']=(dsp.last.get('status')==0 and finite and (row['outputs_equal'] or a.allow_inexact) and
                                dsp.last.get('native_prepared_program') is True and len(trace)==16 and
                                trace[8]==commands and trace[9]==commands and
                                all(dsp.last.get('native_'+f,{}).get('calls')==0 for f in ('1x1','3x3')))
                 report['runs'].append(row);save()
                 print(json.dumps({'case':label,'run':run,'passed':row['passed'],'outputs_equal':row['outputs_equal'],
+                                  'output_error':row.get('output_error'),
                                   'dsp_ms':row.get('dsp_ms'),'total_seconds':row.get('total_seconds'),
                                   'near_conv_phases_ms':row.get('near_conv_phases_ms'),
                                   'top_variants_ms':{v['variant']:round(v['ms'],1) for v in row['variant_profile'][:6]},

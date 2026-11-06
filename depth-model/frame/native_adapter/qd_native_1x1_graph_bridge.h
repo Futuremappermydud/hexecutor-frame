@@ -78,10 +78,10 @@ static int native_1x1_hmx_owned(void) {
 static int native_1x1_workers_idle(void) {
     uint32_t generation = work->generation;
     __asm__ volatile("barrier" ::: "memory");
-    uint32_t done1 = work->done[1], done2 = work->done[2];
+    int idle=1;
+    for(uint32_t t=1;t<QDS_WORKER_SLOTS;t++)idle &= work->done[t]==generation;
     __asm__ volatile("barrier" ::: "memory");
-    return work->generation == generation && done1 == generation &&
-           done2 == generation;
+    return work->generation==generation && idle;
 }
 
 static int native_1x1_try(QdgGraph *g, const C *c, uint32_t index) {

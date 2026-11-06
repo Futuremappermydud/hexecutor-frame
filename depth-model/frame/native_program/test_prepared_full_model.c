@@ -23,6 +23,8 @@
 #include "prepared_sign.h"
 #include "prepared_spill_fill.h"
 #include "prepared_fuse.h"
+#include "prepared_dma_ring.h"
+#include "prepared_executor.h"
 #include "../qd_graph.h"
 
 #include <pthread.h>
@@ -33,6 +35,36 @@
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
 
 static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+
+typedef struct { uint64_t seq;void *dst;const void *src;size_t bytes;uint8_t queued; } MockDmaDesc;
+typedef struct { MockDmaDesc d[NPRG2_DMA_RING_SLOTS];uint64_t clock;uint8_t active;uint32_t issued,completed; } MockDma;
+static int mock_dma_begin(void *ctx){MockDma *m=ctx;if(m->active)return 0;m->active=1;return 1;}
+static int mock_dma_issue(void *ctx,uint64_t seq,uint32_t slot,void *dst,const void *src,size_t bytes){
+    MockDma *m=ctx;if(!m->active||slot>=NPRG2_DMA_RING_SLOTS||!bytes)return -1;
+    if((((uintptr_t)dst|(uintptr_t)src|bytes)&127u)!=0)return 0;
+    MockDmaDesc *d=&m->d[slot];if(d->queued)return -1;
+    *d=(MockDmaDesc){seq,dst,src,bytes,1};m->issued++;return 1;
+}
+static int mock_dma_done(void *ctx,uint64_t seq,uint32_t slot){
+    MockDma *m=ctx;if(!m->active||slot>=NPRG2_DMA_RING_SLOTS)return -1;
+    MockDmaDesc *d=&m->d[slot];if(!d->queued||d->seq!=seq)return -1;
+    memmove(d->dst,d->src,d->bytes);d->queued=0;m->completed++;return 1;
+}
+static int mock_dma_finish(void *ctx,int had_error){
+    MockDma *m=ctx;
+    if(had_error){for(uint32_t i=0;i<NPRG2_DMA_RING_SLOTS;i++)m->d[i].queued=0;m->active=0;return -1;}
+    for(uint32_t i=0;i<NPRG2_DMA_RING_SLOTS;i++)if(m->d[i].queued)return 0;
+    m->active=0;return 1;
+}
+static uint64_t mock_dma_clock(void *ctx){return ((MockDma *)ctx)->clock;}
+static void mock_dma_relax(void *ctx){((MockDma *)ctx)->clock++;}
+static const Nprg2DmaRingOps mock_dma_ops={mock_dma_begin,mock_dma_issue,mock_dma_done,
+    mock_dma_finish,mock_dma_clock,mock_dma_relax};
+static void mock_dma_init(Nprg2WeightsAsync *a,Nprg2DmaRing *r,MockDma *m,uint32_t commands){
+    memset(a,0,sizeof *a);memset(m,0,sizeof *m);
+    CHECK(nprg2_dma_ring_init(r,&mock_dma_ops,m,100000000u));
+    a->command_count=commands;a->ring=r;a->ring_mode=1;a->timeout_cycles=100000000u;
+}
 
 static uint8_t *read_file(const char *path, uint32_t *n) {
     FILE *f = fopen(path, "rb");
@@ -472,9 +504,250 @@ static void whole(Session *s) {
     }
     printf("PASS %s whole schedule: one preflight validated %lu commands without pool writes, one run executed all\n",
            s->model, (unsigned long)st.executed_commands);
+    if (st.approx_cost_volume_commands || st.approx_cost_volume_interpolated_planes)
+        printf("%s cost-volume step %d: skipped %u handlers (%u conv planes), interpolated %u planes\n",
+               s->model, NPRG2_APPROX_COST_VOLUME_STEP, st.approx_cost_volume_commands, st.approx_cost_volume_conv_planes,
+               st.approx_cost_volume_interpolated_planes);
     check_outputs(s, out, "whole");
     free(out[0]);
     free(out[1]);
+}
+
+/* Host-only QNN run-list replay: events are generated from the metadata-only
+ * x86 capture and carry command index, wait CP, done CP, and source list. */
+static void runlists(Session *s, const char *order) {
+    const char *path = getenv("QD_RUNLIST_EVENTS");
+    CHECK(path && *path);
+    uint32_t bytes = 0;
+    uint8_t *raw = read_file(path, &bytes);
+    CHECK(bytes >= 4);
+    uint32_t cp_count = rd32(raw);
+    CHECK(cp_count > 1 && cp_count <= 8192);
+    uint64_t need_bytes = 4ull + 4ull * cp_count + 24ull * s->program.command_count;
+    CHECK(need_bytes == bytes);
+    uint32_t *cp = calloc(cp_count, sizeof *cp);
+    CHECK(cp);
+    for (uint32_t i = 0; i < cp_count; i++) cp[i] = rd32(raw + 4u + i * 4u);
+    const uint8_t *events = raw + 4u + cp_count * 4u;
+    Nprg2WeightsAsync dma;Nprg2DmaRing ring;MockDma mock;
+    mock_dma_init(&dma,&ring,&mock,s->program.command_count);
+    pools_reset(s);
+    uint8_t *out[2] = {calloc(1, 163840), calloc(1, 655360)};
+    CHECK(out[0] && out[1]);
+    Nprg2ExecBuffer in[4], ob[2] = {{out[0], 163840}, {out[1], 655360}};
+    for (int k = 0; k < 4; k++) in[k] = (Nprg2ExecBuffer){s->inputs[k], s->input_bytes[k]};
+    for (uint32_t i = 0; i < s->program.command_count; i++) {
+        const uint8_t *ev = events + i * 24u;
+        uint32_t ix = rd32(ev), wait = rd32(ev + 4), done = rd32(ev + 8), lid = rd32(ev + 12);
+        uint32_t dma_event_id=rd32(ev+16),dma_event_kind=rd32(ev+20);
+        CHECK(ix < s->program.command_count && wait < cp_count && done < cp_count && lid < 2);
+        if (cp[wait] != 0) {
+            fprintf(stderr, "%s %s blocked at step=%lu command=%lu list=%lu wait=%lu value=%lu\n",
+                    s->model, order, (unsigned long)i, (unsigned long)ix, (unsigned long)lid,
+                    (unsigned long)wait, (unsigned long)cp[wait]);
+            exit(1);
+        }
+        if(dma_event_kind==2u)CHECK(nprg2_exec_weights_dma_checkpoint_wait(&dma,dma_event_id)==NPRG2_EXEC_OK);
+        Nprg2ExecStats st;
+        Nprg2ExecRequest r = request(s, in, ob, ix, 1, &st);
+        r.weights_async=&dma;
+        if (s->reference_only) r.scratch_bytes = s->need[ix];
+        int rc = nprg2_executor_run(&s->executor, &r);
+        if (rc != NPRG2_EXEC_OK || st.validated_commands != 1 || st.executed_commands != 1) {
+            Nprg2Command c = {0}; nprg2_command_at(&s->bound, ix, &c);
+            fprintf(stderr, "%s %s failed step=%lu command=%lu op=%u var=%u rc=%d line=%lu\n",
+                    s->model, order, (unsigned long)i, (unsigned long)ix, c.opcode, c.variant, rc,
+                    (unsigned long)nprg2_exec_reference_error_line());
+            exit(1);
+        }
+        if(dma_event_kind==1u)CHECK(nprg2_exec_weights_dma_checkpoint_set(&dma,dma_event_id)==NPRG2_EXEC_OK);
+        if (done) {
+            CHECK(cp[done] != 0);
+            cp[done]--;
+        }
+    }
+    CHECK(nprg2_exec_weights_dma_drain_all(&dma)==NPRG2_EXEC_OK);
+    for (uint32_t i = 0; i < cp_count; i++) CHECK(cp[i] == 0);
+    printf("PASS %s QNN %s run-list replay: %lu prepared commands, %lu CPU CPs and %lu DMA copies drained\n",
+           s->model, order, (unsigned long)s->program.command_count, (unsigned long)cp_count,
+           (unsigned long)mock.completed);
+    check_outputs(s, out, order);
+    free(out[0]); free(out[1]); free(cp); free(raw);
+}
+
+typedef struct { uint32_t command, wait_cp, done_cp, list, dma_event_id, dma_event_kind; } RunlistEvent;
+typedef struct {
+    pthread_mutex_t lock;
+    pthread_cond_t changed;
+    uint32_t *cp;
+    uint32_t cp_count;
+    int failed;
+    int preferred_list, other_started;
+    char failure[192];
+    Session *session;
+    Nprg2ExecBuffer *inputs, *outputs;
+    Nprg2ExecRequest lane_request[2];
+    Nprg2Parallel *worker_parallel;
+    Nprg2WeightsAsync *dma;
+    uint8_t *scratch[2];
+    uint8_t *near_scratch[2];
+} RunlistShared;
+typedef struct { RunlistShared *shared; RunlistEvent *events; uint32_t count, list; } RunlistThread;
+
+static void runlist_fail(RunlistShared *sh, const char *msg) {
+    pthread_mutex_lock(&sh->lock);
+    if (!sh->failed) { sh->failed = 1; snprintf(sh->failure, sizeof sh->failure, "%s", msg); }
+    pthread_cond_broadcast(&sh->changed);
+    pthread_mutex_unlock(&sh->lock);
+}
+static void *runlist_thread(void *arg) {
+    RunlistThread *t = (RunlistThread *)arg;
+    RunlistShared *sh = t->shared;
+    Session *s = sh->session;
+    pthread_mutex_lock(&sh->lock);
+    while (!sh->failed && (int)t->list != sh->preferred_list && !sh->other_started)
+        pthread_cond_wait(&sh->changed, &sh->lock);
+    pthread_mutex_unlock(&sh->lock);
+    for (uint32_t i = 0; i < t->count; i++) {
+        RunlistEvent *ev = &t->events[i];
+        pthread_mutex_lock(&sh->lock);
+        if ((int)t->list == sh->preferred_list && sh->cp[ev->wait_cp] != 0 && !sh->other_started) {
+            sh->other_started = 1;
+            pthread_cond_broadcast(&sh->changed);
+        }
+        while (!sh->failed && sh->cp[ev->wait_cp] != 0)
+            pthread_cond_wait(&sh->changed, &sh->lock);
+        int stop = sh->failed;
+        pthread_mutex_unlock(&sh->lock);
+        if (stop) return NULL;
+
+        if (t->list==0u && ev->dma_event_kind==2u &&
+            nprg2_exec_weights_dma_checkpoint_wait(sh->dma,ev->dma_event_id)!=NPRG2_EXEC_OK) {
+            runlist_fail(sh,"DMA checkpoint wait failed");return NULL;
+        }
+        int rc = nprg2_executor_run_preflighted_command_prepared(&s->executor,
+            &sh->lane_request[t->list],ev->command);
+        if (rc != NPRG2_EXEC_OK) {
+            char msg[192];
+            Nprg2Command c={0};nprg2_command_at(&s->bound,ev->command,&c);
+            snprintf(msg, sizeof msg, "list %lu command %lu op=%u var=%u failed rc=%d async=%lu fallback=%lu ringfail=%u issued=%lu completed=%lu line=%lu",
+                     (unsigned long)t->list, (unsigned long)ev->command,c.opcode,c.variant,rc,
+                     (unsigned long)sh->dma->starts,(unsigned long)sh->dma->cpu_fallbacks,
+                     sh->dma->ring->failed,(unsigned long)sh->dma->ring->issued,(unsigned long)sh->dma->ring->completed,
+                     (unsigned long)nprg2_exec_reference_error_line());
+            runlist_fail(sh, msg);
+            return NULL;
+        }
+        if(ev->dma_event_kind==1u &&
+           nprg2_exec_weights_dma_checkpoint_set(sh->dma,ev->dma_event_id)!=NPRG2_EXEC_OK) {
+            runlist_fail(sh,"DMA checkpoint set failed");return NULL;
+        }
+        pthread_mutex_lock(&sh->lock);
+        if (ev->done_cp && !sh->cp[ev->done_cp]) {
+            if (!sh->failed) {
+                sh->failed = 1;
+                snprintf(sh->failure, sizeof sh->failure, "list %lu command %lu underflowed CP %lu",
+                         (unsigned long)t->list, (unsigned long)ev->command, (unsigned long)ev->done_cp);
+            }
+        } else if (ev->done_cp) {
+            sh->cp[ev->done_cp]--;
+        }
+        pthread_cond_broadcast(&sh->changed);
+        int failed = sh->failed;
+        pthread_mutex_unlock(&sh->lock);
+        if (failed) return NULL;
+    }
+    pthread_mutex_lock(&sh->lock);
+    if ((int)t->list == sh->preferred_list && !sh->other_started) {
+        sh->other_started = 1;
+        pthread_cond_broadcast(&sh->changed);
+    }
+    pthread_mutex_unlock(&sh->lock);
+    return NULL;
+}
+
+static void runlists_parallel(Session *s, int preferred_list) {
+    CHECK(!s->fuse);
+    const char *path = getenv("QD_RUNLIST_EVENTS");
+    CHECK(path && *path);
+    uint32_t bytes = 0;
+    uint8_t *raw = read_file(path, &bytes);
+    CHECK(bytes >= 4);
+    uint32_t cp_count = rd32(raw);
+    CHECK(cp_count > 1 && cp_count <= 8192);
+    uint64_t need_bytes = 4ull + 4ull * cp_count + 24ull * s->program.command_count;
+    CHECK(need_bytes == bytes);
+    uint32_t *cp = calloc(cp_count, sizeof *cp);
+    RunlistEvent *events[2] = {calloc(s->program.command_count, sizeof(RunlistEvent)),
+                               calloc(s->program.command_count, sizeof(RunlistEvent))};
+    CHECK(cp && events[0] && events[1]);
+    for (uint32_t i = 0; i < cp_count; i++) cp[i] = rd32(raw + 4u + i * 4u);
+    uint32_t counts[2] = {0, 0};
+    const uint8_t *encoded = raw + 4u + cp_count * 4u;
+    for (uint32_t i = 0; i < s->program.command_count; i++) {
+        const uint8_t *p = encoded + i * 24u;
+        uint32_t lid = rd32(p + 12);
+        CHECK(lid < 2);
+        events[lid][counts[lid]++] = (RunlistEvent){rd32(p), rd32(p + 4), rd32(p + 8), lid,
+                                                    rd32(p + 16), rd32(p + 20)};
+    }
+    CHECK(counts[0] == 2668 && counts[1] == 2400);
+
+    /* Complete the normal whole-program preflight before either list starts. */
+    pools_reset(s);
+    Nprg2ExecBuffer out_buf[2] = {{calloc(1, 163840), 163840}, {calloc(1, 655360), 655360}};
+    CHECK(out_buf[0].data && out_buf[1].data);
+    Nprg2ExecBuffer in_buf[4];
+    for (int k = 0; k < 4; k++) in_buf[k] = (Nprg2ExecBuffer){s->inputs[k], s->input_bytes[k]};
+    Nprg2ExecStats preflight_stats;
+    Nprg2ExecRequest preflight = request(s, in_buf, out_buf, 0, s->program.command_count, &preflight_stats);
+    Nprg2WeightsAsync dma;Nprg2DmaRing ring;MockDma mock;
+    mock_dma_init(&dma,&ring,&mock,s->program.command_count);
+    preflight.weights_async=&dma;
+    preflight.parallel = NULL; preflight.fuse = NULL;
+    preflight.extra_scratch[0] = (Nprg2ExecBuffer){NULL, 0};
+    CHECK(nprg2_executor_preflight(&s->executor, &preflight) == NPRG2_EXEC_OK);
+    CHECK(preflight_stats.validated_commands == s->program.command_count);
+    uint32_t qweights=0;for(uint32_t wi=0;wi<s->program.command_count;wi++){Nprg2Command wc;if(!nprg2_command_at(&s->bound,wi,&wc)&&wc.opcode==QDR_WEIGHTS_TO_VTCM)qweights++;}
+    fprintf(stderr,"host DMA mock observed %u weights commands\n",qweights);
+    CHECK(nprg2_exec_reference_clone_lane(0, 1));
+    for (int p = 0; p < 7; p++)
+        CHECK(!s->pools[p].bytes || !memcmp(s->pools[p].base, s->initial[p], s->pools[p].bytes));
+
+    RunlistShared sh;
+    memset(&sh, 0, sizeof sh);
+    CHECK(!pthread_mutex_init(&sh.lock, NULL)); CHECK(!pthread_cond_init(&sh.changed, NULL));
+    sh.cp = cp; sh.cp_count = cp_count; sh.session = s; sh.inputs = in_buf; sh.outputs = out_buf;sh.dma=&dma;
+    memset(&g_par,0,sizeof g_par);g_par.max_parts=2;g_par.run=pt_run;
+    sh.worker_parallel=&g_par;
+    sh.preferred_list = preferred_list;
+    sh.scratch[0] = aligned_alloc(128, (s->scratch_bytes + 127u) & ~127u);
+    sh.scratch[1] = aligned_alloc(128, (s->scratch_bytes + 127u) & ~127u);
+    sh.near_scratch[0] = aligned_alloc(128, 0x8000u);
+    sh.near_scratch[1] = aligned_alloc(128, 0x8000u);
+    CHECK(sh.scratch[0] && sh.scratch[1] && sh.scratch[0] != sh.scratch[1] &&
+          sh.near_scratch[0] && sh.near_scratch[1] && sh.near_scratch[0] != sh.near_scratch[1]);
+    CHECK(nprg2_executor_prepare_preflighted_request(&s->executor,&preflight,0,NULL,
+        sh.scratch[0],s->scratch_bytes,sh.near_scratch[0],0x8000u,&sh.lane_request[0])==NPRG2_EXEC_OK);
+    CHECK(nprg2_executor_prepare_preflighted_request(&s->executor,&preflight,1,sh.worker_parallel,
+        sh.scratch[1],s->scratch_bytes,sh.near_scratch[1],0x8000u,&sh.lane_request[1])==NPRG2_EXEC_OK);
+    pthread_t th[2];
+    RunlistThread tasks[2] = {{&sh, events[0], counts[0], 0}, {&sh, events[1], counts[1], 1}};
+    CHECK(!pthread_create(&th[preferred_list], NULL, runlist_thread, &tasks[preferred_list]));
+    CHECK(!pthread_create(&th[1u-(uint32_t)preferred_list], NULL, runlist_thread, &tasks[1u-(uint32_t)preferred_list]));
+    CHECK(!pthread_join(th[0], NULL)); CHECK(!pthread_join(th[1], NULL));
+    if(nprg2_exec_weights_dma_drain_all(&dma)!=NPRG2_EXEC_OK)runlist_fail(&sh,"DMA drain failed after both lists joined");
+    if (sh.failed) { fprintf(stderr, "parallel QNN run-list failure: %s\n", sh.failure); exit(1); }
+    for (uint32_t i = 0; i < cp_count; i++) CHECK(cp[i] == 0);
+    printf("PASS %s concurrent QNN run lists (%s preferred): %lu main + %lu worker entries, %lu CPU CPs, %lu DMA starts/%lu fallback (%lu/%lu copies queued/completed)\n",
+           s->model, preferred_list ? "worker" : "main", (unsigned long)counts[0],
+           (unsigned long)counts[1], (unsigned long)cp_count,(unsigned long)dma.starts,(unsigned long)dma.cpu_fallbacks,
+           (unsigned long)mock.issued,(unsigned long)mock.completed);
+    check_outputs(s, (uint8_t *const[]){out_buf[0].data, out_buf[1].data}, "concurrent-runlists");
+    pthread_cond_destroy(&sh.changed); pthread_mutex_destroy(&sh.lock);
+    free(sh.scratch[0]); free(sh.scratch[1]); free(out_buf[0].data); free(out_buf[1].data);
+    free(sh.near_scratch[0]); free(sh.near_scratch[1]);
+    free(events[0]); free(events[1]); free(cp); free(raw);
 }
 
 int main(int argc, char **argv) {
@@ -496,6 +769,12 @@ int main(int argc, char **argv) {
     }
     register_handlers(&s, mixed, fast);
     census(&s);
+    if (!strcmp(what, "runlist-main") || !strcmp(what, "runlist-worker")) {
+        runlists(&s, !strcmp(what, "runlist-main") ? "main-first" : "worker-first");
+        return 0;
+    }
+    if (!strcmp(what, "runlists-parallel-main")) { runlists_parallel(&s, 0); return 0; }
+    if (!strcmp(what, "runlists-parallel-worker")) { runlists_parallel(&s, 1); return 0; }
     if (strcmp(what, "whole")) lockstep(&s);
     /* QD_REPEAT=n: n whole runs (pools reset each time), so state carried
      * between runs (memoised per-command decisions, caches) is exercised. */

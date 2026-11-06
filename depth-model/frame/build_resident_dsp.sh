@@ -25,6 +25,8 @@ docker run --rm --platform linux/amd64 -v "$task_sdk_root:/sdk:ro" -v "$PWD/fram
    -e QDS_PREPARED_REFERENCE="${QDS_PREPARED_REFERENCE:-0}" \
    -e QDS_PREPARED_PROFILE="${QDS_PREPARED_PROFILE:-1}" \
    -e QDS_PREPARED_FUSE="${QDS_PREPARED_FUSE:-0}" \
+   -e QDS_PREPARED_DMA_ASYNC="${QDS_PREPARED_DMA_ASYNC:-0}" \
+   -e QDS_PREPARED_DMA_VERIFY="${QDS_PREPARED_DMA_VERIFY:-0}" \
    -e QDS_L2_CACHE="${QDS_L2_CACHE:-0}" \
    -e QDS_PREPARED_THREADS="${QDS_PREPARED_THREADS:-1}" \
    -e QDS_PREPARED_HMX="${QDS_PREPARED_HMX:-0}" \
@@ -135,15 +137,31 @@ engine_flags="$engine_flags -DQDS_PREPARED_REFERENCE=$QDS_PREPARED_REFERENCE"
 case "$QDS_PREPARED_PROFILE" in 0|1) ;; *) echo "QDS_PREPARED_PROFILE must be 0 or 1" >&2; exit 1;; esac
 engine_flags="$engine_flags -DQDS_PREPARED_PROFILE=$QDS_PREPARED_PROFILE"
 case "$QDS_PREPARED_FUSE" in 0|1) ;; *) echo "QDS_PREPARED_FUSE must be 0 or 1" >&2; exit 1;; esac
+case "$QDS_PREPARED_DMA_ASYNC" in 0|1) ;; *) echo "QDS_PREPARED_DMA_ASYNC must be 0 or 1" >&2; exit 1;; esac
+case "$QDS_PREPARED_DMA_VERIFY" in 0|1) ;; *) echo "QDS_PREPARED_DMA_VERIFY must be 0 or 1" >&2; exit 1;; esac
+if [ "$QDS_PREPARED_DMA_ASYNC" = 1 ] && { [ "$QDS_NATIVE_PREPARED" != 1 ] || [ "$QDS_PRESERVE_VTCM" != 1 ]; }; then
+  echo "QDS_PREPARED_DMA_ASYNC requires prepared execution and preserved VTCM" >&2; exit 1
+fi
+engine_flags="$engine_flags -DQDS_PREPARED_DMA_ASYNC=$QDS_PREPARED_DMA_ASYNC -DQDS_PREPARED_DMA_VERIFY=$QDS_PREPARED_DMA_VERIFY"
 if [ "$QDS_PREPARED_FUSE" = 1 ] && [ "$QDS_PREPARED_REFERENCE" != 1 ]; then
   echo "QDS_PREPARED_FUSE requires QDS_PREPARED_REFERENCE (the fast conv runs the fused epilogue)" >&2; exit 1
 fi
 engine_flags="$engine_flags -DQDS_PREPARED_FUSE=$QDS_PREPARED_FUSE"
 engine_flags="$engine_flags -DQDS_L2_CACHE=$QDS_L2_CACHE"
-case "$QDS_PREPARED_THREADS" in 1|3) ;; *) echo "QDS_PREPARED_THREADS must be 1 or 3" >&2; exit 1;; esac
-if [ "$QDS_PREPARED_THREADS" = 3 ] && [ "$QDS_PREPARED_REFERENCE" != 1 ]; then echo "QDS_PREPARED_THREADS=3 requires QDS_PREPARED_REFERENCE=1" >&2; exit 1; fi
+case "$QDS_PREPARED_THREADS" in 1|3|4) ;; *) echo "QDS_PREPARED_THREADS must be 1, 3, or 4" >&2; exit 1;; esac
+if [ "$QDS_PREPARED_THREADS" != 1 ] && [ "$QDS_PREPARED_REFERENCE" != 1 ]; then echo "QDS_PREPARED_THREADS>1 requires QDS_PREPARED_REFERENCE=1" >&2; exit 1; fi
+boot_extra_src=""
+boot_extra_flags=""
+if [ "$QDS_PREPARED_THREADS" = 4 ]; then
+  if [ "$QDS_PRESERVE_VTCM" != 1 ]; then echo "QDS_PREPARED_THREADS=4 requires QDS_PRESERVE_VTCM=1" >&2; exit 1; fi
+  boot_extra_src="qd_hvx_context.S"
+  # HT5 enters this trampoline with HVX disabled. Only the explicit context
+  # lease helpers may execute vector instructions in the four-worker build.
+  boot_extra_flags="-fno-vectorize -fno-slp-vectorize"
+fi
 # QDS_PREPARED_THREADS=3 with QDS_L2_CACHE: followers and helper slots move off the TCM part that becomes cache (qd_l2_cache.h).
 engine_flags="$engine_flags -DQDS_PREPARED_THREADS=$QDS_PREPARED_THREADS"
+if [ "$QDS_PREPARED_THREADS" = 4 ]; then engine_flags="$engine_flags -DNPRG2_PAR_MAX_PARTS=4"; fi
 case "$QDS_PREPARED_HMX" in 0|1) ;; *) echo "QDS_PREPARED_HMX must be 0 or 1" >&2; exit 1;; esac
 if [ "$QDS_PREPARED_HMX" = 1 ] && [ "$QDS_PREPARED_REFERENCE" != 1 ]; then echo "QDS_PREPARED_HMX=1 requires QDS_PREPARED_REFERENCE=1" >&2; exit 1; fi
 engine_flags="$engine_flags -DQDS_PREPARED_HMX=$QDS_PREPARED_HMX"
@@ -175,7 +193,7 @@ if [ "$QDS_NATIVE_DIRECT_RANGE" = 1 ]; then
 fi
 if [ "$QDS_NATIVE_PREPARED" = 1 ]; then
   engine="${engine%.elf}-prepared.elf"
-  native_src="$native_src native_program/nprg2_runtime.c native_program/prepared_executor.c native_program/prepared_native.c native_program/prepared_io.c native_program/prepared_runner.c native_program/prepared_fuse.c"
+  native_src="$native_src native_program/nprg2_runtime.c native_program/prepared_executor.c native_program/prepared_native.c native_program/prepared_io.c native_program/prepared_runner.c native_program/prepared_fuse.c native_program/prepared_dma_ring.c"
 fi
 if [ "$QDS_DIRECT_COMPACT_INPUT" != 0 ]; then engine="${engine%.elf}-compact-input.elf"; fi
 if [ "$QDS_DIRECT_COMPACT_INPUT" = 2 ]; then engine="${engine%.elf}-aliases.elf"; fi
@@ -214,7 +232,7 @@ $cc $engine_flags -ffunction-sections -fdata-sections -nostdlib -Wl,--gc-section
 # Experiments only write a separate engine. Use the existing mode-specific
 # bootstrap; never replace the normal bootstrap/probe during these builds.
 if [ "$QDS_PRESERVE_VTCM" = 1 ]; then
-  $cc $flags -DQDS_PRESERVE_VTCM=1 -DQDS_ENTRY_GUARD=1 -DQDS_L2_CACHE=$QDS_L2_CACHE $(echo "$QDS_EXTRA_CFLAGS" | tr + " ") -nostdlib -Wl,-T,qd_payload.ld qd_graph_boot.c qd_graph_stack.S -o "$bootstrap"
+  $cc $flags $boot_extra_flags -DQDS_PRESERVE_VTCM=1 -DQDS_ENTRY_GUARD=1 -DQDS_L2_CACHE=$QDS_L2_CACHE -DQDS_PREPARED_THREADS=$QDS_PREPARED_THREADS $(echo "$QDS_EXTRA_CFLAGS" | tr + " ") -nostdlib -Wl,-T,qd_payload.ld qd_graph_boot.c qd_graph_stack.S $boot_extra_src -o "$bootstrap"
   echo "Experimental engine: $engine; preserving bootstrap: $bootstrap"
   exit 0
 fi
@@ -222,7 +240,7 @@ if [ "$QDS_DYNAMIC_TCM" = 1 ] || [ "$QDS_FALLBACK_TCM" != 0 ] || [ "$QDS_BLOCKED
   echo "Experimental engine: $engine; use existing bootstrap: $bootstrap"
   exit 0
 fi
-$cc $flags $(echo "$QDS_EXTRA_CFLAGS" | tr + " ") -nostdlib -Wl,-T,qd_payload.ld qd_graph_boot.c qd_graph_stack.S -o "$bootstrap"
+$cc $flags $boot_extra_flags -DQDS_PREPARED_THREADS=$QDS_PREPARED_THREADS $(echo "$QDS_EXTRA_CFLAGS" | tr + " ") -nostdlib -Wl,-T,qd_payload.ld qd_graph_boot.c qd_graph_stack.S $boot_extra_src -o "$bootstrap"
 $cc $flags -nostdlib -Wl,-T,qd_payload.ld bench/qd_owned_mem_probe.c -o "$probe"
 if [ "$QDS_SCALAR_CACHE" = 0 ]; then
   cp "$bootstrap" build/qd_graph_boot.elf

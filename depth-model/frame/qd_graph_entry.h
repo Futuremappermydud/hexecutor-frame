@@ -22,10 +22,11 @@ static inline int qds_initial_command_valid(const volatile uint32_t *command,
 }
 
 static inline int qds_entry_all_arrived(const volatile uint32_t *arrivals,
-                                      uint32_t sequence) {
+                                      uint32_t sequence, uint32_t workers) {
     QDS_ENTRY_BARRIER();
-    return sequence && arrivals[0]==sequence && arrivals[1]==sequence &&
-           arrivals[2]==sequence;
+    if(!sequence || workers<1 || workers>4)return 0;
+    for(uint32_t i=0;i<workers;i++)if(arrivals[i]!=sequence)return 0;
+    return 1;
 }
 #undef QDS_ENTRY_BARRIER
 #endif

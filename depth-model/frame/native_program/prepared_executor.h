@@ -3,6 +3,11 @@
 
 #include "nprg2_runtime.h"
 #include "prepared_fuse.h"
+#include "prepared_dma_ring.h"
+
+#ifndef NPRG2_PAR_MAX_PARTS
+#define NPRG2_PAR_MAX_PARTS 3u
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -54,10 +59,30 @@ typedef struct Nprg2Parallel {
     uint64_t not_ready, declined;
 } Nprg2Parallel;
 /* Parts the caller may use for a job of `want` natural parts (>= 1). */
+extern volatile uint32_t nprg2_par_kind; /* kind of the job being dispatched (diagnostics) */
 uint32_t nprg2_parallel_parts(Nprg2Parallel *p, uint32_t want);
 void nprg2_parallel_for(Nprg2Parallel *p, uint32_t kind, uint32_t parts, Nprg2ParallelFn fn, void *ctx);
 
 typedef struct { uint8_t *data; uint32_t bytes; } Nprg2ExecBuffer;
+enum { NPRG2_DMA_DRAIN_HAZARD=1, NPRG2_DMA_DRAIN_CANCEL=2,
+       NPRG2_DMA_DRAIN_ERROR=3, NPRG2_DMA_DRAIN_END=4, NPRG2_DMA_DRAIN_NEXT_COPY=5 };
+typedef int (*Nprg2WeightsDmaStart)(void *ctx,uint32_t command_index,void *dst,
+                                   const void *src,size_t bytes,uint64_t timeout_cycles);
+typedef int (*Nprg2WeightsDmaDrain)(void *ctx,uint32_t reason,uint32_t command_index,
+                                   uint64_t timeout_cycles);
+typedef struct {
+    const uint32_t *first_hazard;
+    uint32_t command_count;
+    Nprg2DmaRing *ring;
+    Nprg2WeightsDmaStart start;
+    Nprg2WeightsDmaDrain drain;
+    void *ctx;
+    uint64_t timeout_cycles;
+    uint8_t pending,ring_mode;
+    uint32_t pending_command,pending_hazard;
+    uint64_t starts,drains,hazard_drains,cancel_drains,error_drains,end_drains,
+             next_copy_drains,cpu_fallbacks,failures;
+} Nprg2WeightsAsync;
 /* Scratch regions. Each handler names the region it receives as
  * call->scratch. Region 0 is the request's scratch/scratch_bytes; region k>0
  * is request->extra_scratch[k-1]. A handler whose region is too small is
@@ -78,6 +103,7 @@ struct Nprg2ExecCall {
     const Nprg2ExecBuffer *outputs;
     uint32_t output_count;
     void *user;
+    Nprg2WeightsAsync *weights_async;
     /* NULL = serial. Shared by every call of a request. */
     Nprg2Parallel *parallel;
     /* The region the executor selected for this handler. */
@@ -91,6 +117,8 @@ struct Nprg2ExecCall {
      * may skip a purely repeated dry-run of its own validator. Always 0 in
      * validation calls. */
     uint8_t preflighted;
+    /* Execution owner for handlers with per-thread mutable scratch/memos. */
+    uint8_t execution_lane;
     /* Conv epilogue fusion (see prepared_fuse.h): set on the conv's call when
      * the executor activated a pair for this request; the epilogue command's
      * call, and whether the conv's raw output is dead (need not be stored).
@@ -152,6 +180,9 @@ typedef struct {
      * no_effect command, counted but not decoded. stripped_by_slot counts them
      * per registry slot (for the handler profile). */
     uint8_t strip_valid;
+    /* Step-2 cost-volume approximation activation counters; reset per run. */
+    uint32_t approx_cost_volume_commands;
+    uint16_t approx_cost_volume_conv_planes, approx_cost_volume_interpolated_planes;
     uint32_t effect_bits[NPRG2_EXEC_STRIP_COMMANDS/32u];
     uint32_t stripped_by_slot[NPRG2_EXEC_REGISTRY_CAPACITY];
     /* Compact run list, built by the same full preflight that sets strip_valid
@@ -175,6 +206,7 @@ typedef struct {
     const Nprg2ExecBuffer *outputs;
     uint32_t output_count;
     void *user;
+    Nprg2WeightsAsync *weights_async;
     void *scratch;
     uint32_t scratch_bytes;
     /* Regions 1.. (zero bytes = absent). */
@@ -200,6 +232,7 @@ typedef struct {
      * bytes must re-derive them in its run callback (the elementwise handlers
      * and the reference chain do). */
     uint8_t reuse_preflight;
+    uint8_t execution_lane;
 } Nprg2ExecRequest;
 
 typedef struct {
@@ -246,11 +279,42 @@ int nprg2_executor_preflight(const Nprg2Executor *executor,
 /* Entire requested interval is validated before the first handler writes. No
  * legacy fallback route exists. Handler scratch must be caller-owned. */
 int nprg2_executor_run(const Nprg2Executor *executor, const Nprg2ExecRequest *request);
+/* Dispatch one command from a previously successful full-range preflight.
+ * The proof is read-only and remains valid while commands from independent
+ * QNN run lists execute concurrently. Caller supplies private scratch/near
+ * regions for each list; `request->fuse` must be NULL. */
+int nprg2_executor_run_preflighted_command(const Nprg2Executor *executor,
+                                            const Nprg2ExecRequest *full_request,
+                                            uint32_t command_index,
+                                            uint8_t execution_lane,
+                                            Nprg2Parallel *parallel_override,
+                                            void *scratch,uint32_t scratch_bytes,
+                                            void *near_scratch,uint32_t near_scratch_bytes);
+/* Prepare the immutable per-list request once after full preflight; subsequent
+ * commands dispatch directly without reconstructing or revalidating it. */
+int nprg2_executor_prepare_preflighted_request(const Nprg2Executor *executor,
+                                               const Nprg2ExecRequest *full_request,
+                                               uint8_t execution_lane,
+                                               Nprg2Parallel *parallel_override,
+                                               void *scratch,uint32_t scratch_bytes,
+                                               void *near_scratch,uint32_t near_scratch_bytes,
+                                               Nprg2ExecRequest *prepared_request);
+/* Diagnostic: per lane, sum of clock() at handler entry (caller subtracts entry times). */
+extern uint64_t (*nprg2_lane_clock)(void);
+extern uint64_t nprg2_lane_prehandler[2];
+int nprg2_executor_handler_slot(const Nprg2Executor *executor,uint8_t op,uint8_t variant);
+int nprg2_executor_run_preflighted_command_prepared(const Nprg2Executor *executor,
+                                                    const Nprg2ExecRequest *prepared_request,
+                                                    uint32_t command_index);
 
 /* Implements the existing weights_to_vtcm CPU semantics for validated direct
  * tensors: memmove(min(max-shape source bytes, max-shape destination bytes)). */
 int nprg2_exec_weights_validate(const Nprg2ExecCall *call, void *ctx);
 int nprg2_exec_weights_run(const Nprg2ExecCall *call, void *ctx);
+int nprg2_exec_weights_async_try(const Nprg2ExecCall *call,void *dst,const void *src,size_t bytes);
+int nprg2_exec_weights_dma_checkpoint_set(Nprg2WeightsAsync *async,uint32_t event_id);
+int nprg2_exec_weights_dma_checkpoint_wait(Nprg2WeightsAsync *async,uint32_t event_id);
+int nprg2_exec_weights_dma_drain_all(Nprg2WeightsAsync *async);
 int nprg2_executor_register_weights(Nprg2Executor *executor);
 
 #ifdef __cplusplus
