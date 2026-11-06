@@ -274,3 +274,49 @@ qd_hmx_nativep1_n:
     { p0 = cmp.gt(r5,#0) }
     { if (p0) jump 2b }
     { jumpr r31 }
+/* Stride 2 on the planes (QNN hmx_v73_convbbb_stride2's walk), input read in place:
+ * per column and 32-channel output group, four loads over the four space-to-depth
+ * channel blocks with 4, 2, 2, 1 taps. r0 = per (column, group) {rs0,rt0,..,rs3,rt3},
+ * r1 = B (9 K tiles per group), r2 = Fi as qd_hmx_slide3p_n, r3 = {low, high} per
+ * column (low 0: no store), r4 = groups, r5 = columns. */
+    .globl qd_hmx_slide2p_n
+qd_hmx_slide2p_n:
+    { r7 = #3; r6 = #4096; r28 = #0 }
+    { r14 = add(r2,#257) }
+    { mxclracc }
+    { bias = mxmem2(r14) }
+    { bias = mxmem2(r2) }
+    { r10 = #4095; r11 = #2047 }
+1:
+    { r8 = r4; r9 = r1 }
+2:
+    { r12 = memw(r0+#0); r13 = memw(r0+#4) }
+    { activation.ub = mxmem(r12,r13):cm
+      weight.b = mxmem(r9,r10) }
+    { r9 = add(r9,#4096); r12 = memw(r0+#8); r13 = memw(r0+#12) }
+    { activation.ub = mxmem(r12,r13):cm
+      weight.b = mxmem(r9,r11) }
+    { r9 = add(r9,#2048); r12 = memw(r0+#16); r13 = memw(r0+#20) }
+    { activation.ub = mxmem(r12,r13):cm
+      weight.b = mxmem(r9,r11) }
+    { r9 = add(r9,#2048); r12 = memw(r0+#24); r13 = memw(r0+#28) }
+    { r14 = #1023; r0 = add(r0,#32) }
+    { activation.ub = mxmem(r12,r13):cm
+      weight.b = mxmem(r9,r14) }
+    { r9 = add(r9,#1024); r8 = add(r8,#-1) }
+    { p0 = cmp.gt(r8,#0) }
+    { if (p0) jump 2b }
+    { r12 = memw(r3+#0); r13 = memw(r3+#4); r3 = add(r3,#8) }
+    { p1 = cmp.eq(r12,#0)
+      cvt.ub = acc(r7) }
+    { if (p1) jump 3f }
+    { mxmem(r12,r28):cm = cvt }
+3:
+    { cvt.ub = acc(r6) }
+    { if (p1) jump 4f }
+    { mxmem(r13,r28):cm = cvt }
+4:
+    { r5 = add(r5,#-1) }
+    { p0 = cmp.gt(r5,#0) }
+    { if (p0) jump 1b }
+    { jumpr r31 }

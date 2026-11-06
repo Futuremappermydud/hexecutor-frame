@@ -96,6 +96,8 @@ typedef struct Nprg2HmxOps {
     void (*slide3p_n)(const uint32_t *rec, const void *b, const void *fi, const uint32_t *st, uint32_t cbs, uint32_t ncol);
     /* nativep_n over A tiles read in place: a[t*kb+k], 2048-aligned input blocks. */
     void (*nativep1_n)(const void *const *a, void *b, void *fi, void *const *out, uint32_t kb, uint32_t mt);
+    /* Stride 2 on the planes: rec = {rs,rt} x 4 per (column, group), input read in place. */
+    void (*slide2p_n)(const uint32_t *rec, const void *b, const void *fi, const uint32_t *st, uint32_t groups, uint32_t ncol);
 } Nprg2HmxOps;
 /* Fuse hook registered with the conv keys: the conv handler can run the
  * REQUANT_U8/70 or ADD_U8/13 command `epilogue` fused into its output step

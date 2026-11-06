@@ -162,6 +162,7 @@ void qd_hmx_slide3_n(const uint32_t *,const void *,const void *,const uint32_t *
 void qd_hmx_nativep_n(void *,void *,void *,void *const *,uint32_t,uint32_t);
 void qd_hmx_slide3p_n(const uint32_t *,const void *,const void *,const uint32_t *,uint32_t,uint32_t);
 void qd_hmx_nativep1_n(const void *const *,void *,void *,void *const *,uint32_t,uint32_t);
+void qd_hmx_slide2p_n(const uint32_t *,const void *,const void *,const uint32_t *,uint32_t,uint32_t);
 static uint32_t prepared_hmx_enter(void) {
     uint32_t saved;__asm__ volatile("%0=ssr":"=r"(saved));
     uint32_t on=saved|(1u<<26);__asm__ volatile("ssr=%0\n isync\n barrier"::"r"(on):"memory");
@@ -184,7 +185,7 @@ static const Nprg2HmxOps prepared_hmx_ops={prepared_hmx_enter,prepared_hmx_leave
 #else
     NULL
 #endif
-    ,qd_hmx_nativep_n,qd_hmx_slide3p_n,qd_hmx_nativep1_n
+    ,qd_hmx_nativep_n,qd_hmx_slide3p_n,qd_hmx_nativep1_n,qd_hmx_slide2p_n
 };
 #endif
 #ifndef QDS_PREPARED_FUSE

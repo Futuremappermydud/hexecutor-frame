@@ -449,7 +449,7 @@ static inline __attribute__((always_inline)) HVX_Vector plane_rq(HVX_Vector lo, 
  * tile (t, j) + its next column's tile, realigned by one pixel. */
 typedef struct {
     const uint8_t *C; uint8_t *const *out; const uint8_t *mh; const int32_t *Mq;
-    int32_t mt, NB, bw, ncol, shift;
+    int32_t mt, NB, bw, ncol, shift, tile0; /* shift: output block bx starts in column bx+tile0 */
     int32_t rows, partial_from; /* tiles t >= partial_from write only their first rows rows (oh%8) */
     /* shift: output blocks read here, in the parts, not ahead of the job. */
     uint8_t *const *pool; const uint32_t *oblk; uint32_t ocount, oslice, onbw, onbd; int32_t oR, oC;
@@ -495,7 +495,7 @@ static void plane_part(void *ctx, uint32_t part, uint32_t parts) {
     /* mt = strips*bw tiles in output order; C has ncol columns per strip */
     int32_t bx=0,by=0;size_t row=0;
     for(int32_t t=0;t<J->mt;t++) {
-        const size_t col=(row+(size_t)bx+1)*(size_t)J->NB;
+        const size_t col=(row+(size_t)bx+(size_t)J->tile0)*(size_t)J->NB;
         const uint32_t idx=(((uint32_t)(J->oR+by))*J->onbw+(uint32_t)(J->oC+bx))*J->onbd+J->oslice;
         for(int32_t j=0;j<J->NB;j++,u++) {
             if(u!=next) continue;
@@ -754,13 +754,13 @@ typedef struct {
     const uint8_t *ft; const int8_t *wbase;
     uint32_t xcount, xslice, xnbw, xnbd, ocount, oslice, onbw, onbd;
     int32_t R0, C0, oR, oC, bw, bh, oh, NB, cbs, KB, ncol, zp;
-    uint32_t valid, inplace;
+    uint32_t valid, inplace, s2; /* s2: stride 2, cbs = output groups, four input channel blocks each */
 } ConvPlan;
 static size_t slide_ws(const ConvPlan *P) {
     return slide_fixed(P->NB)+(size_t)P->bh*P->ncol*P->NB*4096+((size_t)2*P->ncol*P->cbs+1)*2048+2048;
 }
 static size_t slide_near(const ConvPlan *P, size_t at) {
-    (void)nbump(&at,(size_t)P->ncol*P->cbs*16);(void)nbump(&at,(size_t)P->ncol*8);
+    (void)nbump(&at,(size_t)P->ncol*P->cbs*(P->s2?32:16));(void)nbump(&at,(size_t)P->ncol*8);
     return at+512; /* the vector record build may store up to one batch past its end */
 }
 #ifndef SLIDE_STAGE_SERIAL_BELOW
@@ -807,7 +807,7 @@ static int plane_slide_run(const ConvPlan *P, const Nprg2ReferenceConv *c, uint8
     uint64_t (*clock)(void)=c->phase?c->clock:NULL,t0=clock?clock():0,t1;
     int32_t *fi=(int32_t *)base,*zero=(int32_t *)(base+(size_t)NB*512);
     uint8_t *completion=base+fixed-2048,*C=base+fixed,*S=C+cbytes,*n=c->near;
-    size_t o_rec=nbump(&at,(size_t)groups*16),o_st=nbump(&at,(size_t)ncol*8);
+    size_t o_rec=nbump(&at,(size_t)groups*(P->s2?32:16)),o_st=nbump(&at,(size_t)ncol*8);
     uint32_t *rec=(uint32_t *)(n+o_rec),*st=(uint32_t *)(n+o_st);
     typedef uint32_t W32 __attribute__((vector_size(128)));
     /* HVX stores must land before HMX reads them: on silicon a stale Fi can leave
@@ -832,6 +832,26 @@ static int plane_slide_run(const ConvPlan *P, const Nprg2ReferenceConv *c, uint8
 #endif
     for(int32_t by=0;by<bh;by++) {
 #ifdef SLIDE_INPLACE_ALL
+        if(P->s2) {
+            /* one window per input channel block: tap rows 0 and 1, the block below or zero */
+            static const uint16_t rl[4]={0x120,0x100,0x020,0x000};
+            const uint32_t drr=P->xnbw*P->xnbd,zb=(uint32_t)(uintptr_t)S,pb=(uint32_t)(uintptr_t)pool[1];uint32_t *r=rec;
+            const int32_t Rb=P->R0+by;
+            if(P->inplace==2u && !by) {const HVX_Vector zv=Q6_V_vzero();for(int i=0;i<16;i++)((HVX_Vector *)S)[i]=zv;}
+            for(int32_t cc=0;cc<ncol;cc++) {
+                const int32_t wb=P->C0+cc;
+                const int live=Rb>=0 && wb>=0 && wb<(int32_t)P->xnbw;
+                const uint32_t i0=live?(((uint32_t)Rb*P->xnbw+(uint32_t)wb)*P->xnbd)+P->xslice:0;
+                for(uint32_t q=0;q<(uint32_t)cbs*4u;q++,r+=2) {
+                    const uint32_t ia=i0+q,ib=ia+drr;
+                    const uint32_t ea=live&&ia<P->xcount?P->xblk[ia]:0,eb=live&&ib<P->xcount?P->xblk[ib]:0;
+                    const uint32_t a=ea&127u?pb+(ea&~127u):zb,bb=eb&127u?pb+(eb&~127u):zb;
+                    r[0]=a|rl[q&3u];r[1]=(bb-a)|0x71fu;
+                }
+            }
+            __asm__ volatile("barrier":::"memory");
+            {W32 v=*(volatile W32 *)(uintptr_t)(rec[0]&~2047u);__asm__ volatile(""::"r"(v[0]):"memory");}
+        } else
         if(P->inplace) {
             /* HMX reads the input blocks where they are (needs the single VTCM page:
              * QDS_VTCM_SINGLE_PAGE). Absent blocks read a zero block at S. */
@@ -885,10 +905,14 @@ static int plane_slide_run(const ConvPlan *P, const Nprg2ReferenceConv *c, uint8
         for(int32_t j=0;j<NB;j++) {
             /* whole tiles, realigned by plane_part: column 0 holds no output pixel */
             st[0]=0;st[1]=0;
-            for(int32_t cc=1;cc<ncol;cc++) {
+            for(int32_t cc=P->s2?0:1;cc<ncol;cc++) {
                 const uint32_t d=(uint32_t)(uintptr_t)(C+(((size_t)by*ncol+cc)*NB+(size_t)j)*4096);
                 st[2*cc]=d;st[2*cc+1]=d+2048u;
             }
+#ifdef SLIDE_INPLACE_ALL
+            if(P->s2) c->hmx->slide2p_n(rec,P->wbase+(size_t)j*KB*1024,fi+j*128,st,(uint32_t)cbs,(uint32_t)ncol);
+            else
+#endif
             c->hmx->slide3p_n(rec,P->wbase+(size_t)j*KB*1024,fi+j*128,st,(uint32_t)cbs,(uint32_t)ncol);
         }
         if(clock){t1=clock();c->phase[1]+=t1-t0;t0=t1;}
@@ -912,7 +936,7 @@ static int plane_slide_run(const ConvPlan *P, const Nprg2ReferenceConv *c, uint8
     if(clock){t1=clock();c->phase[1]+=t1-t0;t0=t1;}
     if(e){*err=E_RANGE;return -1;}
     SP4(7);
-    PlaneJob J={.C=C,.mh=mh,.mt=total,.NB=NB,.bw=bw,.ncol=ncol,.shift=1,
+    PlaneJob J={.C=C,.mh=mh,.mt=total,.NB=NB,.bw=bw,.ncol=ncol,.shift=1,.tile0=P->s2?0:1,
                 .rows=P->oh&7,.partial_from=(P->oh&7)?(bh-1)*bw:total,
                 .pool=pool,.oblk=P->oblk,.ocount=P->ocount,.oslice=P->oslice,.onbw=P->onbw,.onbd=P->onbd,.oR=P->oR,.oC=P->oC};
     uint32_t parts=nprg2_parallel_parts(par,NPRG2_PAR_MAX_PARTS);
@@ -933,36 +957,49 @@ static uint32_t plan_pool_bytes[7];
 static const uint8_t *plan_commands;
 static int hmx_slide_planes(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int32_t cbs, int32_t co, int32_t oh,
                             int32_t ow, const uint32_t *ktab, const int32_t *corr, const int32_t *pre, const int32_t *Mq,
-                            const int8_t *wbase, const T *ft, const uint8_t *fipre, size_t at, int32_t *err) {
+                            const int8_t *wbase, const T *ft, const uint8_t *fipre, size_t at, int32_t *err, int s2) {
     const Nprg2ReferenceConv *c=g->conv;
     (void)co;
+#ifdef SLIDE_INPLACE_ALL
+    if(s2) {
+        /* raw weights in place (s2ip), input origin on a block corner */
+        if(!c->hmx->slide2p_n || cbs%4 || KB!=9*(cbs/4) || (xt->p[1]&7) || (xt->p[2]&7)) return 0;
+        cbs/=4;
+    } else
+#else
+    if(s2) return 0;
+#endif
+    {
     if(!c->hmx->slide3p_n || KB!=9*cbs || cbs<1 || cbs>8) return 0;
     if((xt->p[1]&7)!=7 || (xt->p[2]&7)!=7) return 0;
     for(int32_t cb=0;cb<cbs;cb++)for(int32_t ky=0;ky<3;ky++)for(int32_t kp=0;kp<3;kp++)
         if(ktab[cb*9+ky*3+kp]!=((uint32_t)ky|(uint32_t)(2-kp)<<8|(uint32_t)cb<<16)) return 0;
+    }
     if((uintptr_t)wbase&1023u) return 0;
     const int32_t bw=ow/8,bh=(oh+7)/8;
     ConvPlan P={.xblk=xt->blocks,.oblk=o->blocks,.ft=g->pool[ft->pool]+ft->offset,.wbase=wbase,
                 .xcount=xt->nblocks,.xslice=xt->slice,.xnbw=(uint32_t)(xt->m[2]+7)/8u,.xnbd=(uint32_t)(xt->m[3]+31)/32u,
                 .ocount=o->nblocks,.oslice=o->slice,.onbw=(uint32_t)(o->m[2]+7)/8u,.onbd=(uint32_t)(o->m[3]+31)/32u,
                 .R0=xt->p[1]>>3,.C0=xt->p[2]>>3,.oR=o->p[1]>>3,.oC=o->p[2]>>3,.bw=bw,.bh=bh,.oh=oh,.NB=NB,.cbs=cbs,.KB=KB,
-                .ncol=bw+2,.zp=xt->zp,.valid=1};
+                .ncol=s2?bw+1:bw+2,.zp=xt->zp,.valid=1,.s2=(uint32_t)s2};
 #ifdef SLIDE_INPLACE_ALL
     if(!g->dry) {
         /* every present block of the windows in pool 1 and 2048-aligned; 2: some absent */
         uint32_t ok=1u;const uint32_t drr=P.xnbw*P.xnbd;
+        const int32_t nrow=s2?2:3,nq=s2?cbs*4:cbs;
         for(int32_t by=0;by<bh && ok;by++)for(int32_t cc=0;cc<P.ncol && ok;cc++) {
             const int32_t wb=P.C0+cc,Rb=P.R0+by;
             const int live=Rb>=0 && wb>=0 && wb<(int32_t)P.xnbw;
             const uint32_t i0=live?(((uint32_t)Rb*P.xnbw+(uint32_t)wb)*P.xnbd)+P.xslice:0;
-            for(int32_t cb=0;cb<cbs && ok;cb++)for(uint32_t rr=0;rr<3u;rr++) {
-                const uint32_t ix=i0+(uint32_t)cb+rr*drr,ee=live&&ix<P.xcount?P.xblk[ix]:0,pl=ee&127u;
+            for(int32_t cb=0;cb<nq && ok;cb++)for(int32_t rr=0;rr<nrow;rr++) {
+                const uint32_t ix=i0+(uint32_t)cb+(uint32_t)rr*drr,ee=live&&ix<P.xcount?P.xblk[ix]:0,pl=ee&127u;
                 if(!pl){ok=2u;continue;}
                 if(pl!=1u || !g->pool[1] || (ee&(~127u)&2047u)){ok=0;break;}
             }
         }
         P.inplace=ok;
-    }
+    } else P.inplace=1u;
+    if(s2 && !P.inplace) return 0; /* stride 2 has no staged form */
 #endif
     size_t o_mh=nbump(&at,(size_t)NB*128);
     if(slide_near(&P,at)>c->near_bytes || c->workspace_bytes<slide_ws(&P)) return 0;
@@ -976,7 +1013,7 @@ static int hmx_slide_planes(G *g, const T *xt, const T *o, int32_t KB, int32_t N
     int r=plane_slide_run(&P,c,g->pool,g->call->parallel,base,c->near+o_mh,at,err);
 #ifndef NO_CONV_PLANS
     /* Worth repeating only with the vector parameters the plan also uses. */
-    if(r==1 && fipre && conv_plans && plan_conv==c && g->variant==33 && g->call->execution_lane==0 &&
+    if(r==1 && fipre && conv_plans && plan_conv==c && (g->variant==33 || g->variant==36) && g->call->execution_lane==0 &&
        g->call->program==plan_program && g->call->command_index<MEMO_COMMANDS && !((uintptr_t)P.ft&127u))
         conv_plans[g->call->command_index]=P;
 #else
@@ -1353,9 +1390,15 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
     if(ow%8 || o->p[1]%8 || o->p[2]%8) return 0; /* oh%8: full tiles computed, rows written */
 #if BLK_HVX && defined(NPRG2_SLIDE3) && NPRG2_SLIDE3
     if(!bcopy && !s2ip) {
-        int r=hmx_slide_planes(g,xt,o,KB,NB,cbs,co,oh,ow,ktab,corr,pre,Mq,wbase,ft,fipre,at,err);
+        int r=hmx_slide_planes(g,xt,o,KB,NB,cbs,co,oh,ow,ktab,corr,pre,Mq,wbase,ft,fipre,at,err,0);
         if(r) return r;
     }
+#ifdef SLIDE_INPLACE_ALL
+    if(s2ip) {
+        int r=hmx_slide_planes(g,xt,o,KB,NB,cbs,co,oh,ow,ktab,corr,pre,Mq,wbase,ft,fipre,at,err,1);
+        if(r) return r;
+    }
+#endif
 #endif
     const int32_t bw=ow/8,total=((oh+7)/8)*bw;
     const size_t bsz=bcopy?((size_t)KB*NB*1024+2047)&~(size_t)2047:0,per=(size_t)KB*2048+(size_t)NB*4096,fixed=slide_fixed(NB);
