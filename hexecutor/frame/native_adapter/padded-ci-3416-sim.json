@@ -1,0 +1,44 @@
+{
+  "passed": true,
+  "offline_only": true,
+  "sequence": 3416,
+  "input_ci": 20,
+  "native_padded_ci": 32,
+  "output_co": 128,
+  "geometry": [
+    8,
+    64
+  ],
+  "effective_geometry": [
+    8,
+    64
+  ],
+  "slices": [
+    224,
+    84
+  ],
+  "native_minus_integer_bound": [
+    0,
+    1
+  ],
+  "native_different_values": 987,
+  "native_different_from_cpu": 987,
+  "first_difference": {
+    "y": 0,
+    "x": 0,
+    "out": 5,
+    "acc": 493,
+    "multiplier_word": 4212840,
+    "bias": 0,
+    "expected": 8,
+    "actual": 9,
+    "cpu": 8,
+    "delta": 1
+  },
+  "inactive_output_blocks_changed": [],
+  "expanded_weights_bytes": 4096,
+  "input_padding_zero_weighted": true,
+  "output_sha256": "8f0a8a2d21fbcaf686552c9f32faacbefae3861e07582c7f03d5919ef5531c01",
+  "poisoned_tail_full_output_identical": true,
+  "poisoned_output_sha256": "8f0a8a2d21fbcaf686552c9f32faacbefae3861e07582c7f03d5919ef5531c01"
+}

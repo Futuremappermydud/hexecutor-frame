@@ -1,0 +1,44 @@
+{
+  "passed": true,
+  "offline_only": true,
+  "fixture_sequence": 1195,
+  "input_pages": 32,
+  "output_pages": 32,
+  "workspace_tensor_staging_bytes": 0,
+  "output_bytes": 65536,
+  "oracle_delta": [
+    0,
+    1
+  ],
+  "direct_equals_staged": true,
+  "direct_output_sha256": "e8b3a695bef296a786bf09a721bf2d49721584bc5e71af3ac67c25f91cab9074",
+  "staged_output_sha256": "e8b3a695bef296a786bf09a721bf2d49721584bc5e71af3ac67c25f91cab9074",
+  "fixture_sha256": "5b8df2879945eed2ec46218cf397a73bcdf029e55da090def422adc779b079d9",
+  "source_sha256": {
+    "qd_native_direct.c": "3f136cced492f44115f56b23c292813702d6795633a44a47636eb892a7455b30",
+    "qd_native_direct.h": "933c72b9f6f1072b40b78258460139c51dddcec3abc2110ffe6c41613c96469b",
+    "direct_1x1_sim.c": "7bbf678191b508eab992a8ff50f5d1feaa360b4ee100ce6924fc2647d2227c78"
+  },
+  "current_source_sha256": {
+    "qd_native_direct.c": "3f136cced492f44115f56b23c292813702d6795633a44a47636eb892a7455b30",
+    "qd_native_direct.h": "933c72b9f6f1072b40b78258460139c51dddcec3abc2110ffe6c41613c96469b"
+  },
+  "hardware_retest_required_for_current_core": true,
+  "hardware_proof_v1_sha256": {
+    "qd_native_direct.c": "6622e8126839081fa781736019f8605702e684a30bb6f75ad2b155676b955ce8",
+    "qd_native_direct.h": "933c72b9f6f1072b40b78258460139c51dddcec3abc2110ffe6c41613c96469b"
+  },
+  "sdk_build_flags": [
+    "-mv75",
+    "-mhmx",
+    "-mhvx",
+    "-mhvx-length=128b",
+    "-O2",
+    "-G0",
+    "-ffreestanding",
+    "-fno-builtin",
+    "-fno-stack-protector"
+  ],
+  "simulator": "Qualcomm Hexagon SDK 6.6.0.0 hexagon-sim -mv75 --quiet; simulator VTCM layout override 512 KiB (384 KiB active + 128 KiB reserved tail)",
+  "checks": "QNN leaf [0,+1] int64 oracle; exact staged output; sim also checks source pools, VTCM outside active Y pages, input/A5 guards and zero-Fi unchanged"
+}

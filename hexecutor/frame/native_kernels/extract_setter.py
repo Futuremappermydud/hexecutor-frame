@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Extract the local QAIRT stride-1 HMX parameter setter for offline simulation."""
+from pathlib import Path
+import hashlib, struct
+
+provider = Path('/Users/owenelliott/Downloads/qairt/2.50.0.260828/lib/hexagon-v75/unsigned/libQnnHtpV75.so')
+raw = provider.read_bytes()
+assert raw[:7] == b'\x7fELF\x01\x01\x01'
+shoff = struct.unpack_from('<I', raw, 32)[0]
+stride, count = struct.unpack_from('<HH', raw, 46)
+sections = [struct.unpack_from('<10I', raw, shoff + i * stride) for i in range(count)]
+for sec in sections:
+    if sec[1] != 11:  # SHT_DYNSYM
+        continue
+    strings = sections[sec[6]]
+    names = raw[strings[4]:strings[4] + strings[5]]
+    for off in range(sec[4], sec[4] + sec[5], sec[9]):
+        name, addr, size, info, other, si = struct.unpack_from('<IIIBBH', raw, off)
+        symbol = names[name:names.find(b'\0', name)].decode()
+        if symbol != '_Z22set_hmx_params_stride1P10hmx_paramsmmmmmmm':
+            continue
+        src = sections[si]
+        code = raw[src[4] + addr - src[3]:src[4] + addr - src[3] + size]
+        assert len(code) == size and addr == 0x2f35c0 and size == 1400
+        out = Path(__file__).with_name('qd_set_hmx_params_stride1.S')
+        lines = ['/* Extracted QAIRT 2.50 stride1 setter; simulator-only ABI probe. */',
+                 '.text', '.p2align 6', '.globl qd_set_hmx_params_stride1',
+                 'qd_set_hmx_params_stride1:']
+        lines += [f'  .word 0x{x:08x}' for x in struct.unpack('<%dI' % (size // 4), code)]
+        out.write_text('\n'.join(lines) + '\n')
+        print(f'{out}: va={addr:#x} bytes={size} code_sha256={hashlib.sha256(code).hexdigest()} provider_sha256={hashlib.sha256(raw).hexdigest()}')
+        break
+    else:
+        continue
+    break
+else:
+    raise SystemExit('setter symbol missing')

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Frame NPU Chat
+Comment=Qwen3-0.6B chat on the Frame NPU
+Exec=/home/steamos/frame-dsp/depth-model/dev/frame/llm/launch.sh
+Icon=dialog-information
+Terminal=false
+Categories=Utility;
+OnlyShowIn=gamescope;

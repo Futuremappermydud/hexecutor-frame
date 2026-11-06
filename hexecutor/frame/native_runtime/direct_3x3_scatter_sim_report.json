@@ -1,0 +1,40 @@
+{
+  "passed": true,
+  "offline_only": true,
+  "sequence": 247,
+  "input_block_refs": 108,
+  "input_pages_consumed": 108,
+  "unique_input_pages": 97,
+  "repeated_input_aliases": 11,
+  "output_pages_consumed": 32,
+  "unique_touched_physical_pages": 129,
+  "independent_physical_page_permutation_multiplier": 73,
+  "nonmonotone_input_table_transitions": 57,
+  "weight_pool1_offset": "0x396800",
+  "fi_pool1_offset": "0x39f800",
+  "direct_equals_staged": true,
+  "workspace_tensor_staging_bytes": 0,
+  "cpu_prefix_delta_histogram": {
+    "0": 64863,
+    "1": 673
+  },
+  "direct_output_sha256": "cfec6dbed3eb2e88544d5c0371c8c50915ce90e6b14f44be7c4411c19bf5e15f",
+  "staged_output_sha256": "cfec6dbed3eb2e88544d5c0371c8c50915ce90e6b14f44be7c4411c19bf5e15f",
+  "fixture_sha256": "e7f6f22a833befb58114a4ead798bcd399811cdf6ec7c3164a38fb34f66ca132",
+  "source_sha256": {
+    "qd_native_direct.c": "38cba2830af8dbd630356fe27dac7e191d4b82f794f575761b92728186e144da",
+    "qd_native_direct.h": "933c72b9f6f1072b40b78258460139c51dddcec3abc2110ffe6c41613c96469b",
+    "scatter_sim.c": "0746c6bbf8d3f2510695b0c10b699f54e9fd7d88b700bb109c6a2404a471ff0e",
+    "offset_generator.py": "338a3a6e0426bbd3db7deb4bbe13c21ea213c13b5b1568cbc6a9176da60457b7"
+  },
+  "current_source_sha256": {
+    "qd_native_direct.c": "38cba2830af8dbd630356fe27dac7e191d4b82f794f575761b92728186e144da",
+    "qd_native_direct.h": "933c72b9f6f1072b40b78258460139c51dddcec3abc2110ffe6c41613c96469b"
+  },
+  "hardware_retest_required_for_current_core": true,
+  "hardware_proof_v1_sha256": {
+    "qd_native_direct.c": "6622e8126839081fa781736019f8605702e684a30bb6f75ad2b155676b955ce8",
+    "qd_native_direct.h": "933c72b9f6f1072b40b78258460139c51dddcec3abc2110ffe6c41613c96469b"
+  },
+  "checks": "real seq247 pool1 offsets; duplicate X refs preserved; unique scattered VTCM pages independently permuted; output compared bytewise to staged leaf and within [0,+1] CPU-prefix tolerance; C harness verifies source unchanged and VTCM outside scattered output unchanged"
+}

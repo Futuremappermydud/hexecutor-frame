@@ -1,0 +1,41 @@
+{
+  "image": "frame/build/resident-primary.qdrx",
+  "sequence": 1022,
+  "command_index": 836,
+  "variant": "ConvLayer_s1.opt@CB*2.Xwb.Fi.t",
+  "input_tensor_id": 998,
+  "weights_tensor_id": 960,
+  "weights_ref": {
+    "pool": 1,
+    "offset": 4470784
+  },
+  "weights_bytes": 9216,
+  "weights_sha256": "5119e1c781aad96bfdaad620cc10813d10a9c15873ab37e8a2159ceaa46cf102",
+  "fi_tensor_id": 933,
+  "fi_ref": {
+    "pool": 1,
+    "offset": 4509696
+  },
+  "fi_bytes": 256,
+  "fi_sha256": "8ff7ffedc5ab78ce2faee5d91bcd17cc79928fc34700a979165a6620ca00739d",
+  "synthetic_oracle_sha256": "246f4246492b5d4ddd268963de7443b52a72f8fe5bd6139c3411e92fd898a3cb",
+  "cpu_output_sha256": "7c4b4e4a705f3d771564612f0be77ae3cb3f21ca8906014f7e80166a531fd1b5",
+  "actual_activation_sha256": "ce5a15785979dfba4844301a28002306210109210d6089bc89958e9df73a20de",
+  "actual_simple_oracle_sha256": "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31",
+  "actual_input_lowfi_oracle_sha256": "c738f1b06ee792ec88021fb3995a358a86bdbf4852ab8f3e2206cdc6ad06fe20",
+  "ones_actualfi_oracle_sha256": "58947bf29401e441ac14ece38e368dba436758191f22b79aa91e366d8ea8fe18",
+  "actual_fi_first_multiplier_hex": "0x403a04",
+  "actual_fi_channel4_bias": -216903,
+  "raw_acc_actual_input_minmax": [
+    4633,
+    193203
+  ],
+  "raw_acc_ones_actualfi_minmax": [
+    -221100,
+    24325
+  ],
+  "cpu_output_method": "NativeGraph CPU QDRX prefix through command index 836, then htp_emu.Memory logical read of output tensor",
+  "input_pages_bytes": 208896,
+  "input_pages_sha256": "247be4851d5804d80e254055530dac59f333574057c07ca30459dae00d0016b8",
+  "execution": "NativeGraph CPU QDRX prefix through command index 836; no DSP/device"
+}

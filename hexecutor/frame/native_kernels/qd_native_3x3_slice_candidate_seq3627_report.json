@@ -1,0 +1,35 @@
+{
+  "passed": true,
+  "candidate": "selected bounded adapter source with relaxed output slice eligibility",
+  "used_core": "frame/native_kernels/qd_native_3x3_adapter.c",
+  "used_core_sha256": "64e5d6a0b6015ee9167b54360ecb54c7e9c33863ced81bc5e299a1d13a17b974",
+  "native_3x3_slices": 1,
+  "frozen_core_c_sha256": "64e5d6a0b6015ee9167b54360ecb54c7e9c33863ced81bc5e299a1d13a17b974",
+  "candidate_core_c_sha256": "bf5440146445a26a8cdcef86b5c129ae6e3f77427ef78b92d8d777281658428b",
+  "fixture_sha256": "448e8c3b03ce03608af9d5a72905a3b822b173169bf9357d346c888244566f74",
+  "sequence": 3627,
+  "input_channels": 128,
+  "output_channels": 128,
+  "input_slice": 0,
+  "output_slice": 67,
+  "input_slice_mod_CI_blocks": 0,
+  "output_slice_mod_CO_blocks": 3,
+  "input_pages": 120,
+  "output_pages": 32,
+  "physical_output_bytes": 65536,
+  "delta_histogram": {
+    "0": 64457,
+    "1": 1079
+  },
+  "staged_fnv64": {
+    "X": "9a5f69a4cf48367d",
+    "W": "e15b79304e623e65",
+    "FI": "aea55cceb2f6a8ca"
+  },
+  "cpu_output_sha256": "4c569b5a0bd7e88112145f51e6ee7d1a89de7c9a93074e072e9a4ad65e8fdaa6",
+  "candidate_output_sha256": "e8a218d54db053e8781480347e3e065f54d7a08f21e24b9554d2cfbee65cc75d",
+  "log_sha256": "51a48952f96e7fe6da72999a67294dfa27632e8fbfe6219951ad147ffca2a71d",
+  "guard_and_table_tails": "passed",
+  "workspace_boundary_canary": "passed",
+  "hardware_accessed": false
+}

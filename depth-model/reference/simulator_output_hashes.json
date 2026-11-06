@@ -1,0 +1,214 @@
+{
+ "generator": "tools/stereo_probes.py make (deterministic, seed 0)",
+ "runtime": "QAIRT 2.50.0.260828 x86_64 HTP simulator via tools/run_qnn_sim.py",
+ "models": {
+  "primary": {
+   "same": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "bc577a44ca8a81d50924fa0eb56a1e7d03ffb87a8908fa0d0b9acd9f535fb36d",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "2ee4f16625c040743654d0b8ba98d60f7732ef45f13ef79dcf872826ea6e4fd3"
+   },
+   "w+2": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "ccca09073b99fb78d3184169cf5d2793e252bf5887c49f0341be8b47641d3b0c",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "ade6f702b99af72c256515ae2680a7054560187f3c60ff64dc58d8baba455dfd"
+   },
+   "w-2": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "04adb054dd75c7964c5dd5eb2a3d49abdbef6f5c8fec679925b67306dbcbba75",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "78517647ca439b4d1fd4f1d91c309ab6a29cbbe2ca3568061b1e3e9c43a7863b"
+   },
+   "h+2": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "0fdb3845dbdeb2cb887b5f9ff99191476e3ba36142d092b54d91387ddcc0bcd9",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "f71b340e6d1f2fcaec30be0fea0ade53df89f23d28034e9584ab51652ec4435f"
+   },
+   "h-2": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "b4b55fb6a6147d5c55f215aee57d82f29646059f3509456340694bce7d54a773",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "2d1b614da54c0e017b4c98fee4ce9f05e1a118e3ccf0db2b43aae64fa2002f46"
+   },
+   "w+4": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "f1f6da308e5008f30d24c28331dfe49f9a47e3bac9f45a4e48a4ff610d322aef",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "a5bcdface27f0cdd276d27a07ad8c020b021d7717ddeb1ed17e0b1f7d883e499"
+   },
+   "w-4": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "7dff7e608edcea075ab21c0c877837997ed6bb33029292e32e7743fdaac38f83",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "ebd51e8374a90f2f1b548cb889b05c4e44cf35044e7c259274748a0c5dee087b"
+   },
+   "h+4": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "72bc7de8587bccfc68767c7d894242c0eb9d1cdbb655251b3bffca6db91ff43e",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "4e720ad8e86c8ebfa5f903ea730964915a368a120d0b85ebfb028428445df32f"
+   },
+   "h-4": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "5871cdebe8595e03b2addedd74d91d118fb1afe999461cae70c83c09c84f0567",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "23a3bded363c8e08fa9f1f0b6f2d35b16f5d09803903f9f9610261c3fc526582"
+   },
+   "w+8": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "d4a24018663ffebe8b504666fa407aa5c94a6515dab696e392d1d094b2954e38",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "7339695b4b61c3f4be9222f9721573c9082b77c51eb84e3b2807b5c115a62798"
+   },
+   "w-8": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "e018a7b94c19b597c9bd2f5a5f23bd7d8fd03e363bfb3e22823d40aefd51aef3",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "df251c524a54c63cf3bd0793c57644e6c167e7ce0fc2666fa438fe603bd82eff"
+   },
+   "h+8": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "0565d451b16affd59baf947d64ba325503366e394d499d32ade3c044e8009933",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "0fee27adfc2e7bc8327d4fa8130a94d6469b3cb047e244ded7ad2b977abec668"
+   },
+   "h-8": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "d7d9629ce3444f9e5d6e340902769c8f69b4342208c21fc0520ad11a12d8c7ec",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "53da67e238c8b1d19d5b1e738481bc165659a48a3d3efea835f55e86abaad108"
+   },
+   "w+16": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "9b997af553c9a13091feb88dbfc54ec9186275234b3416ef05891636a8bc6960",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "6133dc63fdad5d847742902fe8b6bb754cfa46101ec97fc8721572a40c59ee9e"
+   },
+   "w-16": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "1bfd1df5a0ffc32928cf2a14955efe401691f04213659e94c1dc576908d28163",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "ebf325bd60a257ec8488535df40bb93e0910b24d12a7494f8f7f805e6c633872"
+   },
+   "h+16": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "5ff7f9a11108eb40bd0388fe3ca3a5e91decd9b896a144c61976d6f26871dcfc",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "eadfd5e438cce122f4baaf14281b5b3a60147087615370b80033ab299ca1e6cf"
+   },
+   "h-16": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "b520f94d3553de92e458860bb72185b5985090925fc92a0a763e68626e21352a",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "2044a4b7aca5a2ee636b395b9f43ca59f6eaea3c610d3d2753080931b5a6bcf7"
+   },
+   "w+32": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "510026f0541da146cd25bd5e02cc375cf04210901023684c2e490b6980ca03d6",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "a1080c845a30fd28277b7352cbe87f12a9cfbc61b2c6c64b24f1c83b228cc3d0"
+   },
+   "w-32": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "31b6ca2f79f785bc4faec1a42d02414c83e359869f6069fe7cf4223024da0ffd",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "f15a043724c43aa0a2428e7de2716400a32ab37c8bf3c48a91c553fc3ea8de00"
+   },
+   "h+32": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "360e30f1229d359316dd822119117734e69b5628075264190499629fd0300f54",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "723f67d9707ce17d2dc6ab9d8f1c92cac7795ddf5aa5fb8d602f22ac820f718f"
+   },
+   "h-32": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "0125b16d79b0aae0beba1b3d72332927743f83b0efdeecd0d55106acaca7a90e",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "60f7496b147f4d4fc574b844f34a8afbef0dfa6e325af3325b5382dbcf4f9ed6"
+   },
+   "flat_h0_id": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "428d91e632f4cf21a38ec02f879bb819fd53138890e9809e542411beb32d7fa3",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "99afd62a89f868bd15515f464573411e9548a9b083966a4f50b81d59d2895630"
+   },
+   "flat_h0_zero": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "428d91e632f4cf21a38ec02f879bb819fd53138890e9809e542411beb32d7fa3",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "99afd62a89f868bd15515f464573411e9548a9b083966a4f50b81d59d2895630"
+   },
+   "flat_h16_id": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "428d91e632f4cf21a38ec02f879bb819fd53138890e9809e542411beb32d7fa3",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "8d5c7d3e216c165c5e0f78d180083437e9da15061249603316f6250e7d6fd7b3"
+   },
+   "flat_h16_zero": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "428d91e632f4cf21a38ec02f879bb819fd53138890e9809e542411beb32d7fa3",
+    "quantized_decomposed_dequantize_per_tensor_default_333.raw": "146befae05a07d78c90fb6b60f49064e6bc164ff00aaa54df36ddcc02173ee0a"
+   }
+  },
+  "alternate": {
+   "same": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "bc577a44ca8a81d50924fa0eb56a1e7d03ffb87a8908fa0d0b9acd9f535fb36d",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "53eac1abe62dc4b1a1b2ce68bb6b58b0c32de99d098c1f342e83fd9ca3fb1263"
+   },
+   "w+2": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "ccca09073b99fb78d3184169cf5d2793e252bf5887c49f0341be8b47641d3b0c",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "572b8c9d8e86d6fcc5afd096926cceb4dfd8f39915c5c6cead53751961ef0ee7"
+   },
+   "w-2": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "04adb054dd75c7964c5dd5eb2a3d49abdbef6f5c8fec679925b67306dbcbba75",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "11fe016b8738b84cc00dfa60842d2ec19a12e8ea72964444288e21b99093deb8"
+   },
+   "h+2": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "0fdb3845dbdeb2cb887b5f9ff99191476e3ba36142d092b54d91387ddcc0bcd9",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "7393e7f2b1c27a5128fd0519d49d7caf7ea3e6ef270bf9686a78fc05b3b09233"
+   },
+   "h-2": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "b4b55fb6a6147d5c55f215aee57d82f29646059f3509456340694bce7d54a773",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "34378858a4ffe16a835746d8894d3667c80d32c04c906437235060294b808e69"
+   },
+   "w+4": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "f1f6da308e5008f30d24c28331dfe49f9a47e3bac9f45a4e48a4ff610d322aef",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "a119e956a21eabc35494e6d2424f01a1b0e3a6fa46adb1805caa7cac046d61d1"
+   },
+   "w-4": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "7dff7e608edcea075ab21c0c877837997ed6bb33029292e32e7743fdaac38f83",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "df5791782ff853547b72c1c89d9b451e891dcdf8c81f45708f872bc5579e6772"
+   },
+   "h+4": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "72bc7de8587bccfc68767c7d894242c0eb9d1cdbb655251b3bffca6db91ff43e",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "0ea13868f7b2de387bf96e4198f8c05cf1d615865f0120bb24301658d3e14ba6"
+   },
+   "h-4": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "5871cdebe8595e03b2addedd74d91d118fb1afe999461cae70c83c09c84f0567",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "ce8d6298949026115d45bc500dd650ee03e86f22ce28adf3881b0550b1e45482"
+   },
+   "w+8": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "d4a24018663ffebe8b504666fa407aa5c94a6515dab696e392d1d094b2954e38",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "65a8b8e09b3c9546069ca4011ff617cbd04006b08289404570fd9c1cfe467b4d"
+   },
+   "w-8": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "e018a7b94c19b597c9bd2f5a5f23bd7d8fd03e363bfb3e22823d40aefd51aef3",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "24f1b2c745aec0d71cb5e783cc75423e18d30d7ad0c0729b48fdf185fd2d8682"
+   },
+   "h+8": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "0565d451b16affd59baf947d64ba325503366e394d499d32ade3c044e8009933",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "0667418921d7dd8a858e7d31d125c0a9cdf38fd5ba94a16824db5f706948e404"
+   },
+   "h-8": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "d7d9629ce3444f9e5d6e340902769c8f69b4342208c21fc0520ad11a12d8c7ec",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "31379f41424b5738e9a4a332f9348c1c309439aa9d823df18af75de8c147e2b8"
+   },
+   "w+16": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "9b997af553c9a13091feb88dbfc54ec9186275234b3416ef05891636a8bc6960",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "1cdb5d1b609cb597dc3c2fdcf4add71bd54bc29cdaaf19f399e1d106dde53611"
+   },
+   "w-16": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "1bfd1df5a0ffc32928cf2a14955efe401691f04213659e94c1dc576908d28163",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "48f84b5acc936e6404420c8f11bcc1d78c00a147aae274c199ced6f18d9a6dff"
+   },
+   "h+16": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "5ff7f9a11108eb40bd0388fe3ca3a5e91decd9b896a144c61976d6f26871dcfc",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "0d42d8d02008ed737ec576f5bd690f86469e1be4cdab7117e1249b164a872707"
+   },
+   "h-16": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "b520f94d3553de92e458860bb72185b5985090925fc92a0a763e68626e21352a",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "df9a05f2bcf79ce3591af55a498e316aef1acac6adb321b91ef9cc2eb3136162"
+   },
+   "w+32": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "510026f0541da146cd25bd5e02cc375cf04210901023684c2e490b6980ca03d6",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "3b9a65c11d64377b59707311aaf9b8d6e5cc510a90f844a723ff623877744fde"
+   },
+   "w-32": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "31b6ca2f79f785bc4faec1a42d02414c83e359869f6069fe7cf4223024da0ffd",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "157059774c9c7ce84180126a004d4d4f42aab34a4c08eff36e80e69358af37f0"
+   },
+   "h+32": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "360e30f1229d359316dd822119117734e69b5628075264190499629fd0300f54",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "b85c9fa74e3238b86941b54f601d50ac35b4d022a556a21b2a9792b6c8dd6315"
+   },
+   "h-32": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "0125b16d79b0aae0beba1b3d72332927743f83b0efdeecd0d55106acaca7a90e",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "6c8cbcf24ec7c7337c186088f2a7a81050a99c92671ddf003c917e9e66f517da"
+   },
+   "flat_h0_id": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "428d91e632f4cf21a38ec02f879bb819fd53138890e9809e542411beb32d7fa3",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "47c7ef964f9a48827777158b9ccd9e2296323884d67ec30b46e5089e0ef00a61"
+   },
+   "flat_h0_zero": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "428d91e632f4cf21a38ec02f879bb819fd53138890e9809e542411beb32d7fa3",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "47c7ef964f9a48827777158b9ccd9e2296323884d67ec30b46e5089e0ef00a61"
+   },
+   "flat_h16_id": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "428d91e632f4cf21a38ec02f879bb819fd53138890e9809e542411beb32d7fa3",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "3805b0ae27b3b3aa9a6b2cf637df93140d55499eca38f2ea2881f003e3e265c1"
+   },
+   "flat_h16_zero": {
+    "boltnn_permute_from_boltnn_tensor_81_native.raw": "428d91e632f4cf21a38ec02f879bb819fd53138890e9809e542411beb32d7fa3",
+    "quantized_decomposed_dequantize_per_tensor_default_335.raw": "ffd1ddecd5d3dbbe95eb2dd29847c627d38da5b3ecda7a3e1bf2e7ada5fdd09c"
+   }
+  }
+ },
+ "smoke_primary": {
+  "boltnn_permute_from_boltnn_tensor_81_native.raw": "dfacee192b7a534ef79634993d03a1c870e1550e5ba1c485af5ab17466616ad3",
+  "quantized_decomposed_dequantize_per_tensor_default_333.raw": "a978ee8291ea05c0b482b72cdc54f09c1ad8294a366f3ba215bb32653cb3f32b"
+ }
+}

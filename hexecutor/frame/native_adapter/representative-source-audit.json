@@ -1,0 +1,433 @@
+{
+  "qdrx_image": "/Users/owenelliott/Documents/projects/spatial-stuff/depth-model/frame/build/resident-primary.qdrx",
+  "qdrx_sha256": "dc8fcddcf4876d11f7a717ec4f111e1d3d3a40d4f3163758b590234e0b50b92b",
+  "constant_pool_sha256": {
+    "5": "fbf9d527c742521ac73c85fb7d2a68f097ba2bb098c9c17ab3dba3375d08fe73"
+  },
+  "samples": [
+    {
+      "sequence": 1195,
+      "variant": "ConvLayer_s1.opt@CB*2.Xpb.Fi.t",
+      "input_id": 929,
+      "output_id": 1215,
+      "input_hw": [
+        8,
+        64
+      ],
+      "output_hw": [
+        8,
+        64
+      ],
+      "input_max_hw": [
+        8,
+        64
+      ],
+      "output_max_hw": [
+        8,
+        64
+      ],
+      "ci": 128,
+      "co": 128,
+      "weight_tensor": 1200,
+      "weight_source_tensor": 1199,
+      "weight_source": {
+        "pool": 5,
+        "offset": 4474880
+      },
+      "weight_producer": "ConvLayer.opt.weights_to_vtcm@Xpb.xpb.",
+      "weight_bytes": 16384,
+      "weight_sha256": "61bf01a811aa71a2b2a4027b4a903190422672b589af97a34a6b019a71cd43c9",
+      "fi_tensor": 1202,
+      "fi_source_tensor": 1201,
+      "fi_source": {
+        "pool": 5,
+        "offset": 7180800
+      },
+      "fi_producer": "ConvLayer.opt.weights_to_vtcm@Fi.fi.",
+      "fi_bytes": 1024,
+      "fi_sha256": "deb6df5179b5f78513b4390e363f9ee69476f1678523c9f14c444fbbf84124eb",
+      "slice_offsets": [
+        0,
+        0
+      ],
+      "static_raw_weight_fi": true
+    },
+    {
+      "sequence": 2380,
+      "variant": "ConvLayer_s1.opt@CB*2.Xpb.Fi.t",
+      "input_id": 1931,
+      "output_id": 2054,
+      "input_hw": [
+        8,
+        8
+      ],
+      "output_hw": [
+        8,
+        8
+      ],
+      "input_max_hw": [
+        8,
+        8
+      ],
+      "output_max_hw": [
+        8,
+        8
+      ],
+      "ci": 128,
+      "co": 64,
+      "weight_tensor": 1622,
+      "weight_source_tensor": 1434,
+      "weight_source": {
+        "pool": 4,
+        "offset": 8192
+      },
+      "weight_producer": "ConvLayer.opt.weights_to_vtcm@Xpb.xpb.",
+      "weight_bytes": null,
+      "weight_sha256": null,
+      "fi_tensor": 1985,
+      "fi_source_tensor": 1443,
+      "fi_source": {
+        "pool": 3,
+        "offset": 49920
+      },
+      "fi_producer": "ConvLayer.opt.bias_scale_shuff@Fi.fi.Fs.t",
+      "fi_bytes": null,
+      "fi_sha256": null,
+      "slice_offsets": [
+        12,
+        6
+      ],
+      "static_raw_weight_fi": false
+    },
+    {
+      "sequence": 4136,
+      "variant": "ConvLayer_s1.opt@CB*2.Xpb.Fi.t",
+      "input_id": 3685,
+      "output_id": 3687,
+      "input_hw": [
+        8,
+        8
+      ],
+      "output_hw": [
+        8,
+        8
+      ],
+      "input_max_hw": [
+        8,
+        8
+      ],
+      "output_max_hw": [
+        8,
+        8
+      ],
+      "ci": 128,
+      "co": 128,
+      "weight_tensor": 3544,
+      "weight_source_tensor": 3543,
+      "weight_source": {
+        "pool": 5,
+        "offset": 6533120
+      },
+      "weight_producer": "ConvLayer.opt.weights_to_vtcm@Xpb.xpb.",
+      "weight_bytes": 16384,
+      "weight_sha256": "539dae1b54b0151ae40ee0299a27c2458b46d0c31117e18f2d6e04052466189f",
+      "fi_tensor": 3542,
+      "fi_source_tensor": 3541,
+      "fi_source": {
+        "pool": 5,
+        "offset": 7198720
+      },
+      "fi_producer": "ConvLayer.opt.weights_to_vtcm@Fi.fi.",
+      "fi_bytes": 1024,
+      "fi_sha256": "94517c8c2f1487ff8ed548fff4bb1ac8106ebe58912e166ffd55ece22f28cad9",
+      "slice_offsets": [
+        98,
+        0
+      ],
+      "static_raw_weight_fi": true
+    },
+    {
+      "sequence": 4137,
+      "variant": "ConvLayer_s1.opt@CB*2.Xpb.Fi.t",
+      "input_id": 3686,
+      "output_id": 3688,
+      "input_hw": [
+        2,
+        8
+      ],
+      "output_hw": [
+        2,
+        8
+      ],
+      "input_max_hw": [
+        8,
+        8
+      ],
+      "output_max_hw": [
+        8,
+        8
+      ],
+      "ci": 128,
+      "co": 128,
+      "weight_tensor": 3544,
+      "weight_source_tensor": 3543,
+      "weight_source": {
+        "pool": 5,
+        "offset": 6533120
+      },
+      "weight_producer": "ConvLayer.opt.weights_to_vtcm@Xpb.xpb.",
+      "weight_bytes": 16384,
+      "weight_sha256": "539dae1b54b0151ae40ee0299a27c2458b46d0c31117e18f2d6e04052466189f",
+      "fi_tensor": 3542,
+      "fi_source_tensor": 3541,
+      "fi_source": {
+        "pool": 5,
+        "offset": 7198720
+      },
+      "fi_producer": "ConvLayer.opt.weights_to_vtcm@Fi.fi.",
+      "fi_bytes": 1024,
+      "fi_sha256": "94517c8c2f1487ff8ed548fff4bb1ac8106ebe58912e166ffd55ece22f28cad9",
+      "slice_offsets": [
+        102,
+        4
+      ],
+      "static_raw_weight_fi": true
+    },
+    {
+      "sequence": 4151,
+      "variant": "ConvLayer_s1.opt@CB*2.Xpb.Fi.t",
+      "input_id": 3697,
+      "output_id": 3700,
+      "input_hw": [
+        8,
+        16
+      ],
+      "output_hw": [
+        8,
+        16
+      ],
+      "input_max_hw": [
+        8,
+        16
+      ],
+      "output_max_hw": [
+        8,
+        16
+      ],
+      "ci": 128,
+      "co": 128,
+      "weight_tensor": 3577,
+      "weight_source_tensor": 3576,
+      "weight_source": {
+        "pool": 5,
+        "offset": 6713344
+      },
+      "weight_producer": "ConvLayer.opt.weights_to_vtcm@Xpb.xpb.",
+      "weight_bytes": 16384,
+      "weight_sha256": "c5f4e4d9055e5738b686184959871d59fc63eeaa413aff7bd7b97e144a9878f4",
+      "fi_tensor": 3546,
+      "fi_source_tensor": 3545,
+      "fi_source": {
+        "pool": 5,
+        "offset": 7201792
+      },
+      "fi_producer": "ConvLayer.opt.weights_to_vtcm@Fi.fi.",
+      "fi_bytes": 1024,
+      "fi_sha256": "c661a3da812769e738f0cf303c8707079211106cbb3c34ae327eb633a4e5fd58",
+      "slice_offsets": [
+        52,
+        188
+      ],
+      "static_raw_weight_fi": true
+    },
+    {
+      "sequence": 4154,
+      "variant": "ConvLayer_s1.opt@CB*2.Xpb.Fi.t",
+      "input_id": 3699,
+      "output_id": 3703,
+      "input_hw": [
+        4,
+        16
+      ],
+      "output_hw": [
+        4,
+        16
+      ],
+      "input_max_hw": [
+        8,
+        16
+      ],
+      "output_max_hw": [
+        8,
+        16
+      ],
+      "ci": 128,
+      "co": 128,
+      "weight_tensor": 3577,
+      "weight_source_tensor": 3576,
+      "weight_source": {
+        "pool": 5,
+        "offset": 6713344
+      },
+      "weight_producer": "ConvLayer.opt.weights_to_vtcm@Xpb.xpb.",
+      "weight_bytes": 16384,
+      "weight_sha256": "c5f4e4d9055e5738b686184959871d59fc63eeaa413aff7bd7b97e144a9878f4",
+      "fi_tensor": 3546,
+      "fi_source_tensor": 3545,
+      "fi_source": {
+        "pool": 5,
+        "offset": 7201792
+      },
+      "fi_producer": "ConvLayer.opt.weights_to_vtcm@Fi.fi.",
+      "fi_bytes": 1024,
+      "fi_sha256": "c661a3da812769e738f0cf303c8707079211106cbb3c34ae327eb633a4e5fd58",
+      "slice_offsets": [
+        144,
+        135
+      ],
+      "static_raw_weight_fi": true
+    },
+    {
+      "sequence": 4169,
+      "variant": "ConvLayer_s1.opt@CB*2.Xwb.Fi.t",
+      "input_id": 3625,
+      "output_id": 3715,
+      "input_hw": [
+        8,
+        32
+      ],
+      "output_hw": [
+        8,
+        32
+      ],
+      "input_max_hw": [
+        8,
+        32
+      ],
+      "output_max_hw": [
+        8,
+        32
+      ],
+      "ci": 128,
+      "co": 128,
+      "weight_tensor": 3583,
+      "weight_source_tensor": 3582,
+      "weight_source": {
+        "pool": 5,
+        "offset": 2187264
+      },
+      "weight_producer": "ConvLayer.opt.weights_to_vtcm@Xwb.xwb.",
+      "weight_bytes": 16384,
+      "weight_sha256": "ebae4220e96ea3310e9d45e353b6d26948854e5fe14936de6a9b1a97528e7400",
+      "fi_tensor": 3585,
+      "fi_source_tensor": 3584,
+      "fi_source": {
+        "pool": 5,
+        "offset": 7154176
+      },
+      "fi_producer": "ConvLayer.opt.weights_to_vtcm@Fi.fi.",
+      "fi_bytes": 1024,
+      "fi_sha256": "879673b243a23517641bd3c64c43399d0abc27f941a5da7d14091c29893f5302",
+      "slice_offsets": [
+        47,
+        7
+      ],
+      "static_raw_weight_fi": true
+    },
+    {
+      "sequence": 4173,
+      "variant": "ConvLayer_s1.opt@CB*2.Xpb.Fi.t",
+      "input_id": 3714,
+      "output_id": 3719,
+      "input_hw": [
+        8,
+        32
+      ],
+      "output_hw": [
+        8,
+        32
+      ],
+      "input_max_hw": [
+        8,
+        32
+      ],
+      "output_max_hw": [
+        8,
+        32
+      ],
+      "ci": 128,
+      "co": 128,
+      "weight_tensor": 3581,
+      "weight_source_tensor": 3580,
+      "weight_source": {
+        "pool": 5,
+        "offset": 6729728
+      },
+      "weight_producer": "ConvLayer.opt.weights_to_vtcm@Xpb.xpb.",
+      "weight_bytes": 16384,
+      "weight_sha256": "4c7a62e8e25436277eb05b0091738a752c65b9455bf600f1684d52740a038831",
+      "fi_tensor": 3579,
+      "fi_source_tensor": 3578,
+      "fi_source": {
+        "pool": 5,
+        "offset": 7202816
+      },
+      "fi_producer": "ConvLayer.opt.weights_to_vtcm@Fi.fi.",
+      "fi_bytes": 1024,
+      "fi_sha256": "517352e7660bfcef20547d68a71dce2377da59413648bc137496dfd61f94a1d7",
+      "slice_offsets": [
+        133,
+        0
+      ],
+      "static_raw_weight_fi": true
+    },
+    {
+      "sequence": 4269,
+      "variant": "ConvLayer_s1.opt@CB*2.Xwb.Fi.t",
+      "input_id": 3758,
+      "output_id": 3801,
+      "input_hw": [
+        8,
+        16
+      ],
+      "output_hw": [
+        8,
+        16
+      ],
+      "input_max_hw": [
+        8,
+        16
+      ],
+      "output_max_hw": [
+        8,
+        16
+      ],
+      "ci": 128,
+      "co": 128,
+      "weight_tensor": 3609,
+      "weight_source_tensor": 3608,
+      "weight_source": {
+        "pool": 5,
+        "offset": 2531328
+      },
+      "weight_producer": "ConvLayer.opt.weights_to_vtcm@Xwb.xwb.",
+      "weight_bytes": 16384,
+      "weight_sha256": "2eb0177abed06e428ab9cf9fd3260c195b090750ba6975b558ffb4c2da94f879",
+      "fi_tensor": 3607,
+      "fi_source_tensor": 3606,
+      "fi_source": {
+        "pool": 5,
+        "offset": 7159296
+      },
+      "fi_producer": "ConvLayer.opt.weights_to_vtcm@Fi.fi.",
+      "fi_bytes": 1024,
+      "fi_sha256": "c0f5e5797e8e903c6202e2d0fc5f416e3aec8d85cc265fd9e6ee378344d52754",
+      "slice_offsets": [
+        46,
+        28
+      ],
+      "static_raw_weight_fi": true
+    }
+  ],
+  "note": "Command 2380 Fi is runtime-generated; source audit records its producer but does not claim raw final Fi validation."
+}

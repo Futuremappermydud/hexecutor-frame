@@ -1,0 +1,41 @@
+{
+  "scope": "host dispatch-only proxy; not validation or device latency",
+  "results": [
+    {
+      "image": "primary-v2.nprg",
+      "commands": 5068,
+      "unique_signatures": 76,
+      "tag_table_bytes": 5120,
+      "rounds": 500,
+      "decode_and_registry_lookup": {
+        "median_ns": 1932229,
+        "min_ns": 1818959,
+        "max_ns": 2203500
+      },
+      "cached_tag_walk": {
+        "median_ns": 69895,
+        "min_ns": 63000,
+        "max_ns": 134584
+      },
+      "coverage": "synthetic registry entries; no handler validation executed"
+    },
+    {
+      "image": "alternate-v2.nprg",
+      "commands": 5040,
+      "unique_signatures": 76,
+      "tag_table_bytes": 5120,
+      "rounds": 500,
+      "decode_and_registry_lookup": {
+        "median_ns": 1944625,
+        "min_ns": 1797666,
+        "max_ns": 2255666
+      },
+      "cached_tag_walk": {
+        "median_ns": 64208,
+        "min_ns": 62000,
+        "max_ns": 155834
+      },
+      "coverage": "synthetic registry entries; no handler validation executed"
+    }
+  ]
+}

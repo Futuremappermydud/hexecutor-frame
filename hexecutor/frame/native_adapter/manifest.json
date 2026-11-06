@@ -1,0 +1,401 @@
+{
+  "scope": "native 1x1 adapter and source-included graph bridge offline evidence plus first Frame checkpoint",
+  "files": [
+    {
+      "path": "qd_native_1x1_adapter.h",
+      "bytes": 3478,
+      "sha256": "598b0540f71854033816e600ef4f5c1d7747d0af988c5b1e35cd763aecde5d46"
+    },
+    {
+      "path": "qd_native_1x1_adapter.c",
+      "bytes": 16426,
+      "sha256": "4c0dcd5f0edf3e7dd26f4cf3a78da909dd9d39090497022a39caaac776b98bd8"
+    },
+    {
+      "path": "qd_native_1x1_graph_bridge.h",
+      "bytes": 11391,
+      "sha256": "240e1dbe5302c9ba02caf286acadafbcf081e0114133dbef87b8b9e045307218"
+    },
+    {
+      "path": "qd_native_1x1_graph_eligibility.h",
+      "bytes": 3303,
+      "sha256": "c099b0451ce94082264df71bf7597c0c177a44b11bde1c05fc2df360db6f0daa"
+    },
+    {
+      "path": "test_graph_eligibility.c",
+      "bytes": 2661,
+      "sha256": "7d0c0de4ba24e86fc0de2e59e16f01ea88d36b11ab7a0f2e13b15168f77330e9"
+    },
+    {
+      "path": "make_graph_eligibility_fixtures.py",
+      "bytes": 2229,
+      "sha256": "f6c60873c4d043118144ae72a22a8de47e864a51ea2c7109dd0691c48fb831b9"
+    },
+    {
+      "path": "graph-eligibility-115.bin",
+      "bytes": 328,
+      "sha256": "513dc9518cf6a863baacd0754ed5212cf3098b3f38d101ccf57ffd4b4a9894e8"
+    },
+    {
+      "path": "graph-eligibility-3416.bin",
+      "bytes": 328,
+      "sha256": "8164f4c79283e7fe54a8d66edcf26504cbf7b18a5b946d58aeee5d756ae1bf03"
+    },
+    {
+      "path": "graph-eligibility-1195.bin",
+      "bytes": 328,
+      "sha256": "11f2107062d8c4ec59beef243f5829e2f76f9bca0f116176bad7ce5e70082040"
+    },
+    {
+      "path": "census_qdrx_1x1.py",
+      "bytes": 6596,
+      "sha256": "e8eddbd106ae3de5c3be4bde9f73b4957d514b8c8a21535f487806d84ade7366"
+    },
+    {
+      "path": "qdrx-1x1-census.json",
+      "bytes": 253634,
+      "sha256": "68b72d88a2656285333654b6d3ff11a5be730fc73a7c84d35876f9335b0c474b"
+    },
+    {
+      "path": "make_preflight_fixture.py",
+      "bytes": 2346,
+      "sha256": "65ae337e00cad5ea04bac08d98914cffef373f209faaf59a2eabeaa5b18d0b31"
+    },
+    {
+      "path": "preflight-primary.bin",
+      "bytes": 193220,
+      "sha256": "6c6a0a2722160d79bb629a2a6a0bb04034be001b9f35af44b35c6d7899d2c9d3"
+    },
+    {
+      "path": "preflight_qdrx.c",
+      "bytes": 5181,
+      "sha256": "a627bbba4b81ca7317c89a470581d66ec71440c4decab7ea1cc0a1dda8273423"
+    },
+    {
+      "path": "audit_representative_sources.py",
+      "bytes": 3446,
+      "sha256": "5615f896a7d4867b98ce5f129ad563c7b50ff5f1d4d0d853f2e90718f5b4b6ac"
+    },
+    {
+      "path": "representative-source-audit.json",
+      "bytes": 10330,
+      "sha256": "fbe33a6a542d12f5bb8b17c1005aa95804c532f44f7fae381840ea825dfc5a90"
+    },
+    {
+      "path": "evaluate_dynamic_fi.py",
+      "bytes": 1936,
+      "sha256": "9b28e24dbfce4246b01a0ef3c4c4abd59736199ecd0b7d3d48928814e804d445"
+    },
+    {
+      "path": "dynamic-fi-2380.json",
+      "bytes": 675,
+      "sha256": "9424a577956aa4b54231482e96f16bc1b97f83a5a6b8e93af6e10627b6c6a923"
+    },
+    {
+      "path": "make_dynamic_fixture.py",
+      "bytes": 2742,
+      "sha256": "8318a7eb2a2a64a9074a213334e28429fd25ce16d2e10c747617d085ff23bfb1"
+    },
+    {
+      "path": "fixture-qdrx-2380.bin",
+      "bytes": 74368,
+      "sha256": "664fc91c03488892e0b5e33f84abaeea87a4f596079a5391028a17bd43200665"
+    },
+    {
+      "path": "qnn_hmx_1x1_dynamic_sim.c",
+      "bytes": 4479,
+      "sha256": "4aad217991e9ae606ec7d29f47b756fca49a251636662401391952274c852f4a"
+    },
+    {
+      "path": "qnn_hmx_1x1_dynamic_sim.elf",
+      "bytes": 94920,
+      "sha256": "443e3b4fc6a61a4438826df22400a0952f25c2e4568f293a1a276ef7d0e55d31"
+    },
+    {
+      "path": "output-qdrx-2380.bin",
+      "bytes": 32896,
+      "sha256": "89b9155e7dd7d162969ae8cafd77c553cbda3e087a190a701ea9f68e4180ac95"
+    },
+    {
+      "path": "check_dynamic_2380_sim.py",
+      "bytes": 4527,
+      "sha256": "60689b30352a04a2fde69413074746a7b11dc49848f136f0cd96ce1d711a70f1"
+    },
+    {
+      "path": "qdrx-2380-adapter-sim.json",
+      "bytes": 912,
+      "sha256": "7d846dea72383523b26c013748a73d372050f3a04fc22dce16abc0dadb16a298"
+    },
+    {
+      "path": "qdrx-1195-adapter-sim.json",
+      "bytes": 912,
+      "sha256": "e848bc2091d4f15e28621b5bfff7ceb2807d7c1e395e15655a916725d633b383"
+    },
+    {
+      "path": "qdrx-4136-adapter-sim.json",
+      "bytes": 912,
+      "sha256": "e1b3f998ff0ebf1a87452c02b6e88405968db5ffe66e68ddb0955f1f3f46ca29"
+    },
+    {
+      "path": "qdrx-4137-adapter-sim.json",
+      "bytes": 912,
+      "sha256": "513190e3a963fc731d364d6b95155804b5164ad295e8d90fc1e59467cdb9963a"
+    },
+    {
+      "path": "qdrx-4151-adapter-sim.json",
+      "bytes": 912,
+      "sha256": "5084545f132ec08bb42976cc0aa27c3a22ef38f0af9b795affa14d9d498fa8a9"
+    },
+    {
+      "path": "qdrx-4154-adapter-sim.json",
+      "bytes": 912,
+      "sha256": "052872e855520bd53dd814c93b577d52a4dade9c63dea925475bb1bb452dba5f"
+    },
+    {
+      "path": "qdrx-4169-adapter-sim.json",
+      "bytes": 912,
+      "sha256": "ab2a40e04809e551818ddf598a162630129ccea2ea43de8dd31728e9e1d35fb9"
+    },
+    {
+      "path": "qdrx-4173-adapter-sim.json",
+      "bytes": 912,
+      "sha256": "fc688149e41641b9faeccf11994f93f519f218c88cbc03030014c3328630d85a"
+    },
+    {
+      "path": "qdrx-4269-adapter-sim.json",
+      "bytes": 912,
+      "sha256": "2bf1528d4c0067f62eeebbadcc23203b3bdc257a70e57f50a685ae17b70a57cf"
+    },
+    {
+      "path": "make_qdrx_1195_fixture.py",
+      "bytes": 2960,
+      "sha256": "fcd6254840a28bed94b3b43d716037f7b96e75fb9b78693d89dbd1c30086a05a"
+    },
+    {
+      "path": "fixture-qdrx-1195.bin",
+      "bytes": 82980,
+      "sha256": "5b8df2879945eed2ec46218cf397a73bcdf029e55da090def422adc779b079d9"
+    },
+    {
+      "path": "qnn_hmx_1x1_adapter_sim.c",
+      "bytes": 4322,
+      "sha256": "5ae4874c2afe04d05b7f2ac7588bd48aba02d0bb0c89821a294c360364161b96"
+    },
+    {
+      "path": "qnn_hmx_1x1_adapter_sim.elf",
+      "bytes": 94792,
+      "sha256": "fe905a13f522a161ada9036d97a24a34b907320acfed17747c915397b4a3a3c2"
+    },
+    {
+      "path": "output-qdrx-1195.bin",
+      "bytes": 65572,
+      "sha256": "e8b3a695bef296a786bf09a721bf2d49721584bc5e71af3ac67c25f91cab9074"
+    },
+    {
+      "path": "check_qdrx_1195_sim.py",
+      "bytes": 2886,
+      "sha256": "011a505b93d664101dd550781ed02f3bdb65fd9f2f11fe63eb2853c725e9728b"
+    },
+    {
+      "path": "qdrx-1195-adapter-sim.json",
+      "bytes": 912,
+      "sha256": "e848bc2091d4f15e28621b5bfff7ceb2807d7c1e395e15655a916725d633b383"
+    },
+    {
+      "path": "masked_scatter_sim.c",
+      "bytes": 3836,
+      "sha256": "4bb3895854be9926f2b680a4842a182183b41aa8f024441afd7ef4fdd3299383"
+    },
+    {
+      "path": "masked_scatter_sim.elf",
+      "bytes": 95240,
+      "sha256": "27709e3caaed9b2a73e22ebf0e457cfa498ba86b609cf2235b95bcda287ff33f"
+    },
+    {
+      "path": "make_padded_ci_fixture.py",
+      "bytes": 4818,
+      "sha256": "0b9039749d1ff379197626af0904dc745e8768523d31ff15dc29b0966f587281"
+    },
+    {
+      "path": "padded_ci_leaf_sim.c",
+      "bytes": 7157,
+      "sha256": "fb9eeecdaf2f8401dc818da1b19d657de246d186405eddf2b4b49c248ac474f8"
+    },
+    {
+      "path": "padded_ci_leaf_sim.elf",
+      "bytes": 94888,
+      "sha256": "0e0308dfcf1ab4144dd0ff1cf17b9b1513fe04dbc83df61f902bdfc91b5f5f88"
+    },
+    {
+      "path": "padded_ci_leaf_poison_sim.elf",
+      "bytes": 98984,
+      "sha256": "03c3f37e2ab20b41a99cf27123dda71217cff787bff5e987fe72a65b88422ad5"
+    },
+    {
+      "path": "check_padded_ci_sim.py",
+      "bytes": 5835,
+      "sha256": "cb395db541ca8de6323746bb770eeb5f30dc598dc0914ee0ee7b9794adcc26c2"
+    },
+    {
+      "path": "padded-ci-115.bin",
+      "bytes": 698112,
+      "sha256": "fc7d09ef2b07f057ded2de28128700c8ed5c61ee35d1158f46e78c262f3d7b4b"
+    },
+    {
+      "path": "padded-ci-3416.bin",
+      "bytes": 1023616,
+      "sha256": "43d4f61dbe619beb2e3e7704a25ef619654a4a3e168f3ac0e788e64af60a737f"
+    },
+    {
+      "path": "padded-ci-115-sim.json",
+      "bytes": 913,
+      "sha256": "d51059381d0d52e3ff5f669bbbbb905e930507aa68bbfcef1de36184e2db9d2e"
+    },
+    {
+      "path": "padded-ci-3416-sim.json",
+      "bytes": 904,
+      "sha256": "1ccbcf8b75beb4845f31bd137b3a0c1135df30952bdb7114040614e094f3704c"
+    },
+    {
+      "path": "padded-ci-115-out.bin",
+      "bytes": 418560,
+      "sha256": "554686ae2cb10aee584ae8ec8a1a7031ec6d0c350b480c9672efe2789769fe75"
+    },
+    {
+      "path": "padded-ci-115-poison-out.bin",
+      "bytes": 418560,
+      "sha256": "554686ae2cb10aee584ae8ec8a1a7031ec6d0c350b480c9672efe2789769fe75"
+    },
+    {
+      "path": "padded-ci-3416-out.bin",
+      "bytes": 495232,
+      "sha256": "e65ebca6d915d0eafaa83bf9eeb46c89fb6aaea59048f28739aee2a33392d935"
+    },
+    {
+      "path": "padded-ci-3416-poison-out.bin",
+      "bytes": 495232,
+      "sha256": "e65ebca6d915d0eafaa83bf9eeb46c89fb6aaea59048f28739aee2a33392d935"
+    },
+    {
+      "path": "adapter_frame_probe.c",
+      "bytes": 11834,
+      "sha256": "be5c6399ec47f849b890a2277d3cda93a61c156656beba98be0fcd19d45356fa"
+    },
+    {
+      "path": "adapter_frame_probe.elf",
+      "bytes": 15688,
+      "sha256": "e9d69a866fc50659ebabaf9e439d66a9d9763a6ecefb60902242b6f88c5c987e"
+    },
+    {
+      "path": "run_adapter_frame_probe.py",
+      "bytes": 6161,
+      "sha256": "818a6f3e396e8b0fa751b9290fa3bd93c82d84d38d73f3c948ca77543104ea7e"
+    },
+    {
+      "path": "validate_frame_probe.py",
+      "bytes": 2529,
+      "sha256": "77b6f17f0cfb9be9f0618a11da0d83f95e692fc9a9fc776248e8455af6a4545a"
+    },
+    {
+      "path": "frame-probe-preflight.json",
+      "bytes": 1049,
+      "sha256": "b1b9984a4417a0663d8b0fb34f127ee591f73ac5118fbc94a013ade2aa7b8b9b"
+    },
+    {
+      "path": "build_adapter_frame_probe.sh",
+      "bytes": 728,
+      "sha256": "1c2e76c73fc5fcfdb9a93ddc51507252951af82d6eded00c4a4cc624204c65bd"
+    },
+    {
+      "path": "README.md",
+      "bytes": 13794,
+      "sha256": "7e97a8d53c463b852eaf019e3a8072dec0501c6af1df904686370b42615ba076"
+    }
+  ],
+  "frame_checkpoint": {
+    "path": ".work/frame-direct-kernels-20261030/native-adapter-1195-first.json",
+    "sha256": "b1982afb5f66b23a94a4c97533f7d4d2085564928b2bf1182a9f97d264aa7d92",
+    "adapter_source_sha256_at_run": "d1d0b2fb9512ba71ebbfa5696b552fbc927cc1db5e9b53fb11282d49589fd102",
+    "payload_sha256": "e9d69a866fc50659ebabaf9e439d66a9d9763a6ecefb60902242b6f88c5c987e",
+    "passed": true,
+    "run": {
+      "tlb_before_backup": [
+        4144373792,
+        3221426176,
+        4144375840,
+        3221427200
+      ],
+      "tlb_before_restore": [
+        4144373792,
+        3221426176,
+        4144375840,
+        3221427200
+      ],
+      "expected_tlb": [
+        4144373792,
+        3221426176,
+        4144375840,
+        3221427200
+      ],
+      "seconds": 0.038896332000149414,
+      "words": [
+        827408721,
+        0,
+        4,
+        0,
+        366637,
+        6494,
+        0,
+        23337,
+        65536,
+        65536,
+        0,
+        0,
+        0,
+        0,
+        0,
+        25677,
+        98938,
+        1,
+        1,
+        4144373792,
+        3221426176,
+        4144375840,
+        3221427200,
+        4144373792,
+        3221426176,
+        4144375840,
+        3221427200,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "native_minus_integer_bound": [
+        0,
+        1
+      ],
+      "different_outputs": 552,
+      "input_unchanged": true,
+      "vtcm_restored": true,
+      "output_sha256": "d985dc47f586ac92ef379273dcf9bc182812a2b281045f361690e645afc72193"
+    },
+    "adapter_optimization_applied_after_checkpoint": true
+  },
+  "checks": [
+    "host adapter C -Wall -Wextra -Werror compile with QDS_NATIVE_PADDED_1X1=0",
+    "actual-primary QDRX C prepare 140/140",
+    "source-included DSP translation-unit bridge compile with QDS_NATIVE_1X1 and QDS_PRESERVE_VTCM",
+    "Hexagon Simulator nine actual CPU-prefix QDRX commands with workspace initialized to 0xA5; each native delta [0,+1] and inactive output tables preserved",
+    "Hexagon Simulator detects first and last byte corruption in all 16 128-byte lanes of both guard blocks",
+    "Hexagon Simulator effective-H2 masked-scatter preservation",
+    "Host C graph eligibility predicate tests use actual compiled QDRX metadata for commands 115, 3416 and 1195, with padded feature on and off",
+    "Hexagon Simulator actual raw-Xpb adapter expansion for CI12 command 115 and CI20 command 3416 matches independent expansion and integer oracle [0,+1]; poisoned input tails are byte-identical; unsupported prepare leaves workspace unchanged",
+    "Frame command 1195 first controlled run passed; report hash recorded above"
+  ],
+  "not_performed": [
+    "Frame hardware run of the source-included graph bridge",
+    "full-graph exact arithmetic (native leaf bound is [0,+1])"
+  ]
+}

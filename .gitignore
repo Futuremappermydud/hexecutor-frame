@@ -1,0 +1,15 @@
+# Local model collections and hand-model binaries (previously ignored).
+/model-assets/
+/hand-tracking/models/
+
+# DSP build products and scratch captures.
+/depth-model/.work/
+/hexecutor/frame/build/
+/hexecutor/frame/native_kernels/full_provider_v75_decoded.asm
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+
+# Local runtime recordings and generated datasets.
+/runtime/experiments/

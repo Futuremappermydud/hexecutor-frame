@@ -1,0 +1,24 @@
+{
+  "passed": true,
+  "purpose": "Input-only staging diagnostic; not zero-copy convolution",
+  "sequence": 247,
+  "actual_graph_direct_run": true,
+  "input_pages_compacted": 108,
+  "input_bytes_staged": 221184,
+  "weights_fi_outputs": "remain at original direct binding addresses",
+  "all_outside_output_bytes_exact": true,
+  "compact_tail_guard_passed": true,
+  "output_sha256": "cfec6dbed3eb2e88544d5c0371c8c50915ce90e6b14f44be7c4411c19bf5e15f",
+  "marker_mode": 2,
+  "sim_vtcm_bytes": 1048576,
+  "source_and_elf_sha256": {
+    "frame/qd_graph_native_direct.h": "4a3031b3667f0bbc4d99eb732ab07c9aeeea504bc79c31e5df2b81628adeb004",
+    "frame/native_runtime/qd_native_direct.c": "38cba2830af8dbd630356fe27dac7e191d4b82f794f575761b92728186e144da",
+    "frame/native_runtime/qd_native_direct.h": "933c72b9f6f1072b40b78258460139c51dddcec3abc2110ffe6c41613c96469b",
+    "frame/native_runtime/direct_3x3_scatter_sim.c": "a086e0073649170483c621076d7b2306f1ba327887911efa47361eea76c0d4fd",
+    "frame/native_runtime/build_direct_3x3_graph_compact_input_sim.sh": "d4bf1040b39cfa77fb7c44f7c7afcfdca70091a2d22e5a722e298bbd11082b0e",
+    "frame/native_runtime/direct_3x3_graph_compact_input_sim.elf": "c43db2334a481a493ad5eb107dc810b4cf8524586ccbbef024a39661d935be0f",
+    "frame/native_kernels/qd_qnn_hmx_stride1_generic.S": "964ec477c48ce528e8dfef7cbd51925f8ebedc15af51e5c915e18f95de32cb05",
+    "frame/native_kernels/qd_set_hmx_params_stride1.S": "7b18d8a11bb0e7eb278ddc2d1590acf9356ae9498148beb4d6f621648a342bf6"
+  }
+}
