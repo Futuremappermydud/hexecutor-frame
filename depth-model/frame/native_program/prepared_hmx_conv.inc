@@ -53,7 +53,13 @@
 #ifndef HMX_PROF
 #define HMX_PROF 0
 #endif
+#ifdef SETUP_PROF
+/* u16 slots: 4 k_hmx_conv..hmx_conv, 5 checks (mark 1), 6 params (mark 2), 7 mark 2..slide timer */
+static uint64_t hmx_prof_mark;
+#define HMX_MARK(step) do { if(clock){t1=clock();uint64_t d_=t1-t0;c->phase[HMX_SETUP_SLOT]+=d_;if((step)==1)c->phase[5]+=d_;if((step)==2){c->phase[6]+=d_;hmx_prof_mark=t1;}t0=t1;} } while(0)
+#else
 #define HMX_MARK(step) do { if(clock){t1=clock();c->phase[HMX_PROF==(step)?3:HMX_SETUP_SLOT]+=t1-t0;t0=t1;} } while(0)
+#endif
 /* Fi words (per 32 channels: 32 requant words, 32 offsets; then a block of
  * 32 x 0x404000 and 32 zeros) into the workspace at base. fipre, when given,
  * holds the first NB*256 bytes already built (HVX vectors, 128-aligned);
@@ -445,26 +451,26 @@ static inline __attribute__((always_inline)) HVX_Vector plane_rq(HVX_Vector lo, 
 typedef struct {
     const uint8_t *C; uint8_t *const *out; const uint8_t *mh; const int32_t *Mq;
     int32_t mt, NB, bw, ncol, shift;
+    int32_t rows, partial_from; /* tiles t >= partial_from write only their first rows rows (oh%8) */
 } PlaneJob;
-static inline void plane_block(const PlaneJob *J, uint8_t *o, const uint8_t *c, const uint8_t *next, int32_t j) {
+static inline void plane_block(const PlaneJob *J, uint8_t *o, const uint8_t *c, const uint8_t *next, int32_t j, int32_t rows) {
 #if BLK_HVX
     const HVX_Vector mv=((const HVX_Vector *)J->mh)[j];
     const HVX_Vector *lo=(const HVX_Vector *)c,*hi=(const HVX_Vector *)(c+2048);
     HVX_Vector *d=(HVX_Vector *)o;
     if(!next) {
-#pragma unroll
-        for(int i=0;i<16;i++) d[i]=plane_rq(lo[i],hi[i],mv);
+        for(int i=0;i<2*rows;i++) d[i]=plane_rq(lo[i],hi[i],mv);
         return;
     }
     const HVX_Vector *lo2=(const HVX_Vector *)next,*hi2=(const HVX_Vector *)(next+2048);
-    for(int y=0;y<8;y++) {
+    for(int y=0;y<rows;y++) {
         HVX_Vector l0=lo[2*y],l1=lo[2*y+1],l2=lo2[2*y],h0=hi[2*y],h1=hi[2*y+1],h2=hi2[2*y];
         d[2*y]=plane_rq(Q6_V_valign_VVR(l1,l0,32),Q6_V_valign_VVR(h1,h0,32),mv);
         d[2*y+1]=plane_rq(Q6_V_valign_VVR(l2,l1,32),Q6_V_valign_VVR(h2,h1,32),mv);
     }
 #else
     const int32_t *M=J->Mq+32*j;
-    for(int p=0;p<64;p++)for(int n=0;n<32;n++) {
+    for(int p=0;p<rows*8;p++)for(int n=0;n<32;n++) {
         const size_t i=(size_t)p*32+n;
         int32_t v=(int32_t)c[i]|(int32_t)c[2048+i]<<8;
         v=(v<4096?4096:v>8192?8192:v)-4096;
@@ -481,7 +487,7 @@ static void plane_part(void *ctx, uint32_t part, uint32_t parts) {
         for(int32_t t=0;t<J->mt;t++)for(int32_t j=0;j<J->NB;j++,u++) {
             if(u!=next) continue;
             next+=parts;
-            if(J->out[u]) plane_block(J,J->out[u],J->C+(size_t)u*4096,NULL,j);
+            if(J->out[u]) plane_block(J,J->out[u],J->C+(size_t)u*4096,NULL,j,t>=J->partial_from?J->rows:8);
         }
         return;
     }
@@ -494,7 +500,7 @@ static void plane_part(void *ctx, uint32_t part, uint32_t parts) {
             next+=parts;
             if(J->out[u]) {
                 const uint8_t *c=J->C+(col+(size_t)j)*4096;
-                plane_block(J,J->out[u],c,c+(size_t)J->NB*4096,j);
+                plane_block(J,J->out[u],c,c+(size_t)J->NB*4096,j,t>=J->partial_from?J->rows:8);
             }
         }
         if(++bx==J->bw){bx=0;row+=(size_t)J->ncol;}
@@ -752,10 +758,12 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
     for(int32_t cb=0;cb<cbs;cb++)for(int32_t ky=0;ky<3;ky++)for(int32_t kp=0;kp<3;kp++)
         if(ktab[cb*9+ky*3+kp]!=((uint32_t)ky|(uint32_t)(2-kp)<<8|(uint32_t)cb<<16)) return 0;
     if((uintptr_t)wbase&1023u) return 0;
-    const int32_t bw=ow/8,bh=oh/8,total=bh*bw,ncol=bw+2;
+    const int32_t bw=ow/8,bh=(oh+7)/8,total=bh*bw,ncol=bw+2;
     const int64_t xnbw=((int64_t)xt->m[2]+7)/8,xnbd=((int64_t)xt->m[3]+31)/32;
     const int32_t R0=xt->p[1]>>3,C0=xt->p[2]>>3;
-    /* every present input block of the windows 2048-aligned (else not eligible) */
+    /* every present input block of the windows 2048-aligned (else not eligible):
+     * only when HMX reads them in place, staged windows take any block */
+#if !(NPRG2_PLANES && defined(SLIDE_STAGE))
     {
         Memo *mm=g->dry?NULL:gmemo(g);
         uint8_t *mb=mm?&mm->slide[g->call->command_index]:NULL;
@@ -775,6 +783,7 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
             if(!ok) return 0;
         } else if(*mb==2) return 0;
     }
+#endif
     size_t o_rec=nbump(&at,(size_t)ncol*cbs*16),o_st=nbump(&at,(size_t)ncol*8),o_tyx=nbump(&at,(size_t)total*8);
 #if NPRG2_PLANES
     size_t o_mh=nbump(&at,(size_t)NB*128),o_pout=nbump(&at,(size_t)total*NB*sizeof(uint8_t *));
@@ -808,6 +817,9 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
     printf("SLIDE cmd %u cbs=%d NB=%d oh=%d ow=%d staged=%d\n",(unsigned)g->call->command_index,(int)cbs,(int)NB,(int)oh,(int)ow,staged);
 #endif
     uint64_t (*clock)(void)=c->phase?c->clock:NULL,t0=clock?clock():0,t1;
+#ifdef SETUP_PROF
+    if(clock && hmx_prof_mark && hmx_prof_mark<=t0) c->phase[7]+=t0-hmx_prof_mark;
+#endif
     uint8_t *base=(uint8_t *)(((uintptr_t)ws+2047)&~(uintptr_t)2047);
     int32_t *fi=(int32_t *)base,*zero=(int32_t *)(base+(size_t)NB*HMX_FI_BYTES);
     uint8_t *completion=base+fixed-2048,*dummy=base+fixed,*zblk=dummy+4096,*C=zblk+2048,*S=C+cbytes;
@@ -838,7 +850,16 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
     int32_t *tyx=(int32_t *)(n+o_tyx);
     const uint32_t onbw=(uint32_t)(o->m[2]+7)/8u,onbd=(uint32_t)(o->m[3]+31)/32u,ocount=o->nblocks;
     const uint32_t *oblk=o->blocks;
+#ifdef SLIDE_PROF
+#define SP(slot) do { if(clock){t1=clock();c->phase[slot]+=t1-t0;t0=t1;} } while(0)
+#else
+#define SP(slot) do {} while(0)
+#endif
+#ifdef SLIDE_PROF
+    if(clock){t1=clock();c->phase[6]+=t1-t0;c->phase[HMX_SETUP_SLOT]+=t1-t0;t0=t1;}
+#else
     if(clock){t1=clock();c->phase[HMX_SETUP_SLOT]+=t1-t0;t0=t1;}
+#endif
     uint32_t saved=c->hmx->enter?c->hmx->enter():0;
     for(int32_t by=0;by<bh;by++) {
         for(int32_t cc=0;cc<ncol;cc++)for(int32_t cb=0;cb<cbs;cb++) {
@@ -871,6 +892,7 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
         __asm__ volatile("barrier":::"memory");
         {typedef uint32_t W32 __attribute__((vector_size(128)));W32 v=*(volatile W32 *)(S+sbytes-2048);__asm__ volatile(""::"r"(v[0]):"memory");}
 #endif
+        SP(4);
         for(int32_t j=0;j<NB;j++) {
 #if NPRG2_PLANES
             /* whole tiles, realigned by plane_part: column 0 holds no output pixel */
@@ -919,6 +941,7 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
         __asm__ volatile("barrier":::"memory");
     }
     if(c->hmx->leave) c->hmx->leave(saved);
+    SP(5);
     if(clock){t1=clock();c->phase[1]+=t1-t0;t0=t1;}
     if(e){*err=E_RANGE;return -1;}
 #if NPRG2_PLANES
@@ -933,10 +956,12 @@ static int hmx_slide(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int3
             }
             if(++bx==bw){bx=0;by++;}
         }
-        PlaneJob P={.C=C,.out=pout,.mh=n+o_mh,.Mq=Mq,.mt=total,.NB=NB,.bw=bw,.ncol=ncol,.shift=1};
+        PlaneJob P={.C=C,.out=pout,.mh=n+o_mh,.Mq=Mq,.mt=total,.NB=NB,.bw=bw,.ncol=ncol,.shift=1,
+                    .rows=oh&7,.partial_from=(oh&7)?(bh-1)*bw:total};
         uint32_t parts=nprg2_parallel_parts(g->call->parallel,NPRG2_PAR_MAX_PARTS);
         if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,plane_part,&P);
         else plane_part(&P,0,1);
+        SP(7);
         if(clock){t1=clock();c->phase[3]+=t1-t0;t0=t1;}
     }
     return 1;
@@ -975,11 +1000,15 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
 #else
     if((!xtab && !one) || (BLK_HVX && !c->hmx->native_n)) return 0;
 #endif
+#if NPRG2_PLANES
+    if(ow%8 || o->p[1]%8 || o->p[2]%8) return 0; /* oh%8: full tiles computed, rows written */
+#else
     if(oh%8 || ow%8 || o->p[1]%8 || o->p[2]%8) return 0;
+#endif
     if(g->fx.kind && (g->fx.oe.p[1]%8 || g->fx.oe.p[2]%8 || (g->fx.kind==2 && (g->fx.ob.p[1]%8 || g->fx.ob.p[2]%8)))) return 0;
     if(!hit) for(int32_t k=0;k<co;k++) if(pre[k]<0 || pre[k]>20) return 0;
     uint64_t (*clock)(void)=c->phase && !g->dry?c->clock:NULL,t0=clock?clock():0,t1;
-    const int32_t bw=ow/8,total=(oh/8)*bw;
+    const int32_t bw=ow/8,total=((oh+7)/8)*bw;
     /* :cm stores need 2048-aligned blocks; pool blocks are only 128-aligned.
      * Fused convs, or any misaligned output block, go through the C blocks
      * (2048-aligned workspace) and an HVX pass. Memoised per command (bit 6/7
@@ -1021,7 +1050,7 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
     conv_path[g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u]=4;
     if(fused) g->fx_ok=1;
 #ifdef CONV_SHAPES
-    if(!g->dry) fprintf(stderr,"NATCONV var=%u KB=%d NB=%d oh=%d ow=%d tiles=%d mt=%d fused=%d staged=%d bcopy=%d\n",g->variant,KB,NB,oh,ow,total,mt,fused,staged,bcopy);
+    if(!g->dry) fprintf(stderr,"NATCONV var=%u KB=%d cbs=%d NB=%d oh=%d ow=%d px=%d py=%d ox=%d oy=%d one=%d bcopy=%d s2ip=%d\n",g->variant,KB,cbs,NB,oh,ow,xt->p[2]&7,xt->p[1]&7,o->p[2]&7,o->p[1]&7,one,bcopy,s2ip);
 #endif
     if(g->dry) return 1;
     uint8_t *base=(uint8_t *)(((uintptr_t)ws+2047)&~(uintptr_t)2047);
@@ -1095,7 +1124,8 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
         if(e) break;
 #if NPRG2_PLANES
         {
-            PlaneJob P={.C=C,.out=pout,.mh=n+o_mh,.Mq=Mq,.mt=J.mt,.NB=NB,.shift=0};
+            PlaneJob P={.C=C,.out=pout,.mh=n+o_mh,.Mq=Mq,.mt=J.mt,.NB=NB,.shift=0,.rows=oh&7,
+                        .partial_from=(oh&7)?((oh+7)/8-1)*bw-m0:J.mt};
             if(parts>1) nprg2_parallel_for(g->call->parallel,NPRG2_PAR_CONV,parts,plane_part,&P);
             else plane_part(&P,0,1);
             if(clock){t1=clock();c->phase[3]+=t1-t0;t0=t1;}
@@ -1153,6 +1183,10 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
 #if HMX_PROF==5
     uint32_t lane=g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u;
     if(clock && hmx_t_entry[lane] && hmx_t_entry[lane]<=t0) c->phase[3]+=t0-hmx_t_entry[lane];
+#endif
+#ifdef SETUP_PROF
+    {uint32_t lane_=g->call->execution_lane<MEMO_LANES?g->call->execution_lane:0u;
+     if(clock && hmx_t_entry[lane_] && hmx_t_entry[lane_]<=t0) c->phase[4]+=t0-hmx_t_entry[lane_];}
 #endif
     if(!c->hmx || !c->near || ((uintptr_t)c->near&127u)) return 0;
     /* A fused epilogue must cover exactly the region the conv writes. */
@@ -1217,7 +1251,12 @@ static int hmx_conv(G *g, const T *xt, const T *wt, const T *ft, const T *o, int
     /* Input row pointers for every (row, block column, channel block) the
      * quads read: rows p1..p1+oh+H-2, columns p2..p2+ow+W-2 (a straddling quad
      * reads one block further). */
-    const int32_t xwb0=xt->p[2]>>3,xnwb=((xt->p[2]+ow+W-2)>>3)-xwb0+1,xrows=oh+H-1;
+#if NPRG2_PLANES
+    const int32_t xrows=((oh+7)&~7)+H-1; /* full tiles: rows past the view feed only discarded output rows */
+#else
+    const int32_t xrows=oh+H-1;
+#endif
+    const int32_t xwb0=xt->p[2]>>3,xnwb=((xt->p[2]+ow+W-2)>>3)-xwb0+1;
     size_t ntab=(size_t)xrows*(size_t)xnwb*(size_t)cbs,o_xtab=nbump(&at,ntab*sizeof(uint8_t *));
     int use_tab=at<=c->near_bytes;
     if(!use_tab) at=o_xtab;
@@ -1840,7 +1879,11 @@ static int hmx_native16(G *g, const T *xt, const T *wt, const T *ft, const T *o,
     }
 #endif
     for(int b=0;b<nbuf;b++) J[b].stage=stage;
+#if defined(SLIDE_PROF) || defined(SETUP_PROF)
+    uint64_t (*clock)(void)=NULL,t0=0,t1;
+#else
     uint64_t (*clock)(void)=c->phase?c->clock:NULL,t0=clock?clock():0,t1;
+#endif
     uint32_t parts=nprg2_parallel_parts(g->call->parallel,NPRG2_PAR_MAX_PARTS);
     uint32_t saved=h->enter?h->enter():0;
     int e=0;
