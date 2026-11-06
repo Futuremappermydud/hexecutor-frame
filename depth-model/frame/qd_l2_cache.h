@@ -161,8 +161,14 @@ typedef struct {uint32_t syscfg,ccr,active;} QdsL2Cache;
 static uint32_t qds_l2_begin(QdsL2Cache *s){
     s->active=0;s->syscfg=qds_l2_syscfg();s->ccr=qds_l2_ccr();
     if(((s->syscfg>>16)&7u)!=0u || s->syscfg!=0x0a80a057u || s->ccr!=0x150049u)return 1;
+#if QDS_L2_CACHE==1 && defined(QDS_L2_NO_VERIFY)
+    /* Opt-in: only the half that becomes cache is saved, nothing is compared. */
+    qds_l2_l1_range(QDS_L2_SAVE,QDS_L2_SAVE_BYTES,1);
+    qds_l2_vcopy_n(QDS_L2_BACKUP+(QDS_L2_SAVE-QDS_L2_TCM),QDS_L2_SAVE,QDS_L2_SAVE_BYTES);
+#else
     qds_l2_l1_tcm(1);
     qds_l2_vcopy(QDS_L2_BACKUP,QDS_L2_TCM);
+#endif
     uint32_t cleared=s->ccr&~(15u<<16);
     __asm__ volatile("ccr=%0\n\tisync"::"r"(cleared):"memory");
     qds_l2_setcfg(s->syscfg&~(7u<<16));
@@ -170,7 +176,7 @@ static uint32_t qds_l2_begin(QdsL2Cache *s){
     qds_l2_setcfg(s->syscfg|(QDS_L2_FIELD<<16));
     s->active=1;
     uint32_t bad=qds_l2_syscfg()!=(s->syscfg|(QDS_L2_FIELD<<16));
-#if QDS_L2_CACHE==1
+#if QDS_L2_CACHE==1 && !defined(QDS_L2_NO_VERIFY)
     /* The live lower half must have come through l2kill and the switch. */
     bad|=qds_l2_lower_diff()!=0;
 #endif
@@ -181,7 +187,7 @@ static uint32_t qds_l2_end(QdsL2Cache *s){
     if(!s->active)return 0;
     uint32_t cleared=s->ccr&~(15u<<16);
     __asm__ volatile("ccr=%0\n\tisync"::"r"(cleared):"memory");
-#if QDS_L2_CACHE==1
+#if QDS_L2_CACHE==1 && !defined(QDS_L2_NO_VERIFY)
     /* Snapshot the live lower half (scalar lines published first) so the
      * switch back can be checked like the restored upper half. */
     qds_l2_l1_range(QDS_L2_TCM,QDS_L2_SAVE-QDS_L2_TCM,1);
@@ -191,7 +197,11 @@ static uint32_t qds_l2_end(QdsL2Cache *s){
     __asm__ volatile("syncht\n\tl2gcleaninv\n\tsyncht\n\tisync\n\tsyncht\n\tsyscfg=%0\n\tisync"
                      ::"r"(s->syscfg):"memory");
     qds_l2_vcopy_n(QDS_L2_SAVE,QDS_L2_BACKUP+(QDS_L2_SAVE-QDS_L2_TCM),QDS_L2_SAVE_BYTES);
+#ifdef QDS_L2_NO_VERIFY
+    uint32_t bad=0;
+#else
     uint32_t bad=qds_l2_vdiff();
+#endif
     qds_l2_l1_range(QDS_L2_SAVE,QDS_L2_SAVE_BYTES,0);
     __asm__ volatile("ccr=%0\n\tisync"::"r"(s->ccr):"memory");
     s->active=0;
