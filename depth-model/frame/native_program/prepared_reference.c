@@ -754,6 +754,15 @@ static int call_args(G *g, uint32_t func, int64_t *args, uint32_t used) {
     }
     CHECK(found,E_ARGS);
     uint32_t mask=rd32(found+4);
+#if defined(SETUP_FAST) && defined(__hexagon__)
+    if(!((uintptr_t)found&7u)) {
+        typedef int64_t __attribute__((may_alias)) i64a;
+        const i64a *q=(const i64a *)(found+8);
+        CHECK(!(mask&used),E_ARGS);
+        args[0]=q[0];args[1]=q[1];args[2]=q[2];args[3]=q[3];args[4]=q[4];args[5]=q[5];args[6]=q[6];args[7]=q[7];args[8]=q[8];args[9]=q[9];
+        return 0;
+    }
+#endif
     for(uint32_t j=0;j<10;j++) {
         uint64_t v=rd64(found+8+8*j);
         if(used&(1u<<j)) CHECK(!(mask&(1u<<j)),E_ARGS);
@@ -4136,6 +4145,15 @@ static int setup_ex(G *g, const Nprg2ExecCall *c, int dry, int measure, const Np
             g->par_slots++;
         }
     }
+#ifdef SETUP_FAST
+    /* Without a conv the pool arrays only depend on the request's pool table. */
+    static struct {const void *pools;uint8_t *pool[7];uint64_t bytes[7];} pool_tpl[MEMO_LANES];
+    if(!g->conv && c->preflighted && pool_tpl[lane].pools==(const void *)c->pools) {
+        const uint8_t *tp=(const uint8_t *)pool_tpl[lane].pool;
+        for(unsigned i=0;i<7;i++){g->pool[i]=pool_tpl[lane].pool[i];g->pool_bytes[i]=pool_tpl[lane].bytes[i];g->write_limit[i]=pool_tpl[lane].bytes[i];}
+        (void)tp;
+    } else
+#endif
     if(ck_hit) {
         for(unsigned i=0;i<7;i++){g->pool[i]=c->pools[i].bytes?c->pools[i].base:NULL;g->write_limit[i]=g->pool_bytes[i];}
     } else for(unsigned i=0;i<7;i++) {
@@ -4151,6 +4169,12 @@ static int setup_ex(G *g, const Nprg2ExecCall *c, int dry, int measure, const Np
         }
         g->write_limit[i]=g->pool_bytes[i];
     }
+#ifdef SETUP_FAST
+    if(!g->conv && c->preflighted && pool_tpl[lane].pools!=(const void *)c->pools) {
+        for(unsigned i=0;i<7;i++){pool_tpl[lane].pool[i]=g->pool[i];pool_tpl[lane].bytes[i]=g->pool_bytes[i];}
+        pool_tpl[lane].pools=(const void *)c->pools;
+    }
+#endif
     if(g->conv && !ck_hit) {   /* every check passed: remember the verdict (key stored above) */
         ck->par_slots=g->par_slots;
         for(unsigned i=0;i<7;i++) ck->pool_bytes[i]=g->pool_bytes[i];
