@@ -33,7 +33,7 @@ add_executable(frame_openxr_point_cloud
     src/openxr_point_cloud.cpp
     src/vulkan_guarded_stereo_pipeline.cpp
     src/cloud_worker.cpp
-    src/model_depth_pipeline.cpp
+    src/model_depth_pipeline.cpp src/model_temporal.cpp
     src/dma_capture.cpp
     src/vk_detile.cpp
     src/depth_pipeline.cpp
@@ -113,7 +113,7 @@ if(EXISTS "${MNN_PREFIX}/include/MNN/Interpreter.hpp")
 endif()
 
 add_library(frame_openxr_occlusion SHARED
-    src/openxr_occlusion_layer.cpp src/occlusion_renderer.cpp src/cloud_worker.cpp src/model_depth_pipeline.cpp src/vulkan_guarded_stereo_pipeline.cpp
+    src/openxr_occlusion_layer.cpp src/occlusion_renderer.cpp src/cloud_worker.cpp src/model_depth_pipeline.cpp src/model_temporal.cpp src/vulkan_guarded_stereo_pipeline.cpp
     src/dma_capture.cpp src/vk_detile.cpp src/depth_pipeline.cpp src/persistent_depth.cpp src/vulkan_stereo_pipeline.cpp)
 
 add_executable(test_persistent_depth
@@ -140,7 +140,16 @@ set_target_properties(frame_openxr_occlusion PROPERTIES
 
 add_executable(test_model_depth_geometry tools/test_model_depth_geometry.cpp)
 target_compile_options(test_model_depth_geometry PRIVATE -O3 -Wall -Wextra)
-add_executable(test_model_depth_pipeline tools/test_model_depth_pipeline.cpp src/model_depth_pipeline.cpp src/vulkan_stereo_pipeline.cpp)
+add_executable(test_model_depth_pipeline tools/test_model_depth_pipeline.cpp src/model_depth_pipeline.cpp src/model_temporal.cpp src/vulkan_stereo_pipeline.cpp)
 target_compile_options(test_model_depth_pipeline PRIVATE -O3 -Wall -Wextra)
 target_link_libraries(test_model_depth_pipeline PRIVATE pthread vulkan)
 add_dependencies(test_model_depth_pipeline stereo_shaders)
+
+# The standalone runtime build also needs the native learned-depth worker.
+if(NOT TARGET frame_depth_worker)
+    add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/.." "${CMAKE_BINARY_DIR}/native-host")
+endif()
+add_dependencies(frame_openxr_point_cloud frame_depth_worker)
+add_dependencies(frame_spatial_runtime frame_depth_worker)
+
+set_target_properties(frame_depth_worker PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

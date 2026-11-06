@@ -3,6 +3,19 @@
 modelMetricDepth gates remove: range, border, low contrast (<12 luma levels in
 5x5), census disagreement (>8/24 bits), neighbour support (<3 of 8 within
 max(4 cm, 4%)). Saves a few frames (luma, depth, gate reason, confidence) to npz."""
+
+# Direct CLI entry points use the same explicit package roots as the root task runner.
+import sys as _path_sys
+from pathlib import Path as _SourcePath
+for _source_root in _SourcePath(__file__).resolve().parents:
+    if (_source_root / "hexecutor/api.py").is_file():
+        _path_sys.path[:0] = [str(_source_root), str(_source_root / "depth-model/python"),
+                             str(_source_root / "depth-model/tools"),
+                             str(_source_root / "hexecutor/benchmarks")]
+        break
+from hexecutor.paths import workspace as _workspace
+PATHS = _workspace()
+
 import argparse, json, sys
 from pathlib import Path
 import numpy as np
@@ -57,13 +70,13 @@ def main():
     ap.add_argument('recording'); ap.add_argument('--package', type=Path, required=True)
     ap.add_argument('--out', type=Path, required=True); ap.add_argument('--save', type=int, default=6)
     a = ap.parse_args()
-    root = a.package.resolve(); here = Path(__file__).resolve().parent
+    root = a.package.resolve(); here = (PATHS.repo / 'runtime/scripts')
     sys.path[:0] = [str(root / 'frame'), str(root / 'tools'), str(here)]
     import hashlib
-    import model_depth_bridge as bridge
+    from depth_model import offline_bridge as bridge
     from model_temporal import ModelTemporalState
     from model_temporal_replay import frames
-    from resident_dsp import ResidentDSP
+    from depth_model.adapters import ResidentDSP
     seq = list(frames(a.recording))
     program = 'frame/native_program/examples/primary-v2.nprg'; image = 'frame/build/resident-primary.qdrx'
     for name in (bridge.QNN_ENGINE, bridge.QNN_BOOTSTRAP, 'frame/build/qd_loader.elf', program, image):

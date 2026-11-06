@@ -8,6 +8,19 @@ Metrics per mode (left disparity plane, model pixels, plausible depth 0.25-5 m):
   flicker_med    median |d_now - warp(d_prev)| where the warp lands (aligned pairs)
   flicker_gt1    fraction of those pixels changing by more than 1 px
 """
+
+# Direct CLI entry points use the same explicit package roots as the root task runner.
+import sys as _path_sys
+from pathlib import Path as _SourcePath
+for _source_root in _SourcePath(__file__).resolve().parents:
+    if (_source_root / "hexecutor/api.py").is_file():
+        _path_sys.path[:0] = [str(_source_root), str(_source_root / "depth-model/python"),
+                             str(_source_root / "depth-model/tools"),
+                             str(_source_root / "hexecutor/benchmarks")]
+        break
+from hexecutor.paths import workspace as _workspace
+PATHS = _workspace()
+
 import argparse, json, struct, sys, time
 from pathlib import Path
 import numpy as np
@@ -47,9 +60,9 @@ def main():
     ap.add_argument('--report', type=Path)
     a = ap.parse_args()
     root = a.package.resolve()
-    here = Path(__file__).resolve().parent
+    here = (PATHS.repo / 'runtime/scripts')
     sys.path[:0] = [str(root / 'frame'), str(root / 'tools'), str(here)]
-    import model_depth_bridge as bridge
+    from depth_model import offline_bridge as bridge
     from model_temporal import ModelTemporalState
     seq = list(frames(a.recording))
     print(f'{len(seq)} pairs, {sum(m is not None for _, _, m in seq)} with motion', flush=True)

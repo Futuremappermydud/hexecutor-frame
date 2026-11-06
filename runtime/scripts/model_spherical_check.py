@@ -3,6 +3,19 @@
   pinhole: the current anisotropic resize to 256x320, z = FB/d
   spherical: resampled into the Model-style spherical model, triangulated
 Depth is compared along identical rays where both are valid (uncertainty < 89)."""
+
+# Direct CLI entry points use the same explicit package roots as the root task runner.
+import sys as _path_sys
+from pathlib import Path as _SourcePath
+for _source_root in _SourcePath(__file__).resolve().parents:
+    if (_source_root / "hexecutor/api.py").is_file():
+        _path_sys.path[:0] = [str(_source_root), str(_source_root / "depth-model/python"),
+                             str(_source_root / "depth-model/tools"),
+                             str(_source_root / "hexecutor/benchmarks")]
+        break
+from hexecutor.paths import workspace as _workspace
+PATHS = _workspace()
+
 import argparse, hashlib, sys
 from pathlib import Path
 import numpy as np
@@ -20,11 +33,11 @@ def main():
     ap.add_argument('left'); ap.add_argument('right'); ap.add_argument('--package', type=Path, required=True)
     ap.add_argument('--k-deg', type=float, default=0.29)
     a = ap.parse_args()
-    root = a.package.resolve(); here = Path(__file__).resolve().parent
+    root = a.package.resolve(); here = (PATHS.repo / 'runtime/scripts')
     sys.path[:0] = [str(root / 'frame'), str(root / 'tools'), str(here)]
-    import model_depth_bridge as bridge
+    from depth_model import offline_bridge as bridge
     from model_spherical import SphericalModel, W, H
-    from resident_dsp import ResidentDSP
+    from depth_model.adapters import ResidentDSP
     F, C, N = 380.0, 308.0, 616
     L = np.fromfile(a.left, np.uint8).reshape(N, N); R = np.fromfile(a.right, np.uint8).reshape(N, N)
     # current path: pixel-centre resize (modelResize)

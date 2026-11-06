@@ -6,6 +6,19 @@ supported/GT mask (or its intersection with baseline), with no new LR, range,
 support or speckle decisions. They are attribution diagnostics, not candidate
 accuracy/coverage measurements or timing benchmarks.
 """
+
+# Direct CLI entry points use the same explicit package roots as the root task runner.
+import sys as _path_sys
+from pathlib import Path as _SourcePath
+for _source_root in _SourcePath(__file__).resolve().parents:
+    if (_source_root / "hexecutor/api.py").is_file():
+        _path_sys.path[:0] = [str(_source_root), str(_source_root / "depth-model/python"),
+                             str(_source_root / "depth-model/tools"),
+                             str(_source_root / "hexecutor/benchmarks")]
+        break
+from hexecutor.paths import workspace as _workspace
+PATHS = _workspace()
+
 import argparse
 from array import array
 import csv
@@ -241,7 +254,7 @@ def main():
         selected = [row for row in stages if row["method"] == method]
         means[method] = {key: statistics.mean(row[key] for row in selected)
                          for key in selected[0] if key.endswith("_pct")}
-    inputs.read(Path(__file__).resolve())
+    inputs.read((PATHS.repo / 'runtime/scripts/analyze_stereo_refinement.py'))
     inputs.read(args.directory / "manifest.json")
     (args.output / "summary.json").write_text(json.dumps(dict(
         scope="Offline saved-output attribution; fixed masks, no acceptance rerun or hardware timing",

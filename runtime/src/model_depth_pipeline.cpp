@@ -15,12 +15,20 @@
 #include <thread>
 #include <unistd.h>
 #include <fcntl.h>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 extern char** environ;
 
 namespace FrameSpatial {
 namespace {
 std::string setting(const char* name,const std::string& fallback) {
     const char* value=std::getenv(name);return value && *value?value:fallback;
+}
+template<class Value> bool writeArray(const std::filesystem::path& path,const std::vector<Value>& values) {
+    std::ofstream file(path,std::ios::binary);
+    file.write(reinterpret_cast<const char*>(values.data()),values.size()*sizeof(Value));
+    return bool(file);
 }
 }
 ModelDepthPipeline::~ModelDepthPipeline(){stop();}
@@ -41,19 +49,19 @@ bool ModelDepthPipeline::transfer(void* data,size_t bytes,bool sending) {
     }
     return true;
 }
-bool ModelDepthPipeline::initialize(const std::string& script) {
+bool ModelDepthPipeline::initialize(const std::string& executable) {
     if(fd_>=0)return true;
     const std::string home=setting("HOME","/home/steamos");
-    const std::string python=setting("FRAME_DEPTH_PYTHON",home+"/frame-dsp/depth-model/.venv/bin/python");
-    const std::string backend=setting("FRAME_DEPTH_BACKEND","hybrid");
-    if(backend!="hybrid" && backend!="prepared" && backend!="prepared-qnn"){error_="FRAME_DEPTH_BACKEND must be hybrid, prepared or prepared-qnn";return false;}
+    const std::string worker=setting("FRAME_DEPTH_WORKER",executable);
+    const std::string backend=setting("FRAME_DEPTH_BACKEND","prepared-qnn");
+    if(backend!="prepared" && backend!="prepared-qnn"){error_="FRAME_DEPTH_BACKEND must be prepared or prepared-qnn";return false;}
     const bool qnn=backend=="prepared-qnn";
-    const bool prepared=backend=="prepared" || qnn;
-    // The prepared engine needs cdsp_mem loaded (128 MB) and takes ~15.5 s per pair.
-    const std::string package=setting("FRAME_DEPTH_PACKAGE",home+(qnn?"/frame-dsp/depth-model/wave1-20261101":prepared?"/frame-dsp/depth-model/perf-20261029"
-                                                                          :"/frame-dsp/depth-model/depth-model-direct-v5"));
+    // Both native engines need cdsp_mem loaded (128 MB).
+    const std::string package=setting("FRAME_DEPTH_PACKAGE",home+(qnn?"/frame-dsp/depth-model/wave1-20261101":"/frame-dsp/depth-model/perf-20261029"));
     const std::string model=setting("FRAME_DEPTH_MODEL","primary");
-    timeoutSeconds_=std::atoi(setting("FRAME_DEPTH_TIMEOUT_S",qnn?"30":prepared?"60":"30").c_str());
+    if(qnn && model!="primary"){error_="prepared-qnn supports primary only; use FRAME_DEPTH_BACKEND=prepared for alternate";return false;}
+    backend_=backend;model_=model;package_=package;
+    timeoutSeconds_=std::atoi(setting("FRAME_DEPTH_TIMEOUT_S",qnn?"30":"60").c_str());
     if(timeoutSeconds_<=0){error_="FRAME_DEPTH_TIMEOUT_S must be a positive number of seconds";return false;}
     int sockets[2];
     if(socketpair(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0,sockets)) {error_=std::strerror(errno);return false;}
@@ -71,27 +79,56 @@ bool ModelDepthPipeline::initialize(const std::string& script) {
     maxUncertainty_=std::clamp(std::atoi(setting("FRAME_DEPTH_UNCERTAINTY_MAX","89").c_str()),1,256);
     // Optional replay capture: every request (header, motion block, resized pair).
     const std::string record=setting("FRAME_DEPTH_RECORD","");
+    recordV2Directory_=setting("FRAME_DEPTH_RECORD_V2","");
+    secondDisparity_=!recordV2Directory_.empty();
+    if(temporal_) {
+        const double degrees=spherical_?std::atof(sphericalDegrees_.c_str()):0.0;
+        temporalState_=std::make_unique<ModelTemporalState>(degrees*3.14159265358979323846/180.0);
+        hidden_.resize(ModelTemporalState::HiddenValues);
+        transforms_.resize(ModelTemporalState::TransformValues);
+        // Starting values, not measured limits: at live rates a step is tens of ms.
+        temporalMaxGapNs_=int64_t(std::atof(setting("FRAME_DEPTH_TEMPORAL_MAX_GAP_MS","250").c_str())*1e6);
+        temporalMaxDegrees_=std::atof(setting("FRAME_DEPTH_TEMPORAL_MAX_DEG","30").c_str());
+    }
+    const bool rightPlane=secondDisparity_||temporal_;
+    const int requestedFrames=std::atoi(setting("FRAME_DEPTH_RECORD_FRAMES","200").c_str());
+    recordLimit_=requestedFrames==0?UINT32_MAX:uint32_t(std::max(1,requestedFrames));
+    if(secondDisparity_) {
+        std::filesystem::create_directories(recordV2Directory_);
+        std::ofstream info(std::filesystem::path(recordV2Directory_)/"capture.json");
+        info<<"{\"version\":2,\"model\":\""<<model<<"\",\"backend\":\""<<backend
+            <<"\",\"projection\":\""<<(spherical_?"spherical":"pinhole")
+            <<"\",\"temporal\":"<<(temporal_?"true":"false")
+            <<",\"model_shape\":[320,256],\"rectified_shape\":[616,616],\"right_disparity\":true,\"capture_clock\":\"CLOCK_MONOTONIC\",\"exposure_timestamp\":false,\"config_sha256\":\""
+            <<setting("FRAME_DEPTH_CONFIG_SHA256","")<<"\"}\n";
+        if(!info){error_="cannot create Model v2 capture metadata";return false;}
+    }
     if(!record.empty()) {
         recordFd_=open(record.c_str(),O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0644);
-        recordLimit_=uint32_t(std::max(1,std::atoi(setting("FRAME_DEPTH_RECORD_FRAMES","200").c_str())));
         if(recordFd_<0)std::cerr<<"[ModelDepth] cannot record to "<<record<<": "<<std::strerror(errno)<<std::endl;
         // Spherical runs also keep the spherical inputs, for an offline A/B on identical captures.
         if(spherical_)recordSphericalFd_=open((record+".sph").c_str(),O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0644);
     }
-    const char* args[]{python.c_str(),"-u",script.c_str(),"--fd","3","--package",package.c_str(),"--model",model.c_str(),
-                       "--backend",backend.c_str(),"--spherical-deg",spherical_?sphericalDegrees_.c_str():"0",
-                       temporal_?"--temporal":nullptr,nullptr};
+    std::vector<const char*> args{worker.c_str(),"--fd","3","--package",package.c_str(),"--model",model.c_str(),
+                                  "--backend",backend.c_str(),"--spherical-deg",spherical_?sphericalDegrees_.c_str():"0"};
+    if(temporal_)args.push_back("--host-temporal");
+    if(rightPlane)args.push_back("--second-disparity");
+    if(secondDisparity_) {
+        if(setting("FRAME_DEPTH_RECORD_CLOSE_EACH_REPLY","1")==std::string("1"))
+            args.push_back("--close-after-reply");
+    }
+    args.push_back(nullptr);
     pid_t child=-1;
-    const int result=posix_spawn(&child,python.c_str(),&actions,nullptr,const_cast<char* const*>(args),environ);
+    const int result=posix_spawn(&child,worker.c_str(),&actions,nullptr,const_cast<char* const*>(args.data()),environ);
     posix_spawn_file_actions_destroy(&actions);close(sockets[1]);
     if(result){close(sockets[0]);error_=std::strerror(result);return false;}
     fd_=sockets[0];pid_=child;
     uint32_t hello[4]{};
-    if(!transfer(hello,sizeof(hello),false) || hello[0]!=0x36524451 || hello[1]!=MODEL_WIDTH || hello[2]!=MODEL_HEIGHT || hello[3]!=3) {
+    if(!transfer(hello,sizeof(hello),false) || hello[0]!=0x36524451 || hello[1]!=MODEL_WIDTH || hello[2]!=MODEL_HEIGHT || hello[3]!=(rightPlane?4u:3u)) {
         if(error_.empty())error_="incompatible Model depth bridge";
         stop();return false;
     }
-    std::cout<<"[ModelDepth] Persistent "<<(qnn?"QNN run-list executor (~23 ms)":prepared?"prepared-executor (exact)":"HMX hybrid")
+    std::cout<<"[ModelDepth] Persistent "<<(qnn?"QNN run-list executor (~23 ms)":"prepared-executor (exact)")
              <<" worker ready; experimental plane-0 disparity, "
              <<(temporal_?"Model-style warped temporal state":"zero temporal state (t=0)")
              <<", gate="<<(censusGate_ && !spherical_?"contrast+census":"uncertainty<"+std::to_string(maxUncertainty_))
@@ -100,7 +137,8 @@ bool ModelDepthPipeline::initialize(const std::string& script) {
 }
 bool ModelDepthPipeline::process(const std::vector<uint8_t>& left,const std::vector<uint8_t>& right,std::vector<float>& depth,
                                  const ModelMotion& motion,const std::vector<uint8_t>* sphericalLeft,
-                                 const std::vector<uint8_t>* sphericalRight,float sphericalStep) {
+                                 const std::vector<uint8_t>* sphericalRight,float sphericalStep,
+                                 const ModelCaptureMetadata* captureMetadata) {
     depth.clear();
     if(fd_<0){error_="Model depth worker is not initialized";return false;}
     try {
@@ -137,32 +175,126 @@ bool ModelDepthPipeline::process(const std::vector<uint8_t>& left,const std::vec
         if(!transfer(header,sizeof(header),true) || !transfer(block,sizeof(block),true) ||
            !transfer(const_cast<uint8_t*>(useSpherical?sphericalLeft->data():l.data()),modelPixels,true) ||
            !transfer(const_cast<uint8_t*>(useSpherical?sphericalRight->data():r.data()),modelPixels,true))return false;
+        if(temporalState_) {
+            const auto warpBegin=std::chrono::steady_clock::now();
+            double rotation[3][3],translation[3];
+            for(int i=0;i<3;i++){translation[i]=motion.translation[i];for(int j=0;j<3;j++)rotation[i][j]=motion.rotation[i][j];}
+            const int64_t poseNs=captureMetadata?captureMetadata->poseTimeNs:0;
+            const auto history=temporalState_->admit(motion.aligned,motion.reset,rotation,
+                                                     lastPoseNs_&&poseNs?poseNs-lastPoseNs_:0,temporalMaxGapNs_,temporalMaxDegrees_);
+            lastPoseNs_=poseNs;
+            temporalDropped_[int(history)]++;
+            if(history==ModelTemporalState::History::Usable)temporalApplied_++;
+            else temporalState_->reset();
+            temporalState_->inputs(rotation,translation,hidden_.data(),transforms_.data());
+            temporalWarpMs_=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-warpBegin).count();
+            if(!transfer(hidden_.data(),hidden_.size()*sizeof(float),true) ||
+               !transfer(transforms_.data(),transforms_.size()*sizeof(float),true))return false;
+        }
         // Reply: magic, sequence, pixel count, inference milliseconds (f32).
         uint32_t reply[4]{};
         if(!transfer(reply,sizeof(reply),false))return false;
         if(reply[0]!=0x364f4451 || reply[1]!=sequence_ || reply[2]!=MODEL_WIDTH*MODEL_HEIGHT){error_="invalid Model depth reply";return false;}
         std::memcpy(&milliseconds_,reply+3,sizeof(float));
-        std::vector<float> disparity(MODEL_WIDTH*MODEL_HEIGHT);
-        if(!transfer(disparity.data(),disparity.size()*sizeof(float),false))return false;
-        std::vector<uint8_t> uncertainty(MODEL_WIDTH*MODEL_HEIGHT);
-        if(!transfer(uncertainty.data(),uncertainty.size(),false))return false;
+        disparity_.assign(MODEL_WIDTH*MODEL_HEIGHT,0.f);
+        if(!transfer(disparity_.data(),disparity_.size()*sizeof(float),false))return false;
+        uncertainty_.assign(MODEL_WIDTH*MODEL_HEIGHT,255);
+        if(!transfer(uncertainty_.data(),uncertainty_.size(),false))return false;
+        std::vector<float> rightDisparity;
+        if(secondDisparity_||temporalState_) {
+            rightDisparity.resize(modelPixels);
+            if(!transfer(rightDisparity.data(),rightDisparity.size()*sizeof(float),false))return false;
+        }
+        if(temporalState_) {
+            const auto saveBegin=std::chrono::steady_clock::now();
+            temporalState_->save(disparity_.data(),rightDisparity.data());
+            temporalWarpMs_+=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-saveBegin).count();
+            if(sequence_%100==1)
+                std::cout<<"[ModelDepth] temporal frame "<<sequence_<<": applied "<<temporalApplied_
+                         <<", none "<<temporalDropped_[int(ModelTemporalState::History::None)]
+                         <<", reset "<<temporalDropped_[int(ModelTemporalState::History::Reset)]
+                         <<", unaligned "<<temporalDropped_[int(ModelTemporalState::History::Unaligned)]
+                         <<", gap "<<temporalDropped_[int(ModelTemporalState::History::TimeGap)]
+                         <<", rotation "<<temporalDropped_[int(ModelTemporalState::History::Rotation)]
+                         <<"; splat "<<temporalState_->splatFraction()<<", warp "<<temporalWarpMs_<<" ms, inference "
+                         <<milliseconds_<<" ms"<<std::endl;
+        }
         const auto confidenceOf=[&](float u){return std::clamp((maxUncertainty_-u)/float(maxUncertainty_-50),.05f,1.f);};
         confidence_.assign(size_t(RECT_WIDTH)*RECT_HEIGHT,.05f);
         if(useSpherical) {
             if(sphericalMap_.step!=sphericalStep)
                 sphericalMap_=modelSphericalMap(sphericalStep,FOCAL_BASELINE/RECT_FOCAL,RECT_WIDTH,RECT_HEIGHT,
                                                 RECT_FOCAL,RECT_CX,RECT_CY);
-            depth=modelSphericalDepth(disparity,uncertainty,sphericalMap_,maxUncertainty_);
+            depth=modelSphericalDepth(disparity_,uncertainty_,sphericalMap_,maxUncertainty_);
             for(size_t i=0;i<confidence_.size();i++)
-                if(sphericalMap_.modelIndex[i]>=0)confidence_[i]=confidenceOf(uncertainty[sphericalMap_.modelIndex[i]]);
+                if(sphericalMap_.modelIndex[i]>=0)confidence_[i]=confidenceOf(uncertainty_[sphericalMap_.modelIndex[i]]);
         } else {
-            depth=modelMetricDepth(disparity,l,r,RECT_WIDTH,RECT_HEIGHT,FOCAL_BASELINE,.25f,5.f,
-                                   censusGate_?nullptr:&uncertainty,maxUncertainty_);
+            depth=modelMetricDepth(disparity_,l,r,RECT_WIDTH,RECT_HEIGHT,FOCAL_BASELINE,.25f,5.f,
+                                   censusGate_?nullptr:&uncertainty_,maxUncertainty_);
             for(int y=0;y<RECT_HEIGHT;y++)for(int x=0;x<RECT_WIDTH;x++) {
                 const int mx=std::min(MODEL_WIDTH-1,int((x+.5f)*MODEL_WIDTH/RECT_WIDTH));
                 const int my=std::min(MODEL_HEIGHT-1,int((y+.5f)*MODEL_HEIGHT/RECT_HEIGHT));
-                confidence_[size_t(y)*RECT_WIDTH+x]=confidenceOf(uncertainty[size_t(my)*MODEL_WIDTH+mx]);
+                confidence_[size_t(y)*RECT_WIDTH+x]=confidenceOf(uncertainty_[size_t(my)*MODEL_WIDTH+mx]);
             }
+        }
+        if(secondDisparity_ && recordedV2_<recordLimit_) {
+            const auto directory=std::filesystem::path(recordV2Directory_);
+            const std::string prefix="frame-"+std::to_string(sequence_);
+            const auto& modelLeft=useSpherical?*sphericalLeft:l;
+            const auto& modelRight=useSpherical?*sphericalRight:r;
+            std::vector<uint8_t> validity(depth.size());
+            for(size_t index=0;index<depth.size();index++)validity[index]=depth[index]>0;
+            const bool written=writeArray(directory/(prefix+"-left.u8"),modelLeft) &&
+                writeArray(directory/(prefix+"-right.u8"),modelRight) &&
+                writeArray(directory/(prefix+"-rect-left.u8"),left) &&
+                writeArray(directory/(prefix+"-rect-right.u8"),right) &&
+                writeArray(directory/(prefix+"-disparity.f32"),disparity_) &&
+                writeArray(directory/(prefix+"-right-disparity.f32"),rightDisparity) &&
+                writeArray(directory/(prefix+"-uncertainty.u8"),uncertainty_) &&
+                writeArray(directory/(prefix+"-depth.f32"),depth) &&
+                writeArray(directory/(prefix+"-confidence.f32"),confidence_) &&
+                writeArray(directory/(prefix+"-validity.u8"),validity);
+            std::ofstream frame(directory/(prefix+".json"));
+            frame<<std::setprecision(9)<<"{\"version\":2,\"sequence\":"<<sequence_
+                <<",\"inference_ms\":"<<milliseconds_<<",\"motion_aligned\":"<<(motion.aligned?"true":"false")
+                <<",\"motion_reset\":"<<(motion.reset?"true":"false")
+                <<",\"spherical_step_rad\":"<<(useSpherical?sphericalStep:0)
+                <<",\"capture_begin_ns\":"<<(captureMetadata?captureMetadata->captureBeginNs:0)
+                <<",\"capture_end_ns\":"<<(captureMetadata?captureMetadata->captureEndNs:0)
+                <<",\"pose_time_ns\":"<<(captureMetadata?captureMetadata->poseTimeNs:0)
+                <<",\"capture_time_pose\":"<<(captureMetadata&&captureMetadata->captureTimePose?"true":"false")
+                <<",\"pose_valid\":"<<(captureMetadata&&captureMetadata->poseValid?"true":"false")
+                <<",\"position_m\":[";
+            for(int i=0;i<3;i++)frame<<(i?",":"")<<(captureMetadata?captureMetadata->position[i]:0);
+            frame<<"],\"orientation_xyzw\":[";
+            for(int i=0;i<4;i++)frame<<(i?",":"")<<(captureMetadata?captureMetadata->orientation[i]:(i==3?1:0));
+            frame<<"],\"camera_to_world_rotation\":[";
+            for(int i=0;i<9;i++)frame<<(i?",":"")<<(captureMetadata?captureMetadata->cameraToWorldRotation[i]:(i%4==0?1:0));
+            frame<<"],\"camera_to_world_translation_m\":[";
+            for(int i=0;i<3;i++)frame<<(i?",":"")<<(captureMetadata?captureMetadata->cameraToWorldTranslation[i]:0);
+            frame<<"],\"camera_sequence\":"<<(captureMetadata?captureMetadata->cameraSequence:0)
+                 <<",\"left_end_of_readout_ns\":"<<(captureMetadata?captureMetadata->leftEndOfReadoutNs:0)
+                 <<",\"right_end_of_readout_ns\":"<<(captureMetadata?captureMetadata->rightEndOfReadoutNs:0)
+                 <<",\"left_write_start_ns\":"<<(captureMetadata?captureMetadata->leftWriteStartNs:0)
+                 <<",\"right_write_start_ns\":"<<(captureMetadata?captureMetadata->rightWriteStartNs:0)
+                 <<",\"skipped_sequences\":"<<(captureMetadata?captureMetadata->skippedSequences:0)
+                 <<",\"pose_timing\":\""<<(captureMetadata&&captureMetadata->cameraSequence?"v4l2_end_of_readout_minus_offset":"dma_read_midpoint")<<"\"";
+            frame<<",\"left_slot\":"<<(captureMetadata?captureMetadata->leftSlot:-1)
+                 <<",\"right_slot\":"<<(captureMetadata?captureMetadata->rightSlot:-1)<<",\"pose_samples\":[";
+            if(captureMetadata) {
+                bool first=true;
+                for(int s=0;s<ModelCaptureMetadata::POSE_SAMPLES;s++) {
+                    if(!captureMetadata->poseSampleValid[s])continue;
+                    frame<<(first?"":",")<<"{\"offset_ms\":"<<ModelCaptureMetadata::poseSampleOffsetMs[s]<<",\"position_m\":[";
+                    for(int i=0;i<3;i++)frame<<(i?",":"")<<captureMetadata->poseSamplePosition[s][i];
+                    frame<<"],\"orientation_xyzw\":[";
+                    for(int i=0;i<4;i++)frame<<(i?",":"")<<captureMetadata->poseSampleOrientation[s][i];
+                    frame<<"]}";first=false;
+                }
+            }
+            frame<<"],\"files_prefix\":\""<<prefix<<"\"}\n";
+            if(!written || !frame){error_="Model v2 recording failed";return false;}
+            ++recordedV2_;
         }
         return true;
     } catch(const std::exception& e){error_=e.what();return false;}
@@ -172,8 +304,8 @@ void ModelDepthPipeline::stop() {
     if(recordSphericalFd_>=0){close(recordSphericalFd_);recordSphericalFd_=-1;}
     if(fd_>=0){shutdown(fd_,SHUT_RDWR);close(fd_);fd_=-1;}
     if(pid_<0)return;
-    // EOF normally exits the Python context, restoring clocks, workers and gaze.
-    // SIGTERM also goes through FrameTransport's bounded cleanup handler; the
+    // EOF normally closes the native session, restoring clocks, workers and gaze.
+    // SIGTERM also lets the native worker finish bounded session cleanup; the
     // first wait covers one in-flight request so it is not interrupted mid-run.
     for(int phase=0;phase<2;phase++) {
         const int polls=phase==0?std::max(160,timeoutSeconds_*20):160;

@@ -3,6 +3,19 @@
 --model-spherical (sequence.bin = resized pinhole, sequence.bin.sph = spherical,
 same captures and motion). Both run with temporal state in their own geometry
 and are converted to the 616x616 pinhole depth the TSDF consumes."""
+
+# Direct CLI entry points use the same explicit package roots as the root task runner.
+import sys as _path_sys
+from pathlib import Path as _SourcePath
+for _source_root in _SourcePath(__file__).resolve().parents:
+    if (_source_root / "hexecutor/api.py").is_file():
+        _path_sys.path[:0] = [str(_source_root), str(_source_root / "depth-model/python"),
+                             str(_source_root / "depth-model/tools"),
+                             str(_source_root / "hexecutor/benchmarks")]
+        break
+from hexecutor.paths import workspace as _workspace
+PATHS = _workspace()
+
 import argparse, hashlib, json, sys
 from pathlib import Path
 import numpy as np
@@ -66,13 +79,13 @@ def main():
     ap.add_argument('recording'); ap.add_argument('--package', type=Path, required=True)
     ap.add_argument('--k-deg', type=float, default=0.29); ap.add_argument('--out', type=Path, required=True)
     a = ap.parse_args()
-    root = a.package.resolve(); here = Path(__file__).resolve().parent
+    root = a.package.resolve(); here = (PATHS.repo / 'runtime/scripts')
     sys.path[:0] = [str(root / 'frame'), str(root / 'tools'), str(here)]
-    import model_depth_bridge as bridge
+    from depth_model import offline_bridge as bridge
     from model_temporal import ModelTemporalState
     from model_temporal_replay import frames
     from model_spherical import SphericalModel
-    from resident_dsp import ResidentDSP
+    from depth_model.adapters import ResidentDSP
     pin = list(frames(a.recording)); sph = list(frames(a.recording + '.sph'))
     assert len(pin) == len(sph)
     m = SphericalModel(a.k_deg, B)

@@ -15,12 +15,12 @@ TARGET = bin/frame_spatial_runtime
 SPV = shaders/stereo_census.spv shaders/stereo_match.spv shaders/stereo_filter.spv shaders/stereo_support.spv
 OPENXR_TARGET = bin/frame_openxr_point_cloud
 MESH_TARGET = bin/frame_openxr_mesh_viewer
-OPENXR_SRC = src/openxr_point_cloud.cpp src/cloud_worker.cpp src/tsdf_volume.cpp src/model_depth_pipeline.cpp src/persistent_depth.cpp src/vulkan_guarded_stereo_pipeline.cpp src/dma_capture.cpp src/vk_detile.cpp src/depth_pipeline.cpp src/vulkan_stereo_pipeline.cpp
+OPENXR_SRC = src/openxr_point_cloud.cpp src/cloud_worker.cpp src/tsdf_volume.cpp src/model_depth_pipeline.cpp src/model_temporal.cpp src/persistent_depth.cpp src/vulkan_guarded_stereo_pipeline.cpp src/dma_capture.cpp src/vk_detile.cpp src/depth_pipeline.cpp src/vulkan_stereo_pipeline.cpp
 OPENXR_OBJ = $(OPENXR_SRC:.cpp=.o)
 POINT_SPV = shaders/point_cloud.vert.spv shaders/point_cloud.frag.spv shaders/occlusion_demo.frag.spv
 MESH_SPV = shaders/mesh.vert.spv shaders/mesh.frag.spv
 
-all: dirs $(SPV) $(POINT_SPV) $(MESH_SPV) $(TARGET) $(OPENXR_TARGET) $(MESH_TARGET)
+all: bin/frame_depth_worker dirs $(SPV) $(POINT_SPV) $(MESH_SPV) $(TARGET) $(OPENXR_TARGET) $(MESH_TARGET)
 
 dirs:
 	mkdir -p bin
@@ -61,7 +61,7 @@ clean:
 .PHONY: all clean dirs
 
 OCCLUSION_TARGET = bin/libframe_openxr_occlusion.so
-OCCLUSION_SRC = src/openxr_occlusion_layer.cpp src/occlusion_renderer.cpp src/cloud_worker.cpp src/tsdf_volume.cpp src/model_depth_pipeline.cpp src/persistent_depth.cpp src/vulkan_guarded_stereo_pipeline.cpp src/dma_capture.cpp src/vk_detile.cpp src/depth_pipeline.cpp src/vulkan_stereo_pipeline.cpp
+OCCLUSION_SRC = src/openxr_occlusion_layer.cpp src/occlusion_renderer.cpp src/cloud_worker.cpp src/tsdf_volume.cpp src/model_depth_pipeline.cpp src/model_temporal.cpp src/persistent_depth.cpp src/vulkan_guarded_stereo_pipeline.cpp src/dma_capture.cpp src/vk_detile.cpp src/depth_pipeline.cpp src/vulkan_stereo_pipeline.cpp
 OCCLUSION_OBJ = $(OCCLUSION_SRC:.cpp=.pic.o)
 OCCLUSION_SPV = shaders/occlusion.vert.spv shaders/occlusion.frag.spv
 
@@ -196,3 +196,9 @@ bin/test_model_depth_geometry: tools/test_model_depth_geometry.cpp include/model
 
 bin/test_model_depth_pipeline: tools/test_model_depth_pipeline.cpp src/model_depth_pipeline.o src/vulkan_stereo_pipeline.o | dirs $(SPV)
 	$(CXX) $(CXXFLAGS) tools/test_model_depth_pipeline.cpp src/model_depth_pipeline.o src/vulkan_stereo_pipeline.o -lvulkan -lpthread -o $@
+
+# Native learned-depth worker; all host/model dependencies are built from the monorepo.
+bin/frame_depth_worker: ../CMakeLists.txt ../hexecutor/host/cpp/executor.cpp ../hexecutor/host/cpp/frame_transport.cpp ../hexecutor/host/cpp/detail.hpp ../hexecutor/include/hexecutor/executor.hpp ../hexecutor/native/program/nprg2_runtime.c tools/frame_depth_worker.cpp include/depth_worker_protocol.hpp src/depth_worker_protocol.cpp ../depth-model/include/depth_model/deployment.hpp ../depth-model/deployment/cpp/package.cpp | dirs
+	$(MAKE) -C .. build-worker
+	cp ../build/bin/frame_depth_worker $@
+$(OPENXR_TARGET) $(MESH_TARGET): | bin/frame_depth_worker

@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 """Post-screen attribution on saved seed-1709 silhouette stages; no new matching."""
+
+# Direct CLI entry points use the same explicit package roots as the root task runner.
+import sys as _path_sys
+from pathlib import Path as _SourcePath
+for _source_root in _SourcePath(__file__).resolve().parents:
+    if (_source_root / "hexecutor/api.py").is_file():
+        _path_sys.path[:0] = [str(_source_root), str(_source_root / "depth-model/python"),
+                             str(_source_root / "depth-model/tools"),
+                             str(_source_root / "hexecutor/benchmarks")]
+        break
+from hexecutor.paths import workspace as _workspace
+PATHS = _workspace()
+
 import argparse
 from array import array
 from pathlib import Path
@@ -51,7 +64,7 @@ def main():
                         leaks_with_censored_descriptor_bits=sum(data['left-support-bits'][i]<48*data['left-information'][i] for i in leaked),
                         boundary_pixels_with_left_anchor=sum(anchors[i]>0 for i in boundary))
     write_json(root/'boundary-diagnostics.json',dict(scope='post-hoc seed-1709 attribution only, not selection or held-out evidence',
-               source_sha256=digest(Path(__file__)),input_sha256=hashes,configurations=result))
+               source_sha256=digest((PATHS.repo / 'runtime/scripts/diagnose_stereo_guarded_boundaries.py')),input_sha256=hashes,configurations=result))
     print('Saved boundary attribution; leakage counts reproduce saved metrics')
 
 

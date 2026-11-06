@@ -1,4 +1,17 @@
 """Shared, standard-library-only protocol definitions for the offline trial."""
+
+# Direct CLI entry points use the same explicit package roots as the root task runner.
+import sys as _path_sys
+from pathlib import Path as _SourcePath
+for _source_root in _SourcePath(__file__).resolve().parents:
+    if (_source_root / "hexecutor/api.py").is_file():
+        _path_sys.path[:0] = [str(_source_root), str(_source_root / "depth-model/python"),
+                             str(_source_root / "depth-model/tools"),
+                             str(_source_root / "hexecutor/benchmarks")]
+        break
+from hexecutor.paths import workspace as _workspace
+PATHS = _workspace()
+
 import csv
 import hashlib
 import json
@@ -17,7 +30,7 @@ SCENES = ["textured-integer", "textured-fractional", "weak-texture-fractional",
           "vertical-half-pixel", "vertical-one-pixel", "thin-silhouette", "unrelated-pair"]
 AMBIGUOUS = {"blank-ambiguous", "repetitive-ambiguous", "repetitive-alias-ambiguous"}
 NOISY = ["independent-noise-3", "independent-noise-6"]
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = (PATHS.repo / 'runtime')
 SOURCES = ["include/stereo_matcher_experiment.hpp", "include/depth_speckle_filter.hpp",
            "tools/compare_stereo_matchers.cpp", "tools/test_stereo_matcher_experiment.cpp",
            "tools/test_stereo_composite_workflow.py",
