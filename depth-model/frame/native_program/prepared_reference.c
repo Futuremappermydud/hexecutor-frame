@@ -4250,30 +4250,32 @@ int nprg2_exec_reference_plan_begin(const Nprg2ExecRequest *r, const Nprg2Refere
     for(unsigned i=0;same && i<7;i++) same=plan_pool[i]==(r->pools[i].bytes?r->pools[i].base:NULL) && plan_pool_bytes[i]==r->pools[i].bytes;
     if(same) return 1;
     if(!conv_plans && !(conv_plans=malloc(sizeof(ConvPlan)*MEMO_COMMANDS))) return 0;
-    memset(conv_plans,0,sizeof(ConvPlan)*MEMO_COMMANDS);
+    if(!native_plans && !(native_plans=malloc(sizeof(NativePlan)*MEMO_COMMANDS))){free(conv_plans);conv_plans=NULL;return 0;}
+    memset(conv_plans,0,sizeof(ConvPlan)*MEMO_COMMANDS);memset(native_plans,0,sizeof(NativePlan)*MEMO_COMMANDS);
     plan_program=r->program;plan_conv=conv;plan_commands=r->bound->command.data;
     for(unsigned i=0;i<7;i++){plan_pool[i]=r->pools[i].bytes?r->pools[i].base:NULL;plan_pool_bytes[i]=r->pools[i].bytes;}
     return 1;
 }
 /* Fi and M of a plan straight from the VTCM filter rows; 0 if any channel is
  * outside what the planes represent (the normal path then decides). */
-static int plan_fi(const ConvPlan *P, uint8_t *base, uint8_t *mh) {
-    const int64_t bound=(int64_t)P->KB*32*255*128,lim64=(int64_t)INT32_MAX-bound-(1<<19);
+static int plan_fi(const uint8_t *ft, const int8_t *wbase, int32_t NB, int32_t KB, int32_t zp, uint32_t wstride, uint32_t wrows,
+                   uint8_t *base, uint8_t *mh) {
+    const int64_t bound=(int64_t)KB*32*255*128,lim64=(int64_t)INT32_MAX-bound-(1<<19);
     if(lim64<=0) return 0;
     const HVX_Vector ones=Q6_V_vsplat_R(0x01010101),m1023=Q6_V_vsplat_R(1023),m31=Q6_V_vsplat_R(31),c1024=Q6_V_vsplat_R(1024),
                      c20=Q6_V_vsplat_R(20),c24=Q6_V_vsplat_R(24),c16=Q6_V_vsplat_R(16),c12=Q6_V_vsplat_R(1<<12),c7=Q6_V_vsplat_R(7),
                      zero=Q6_V_vzero(),lim=Q6_V_vsplat_R((int32_t)lim64),b30=Q6_V_vsplat_R(1<<30);
-    const int32_t zh=(int32_t)((uint32_t)P->zp|(uint32_t)P->zp<<16);
+    const int32_t zh=(int32_t)((uint32_t)zp|(uint32_t)zp<<16);
     HVX_VectorPred bad=Q6_Q_vcmp_gt_VwVw(zero,zero);
     HVX_Vector *d=(HVX_Vector *)base;
-    const HVX_Vector *rows=(const HVX_Vector *)P->ft;
-    for(int32_t j=0;j<P->NB;j++,d+=4,rows+=2) {
+    const HVX_Vector *rows=(const HVX_Vector *)ft;
+    for(int32_t j=0;j<NB;j++,d+=4,rows+=2) {
         const HVX_Vector mv=rows[0],bv=rows[1];
         const HVX_Vector pv=Q6_Vw_vsub_VwVw(c20,Q6_V_vand_VV(Q6_Vuw_vlsr_VuwR(mv,10),m31));
         HVX_Vector a=zero;
-        if(P->zp) {
-            const HVX_Vector *b=(const HVX_Vector *)(P->wbase+(size_t)j*P->KB*1024);
-            for(int32_t r=0;r<P->KB*8;r++) a=Q6_Vw_vrmpyacc_VwVbVb(a,b[r],ones);
+        if(zp) {
+            const int8_t *wb=wbase+(size_t)j*wstride;
+            for(uint32_t r=0;r<wrows;r++) a=Q6_Vw_vrmpyacc_VwVbVb(a,*(const HVX_UVector *)(wb+(size_t)r*128),ones);
         }
         const HVX_Vector off=Q6_Vw_vsub_VwVw(bv,Q6_Vw_vmpyi_VwRh(a,zh));
         bad=Q6_Q_or_QQ(bad,Q6_Q_or_QQ(Q6_Q_vcmp_gt_VwVw(zero,pv),Q6_Q_vcmp_gt_VwVw(pv,c7)));
@@ -4294,16 +4296,28 @@ static int plan_fi(const ConvPlan *P, uint8_t *base, uint8_t *mh) {
 int nprg2_exec_reference_plan_run(uint32_t command, Nprg2Parallel *par, int32_t *err) {
     if(!conv_plans || command>=MEMO_COMMANDS) return 0;
     const uint8_t *r=plan_commands+(size_t)command*NPRG2_COMMAND_BYTES;
-    if(r[2]!=QDR_HMX_CONV || r[3]!=33) return 0;
-    const ConvPlan *P=&conv_plans[command];
-    if(!P->valid) return 0;
+    if(r[2]!=QDR_HMX_CONV || (r[3]!=33 && r[3]!=32 && r[3]!=36)) return 0;
     const Nprg2ReferenceConv *c=plan_conv;
     uint64_t (*clock)(void)=c->phase?c->clock:NULL,t0=clock?clock():0;
     uint8_t *base=(uint8_t *)(((uintptr_t)c->workspace+2047)&~(uintptr_t)2047),*n=c->near;
-    size_t at=0,o_mh=nbump(&at,(size_t)P->NB*128);
-    if(!plan_fi(P,base,n+o_mh)) return 0;
+    size_t at=0;
+    const ConvPlan *P=&conv_plans[command];
+    if(P->valid) {
+        size_t o_mh=nbump(&at,(size_t)P->NB*128);
+        if(!plan_fi(P->ft,P->wbase,P->NB,P->KB,P->zp,(uint32_t)P->KB*1024u,(uint32_t)P->KB*8u,base,n+o_mh)) return 0;
+        if(clock) c->phase[HMX_SETUP_SLOT]+=clock()-t0;
+        return plane_slide_run(P,c,plan_pool,par,base,n+o_mh,at,err);
+    }
+    const NativePlan *Q=&native_plans[command];
+    if(!Q->valid) return 0;
+    size_t o_mh=nbump(&at,(size_t)Q->NB*128),o_ktab=nbump(&at,(size_t)Q->KB*4),o_xtab,o_tyx,o_out,o_pout;
+    if(!plan_fi(Q->ft,Q->wbase,Q->NB,Q->KB,Q->xt.zp,Q->wstride,Q->wrows,base,n+o_mh)) return 0;
+    (void)plane_native_near(Q,at,&o_xtab,&o_tyx,&o_out,&o_pout);
+    uint32_t *ktab=(uint32_t *)(n+o_ktab);
+    plan_ktab(ktab,Q);
     if(clock) c->phase[HMX_SETUP_SLOT]+=clock()-t0;
-    return plane_slide_run(P,c,plan_pool,par,base,n+o_mh,at,err);
+    return plane_native_run(Q,c,plan_pool,par,base,n+o_mh,ktab,(uint8_t **)(n+o_xtab),(int32_t *)(n+o_tyx),(uint8_t **)(n+o_out),(uint8_t **)(n+o_pout),
+                            NULL,NULL,NULL,NULL,err);
 }
 #endif
 uint32_t nprg2_exec_reference_error_line(void) {return reference_error_line;}
