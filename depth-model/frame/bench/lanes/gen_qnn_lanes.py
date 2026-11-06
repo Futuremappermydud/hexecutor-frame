@@ -24,6 +24,8 @@ ap.add_argument('--costs', help='optional JSON list of per-command ms, overrides
 ap.add_argument('--drop', default='', help='op/var list of no-effect commands to leave out, e.g. 1/10')
 ap.add_argument('--move', default='', help='op/var list of main commands (no DMA event) allowed on worker lanes, e.g. 26/8,3/1')
 ap.add_argument('--free-main', action='store_true', help='main keeps only DMA queue order; convs may reorder by priority')
+ap.add_argument('--model-split', type=float, default=0, help='model only: merge share of a u8 conv becomes a separate task; value = single-thread cost multiple')
+ap.add_argument('--scale', default='', help='model only: op/var:factor list applied to costs, e.g. 8/70:0.5,10/13:0')
 ap.add_argument('--no-dma-edges', action='store_true', help='model only: leave out the DMA landing edges')
 ap.add_argument('--strict', action='store_true', help='also enforce conflicts QNN lists leave unordered (they race in QNN too)')
 a = ap.parse_args()
@@ -53,6 +55,9 @@ if a.costs:
     per = json.load(open(a.costs)); assert len(per) == N
     cost = [max(float(x), 0.0) + OVH for x in per]
 
+if a.scale:
+    sc = {tuple(map(int, x.split(':')[0].split('/'))): float(x.split(':')[1]) for x in a.scale.split(',')}
+    cost = [max(cost[i] * sc.get((cmds[i][1], cmds[i][2]), 1.0), 0.00002) for i in range(N)]
 # --- memory footprints, GRAN-byte granules. Direct tensors are exact byte ranges;
 # blocked tensors cover their whole 2 KiB tiles. Spill, Fill and Zap declare no tensors:
 # their memory is in the vector words.
@@ -207,6 +212,60 @@ while _i is not None:
     _k = ('M' if lane[_i] == 0 else 'W', cmds[_i][1], cmds[_i][2]); _agg[_k] += cost[_i]; _n[_k] += 1
     _i = max(succ[_i], key=lambda v: rem[v], default=None)
 print('path:', [(k, round(v, 3), _n[k]) for k, v in _agg.most_common(12)])
+if a.model_split:
+    # Model only: H on main (in order), M on any of nw+1 other threads, one thread per merge.
+    MS = 0.42
+    isconv = lambda i: cmds[i][1] == 6 and cmds[i][2] in (32, 33, 36)
+    H = {i: cost[i] * (1 - MS) for i in range(N) if isconv(i)}
+    Mc = {i: cost[i] * MS * a.model_split for i in H}
+    rem2H = {}; rem2M = {}
+    order_ = list(reversed(topo))
+    for u in order_:
+        tail = max((rem2H.get(v, 0.0) for v in succ[u]), default=0.0)
+        if u in H:
+            rem2M[u] = Mc[u] + max((rem2H[v] for v in succ[u] if not (lane[v] == 0 and v in succ[u] and False)), default=0.0)
+            rem2H[u] = H[u] + rem2M[u]
+        else:
+            rem2H[u] = cost[u] + tail
+    d2 = list(indeg); rdy = []; mq = []
+    def push(i):
+        if lane[i] == 0: heapq.heappush(mq, (-rem2H[i], i))
+        else: heapq.heappush(rdy, (-rem2H[i], i))
+    for i in range(N):
+        if d2[i] == 0: push(i)
+    # successors of a split conv: main chain successor may start after H; memory successors after M.
+    chain = {}
+    for x, y in zip(kept_main, kept_main[1:]): chain[x[0]] = y[0]
+    realmem = {u: {v for v in succ[u] if v != chain.get(u) or v in preds_set[u]} for u in range(N)} if False else None
+    fr = list(range(1, a.workers + 2)); ev = []; t = 0.0; done = 0; mfree = True; cnt = 0; busy = Counter(); tasks = N + len(H)
+    MEMSUCC = [set(x) for x in succ]
+    for x, y in chain.items():
+        if x in H and y not in [j for j in succ[x] if x in preds[j]]: MEMSUCC[x].discard(y)
+    while done < tasks:
+        if mfree and mq:
+            i = heapq.heappop(mq)[1]; mfree = False; dur_ = H.get(i, cost[i]); heapq.heappush(ev, (t + dur_, cnt, i, 'H' if i in H else 'X', 0)); cnt += 1; busy[0] += dur_
+        while fr and rdy:
+            _, i = heapq.heappop(rdy)
+            l = fr.pop()
+            if isinstance(i, tuple): dur_ = Mc[i[0]]
+            else: dur_ = cost[i]
+            heapq.heappush(ev, (t + dur_, cnt, i, 'W', l)); cnt += 1; busy[l] += dur_
+        t, _, i, kind, l = heapq.heappop(ev); done += 1
+        if l == 0: mfree = True
+        else: fr.append(l)
+        def rel(v):
+            d2[v] -= 1
+            if d2[v] == 0: push(v)
+        if kind == 'H':
+            heapq.heappush(rdy, (-rem2M[i], (i, 'M')))
+            c_ = chain.get(i)
+            if c_ is not None and c_ not in MEMSUCC[i]: rel(c_)
+        elif kind == 'W' and isinstance(i, tuple):
+            for v in MEMSUCC[i[0]]: rel(v)
+        else:
+            for v in succ[i]: rel(v)
+    print('split-merge model (M x%.2f): end %.3f ms; busy' % (a.model_split, t), {k: round(v, 2) for k, v in sorted(busy.items())})
+    sys.exit(0)
 # --- list schedule: main fixed, worker lanes by longest remaining path
 nw = a.workers
 d = list(indeg); ready = []; mhead = []

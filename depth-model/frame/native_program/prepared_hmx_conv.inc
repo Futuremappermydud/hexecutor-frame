@@ -404,8 +404,15 @@ static void plane_fi_put(uint8_t *base, int32_t NB, const int32_t *corr, const i
     for(int32_t j=0;j<NB;j++,d+=4) {
         const HVX_Vector pv=*(const HVX_Vector *)(pre+32*j),off=*(const HVX_Vector *)(corr+32*j),Mv=*(const HVX_Vector *)(Mq+32*j);
         d[0]=Q6_Vw_vasl_VwR(Q6_Vw_vsub_VwVw(c24,pv),10);d[1]=off;
+#ifdef PLANE_SAT
+        /* High plane floor(q/256)+239: clips exactly at q>=4096, so the merge is one saturating
+         * subtract (and the multiplier is stored doubled instead of doubling q). */
+        d[2]=Q6_Vw_vasl_VwR(Q6_Vw_vsub_VwVw(c16,pv),10);d[3]=Q6_Vw_vadd_VwVw(off,Q6_Vw_vasl_VwVw(Q6_V_vsplat_R(239<<8),pv));
+        ((HVX_Vector *)mh)[j]=Q6_Vh_vadd_VhVh(Q6_Vh_vpacke_VwVw(Mv,Mv),Q6_Vh_vpacke_VwVw(Mv,Mv));
+#else
         d[2]=Q6_Vw_vasl_VwR(Q6_Vw_vsub_VwVw(c16,pv),10);d[3]=Q6_Vw_vadd_VwVw(off,Q6_Vw_vasl_VwVw(c12,pv));
         ((HVX_Vector *)mh)[j]=Q6_Vh_vpacke_VwVw(Mv,Mv);
+#endif
     }
     d[0]=Q6_V_vsplat_R(0x404000);d[1]=Q6_V_vzero();
 #else
@@ -414,7 +421,11 @@ static void plane_fi_put(uint8_t *base, int32_t NB, const int32_t *corr, const i
 }
 /* Every channel representable: pre 0..7 (hi bias offset at most 2^19 on top of acc + off). */
 static int plane_params_ok(int32_t co, const int32_t *corr, const int32_t *pre, int64_t bound) {
+#ifdef PLANE_SAT
+    const int64_t lim=(int64_t)INT32_MAX-bound-(239LL<<15);
+#else
     const int64_t lim=(int64_t)INT32_MAX-bound-(1<<19);
+#endif
 #if BLK_HVX
     if(lim<=0 || lim>INT32_MAX) return 0;
     const HVX_Vector c7=Q6_V_vsplat_R(7),zero=Q6_V_vzero(),l=Q6_V_vsplat_R((int32_t)lim);
@@ -435,6 +446,14 @@ static int plane_params_ok(int32_t co, const int32_t *corr, const int32_t *pre, 
 }
 #if BLK_HVX
 static inline __attribute__((always_inline)) HVX_Vector plane_rq(HVX_Vector lo, HVX_Vector hi, HVX_Vector mv) {
+#ifdef PLANE_SAT
+    /* q = saturating(v - 239*256), at most 4351, whole-range exact against the clamped rule
+     * for M 1024..2047 (bench/lanes/plane_sat_sim.c). mv holds 2M: (2*q*2M + 2^15)>>16. */
+    const HVX_Vector off=Q6_Vh_vsplat_R(239<<8);
+    HVX_VectorPair ww=Q6_W_vshuff_VVR(hi,lo,-1);
+    return Q6_Vub_vpack_VhVh_sat(Q6_Vh_vmpy_VhVh_s1_rnd_sat(Q6_Vuh_vsub_VuhVuh_sat(Q6_V_hi_W(ww),off),mv),
+                                 Q6_Vh_vmpy_VhVh_s1_rnd_sat(Q6_Vuh_vsub_VuhVuh_sat(Q6_V_lo_W(ww),off),mv));
+#endif
     const HVX_Vector c4096=Q6_Vh_vsplat_R(4096),c8192=Q6_Vh_vsplat_R(8192);
     HVX_VectorPair w=Q6_W_vshuff_VVR(hi,lo,-1);
     HVX_Vector a=Q6_Vh_vsub_VhVh(Q6_Vuh_vmin_VuhVuh(Q6_Vuh_vmax_VuhVuh(Q6_V_lo_W(w),c4096),c8192),c4096),
@@ -474,7 +493,11 @@ static inline void plane_block(const PlaneJob *J, uint8_t *o, const uint8_t *c, 
     for(int p=0;p<rows*8;p++)for(int n=0;n<32;n++) {
         const size_t i=(size_t)p*32+n;
         int32_t v=(int32_t)c[i]|(int32_t)c[2048+i]<<8;
+#ifdef PLANE_SAT
+        v=v<(239<<8)?0:v-(239<<8);
+#else
         v=(v<4096?4096:v>8192?8192:v)-4096;
+#endif
         v=(v*M[n]+8192)>>14;
         o[i]=(uint8_t)(v>255?255:v);
     }
@@ -706,7 +729,11 @@ static int nat_mac(const NatJob *J, int32_t *fi, int32_t *zero, uint8_t *complet
             int64_t q=(acc+J->corr[ch])>>J->pre[ch];
 #if NPRG2_PLANES
             d[p*32+n]=(uint8_t)(q&255);
+#ifdef PLANE_SAT
+            {int64_t v=(q>>8)+239;d[2048+p*32+n]=(uint8_t)(v<0?0:v>255?255:v);}
+#else
             {int64_t v=(q>>8)+16;d[2048+p*32+n]=(uint8_t)(v<0?0:v>255?255:v);}
+#endif
 #else
             int64_t v=((2*q+1)*J->Mq[ch]+((int64_t)1<<14))>>15;
             d[p*32+n]=(uint8_t)(v<0?0:v>255?255:v);
