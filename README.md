@@ -49,7 +49,8 @@ replacement has independent provenance; record its actual dependencies.
 ## Git history and migration
 
 The `monorepo/hexecutor` branch joins the original `model-tsdf` runtime tip and
-the `frame-speed-20261105` spatial-stuff tip with a two-parent merge commit.
+the `frame-speed-20261105` spatial-stuff tip through relocation commits followed
+by a two-parent merge commit.
 Original commits, authors, timestamps, and commit IDs are unchanged. The old
 paths exist in those commits; use `git log --follow -- <new-path>` to trace a
 file across the move. The other spatial-stuff branches are retained locally
