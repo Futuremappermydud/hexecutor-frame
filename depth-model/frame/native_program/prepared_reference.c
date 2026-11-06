@@ -4329,7 +4329,9 @@ int nprg2_exec_reference_plan_run(uint32_t command, Nprg2Parallel *par, int32_t 
         if(!ix) return 0;
         N16Plan *P=&n16_plan_pool[ix-1u];
         if(!plan_fi16(P->ft,P->NB,base)) return 0;
+#ifndef SLIDE_PROF
         if(clock) c->phase[6]+=clock()-t0;
+#endif
         const size_t fixed=((size_t)P->NB*256+256+2048*2+2047)&~(size_t)2047;
         return n16_exec(c,&P->J,1,par,P->KB,P->NB,P->mt,P->total,P->wbase,(int32_t *)base,(int32_t *)(base+(size_t)P->NB*256),base+fixed-2048,err);
     }
@@ -4339,6 +4341,9 @@ int nprg2_exec_reference_plan_run(uint32_t command, Nprg2Parallel *par, int32_t 
     if(P->valid) {
         size_t o_mh=nbump(&at,(size_t)P->NB*128);
         if(!plan_fi(P->ft,P->wbase,P->NB,P->KB,P->zp,(uint32_t)P->KB*1024u,(uint32_t)P->KB*8u,base,n+o_mh)) return 0;
+#ifdef SLIDE_PROF
+        if(clock) c->phase[6]+=clock()-t0;
+#endif
         if(clock) c->phase[HMX_SETUP_SLOT]+=clock()-t0;
         return plane_slide_run(P,c,plan_pool,par,base,n+o_mh,at,err);
     }

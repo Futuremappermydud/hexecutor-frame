@@ -967,6 +967,30 @@ static int prepared_active(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_
     return 0;
 }
 #if QDS_L2_CACHE
+#ifdef QDS_VTCM_SINGLE_PAGE
+/* The firmware maps VTCM as two 4 MiB pages (TLB 8, 9). HMX's window walk across
+ * that boundary wedges the CDSP, so for the lease it is one 16 MiB page at the same
+ * identity address. Nothing touches the unbacked upper half. QNN asks for the same
+ * through compute_resource_attr_set_vtcm_param_v2. Restored before the lease ends. */
+#define QDS_VTCM_TLB_16M 0xc0031000f7062040ull
+static uint32_t qds_vtcm_single_page(int on){
+    uint64_t e8,e9;
+    __asm__ volatile("%0=tlbr(%1)":"=r"(e8):"r"(8u):"memory");
+    __asm__ volatile("%0=tlbr(%1)":"=r"(e9):"r"(9u):"memory");
+    if(on){
+        if(e8!=0xc0031000f7062020ull || e9!=0xc0031400f7062820ull)return 1;
+        __asm__ volatile("barrier\n\tsyncht":::"memory");
+        __asm__ volatile("tlbw(%0,%1)\n\tisync"::"r"(0ull),"r"(9u):"memory");
+        __asm__ volatile("tlbw(%0,%1)\n\tisync"::"r"(QDS_VTCM_TLB_16M),"r"(8u):"memory");
+    }else{
+        if(e8!=QDS_VTCM_TLB_16M || e9!=0ull)return 1;
+        __asm__ volatile("barrier\n\tsyncht":::"memory");
+        __asm__ volatile("tlbw(%0,%1)\n\tisync"::"r"(0xc0031000f7062020ull),"r"(8u):"memory");
+        __asm__ volatile("tlbw(%0,%1)\n\tisync"::"r"(0xc0031400f7062820ull),"r"(9u):"memory");
+    }
+    return 0;
+}
+#endif
 typedef struct {QdgGraph *g;QdPreparedState *s;uint32_t first,last;void *scratch;uint32_t scratch_bytes;
                 int e;uint32_t l2_error;} QdsLeaseCall;
 static QdsLeaseCall qds_lease_call;
@@ -981,7 +1005,13 @@ static void __attribute__((noinline)) prepared_leased(uint32_t unused) {
     if(qds_l2_pool_cache(1)){c->l2_error=16;if(qds_l2_end(&l2))c->l2_error|=4;return;}
 #endif
     qds_l2_lease_active=1;
+#ifdef QDS_VTCM_SINGLE_PAGE
+    if(qds_vtcm_single_page(1)){c->l2_error=512;qds_l2_lease_active=0;if(qds_l2_pool_cache(0))c->l2_error|=32;if(qds_l2_end(&l2))c->l2_error|=4;return;}
+#endif
     c->e=prepared_active(c->g,c->s,c->first,c->last,c->scratch,c->scratch_bytes);
+#ifdef QDS_VTCM_SINGLE_PAGE
+    if(qds_vtcm_single_page(0))c->l2_error|=1024;
+#endif
     qds_l2_lease_active=0;
     t=now_ns();
 #if QDS_L2_POOL_C7
