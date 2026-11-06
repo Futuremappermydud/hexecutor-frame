@@ -1,6 +1,0 @@
-/depth-model/.work
-/depth-model/frame/__pycache__
-/depth-model/frame/bench/__pycache__
-/depth-model/frame/build
-*.log
-depth-model/frame/native_kernels/full_provider_v75_decoded.asm
