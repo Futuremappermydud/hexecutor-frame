@@ -1104,7 +1104,12 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
         if(!nprg2_runner_prepare_preflighted_request(&s->runner,&s->executor,0,QD_QNN_PRIMARY_COMMAND_COUNT,
                QD_DIRECT_ACTIVE_BYTES,s->inputs,4,s->outputs,2,g,s->scratch,QDS_REFERENCE_SCRATCH_BYTES,&s->stats,0,NULL,
                s->scratch,QDS_REFERENCE_SCRATCH_BYTES,s->runner.extra_scratch[0].data,s->runner.extra_scratch[0].bytes,&q))
+        {
             (void)nprg2_exec_reference_plan_begin(&q,&s->conv);
+#ifdef EW_MEMO
+            nprg2_exec_elementwise_memo_begin(q.program,q.pools);
+#endif
+        }
     }
 #endif
 #endif

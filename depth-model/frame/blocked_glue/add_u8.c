@@ -159,10 +159,20 @@ int qd_blocked_add_u8_whole(const QdBlockedAddU8 *prepared) {
     if(!prepared||prepared->cookie!=0x51444138u)return 0;
     return whole(&prepared->a)&&whole(&prepared->b)&&whole(&prepared->out);
 }
-static const uint8_t *blk(const QdBlockedU8 *t,int B,int H,int W,int D) {
-    int nh=(t->meta[1]+7)/8,nw=(t->meta[2]+7)/8,nd=(t->meta[3]+31)/32;
-    int64_t ix=((((int64_t)(B+t->origin[0])*nh+H+t->origin[1]/8)*nw+W+t->origin[2]/8)*nd)+t->slice+D+t->origin[3]/32;
-    return (const uint8_t *)block_start(t,ix);
+/* Block-table position of a tensor's region: 32-bit, no divide per block. */
+typedef struct { const uint32_t *blocks; uint8_t *const *pools; uint32_t count, base, nh, nw, nd; } BlkIx;
+static inline BlkIx blk_ix(const QdBlockedU8 *t) {
+    BlkIx x;
+    x.blocks=t->blocks;x.pools=t->pools;x.count=t->block_count;
+    x.nh=(uint32_t)((t->meta[1]+7)/8);x.nw=(uint32_t)((t->meta[2]+7)/8);x.nd=(uint32_t)((t->meta[3]+31)/32);
+    /* ((B0*nh + H0)*nw + W0)*nd + slice + D0 for the region's origin */
+    x.base=((((uint32_t)t->origin[0]*x.nh+(uint32_t)(t->origin[1]/8))*x.nw+(uint32_t)(t->origin[2]/8))*x.nd)+t->slice+(uint32_t)(t->origin[3]/32);
+    return x;
+}
+static inline const uint8_t *blk32(const BlkIx *x,uint32_t ix) {
+    if(ix>=x->count)return NULL;
+    const uint32_t e=x->blocks[ix],pool=e&127u;
+    return pool&&x->pools[pool]?x->pools[pool]+(e&~127u):NULL;
 }
 int qd_blocked_add_u8_apply_whole(const QdBlockedAddU8 *prepared,const QdAddU8Params *p,uint32_t part,uint32_t parts) {
     if(!qd_blocked_add_u8_whole(prepared)||!params_ok(p)||!parts)return 0;
@@ -171,20 +181,27 @@ int qd_blocked_add_u8_apply_whole(const QdBlockedAddU8 *prepared,const QdAddU8Pa
     const int same=a==b||(a->blocks==b->blocks&&a->slice==b->slice&&!memcmp(a->origin,b->origin,sizeof a->origin)&&
                           !memcmp(a->meta,b->meta,sizeof a->meta));
     const int f16=params16(p);
-    uint32_t i=0;
-    for(int B=0;B<nB;B++)for(int H=0;H<nH;H++)for(int W=0;W<nW;W++)for(int D=0;D<nD;D++,i++) {
-        if(i%parts!=part)continue;
-        uint8_t *po=(uint8_t *)blk(o,B,H,W,D);if(!po)continue;
-        const uint8_t *pa=blk(a,B,H,W,D),*pb=same?pa:blk(b,B,H,W,D);
-        if(f16)for(int v=0;v<16;v++) {
-            HVX_Vector va=pa?((const HVX_Vector *)pa)[v]:Q6_V_vzero();
-            HVX_Vector vb=pb?((const HVX_Vector *)pb)[v]:Q6_V_vzero();
-            ((HVX_Vector *)po)[v]=add_vec16(va,vb,p);
-        }
-        else for(int v=0;v<16;v++) {
-            HVX_Vector va=pa?((const HVX_Vector *)pa)[v]:Q6_V_vzero();
-            HVX_Vector vb=pb?((const HVX_Vector *)pb)[v]:Q6_V_vzero();
-            ((HVX_Vector *)po)[v]=add_vec(va,vb,p);
+    const BlkIx xa=blk_ix(a),xb=blk_ix(b),xo=blk_ix(o);
+    uint32_t i=0,next=part;
+    for(int B=0;B<nB;B++)for(int H=0;H<nH;H++)for(int W=0;W<nW;W++) {
+        const uint32_t ra=xa.base+(((uint32_t)B*xa.nh+(uint32_t)H)*xa.nw+(uint32_t)W)*xa.nd,
+                       rb=xb.base+(((uint32_t)B*xb.nh+(uint32_t)H)*xb.nw+(uint32_t)W)*xb.nd,
+                       ro=xo.base+(((uint32_t)B*xo.nh+(uint32_t)H)*xo.nw+(uint32_t)W)*xo.nd;
+        for(int D=0;D<nD;D++,i++) {
+            if(i!=next)continue;
+            next+=parts;
+            uint8_t *po=(uint8_t *)blk32(&xo,ro+(uint32_t)D);if(!po)continue;
+            const uint8_t *pa=blk32(&xa,ra+(uint32_t)D),*pb=same?pa:blk32(&xb,rb+(uint32_t)D);
+            if(f16)for(int v=0;v<16;v++) {
+                HVX_Vector va=pa?((const HVX_Vector *)pa)[v]:Q6_V_vzero();
+                HVX_Vector vb=pb?((const HVX_Vector *)pb)[v]:Q6_V_vzero();
+                ((HVX_Vector *)po)[v]=add_vec16(va,vb,p);
+            }
+            else for(int v=0;v<16;v++) {
+                HVX_Vector va=pa?((const HVX_Vector *)pa)[v]:Q6_V_vzero();
+                HVX_Vector vb=pb?((const HVX_Vector *)pb)[v]:Q6_V_vzero();
+                ((HVX_Vector *)po)[v]=add_vec(va,vb,p);
+            }
         }
     }
     return 1;

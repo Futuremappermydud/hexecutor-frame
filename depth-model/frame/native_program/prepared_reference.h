@@ -117,6 +117,8 @@ int nprg2_exec_reference_clone_lane(uint8_t source_lane,uint8_t destination_lane
  * normal path, -1 error. */
 int nprg2_exec_reference_plan_begin(const Nprg2ExecRequest *request, const Nprg2ReferenceConv *conv);
 int nprg2_exec_reference_plan_run(uint32_t command, Nprg2Parallel *parallel, int32_t *err);
+/* EW_MEMO builds: before a run list (prepared_elementwise.c). */
+void nprg2_exec_elementwise_memo_begin(const Nprg2Program *program, const Nprg2Pool *pools);
 /* Path the most recently measured or run convolution took: 0 reference,
  * 1 fast with the workspace only, 2 fast with near, 3 HMX (diagnostics only). */
 uint32_t nprg2_exec_reference_conv_path(void);

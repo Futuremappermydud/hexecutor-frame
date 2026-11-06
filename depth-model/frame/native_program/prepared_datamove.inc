@@ -936,13 +936,14 @@ static inline __attribute__((always_inline)) void tr_wc_part_es(const TrWcJob *J
     const int pbs=ES==2?1:2;      /* log2 pixels per vector */
     const int64_t zi0=xt->p[3]/32;
     const int calign=!(((uint32_t)xt->p[2]|(uint32_t)o->p[2])&((1u<<cws)-1u));
-    uint32_t runix=0;
+    uint32_t runix=0,runnext=part;
     for(int32_t b=0;b<n[0];b++)for(int32_t h=0;h<H;runix++) {
         const int64_t Hi=(int64_t)h+xt->p[1],Ho=(int64_t)h+o->p[1],B=b+(int64_t)xt->p[0],OB=b+(int64_t)o->p[0];
         int32_t run=8-(int32_t)(Hi&7);
         if(8-(int32_t)(Ho&7)<run)run=8-(int32_t)(Ho&7);
         if(H-h<run)run=H-h;
-        if(runix%parts!=part){h+=run;continue;}
+        if(runix!=runnext){h+=run;continue;}
+        runnext+=parts;
         const int64_t ibase=(B*bx.nbh+(Hi>>3))*bx.nbw,obase=(OB*bo.nbh+(Ho>>3))*bo.nbw;
         const uint32_t iro=256u*(uint32_t)(Hi&7),oro=256u*(uint32_t)(Ho&7);
         for(int32_t zc=0;zc*32<C;zc++) {

@@ -203,9 +203,10 @@ int qd_blocked_linearclip_u8_u16_apply_whole(const QdBlockedLinearclipU8U16 *pre
     const int oH=(out->meta[1]+7)/8,oW=(out->meta[2]+3)/4,oD=(out->meta[3]+31)/32;
     const int f16=p->shift<=15;
     const uint32_t m2=p->multiplier|p->multiplier<<16;
-    uint32_t i=0;
+    uint32_t i=0,next=part;
     for(int B=0;B<nB;B++)for(int H=0;H<nH;H++)for(int W=0;W<nW;W++)for(int D=0;D<nD;D++,i++) {
-        if(i%parts!=part)continue;
+        if(i!=next)continue;
+        next+=parts;
         int64_t ix=((((int64_t)(B+in->origin[0])*inH+H+in->origin[1]/8)*inW+W+in->origin[2]/8)*inD)+in->slice+D+in->origin[3]/32;
         int64_t ox=((((int64_t)(B+out->origin[0])*oH+H+out->origin[1]/8)*oW+2*W+out->origin[2]/4)*oD)+out->slice+D+out->origin[3]/32;
         const HVX_Vector *pi=(const HVX_Vector *)block_ptr((const uint8_t *const *)in->pools,in->blocks,in->block_count,ix);

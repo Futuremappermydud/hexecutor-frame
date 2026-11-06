@@ -11,6 +11,7 @@
 #include "../blocked_glue/sign_blocked.h"
 #undef QdBlockedU16
 #include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 
 enum { BLOCK_BYTES=2048, MAX_BLOCKS=2560, GEOMETRY_CROUTON=64 };
@@ -244,6 +245,9 @@ static int ew_range(int32_t H,uint32_t part,uint32_t parts,int32_t *h0,int32_t *
 }
 static uint32_t ew_parts(const Nprg2ExecCall *c,const int32_t *dims) {
     uint64_t n=(uint64_t)dims[0]*(uint64_t)dims[1]*(uint64_t)dims[2]*(uint64_t)dims[3];
+#ifdef EW_SHAPES
+    fprintf(stderr,"EWSHAPE %u/%u %d %d %d %d\n",c->command.opcode,c->command.variant,dims[0],dims[1],dims[2],dims[3]);
+#endif
     if (n<PAR_EW_MIN_ELEMS || dims[1]<2) return 1;
     return nprg2_parallel_parts(c->parallel,(uint32_t)dims[1]);
 }
@@ -305,9 +309,58 @@ static void w16_whole_part(void *ctx,uint32_t part,uint32_t parts) {
     (void)qd_blocked_ew16_apply_whole(&j->a,j->has_b?&j->b:NULL,&j->o,&j->p,j->bs,part,parts);
 }
 
+#ifdef EW_MEMO
+/* Worker lane, preflighted commands: descriptors and parameters come only from the
+ * bound program (call records, geometry, block tables), so they are parsed once per
+ * command. u16 scalars are operand values and are still read on every run. */
+typedef struct {
+    uint32_t valid;
+    union {
+        struct { QdBlockedU8 a,b,o; QdAddU8Params p; } add;
+        struct { QdBlockedU16Out a,b,o; QdEw16Params p; const uint8_t *scalar; } w16;
+    } u;
+} EwMemo;
+enum { EW_MEMO_COMMANDS=8192, EW_MEMO_SLOTS=1024 };
+static EwMemo *ew_slab;
+static uint16_t *ew_ix;     /* by command index: slab index + 1 */
+static uint32_t ew_used;
+static const void *ew_program;
+static uint8_t *ew_pool_tab[7];
+void nprg2_exec_elementwise_memo_begin(const Nprg2Program *program,const Nprg2Pool *pools) {
+    if (!ew_slab) ew_slab=malloc(sizeof(EwMemo)*EW_MEMO_SLOTS);
+    if (!ew_ix) ew_ix=malloc(sizeof(uint16_t)*EW_MEMO_COMMANDS);
+    if (!ew_slab || !ew_ix) return;
+    /* Memos stay valid for the same program and pool contents. */
+    int same=ew_program==(const void *)program;
+    for (unsigned i=0;same && i<7;i++) same=ew_pool_tab[i]==pools[i].base;
+    if (same) return;
+    memset(ew_ix,0,sizeof(uint16_t)*EW_MEMO_COMMANDS);ew_used=0;
+    ew_program=program;
+    for (unsigned i=0;i<7;i++) ew_pool_tab[i]=pools[i].base;
+}
+static inline EwMemo *ew_hit(const Nprg2ExecCall *c) {
+    if (!c->preflighted || c->execution_lane!=1u || !ew_ix || c->command_index>=EW_MEMO_COMMANDS ||
+        c->program!=ew_program) return NULL;
+    uint32_t ix=ew_ix[c->command_index];
+    return ix?&ew_slab[ix-1u]:NULL;
+}
+static inline EwMemo *ew_new(const Nprg2ExecCall *c) {
+    if (!c->preflighted || c->execution_lane!=1u || !ew_ix || c->command_index>=EW_MEMO_COMMANDS ||
+        c->program!=ew_program || ew_used>=EW_MEMO_SLOTS) return NULL;
+    return &ew_slab[ew_used];
+}
+static inline void ew_commit(const Nprg2ExecCall *c) {ew_ix[c->command_index]=(uint16_t)(++ew_used);}
+#endif
 static int add_run(const Nprg2ExecCall *c,void *ctx) {
     (void)ctx;QdBlockedU8 a,b,o;QdAddU8Params p;
+#ifdef EW_MEMO
+    {EwMemo *m=ew_hit(c);if (m) return add_apply_parts(c,&m->u.add.a,&m->u.add.b,&m->u.add.o,&m->u.add.p);}
+#endif
     if (!make_u8(c,0,0,&a)||!make_u8(c,1,0,&b)||!make_u8(c,0,1,&o)||!add_params(c,&p)) return 0;
+#ifdef EW_MEMO
+    {EwMemo *m=ew_new(c);if (m){m->u.add.a=a;m->u.add.b=b;m->u.add.o=o;m->u.add.p=p;
+        m->u.add.a.pools=m->u.add.b.pools=m->u.add.o.pools=ew_pool_tab;ew_commit(c);}}
+#endif
     /* The audited helper's prepare() allocates alias lists. The equivalent
      * full proof already ran in executor preflight with caller scratch; this
      * cookie is the helper's apply guard, not a skip around validation. */
@@ -382,7 +435,14 @@ static int requant_validate(const Nprg2ExecCall *c,void *ctx) {
 
 static int requant_run(const Nprg2ExecCall *c,void *ctx) {
     (void)ctx;QdBlockedU8 in,out;QdAddU8Params p;
+#ifdef EW_MEMO
+    {EwMemo *m=ew_hit(c);if (m) return add_apply_parts(c,&m->u.add.a,&m->u.add.a,&m->u.add.o,&m->u.add.p);}
+#endif
     if (!make_u8(c,0,0,&in) || !make_u8(c,0,1,&out) || !requant_params(c,&p)) return 0;
+#ifdef EW_MEMO
+    {EwMemo *m=ew_new(c);if (m){m->u.add.a=in;m->u.add.b=in;m->u.add.o=out;m->u.add.p=p;
+        m->u.add.a.pools=m->u.add.b.pools=m->u.add.o.pools=ew_pool_tab;ew_commit(c);}}
+#endif
     return add_apply_parts(c,&in,&in,&out,&p);
 }
 
@@ -546,13 +606,40 @@ static int w16_validate(const Nprg2ExecCall *c,int which) {
 static int w16_run(const Nprg2ExecCall *c,int which) {
     const W16Spec *sp=&w16_spec[which];
     QdEw16Params p;QdBlockedU16Out a,b,o;int32_t bs=-1;
+#ifdef EW_MEMO
+    {
+        EwMemo *m=ew_hit(c);
+        if (m) {
+            a=m->u.w16.a;o=m->u.w16.o;p=m->u.w16.p;
+            if (sp->two_tensors) b=m->u.w16.b;
+            if (sp->scalar) bs=(int32_t)rd16e(m->u.w16.scalar);
+            goto w16_apply;
+        }
+    }
+#endif
     if (!w16_params(c,which,&p) || !make_u16(c,0,0,&a) || !make_u16(c,0,1,&o)) return 0;
     if (sp->two_tensors && !make_u16(c,1,0,&b)) return 0;
-    if (sp->scalar) {
-        const uint8_t *sa=which==W16_MULINL?mulinl_scalar_addr(c,1):w16_scalar_addr(c,1);
-        if (!sa) return 0;
-        bs=(int32_t)rd16e(sa);
+    {
+        const uint8_t *sa=NULL;
+        if (sp->scalar) {
+            sa=which==W16_MULINL?mulinl_scalar_addr(c,1):w16_scalar_addr(c,1);
+            if (!sa) return 0;
+            bs=(int32_t)rd16e(sa);
+        }
+#ifdef EW_MEMO
+        EwMemo *m=ew_new(c);
+        if (m) {
+            m->u.w16.a=a;m->u.w16.o=o;m->u.w16.p=p;m->u.w16.scalar=sa;
+            if (sp->two_tensors) m->u.w16.b=b;
+            m->u.w16.a.pools=m->u.w16.o.pools=ew_pool_tab;
+            if (sp->two_tensors) m->u.w16.b.pools=ew_pool_tab;
+            ew_commit(c);
+        }
+#endif
     }
+#ifdef EW_MEMO
+w16_apply:;
+#endif
     uint32_t parts=ew_parts(c,a.dims);
     if (parts>1) {
         W16Job j={a,b,o,sp->two_tensors,p,bs};
