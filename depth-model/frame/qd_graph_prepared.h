@@ -717,11 +717,14 @@ static int prepared_qnn_command(QdQnnListRun *run,const Nprg2QnnRunEntry *entry,
 #endif
     if(wait>=QD_QNN_PRIMARY_CHECKPOINT_COUNT || done>=QD_QNN_PRIMARY_CHECKPOINT_COUNT ||
        (done && nprg2_qnn_primary_cp_owner[done]!=list))return NPRG2_EXEC_REJECTED;
+#if !QDS_QNN_LANES || !defined(SLIDE_TRIM)
     uint64_t wait_deadline=now_ns()+4000000000ull;
     uint32_t spins=0;
-#if QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM
+#endif
+#if QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM && !QDS_QNN_LANES
     if(wait && run->checkpoints[wait]){qnn_claim->idle[list]=1;__asm__ volatile("barrier":::"memory");}
 #endif
+#if !QDS_QNN_LANES || !defined(SLIDE_TRIM)
     while(wait && run->checkpoints[wait]) {
 #if QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM
         if(qnn_claim_serve(list))continue;
@@ -733,6 +736,7 @@ static int prepared_qnn_command(QdQnnListRun *run,const Nprg2QnnRunEntry *entry,
         }
         __asm__ volatile("pause(#32)");
     }
+#endif
     __asm__ volatile("barrier":::"memory");
 #if QDS_PREPARED_THREADS==4 && QDS_QNN_CLAIM && !QDS_QNN_LANES
     qnn_claim->idle[list]=0;__asm__ volatile("barrier":::"memory");
@@ -1278,6 +1282,9 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
                s->scratch,QDS_REFERENCE_SCRATCH_BYTES,s->runner.extra_scratch[0].data,s->runner.extra_scratch[0].bytes,&q))
         {
             (void)nprg2_exec_reference_plan_begin(&q,&s->conv);
+#ifdef WEIGHTS_MEMO
+            nprg2_exec_weights_memo_begin();
+#endif
 #ifdef EW_MEMO
             nprg2_exec_elementwise_memo_begin(q.program,q.pools);
 #endif

@@ -611,10 +611,38 @@ int nprg2_exec_weights_validate(const Nprg2ExecCall *c,void *ctx){
     if(s.offset>c->pools[s.pool].bytes||n>c->pools[s.pool].bytes-s.offset||d.offset>dlimit||n>dlimit-d.offset)return 0;
     return 1;
 }
+#ifdef WEIGHTS_MEMO
+/* After preflight, a weight copy's addresses are fixed for a program and pool table: keep
+ * them per command instead of revalidating on every run. WEIGHTS_CPU_BELOW: tensors under
+ * this size are copied directly, which costs less than a DMA descriptor. */
+#include <stdlib.h>
+typedef struct {const void *program;const uint8_t *pool1;uint8_t *dst;const uint8_t *src;uint32_t n;} WeightsMemo;
+static WeightsMemo *weights_memo;
+void nprg2_exec_weights_memo_begin(void){if(!weights_memo)weights_memo=calloc(8192,sizeof(WeightsMemo));}
+#ifndef WEIGHTS_CPU_BELOW
+#define WEIGHTS_CPU_BELOW 0u
+#endif
+static int weights_copy(const Nprg2ExecCall *c,uint8_t *dst,const uint8_t *src,uint32_t n){
+    if(n>=WEIGHTS_CPU_BELOW){
+        int queued=nprg2_exec_weights_async_try(c,dst,src,n);
+        if(queued>0)return 1;if(queued<0)return 0;
+    }
+    qd_vcopy(dst,src,n);return 1;
+}
+#endif
 int nprg2_exec_weights_run(const Nprg2ExecCall *c,void *ctx){
-    (void)ctx;if(!nprg2_exec_weights_validate(c,NULL))return 0;uint32_t si,di;Nprg2TensorView s,d;
+    (void)ctx;
+#ifdef WEIGHTS_MEMO
+    WeightsMemo *wm=c&&c->preflighted&&weights_memo&&c->command_index<8192u?&weights_memo[c->command_index]:NULL;
+    if(wm&&wm->program==(const void *)c->program&&wm->pool1==c->pools[1].base)return weights_copy(c,wm->dst,wm->src,wm->n);
+#endif
+    if(!nprg2_exec_weights_validate(c,NULL))return 0;uint32_t si,di;Nprg2TensorView s,d;
     if(nprg2_exec_input(c,0,&si,&s)||nprg2_exec_output(c,0,&di,&d))return 0;
     uint32_t sb=max_shape_bytes(s.geometry_record),db=max_shape_bytes(d.geometry_record),n=sb<db?sb:db;
+#ifdef WEIGHTS_MEMO
+    if(wm){wm->dst=c->pools[d.pool].base+d.offset;wm->src=c->pools[s.pool].base+s.offset;wm->n=n;wm->program=c->program;wm->pool1=c->pools[1].base;
+           return weights_copy(c,wm->dst,wm->src,wm->n);}
+#endif
     int queued=nprg2_exec_weights_async_try(c,c->pools[d.pool].base+d.offset,c->pools[s.pool].base+s.offset,n);
     if(queued>0)return 1;if(queued<0)return 0;
     qd_vcopy(c->pools[d.pool].base+d.offset,c->pools[s.pool].base+s.offset,n);return 1;

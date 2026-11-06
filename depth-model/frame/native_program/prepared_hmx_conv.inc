@@ -841,6 +841,10 @@ static int plane_slide_run(const ConvPlan *P, const Nprg2ReferenceConv *c, uint8
      * HMX never completing (an HVX VTCM read after the stores forces them). */
     __asm__ volatile("barrier":::"memory");
     {W32 v=*(volatile W32 *)base;__asm__ volatile(""::"r"(v[0]):"memory");}
+#ifdef SLIDE_TRIM
+    /* The in-place walks below write their own records. */
+    if(!P->s2 && !P->inplace)
+#endif
     {
         uint32_t *r=rec;
         for(int32_t i=0;i<groups;i++,r+=4) {

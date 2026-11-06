@@ -26,6 +26,9 @@ ap.add_argument('--move', default='', help='op/var list of main commands (no DMA
 ap.add_argument('--free-main', action='store_true', help='main keeps only DMA queue order; convs may reorder by priority')
 ap.add_argument('--model-split', type=float, default=0, help='model only: merge share of a u8 conv becomes a separate task; value = single-thread cost multiple')
 ap.add_argument('--scale', default='', help='model only: op/var:factor list applied to costs, e.g. 8/70:0.5,10/13:0')
+ap.add_argument('--main-steal-us', type=float, default=0, help='main runs ready worker commands up to this cost when it has no conv ready')
+ap.add_argument('--search', type=int, default=0, help='randomized priority search: this many trials, keep the best modeled end')
+ap.add_argument('--cpu-weights', default='', help='op/var list of weight copies built with WEIGHTS_CPU_BELOW: they never use the DMA queue')
 ap.add_argument('--no-dma-edges', action='store_true', help='model only: leave out the DMA landing edges')
 ap.add_argument('--strict', action='store_true', help='also enforce conflicts QNN lists leave unordered (they race in QNN too)')
 a = ap.parse_args()
@@ -126,7 +129,7 @@ def hb(p, i):  # QNN guarantees p completes before i starts
 
 # --- lane assignment
 def oplist(t): return {tuple(map(int, x.split('/'))) for x in t.split(',') if x}
-drop = oplist(a.drop); move = oplist(a.move)
+drop = oplist(a.drop); move = oplist(a.move); cpuw = oplist(a.cpu_weights)
 dropped_cmds = set()
 for e in main + work:
     c = cmds[e[0]]
@@ -145,7 +148,7 @@ succ = [set() for _ in range(N)]
 def add(p, i): succ[p].add(i)
 if a.free_main:
     # Only the descriptor queue order is fixed: copies, checkpoint sets and waits.
-    dq = [e for e in kept_main if e[4] or cmds[e[0]][1] == 4]
+    dq = [e for e in kept_main if e[4] or (cmds[e[0]][1] == 4 and (cmds[e[0]][1], cmds[e[0]][2]) not in cpuw)]
     for x, y in zip(dq, dq[1:]): add(x[0], y[0])
     print('free main: ordered DMA-queue entries', len(dq))
 else:
@@ -176,7 +179,7 @@ mainpos = {e[0]: k for k, e in enumerate(main)}
 dma_edges = dma_skip = 0
 for k, e in enumerate(main):
     c = cmds[e[0]]
-    if c[1] != 4 or a.no_dma_edges: continue
+    if c[1] != 4 or a.no_dma_edges or (c[1], c[2]) in cpuw: continue
     setk = next((j for j in range(k, len(main)) if main[j][4] == 1), None)
     if setk is None: continue
     ev = main[setk][3]
@@ -268,24 +271,48 @@ if a.model_split:
     sys.exit(0)
 # --- list schedule: main fixed, worker lanes by longest remaining path
 nw = a.workers
-d = list(indeg); ready = []; mhead = []
-def mpush(i): heapq.heappush(mhead, (-rem[i], i))
-for i in range(N):
-    if d[i] == 0: (mpush(i) if lane[i] == 0 else heapq.heappush(ready, (-rem[i], i)))
-free = list(range(1, nw + 1)); ev = []; now = 0.0; mfree = True; done = 0; seq = [[] for _ in range(nw + 1)]; start = [0.0] * N
-while done < N:
-    if mfree and mhead:
-        i = heapq.heappop(mhead)[1]; mfree = False; heapq.heappush(ev, (now + cost[i], i, 0)); seq[0].append(i); start[i] = now
-    while free and ready:
-        _, i = heapq.heappop(ready); l = min(free); free.remove(l)
-        heapq.heappush(ev, (now + cost[i], i, l)); seq[l].append(i); start[i] = now
-    t, i, l = heapq.heappop(ev); now = t; done += 1
-    if l == 0: mfree = True
-    else: free.append(l)
-    for v in succ[i]:
-        d[v] -= 1
-        if d[v] == 0: (mpush(v) if lane[v] == 0 else heapq.heappush(ready, (-rem[v], v)))
-assert a.free_main or [x[0] for x in kept_main] == [i for i in seq[0] if i not in dropped_cmds]
+STEAL = a.main_steal_us / 1000.0
+def schedule(pri):
+    d = list(indeg); ready = []; mhead = []; seq = [[] for _ in range(nw + 1)]; start = [0.0] * N
+    def push(i): heapq.heappush(mhead if lane[i] == 0 else ready, (-pri[i], i))
+    for i in range(N):
+        if d[i] == 0: push(i)
+    free = list(range(1, nw + 1)); ev = []; now = 0.0; mfree = True; done = 0
+    while done < N:
+        if mfree and mhead:
+            i = heapq.heappop(mhead)[1]; mfree = False; heapq.heappush(ev, (now + cost[i], i, 0)); seq[0].append(i); start[i] = now
+        while free and ready:
+            _, i = heapq.heappop(ready); l = min(free); free.remove(l)
+            heapq.heappush(ev, (now + cost[i], i, l)); seq[l].append(i); start[i] = now
+        if mfree and ready and STEAL:
+            # all worker lanes are busy and main has nothing: take the best short ready command
+            pick = None; held = []
+            while ready:
+                x = heapq.heappop(ready)
+                if cost[x[1]] <= STEAL: pick = x; break
+                held.append(x)
+            for x in held: heapq.heappush(ready, x)
+            if pick:
+                i = pick[1]; mfree = False; heapq.heappush(ev, (now + cost[i], i, 0)); seq[0].append(i); start[i] = now
+        t, i, l = heapq.heappop(ev); now = t; done += 1
+        if l == 0: mfree = True
+        else: free.append(l)
+        for v in succ[i]:
+            d[v] -= 1
+            if d[v] == 0: push(v)
+    return now, seq, start
+now, seq, start = schedule(rem)
+print('greedy modeled end %.3f' % now)
+if a.search:
+    rng = random.Random(7); best = (now, seq, start); pri = rem
+    for trial in range(a.search):
+        amp = rng.choice((0.002, 0.005, 0.01, 0.02, 0.05))
+        p2 = [x * (1 + rng.uniform(-amp, amp)) + rng.uniform(0, amp) for x in rem]
+        r = schedule(p2)
+        if r[0] < best[0]: best = r
+    now, seq, start = best
+    print('search best modeled end %.3f' % now)
+assert a.free_main or STEAL or [x[0] for x in kept_main] == [i for i in seq[0] if i not in dropped_cmds]
 print('modeled end %.3f ms; lane busy' % now, [round(sum(cost[i] for i in s), 3) for s in seq], 'counts', [len(s) for s in seq])
 
 # --- per-lane wait thresholds. A dropped command has no memory and no effect, but it can
