@@ -1,0 +1,681 @@
+diff --git a/depth-model/frame/bench/lanes/build_best.sh b/depth-model/frame/bench/lanes/build_best.sh
+index 2c9308e..ddd8271 100644
+--- a/depth-model/frame/bench/lanes/build_best.sh
++++ b/depth-model/frame/bench/lanes/build_best.sh
+@@ -8,6 +8,6 @@ set -eu
+ cd "$(dirname "$0")/../../.."
+ F="-DNPRG2_PLANES=1+-DQDS_POOL1_NOCOPY=1+-DONE_INPLACE=1+-DQDS_VTCM_SINGLE_PAGE=1+-DSLIDE_INPLACE_ALL=1+-DSETUP_FAST=1+-DCHAIN_LUT=1+-DEW_MEMO=1"
+ F="$F+-DQDS_QNN_LANES=1+-DQDS_L2_SIG=1+-DPLANE_SAT=1+-DSLIDE_TRIM=1+-DSLIDE_TRIM2=1+-DWEIGHTS_MEMO=1+-DWEIGHTS_CPU_BELOW=2048"
+-F="$F+-DWEIGHTS_CPU_VARIANTS=0x38000000u+-DQDS_HMX_STAY=1+-DCMD_MEMO=1+-DCHAIN_HVX=1+-mhvx-ieee-fp"
++F="$F+-DWEIGHTS_CPU_VARIANTS=${QDS_WEIGHT_MASK:-0x38000000u}+-DQDS_HMX_STAY=1+-DCMD_MEMO=1+-DCHAIN_HVX=1+-mhvx-ieee-fp"
+ F="$F+-DQDS_LANE_PAUSE=255+-DCLAIM_NOBAR=1+-DLANE_BAR=1+-DLANE_PUBLISH=1"
+ PROFILE=${PROFILE:-0} sh frame/bench/planes_build.sh "$1" "$F${2:++$2}"
+diff --git a/depth-model/frame/bench/lanes/gen_qnn_lanes.py b/depth-model/frame/bench/lanes/gen_qnn_lanes.py
+index 250d33a..e56bf2c 100644
+--- a/depth-model/frame/bench/lanes/gen_qnn_lanes.py
++++ b/depth-model/frame/bench/lanes/gen_qnn_lanes.py
+@@ -33,7 +33,16 @@ ap.add_argument('--serial', action='store_true', help='profiling only: every com
+ ap.add_argument('--serial-order', default='index', choices=('index', 'latest', 'random'), help='with --serial: which topological order to chain; latest and random stress footprints on the device')
+ ap.add_argument('--true-flow', action='store_true', help='model only: drop memory-reuse ordering')
+ ap.add_argument('--active', choices=('off','block','row'), default='off', help='footprints from dims and padding instead of the whole block table')
++ap.add_argument('--all-off-main', action='store_true', help='every command except HMX convs may run on any lane')
++ap.add_argument('--no-dma', action='store_true', help='weight copies by CPU on any lane; DMA checkpoints dropped. Build with WEIGHTS_CPU_VARIANTS covering 27..30')
++ap.add_argument('--helper-lane', action='store_true', help='model: HT5 also takes merges and worker commands')
+ ap.add_argument('--no-dma-edges', action='store_true', help='model only: leave out the DMA landing edges')
++ap.add_argument('--merge-split', type=int, default=0, help='u8 convs become H (main: staging, MAC) and M (any lane: plane merge, output writes); value = VTCM ring slots. Build with PLANE_DEFER')
++ap.add_argument('--merge-share', type=float, default=0.42, help='with --merge-split: M share of a conv cost, from the conv phase profile')
++ap.add_argument('--merge-factor', type=float, default=1.5, help='with --merge-split: M cost multiplier, one thread against the parallel merge it replaces')
++ap.add_argument('--merge-chain', action='store_true', help='with --merge-split: H entries stay in QNN order, so a full ring cannot deadlock')
++ap.add_argument('--merge-lane', action='store_true', help='with --merge-split: HT5 runs a list of M entries only')
++ap.add_argument('--merge-exclude', default='', help='with --merge-split: command indices that keep the whole conv in H')
+ ap.add_argument('--strict', action='store_true', help='also enforce conflicts QNN lists leave unordered (they race in QNN too)')
+ a = ap.parse_args()
+ 
+@@ -162,13 +171,15 @@ drop = oplist(a.drop); move = oplist(a.move); cpuw = oplist(a.cpu_weights)
+ dropped_cmds = set()
+ for e in main + work:
+     c = cmds[e[0]]
+-    if (c[1], c[2]) in drop:
+-        assert not c[4] and not c[5] and not c[6] and not e[4], ('not a no-op', e[0], c[1], c[2])
++    if (c[1], c[2]) in drop or (a.no_dma and e[4]):
++        assert not c[4] and not c[5] and not c[6] and (a.no_dma or not e[4]), ('not a no-op', e[0], c[1], c[2])
+         dropped_cmds.add(e[0])
+ for e in main:
+     c = cmds[e[0]]
+     if (c[1], c[2]) in move and not e[4]:
+         lane[e[0]] = 1
++    elif a.all_off_main and c[1] != 6 and (a.no_dma or not e[4]) and (a.no_dma or c[1] != 4):
++        lane[e[0]] = 1
+ qlane = {e[0]: (0 if k == 0 else 1) for k, lst in enumerate((main, work)) for e in lst}
+ kept_main = [e for e in main if e[0] not in dropped_cmds and lane[e[0]] == 0]
+ print('dropped', len(dropped_cmds), 'moved off main', sum(1 for e in main if lane[e[0]] == 1), 'main entries', len(kept_main))
+@@ -177,7 +188,7 @@ succ = [set() for _ in range(N)]
+ def add(p, i): succ[p].add(i)
+ if a.free_main:
+     # Only the descriptor queue order is fixed: copies, checkpoint sets and waits.
+-    dq = [e for e in kept_main if e[4] or (cmds[e[0]][1] == 4 and (cmds[e[0]][1], cmds[e[0]][2]) not in cpuw)]
++    dq = [] if a.no_dma else [e for e in kept_main if e[4] or (cmds[e[0]][1] == 4 and (cmds[e[0]][1], cmds[e[0]][2]) not in cpuw)]
+     for x, y in zip(dq, dq[1:]): add(x[0], y[0])
+     print('free main: ordered DMA-queue entries', len(dq))
+ else:
+@@ -254,7 +265,7 @@ mainpos = {e[0]: k for k, e in enumerate(main)}
+ dma_edges = dma_skip = 0
+ for k, e in enumerate(main):
+     c = cmds[e[0]]
+-    if c[1] != 4 or a.no_dma_edges or (c[1], c[2]) in cpuw: continue
++    if c[1] != 4 or a.no_dma_edges or a.no_dma or (c[1], c[2]) in cpuw: continue
+     setk = next((j for j in range(k, len(main)) if main[j][4] == 1), None)
+     if setk is None: continue
+     ev = main[setk][3]
+@@ -268,6 +279,32 @@ for k, e in enumerate(main):
+             if hb(wc, i): add(wc, i); dma_edges += 1
+             else: dma_skip += 1
+ print(f'DMA wait edges added {dma_edges}, not ordered by QNN {dma_skip}')
++# --- merge split: H keeps every read, M takes every write. Each ordered pair splits by what
++# actually conflicts, so a reader of the old output waits for H only if it conflicts with H.
++MS_ = {}; HF_ = {}; N0 = N
++if a.merge_split:
++    assert not a.events, 'host replay has no M entries'
++    excl = {int(x) for x in a.merge_exclude.split(',') if x}
++    H_ = [e[0] for e in main if cmds[e[0]][1] == 6 and cmds[e[0]][2] in (32, 33, 36) and e[0] not in excl]
++    for k, i in enumerate(H_): MS_[i] = N + k; HF_[N + k] = i
++    s2_ = [set() for _ in range(N + len(H_))]
++    for p in range(N):
++        for i in succ[p]:
++            mp, mi = MS_.get(p, p), MS_.get(i, i)
++            rw, ww, wr = bool(W[p] & R[i]), bool(W[p] & W[i]), bool(R[p] & W[i])
++            if rw: s2_[mp].add(i)
++            if ww: s2_[mp].add(mi)
++            if wr: s2_[p].add(mi)
++            if not (rw or ww or wr): s2_[mp].add(i)  # queue and landing order: all of p before i
++    for i, m in MS_.items(): s2_[i].add(m)
++    if a.merge_chain:
++        for x, y in zip(H_, H_[1:]): s2_[x].add(y)
++    succ = s2_; cmds = list(cmds)
++    for i in H_:
++        cost.append(cost[i] * a.merge_share * a.merge_factor); cost[i] *= 1 - a.merge_share
++        cmds.append(cmds[i]); lane[MS_[i]] = 1
++    N += len(H_)
++    print('merge split: H', len(H_), 'slots', a.merge_split, 'M total %.3f ms' % sum(cost[m] for m in MS_.values()))
+ if a.serial:
+     # A chain along a topological order of the existing edges.
+     d_ = [0] * N
+@@ -275,9 +312,17 @@ if a.serial:
+         for v in succ[u]: d_[v] += 1
+     rng_s = random.Random(17); pri_s = [rng_s.random() for _ in range(N)]
+     key_s = (lambda i: i) if a.serial_order == 'index' else (lambda i: -i) if a.serial_order == 'latest' else (lambda i: pri_s[i])
+-    q_ = [(key_s(i), i) for i in range(N) if d_[i] == 0]; heapq.heapify(q_); order_s = []
++    q_ = [(key_s(i), i) for i in range(N) if d_[i] == 0]; heapq.heapify(q_); order_s = []; flight_ = 0
+     while q_:
+-        u = heapq.heappop(q_)[1]; order_s.append(u)
++        held_ = []; u = None
++        while q_:
++            x_ = heapq.heappop(q_)
++            if x_[1] in MS_ and flight_ >= a.merge_split: held_.append(x_); continue
++            u = x_[1]; break
++        for x_ in held_: heapq.heappush(q_, x_)
++        assert u is not None, 'serial order: ring full'
++        flight_ += 1 if u in MS_ else -1 if u in HF_ else 0
++        order_s.append(u)
+         for v in succ[u]:
+             d_[v] -= 1
+             if d_[v] == 0: heapq.heappush(q_, (key_s(v), v))
+@@ -308,74 +353,76 @@ while _i is not None:
+     _i = max(succ[_i], key=lambda v: rem[v], default=None)
+ print('path:', [(k, round(v, 3), _n[k]) for k, v in _agg.most_common(12)])
+ if a.model_split:
+-    # Model only: H on main (in order), M on any of nw+1 other threads, one thread per merge.
+-    MS = 0.42
++    MS = 0.40
+     isconv = lambda i: cmds[i][1] == 6 and cmds[i][2] in (32, 33, 36)
+     H = {i: cost[i] * (1 - MS) for i in range(N) if isconv(i)}
+     Mc = {i: cost[i] * MS * a.model_split for i in H}
+-    rem2H = {}; rem2M = {}
+-    order_ = list(reversed(topo))
+-    for u in order_:
+-        tail = max((rem2H.get(v, 0.0) for v in succ[u]), default=0.0)
++    remH = {};remM = {}
++    for u in reversed(topo):
++        tail = max((remH[v] for v in succ[u]), default=0.0)
+         if u in H:
+-            rem2M[u] = Mc[u] + max((rem2H[v] for v in succ[u] if not (lane[v] == 0 and v in succ[u] and False)), default=0.0)
+-            rem2H[u] = H[u] + rem2M[u]
+-        else:
+-            rem2H[u] = cost[u] + tail
++            remM[u] = Mc[u] + tail; remH[u] = H[u] + remM[u]
++        else: remH[u] = cost[u] + tail
+     d2 = list(indeg); rdy = []; mq = []
+-    def push(i):
+-        if lane[i] == 0: heapq.heappush(mq, (-rem2H[i], i))
+-        else: heapq.heappush(rdy, (-rem2H[i], i))
++    def push(i): heapq.heappush(mq if lane[i] == 0 else rdy, (-remH[i], i, 0))
+     for i in range(N):
+         if d2[i] == 0: push(i)
+-    # successors of a split conv: main chain successor may start after H; memory successors after M.
+-    chain = {}
+-    for x, y in zip(kept_main, kept_main[1:]): chain[x[0]] = y[0]
+-    realmem = {u: {v for v in succ[u] if v != chain.get(u) or v in preds_set[u]} for u in range(N)} if False else None
+-    fr = list(range(1, a.workers + 2)); ev = []; t = 0.0; done = 0; mfree = True; cnt = 0; busy = Counter(); tasks = N + len(H)
+-    MEMSUCC = [set(x) for x in succ]
+-    for x, y in chain.items():
+-        if x in H and y not in [j for j in succ[x] if x in preds[j]]: MEMSUCC[x].discard(y)
++    fr = list(range(1, a.workers + 2 if a.helper_lane else a.workers + 1)); ev = []; t = 0.0; done = 0; mfree = True; cnt = 0; busy = Counter(); tasks = N + len(H)
+     while done < tasks:
+         if mfree and mq:
+-            i = heapq.heappop(mq)[1]; mfree = False; dur_ = H.get(i, cost[i]); heapq.heappush(ev, (t + dur_, cnt, i, 'H' if i in H else 'X', 0)); cnt += 1; busy[0] += dur_
++            _, i, _k = heapq.heappop(mq); mfree = False; d_ = H.get(i, cost[i]); heapq.heappush(ev, (t + d_, cnt, i, 'H' if i in H else 'X', 0)); cnt += 1; busy[0] += d_
+         while fr and rdy:
+-            _, i = heapq.heappop(rdy)
+-            l = fr.pop()
+-            if isinstance(i, tuple): dur_ = Mc[i[0]]
+-            else: dur_ = cost[i]
+-            heapq.heappush(ev, (t + dur_, cnt, i, 'W', l)); cnt += 1; busy[l] += dur_
++            _, i, k_ = heapq.heappop(rdy); l = fr.pop(); d_ = Mc[i] if k_ else cost[i]
++            heapq.heappush(ev, (t + d_, cnt, i, 'M' if k_ else 'X', l)); cnt += 1; busy[l] += d_
++        if mfree and rdy and not mq:
++            _, i, k_ = heapq.heappop(rdy); d_ = Mc[i] if k_ else cost[i]; mfree = False
++            heapq.heappush(ev, (t + d_, cnt, i, 'M' if k_ else 'X', 0)); cnt += 1; busy[0] += d_
+         t, _, i, kind, l = heapq.heappop(ev); done += 1
+         if l == 0: mfree = True
+         else: fr.append(l)
+-        def rel(v):
++        if kind == 'H': heapq.heappush(rdy, (-remM[i], i, 1)); continue
++        for v in succ[i]:
+             d2[v] -= 1
+             if d2[v] == 0: push(v)
+-        if kind == 'H':
+-            heapq.heappush(rdy, (-rem2M[i], (i, 'M')))
+-            c_ = chain.get(i)
+-            if c_ is not None and c_ not in MEMSUCC[i]: rel(c_)
+-        elif kind == 'W' and isinstance(i, tuple):
+-            for v in MEMSUCC[i[0]]: rel(v)
+-        else:
+-            for v in succ[i]: rel(v)
+-    print('split-merge model (M x%.2f): end %.3f ms; busy' % (a.model_split, t), {k: round(v, 2) for k, v in sorted(busy.items())})
++    print('merge offload (M x%.2f, main helps): end %.3f ms; busy' % (a.model_split, t), {k: round(v, 2) for k, v in sorted(busy.items())})
+     sys.exit(0)
+ # --- list schedule: main fixed, worker lanes by longest remaining path
+-nw = a.workers
++nw = a.workers + (1 if a.merge_lane else 0)
++ML_ = nw if a.merge_lane else 0
+ STEAL = a.main_steal_us / 1000.0
++SLOT_EDGES = []; SLOT_OF = {}
+ def schedule(pri):
+     d = list(indeg); ready = []; mhead = []; seq = [[] for _ in range(nw + 1)]; start = [0.0] * N
+     def push(i): heapq.heappush(mhead if lane[i] == 0 else ready, (-pri[i], i))
+     for i in range(N):
+         if d[i] == 0: push(i)
+     free = list(range(1, nw + 1)); ev = []; now = 0.0; mfree = True; done = 0
++    slots = list(range(a.merge_split)); slot_of = {}; last_m = {}; SLOT_EDGES.clear()
+     while done < N:
+         if mfree and mhead:
+-            i = heapq.heappop(mhead)[1]; mfree = False; heapq.heappush(ev, (now + cost[i], i, 0)); seq[0].append(i); start[i] = now
++            held = []; pick = None
++            while mhead:
++                x = heapq.heappop(mhead)
++                if x[1] in MS_ and not slots: held.append(x); continue
++                pick = x; break
++            for x in held: heapq.heappush(mhead, x)
++            if pick:
++                i = pick[1]; mfree = False; heapq.heappush(ev, (now + cost[i], i, 0)); seq[0].append(i); start[i] = now
++                if i in MS_:
++                    sl = slots.pop(); slot_of[i] = sl
++                    if sl in last_m: SLOT_EDGES.append((last_m[sl], i))
++                    last_m[sl] = MS_[i]
++        held = []
+         while free and ready:
+-            _, i = heapq.heappop(ready); l = min(free); free.remove(l)
++            x = heapq.heappop(ready); i = x[1]
++            if ML_ and i in HF_ and ML_ in free: l = ML_
++            else:
++                gen = [q for q in free if q != ML_]
++                if not gen: held.append(x); continue
++                l = min(gen)
++            free.remove(l)
+             heapq.heappush(ev, (now + cost[i], i, l)); seq[l].append(i); start[i] = now
++        for x in held: heapq.heappush(ready, x)
+         if mfree and ready and STEAL:
+             # all worker lanes are busy and main has nothing: take the best short ready command
+             pick = None; held = []
+@@ -386,15 +433,21 @@ def schedule(pri):
+             for x in held: heapq.heappush(ready, x)
+             if pick:
+                 i = pick[1]; mfree = False; heapq.heappush(ev, (now + cost[i], i, 0)); seq[0].append(i); start[i] = now
++        assert ev, 'merge ring deadlock: use --merge-chain or more slots'
+         t, i, l = heapq.heappop(ev); now = t; done += 1
+         if l == 0: mfree = True
+         else: free.append(l)
++        if i in HF_: slots.append(slot_of[HF_[i]])
+         for v in succ[i]:
+             d[v] -= 1
+             if d[v] == 0: push(v)
++    SLOT_OF.clear(); SLOT_OF.update(slot_of)
+     return now, seq, start
+ now, seq, start = schedule(rem)
+ print('greedy modeled end %.3f' % now)
++assert not (a.search and a.merge_split), 'slots come from the greedy schedule'
++# The ring: H may start only after the previous M of its slot. The schedule already respects these.
++for p_, i_ in SLOT_EDGES: succ[p_].add(i_)
+ if a.search:
+     rng = random.Random(7); best = (now, seq, start); pri = rem
+     for trial in range(a.search):
+@@ -441,7 +494,7 @@ while steps < N - len(dropped_cmds):
+         while pos[L] < len(seq[L]) and all(pos[(L + j + 1) % L_N] >= w for j, w in enumerate(waits[L][pos[L]])):
+             pos[L] += 1; steps += 1; moved = True
+     assert moved, 'deadlock'
+-dma = {e[0]: (e[3], e[4]) for e in main}
++dma = {e[0]: (e[3], 0 if a.no_dma else e[4]) for e in main}
+ # Check every kept edge is implied by the published tables.
+ for L, s_ in enumerate(seq):
+     for k, i in enumerate(s_):
+@@ -467,8 +520,11 @@ with open(a.out, 'w') as f:
+         f.write(f'#define QD_QNN_LANE{L}_COUNT {len(s)}u\nstatic const Nprg2QnnLaneEntry nprg2_qnn_lane{L}[{len(s)}] = {{\n')
+         for k, i in enumerate(s):
+             di, dk = dma.get(i, (0, 0))
+-            f.write('  {%d,{%s},%d,%d,%d},\n' % (i, ','.join(map(str, waits[L][k])), di, dk, 1 if k + 1 in needed[L] else 0))
++            f.write('  {%d,{%s},%d,%d,%d},\n' % (HF_[i] | 0x8000 if i in HF_ else i, ','.join(map(str, waits[L][k])), di, dk, 1 if k + 1 in needed[L] else 0))
+         f.write('};\n')
++    f.write(f'#define QD_MERGE_SLOTS {a.merge_split}u\n#define QD_MERGE_COUNT {len(MS_)}u\n')
++    if a.merge_split:
++        f.write(f'static const uint8_t nprg2_merge_slot[{N0}] = {{' + ','.join(str(SLOT_OF[i] + 1 if i in MS_ else 0) for i in range(N0)) + '};\n')
+     f.write('#endif\n')
+ 
+ def write_events(path, order):
+diff --git a/depth-model/frame/native_program/prepared_hmx_conv.inc b/depth-model/frame/native_program/prepared_hmx_conv.inc
+index 00bdc29..04dd120 100644
+--- a/depth-model/frame/native_program/prepared_hmx_conv.inc
++++ b/depth-model/frame/native_program/prepared_hmx_conv.inc
+@@ -520,6 +520,50 @@ static void plane_part(void *ctx, uint32_t part, uint32_t parts) {
+         }
+         return;
+     }
++#if BLK_HVX && defined(PLANE_ROWS)
++    /* Row by row across a strip. Each output pair's last column is the next pair's first,
++     * so a column loads once: 2 VTCM loads per output, not 3. VTCM load rate sets this loop. */
++    {
++        const int32_t bw=J->bw,strips=bw?J->mt/bw:0;
++        uint8_t *o[256];
++        if(bw>256) return;
++        for(int32_t by=0;by<strips;by++) {
++            const size_t row=(size_t)by*(size_t)J->ncol;
++            const int32_t rows=by*bw>=J->partial_from?J->rows:8;
++            for(int32_t j=0;j<J->NB;j++) {
++                int have=0;
++                const HVX_Vector mv=((const HVX_Vector *)J->mh)[j];
++                const uint8_t *c0=J->C+((row+(size_t)J->tile0)*(size_t)J->NB+(size_t)j)*4096;
++                const size_t step=(size_t)J->NB*4096;
++                for(int32_t y=0;y<rows;y++,u++) {
++                    if(u!=next) continue;
++                    next+=parts;
++                    if(!have) {
++                        for(int32_t bx=0;bx<bw;bx++) {
++                            const uint32_t ix=(((uint32_t)(J->oR+by))*J->onbw+(uint32_t)(J->oC+bx))*J->onbd+J->oslice+(uint32_t)j;
++                            const uint32_t ee=ix<J->ocount?J->oblk[ix]:0,pl=ee&127u;
++                            o[bx]=pl && J->pool[pl]?J->pool[pl]+(ee&~127u):NULL;
++                        }
++                        have=1;
++                    }
++                    const uint8_t *c=c0;
++                    HVX_Vector l0=((const HVX_Vector *)c)[2*y],h0=((const HVX_Vector *)(c+2048))[2*y];
++                    for(int32_t bx=0;bx<bw;bx++,c+=step) {
++                        const HVX_Vector l1=((const HVX_Vector *)c)[2*y+1],h1=((const HVX_Vector *)(c+2048))[2*y+1];
++                        const HVX_Vector l2=((const HVX_Vector *)(c+step))[2*y],h2=((const HVX_Vector *)(c+step+2048))[2*y];
++                        if(o[bx]) {
++                            HVX_Vector *d=(HVX_Vector *)o[bx]+2*y;
++                            d[0]=plane_rq(Q6_V_valign_VVR(l1,l0,32),Q6_V_valign_VVR(h1,h0,32),mv);
++                            d[1]=plane_rq(Q6_V_valign_VVR(l2,l1,32),Q6_V_valign_VVR(h2,h1,32),mv);
++                        }
++                        l0=l2;h0=h2;
++                    }
++                }
++            }
++        }
++        return;
++    }
++#endif
+     /* mt = strips*bw tiles in output order; C has ncol columns per strip */
+     int32_t bx=0,by=0;size_t row=0;
+     for(int32_t t=0;t<J->mt;t++) {
+@@ -537,6 +581,49 @@ static void plane_part(void *ctx, uint32_t part, uint32_t parts) {
+         if(++bx==J->bw){bx=0;by++;row+=(size_t)J->ncol;}
+     }
+ }
++#ifdef PLANE_DEFER
++/* The merge as its own lane entry. A ring slot is a head (job, multipliers, output table)
++ * and the two conversion planes. H fills it and publishes; M, on any lane, reads it. */
++#define MERGE_HEAD 4096u
++#define MERGE_MH 512u
++#define MERGE_OUT 1536u
++typedef struct {PlaneJob J; uint8_t *pool[7]; uint32_t armed;} MergeHead;
++_Static_assert(sizeof(MergeHead)<=MERGE_MH,"merge head");
++uint8_t *nprg2_merge_cur;
++uint32_t nprg2_merge_cmd;
++static inline uint8_t *merge_slot(size_t cbytes,int32_t NB) {
++    return nprg2_merge_cur && cbytes<=NPRG2_MERGE_SLOT_BYTES-MERGE_HEAD && NB*128<=(int32_t)(MERGE_OUT-MERGE_MH)?nprg2_merge_cur:NULL;
++}
++static void merge_arm(uint8_t *slot,const PlaneJob *J,const uint8_t *mh,uint8_t *const *pool,uint8_t *const *out,size_t nout) {
++    MergeHead *h=(MergeHead *)slot;
++    h->J=*J;
++    for(int32_t i=0;i<J->NB;i++)((HVX_Vector *)(slot+MERGE_MH))[i]=((const HVX_Vector *)mh)[i];
++    h->J.mh=slot+MERGE_MH;
++    if(pool)for(int i=0;i<7;i++)h->pool[i]=pool[i];
++    if(out) {
++        uint8_t **o=(uint8_t **)(slot+MERGE_OUT);
++        for(size_t i=0;i<nout;i++)o[i]=out[i];
++        h->J.out=o;
++    }
++    h->armed=nprg2_merge_cmd+1u;
++}
++int nprg2_merge_run(uint8_t *slot,uint32_t command,Nprg2Parallel *par) {
++    MergeHead *h=(MergeHead *)slot;
++    if(h->armed!=command+1u) return -1; /* H did not defer: a split command took another path */
++    PlaneJob J=h->J;
++    uint8_t *pl[7];
++    if(J.shift) {for(int i=0;i<7;i++)pl[i]=h->pool[i];J.pool=pl;}
++    h->armed=0;
++#ifdef MERGE_SERIAL
++    plane_part(&J,0,1);
++#else
++    uint32_t parts=par?nprg2_parallel_parts(par,NPRG2_PAR_MAX_PARTS):1u; /* the merge lane has no helpers */
++    if(parts>1) nprg2_parallel_for(par,NPRG2_PAR_CONV,parts,plane_part,&J);
++    else plane_part(&J,0,1);
++#endif
++    return 0;
++}
++#endif
+ #endif
+ /* ---------------------------------------------------------- native int8 HMX
+  * HW-rounding builds only (the conversion is silicon's: requant_value with
+@@ -794,6 +881,11 @@ typedef struct {
+     uint32_t valid, inplace, s2; /* s2: stride 2, cbs = output groups, four input channel blocks each */
+ } ConvPlan;
+ static size_t slide_ws(const ConvPlan *P) {
++#ifdef PLANE_DEFER
++    /* The planes are in the ring; an in-place window needs only the zero block at S. */
++    if(merge_slot((size_t)P->bh*P->ncol*P->NB*4096,P->NB))
++        return slide_fixed(P->NB)+(P->inplace?(size_t)2048:((size_t)2*P->ncol*P->cbs+1)*2048)+2048;
++#endif
+     return slide_fixed(P->NB)+(size_t)P->bh*P->ncol*P->NB*4096+((size_t)2*P->ncol*P->cbs+1)*2048+2048;
+ }
+ static size_t slide_near(const ConvPlan *P, size_t at) {
+@@ -844,6 +936,10 @@ static int plane_slide_run(const ConvPlan *P, const Nprg2ReferenceConv *c, uint8
+     uint64_t (*clock)(void)=c->phase?c->clock:NULL,t0=clock?clock():0,t1;
+     int32_t *fi=(int32_t *)base,*zero=(int32_t *)(base+(size_t)NB*512);
+     uint8_t *completion=base+fixed-2048,*C=base+fixed,*S=C+cbytes,*n=c->near;
++#ifdef PLANE_DEFER
++    uint8_t *dsl=merge_slot(cbytes,NB);
++    if(dsl){C=dsl+MERGE_HEAD;S=base+fixed;}
++#endif
+     size_t o_rec=nbump(&at,(size_t)groups*(P->s2?32:16)),o_st=nbump(&at,(size_t)ncol*8);
+     uint32_t *rec=(uint32_t *)(n+o_rec),*st=(uint32_t *)(n+o_st);
+     typedef uint32_t W32 __attribute__((vector_size(128)));
+@@ -976,6 +1072,13 @@ static int plane_slide_run(const ConvPlan *P, const Nprg2ReferenceConv *c, uint8
+     PlaneJob J={.C=C,.mh=mh,.mt=total,.NB=NB,.bw=bw,.ncol=ncol,.shift=1,.tile0=P->s2?0:1,
+                 .rows=P->oh&7,.partial_from=(P->oh&7)?(bh-1)*bw:total,
+                 .pool=pool,.oblk=P->oblk,.ocount=P->ocount,.oslice=P->oslice,.onbw=P->onbw,.onbd=P->onbd,.oR=P->oR,.oC=P->oC};
++#ifdef PLANE_DEFER
++    if(dsl) {
++        merge_arm(dsl,&J,mh,pool,NULL,0);
++        if(clock){t1=clock();c->phase[3]+=t1-t0;t0=t1;}
++        return 1;
++    }
++#endif
+     uint32_t parts=nprg2_parallel_parts(par,NPRG2_PAR_MAX_PARTS);
+     if(parts>1) nprg2_parallel_for(par,NPRG2_PAR_CONV,parts,plane_part,&J);
+     else plane_part(&J,0,1);
+@@ -1301,6 +1404,10 @@ static size_t plane_native_near(const NativePlan *Q, size_t at, size_t *o_xtab,
+ }
+ static size_t plane_native_ws(const NativePlan *Q) {
+     const size_t bsz=Q->bcopy?((size_t)Q->KB*Q->NB*1024+2047)&~(size_t)2047:0;
++#ifdef PLANE_DEFER
++    if(Q->mt>=Q->total && merge_slot((size_t)Q->total*Q->NB*4096,Q->NB) && (size_t)Q->total*Q->NB*sizeof(uint8_t *)<=4096u-MERGE_OUT)
++        return slide_fixed(Q->NB)+bsz+2048+(size_t)Q->mt*(size_t)Q->KB*2048+2048;
++#endif
+     return slide_fixed(Q->NB)+bsz+2048+(size_t)Q->mt*((size_t)Q->KB*2048+(size_t)Q->NB*4096)+2048;
+ }
+ /* base: Fi and the finish record in place; ktab filled; xtab/tyx/outp/pout free near
+@@ -1315,6 +1422,10 @@ static int plane_native_run(const NativePlan *Q, const Nprg2ReferenceConv *c, ui
+     const size_t fixed=slide_fixed(NB),bsz=Q->bcopy?((size_t)KB*NB*1024+2047)&~(size_t)2047:0;
+     int32_t *fi=(int32_t *)base,*zero=(int32_t *)(base+(size_t)NB*512);
+     uint8_t *completion=base+fixed-2048,*Bc=base+fixed,*A=Bc+bsz+2048,*C=A+(size_t)mt*KB*2048;
++#ifdef PLANE_DEFER
++    uint8_t *dsl=mt>=total && (size_t)total*NB*sizeof(uint8_t *)<=4096u-MERGE_OUT?merge_slot((size_t)total*NB*4096,NB):NULL;
++    if(dsl) C=dsl+MERGE_HEAD;
++#endif
+     const int8_t *wbase=Q->wbase;
+     if(Q->bcopy) {
+         for(int32_t j=0;j<NB;j++)for(int32_t k=0;k<KB;k++) {
+@@ -1403,6 +1514,13 @@ static int plane_native_run(const NativePlan *Q, const Nprg2ReferenceConv *c, ui
+         if(e) break;
+         PlaneJob P={.C=C,.out=pout,.mh=mh,.Mq=Mq,.mt=J.mt,.NB=NB,.shift=0,.rows=Q->oh&7,
+                     .partial_from=(Q->oh&7)?((Q->oh+7)/8-1)*bw-m0:J.mt};
++#ifdef PLANE_DEFER
++        if(dsl) {
++            merge_arm(dsl,&P,mh,NULL,pout,(size_t)J.mt*NB);
++            if(clock){t1=clock();c->phase[3]+=t1-t0;t0=t1;}
++            continue;
++        }
++#endif
+         if(parts>1 && J.mt*NB>=PLANE_SERIAL_BELOW) nprg2_parallel_for(par,NPRG2_PAR_CONV,parts,plane_part,&P);
+         else plane_part(&P,0,1);
+         if(clock){t1=clock();c->phase[3]+=t1-t0;t0=t1;}
+@@ -1445,7 +1563,12 @@ static int hmx_native(G *g, const T *xt, const T *o, int32_t KB, int32_t NB, int
+ #endif
+ #endif
+     const int32_t bw=ow/8,total=((oh+7)/8)*bw;
+-    const size_t bsz=bcopy?((size_t)KB*NB*1024+2047)&~(size_t)2047:0,per=(size_t)KB*2048+(size_t)NB*4096,fixed=slide_fixed(NB);
++    const size_t bsz=bcopy?((size_t)KB*NB*1024+2047)&~(size_t)2047:0,fixed=slide_fixed(NB);
++    size_t per=(size_t)KB*2048+(size_t)NB*4096;
++#ifdef PLANE_DEFER
++    if(merge_slot((size_t)total*NB*4096,NB) && (size_t)total*NB*sizeof(uint8_t *)<=4096u-MERGE_OUT &&
++       c->workspace_bytes>=fixed+bsz+2048+(size_t)total*KB*2048+2048) per=(size_t)KB*2048;
++#endif
+     if(c->workspace_bytes<fixed+bsz+2048+per+2048) return 0;
+     int32_t mt=(int32_t)((c->workspace_bytes-fixed-bsz-2048-2048)/per);
+     if(mt>total) mt=total;
+diff --git a/depth-model/frame/native_program/prepared_reference.h b/depth-model/frame/native_program/prepared_reference.h
+index e8d1385..d0387bc 100644
+--- a/depth-model/frame/native_program/prepared_reference.h
++++ b/depth-model/frame/native_program/prepared_reference.h
+@@ -117,6 +117,14 @@ void nprg2_exec_weights_memo_begin(void);
+  * with the list's request and the registered conv; run returns 1 ran, 0 use the
+  * normal path, -1 error. */
+ int nprg2_exec_reference_plan_begin(const Nprg2ExecRequest *request, const Nprg2ReferenceConv *conv);
++#ifdef PLANE_DEFER
++/* Ring slot size; the H part of the next conv on the main list defers its merge into
++ * nprg2_merge_cur when set. nprg2_merge_run does the merge; nonzero: H did not defer. */
++#define NPRG2_MERGE_SLOT_BYTES 0x29000u
++extern uint8_t *nprg2_merge_cur;
++extern uint32_t nprg2_merge_cmd;
++int nprg2_merge_run(uint8_t *slot, uint32_t command, Nprg2Parallel *par);
++#endif
+ int nprg2_exec_reference_plan_run(uint32_t command, Nprg2Parallel *parallel, int32_t *err);
+ /* EW_MEMO builds: before a run list (prepared_elementwise.c). */
+ void nprg2_exec_elementwise_memo_begin(const Nprg2Program *program, const Nprg2Pool *pools);
+diff --git a/depth-model/frame/qd_graph_dsp.c b/depth-model/frame/qd_graph_dsp.c
+index 5928906..07b2360 100644
+--- a/depth-model/frame/qd_graph_dsp.c
++++ b/depth-model/frame/qd_graph_dsp.c
+@@ -529,7 +529,7 @@ static void follower_leased(uint32_t tid) {
+             __asm__ volatile("barrier":::"memory");work->job_finished[tid]++;
+         }
+ #if QDS_QNN_LANES
+-        if(op==8 && (tid==1||tid==2))work->job_fn(work->job_ctx,tid,work->job_parts);
++        if(op==8 && (tid==1||tid==2||(QDS_MERGE_LANE && tid==3)))work->job_fn(work->job_ctx,tid,work->job_parts);
+ #else
+         if(op==8 && tid==1)work->job_fn(work->job_ctx,tid,work->job_parts);
+ #endif
+diff --git a/depth-model/frame/qd_graph_prepared.h b/depth-model/frame/qd_graph_prepared.h
+index b7def6b..32c1a5f 100644
+--- a/depth-model/frame/qd_graph_prepared.h
++++ b/depth-model/frame/qd_graph_prepared.h
+@@ -41,6 +41,21 @@
+ #define QDS_PAUSE_STR(x) QDS_PAUSE_STR2(x)
+ #if QDS_QNN_LANES
+ #include "native_program/qnn_lanes_primary.generated.h"
++#ifndef QD_MERGE_COUNT
++#define QD_MERGE_COUNT 0u
++#endif
++#if defined(PLANE_DEFER)!=(QD_MERGE_SLOTS>0)
++#error lane tables and PLANE_DEFER disagree about the merge split
++#endif
++#if QD_QNN_LANE_COUNT==4
++#define QDS_MERGE_LANE 1 /* HT5 runs a list of merge entries and still serves parts while it waits */
++#else
++#define QDS_MERGE_LANE 0
++#endif
++#ifdef PLANE_DEFER
++/* The merge ring is the top of the VTCM tail; the conv workspace ends where it starts. */
++#define QDS_MERGE_RING ((QD_DIRECT_VTCM_BASE+QD_DIRECT_TAIL_OFFSET+QD_DIRECT_TAIL_BYTES-QD_MERGE_SLOTS*NPRG2_MERGE_SLOT_BYTES)&~2047u)
++#endif
+ #endif
+ #endif
+ #ifndef QDS_L2_CACHE
+@@ -594,7 +609,11 @@ static QdPreparedState *prepared_open(QdgGraph *g,const QdsConfig *cfg,
+ #endif
+ #if QDS_PREPARED_REFERENCE
+     s->conv=(Nprg2ReferenceConv){(uint8_t *)(QD_DIRECT_VTCM_BASE+QD_DIRECT_TAIL_OFFSET+0x2000u),
++#ifdef PLANE_DEFER
++                                 QDS_MERGE_RING-(QD_DIRECT_VTCM_BASE+QD_DIRECT_TAIL_OFFSET+0x2000u),
++#else
+                                  QD_DIRECT_TAIL_BYTES-0x2000u,
++#endif
+                                  (uint8_t *)QDS_REFERENCE_NEAR,QDS_REFERENCE_NEAR_BYTES,
+                                  now_ns,g->dsp_conv_phase,{NULL,NULL},0,NULL};
+ #if QDS_PREPARED_HMX
+@@ -686,10 +705,10 @@ typedef struct {
+     Nprg2ExecRequest requests[3];
+     volatile uint32_t *checkpoints;
+     volatile uint32_t error;
+-    volatile uint32_t completed[3];
++    volatile uint32_t completed[4];
+     volatile uint32_t excl_flag[2],excl_victim;
+ #if QDS_PREPARED_PROFILE
+-    uint64_t wait[3],wall[3],pre[3];
++    uint64_t wait[4],wall[4],pre[4];
+ #endif
+ } QdQnnListRun;
+ #if QDS_PREPARED_PROFILE
+@@ -839,8 +858,11 @@ static int prepared_qnn_command(QdQnnListRun *run,const Nprg2QnnRunEntry *entry,
+     return NPRG2_EXEC_OK;
+ }
+ #if QDS_QNN_LANES
+-_Static_assert(QD_QNN_LANE_COUNT==3u &&
+-               QD_QNN_LANE0_COUNT+QD_QNN_LANE1_COUNT+QD_QNN_LANE2_COUNT+QD_QNN_LANES_DROPPED==QD_QNN_PRIMARY_COMMAND_COUNT,
++#if !QDS_MERGE_LANE
++#define QD_QNN_LANE3_COUNT 0u
++#endif
++_Static_assert((QD_QNN_LANE_COUNT==3u || QDS_MERGE_LANE) &&
++               QD_QNN_LANE0_COUNT+QD_QNN_LANE1_COUNT+QD_QNN_LANE2_COUNT+QD_QNN_LANE3_COUNT+QD_QNN_LANES_DROPPED==QD_QNN_PRIMARY_COMMAND_COUNT+QD_MERGE_COUNT,
+                "lane tables do not cover the program");
+ #define QDS_LANE_STRIDE 8u
+ static volatile uint32_t *const prepared_lane_progress=(volatile uint32_t *)0x30075000u;
+@@ -848,8 +870,15 @@ static volatile uint32_t *const prepared_lane_progress=(volatile uint32_t *)0x30
+ #define QDS_LANE_JITTER 0
+ #endif
+ static int prepared_lane_step(QdQnnListRun *run,const Nprg2QnnLaneEntry *e,uint32_t list,uint32_t i,uint32_t *rng) {
+-    volatile uint32_t *a=&prepared_lane_progress[((list+1u)%3u)*QDS_LANE_STRIDE],*b=&prepared_lane_progress[((list+2u)%3u)*QDS_LANE_STRIDE];
++    volatile uint32_t *a=&prepared_lane_progress[((list+1u)%QD_QNN_LANE_COUNT)*QDS_LANE_STRIDE],*b=&prepared_lane_progress[((list+2u)%QD_QNN_LANE_COUNT)*QDS_LANE_STRIDE];
+     uint32_t wa=e->wait[0],wb=e->wait[1];
++#if QDS_MERGE_LANE
++    volatile uint32_t *c3=&prepared_lane_progress[((list+3u)%QD_QNN_LANE_COUNT)*QDS_LANE_STRIDE];
++    uint32_t wc=e->wait[2];
++#define QDS_LANE_BEHIND (*a<wa || *b<wb || *c3<wc)
++#else
++#define QDS_LANE_BEHIND (*a<wa || *b<wb)
++#endif
+ #if QDS_LANE_JITTER
+     /* Stress build: random pauses move every command relative to the other lists. */
+     *rng=*rng*1664525u+1013904223u;
+@@ -857,13 +886,13 @@ static int prepared_lane_step(QdQnnListRun *run,const Nprg2QnnLaneEntry *e,uint3
+ #else
+     (void)rng;
+ #endif
+-    if(*a<wa || *b<wb) {
++    if(QDS_LANE_BEHIND) {
+ #if QDS_PREPARED_PROFILE
+         uint64_t p0=now_ns();
+ #endif
+         uint64_t deadline=now_ns()+4000000000ull;uint32_t spins=0;
+         qnn_claim->idle[list]=1;__asm__ volatile("barrier":::"memory");
+-        while(*a<wa || *b<wb) {
++        while(QDS_LANE_BEHIND) {
+             if(qnn_claim_serve(list))continue;
+             if((spins++&1023u)==0u) {
+                 __asm__ volatile("barrier":::"memory");
+@@ -879,9 +908,38 @@ static int prepared_lane_step(QdQnnListRun *run,const Nprg2QnnLaneEntry *e,uint3
+ #endif
+     }
+     __asm__ volatile("barrier":::"memory");
++#ifdef PLANE_DEFER
++    int rc;
++    if(e->command&0x8000u) {
++        uint32_t cmd=e->command&0x7fffu;
++        if(cmd>=sizeof nprg2_merge_slot || !nprg2_merge_slot[cmd])return NPRG2_EXEC_REJECTED;
++        if(nprg2_merge_run((uint8_t *)QDS_MERGE_RING+(nprg2_merge_slot[cmd]-1u)*NPRG2_MERGE_SLOT_BYTES,cmd,list<3u?run->requests[list].parallel:NULL)) {
++#ifdef MERGE_DIAG
++            ((volatile uint8_t *)0xa7810000u)[cmd]=0xa5u; /* which split commands did not defer */
++#else
++            return NPRG2_EXEC_HANDLER_ERROR;
++#endif
++        }
++        run->completed[list]++;
++    } else {
++        if(list==0u) {
++            uint32_t sl=e->command<sizeof nprg2_merge_slot?nprg2_merge_slot[e->command]:0u;
++            nprg2_merge_cur=sl?(uint8_t *)QDS_MERGE_RING+(sl-1u)*NPRG2_MERGE_SLOT_BYTES:NULL;
++            nprg2_merge_cmd=e->command;
++        }
++        Nprg2QnnRunEntry t={e->command,0,0,e->dma_event_id,e->dma_event_kind};
++        rc=prepared_qnn_command(run,&t,list);
++#ifdef MERGE_DIAG
++        if(rc)((volatile uint8_t *)0xa7810000u)[e->command]=(uint8_t)(0xb0u+rc);
++#else
++        if(rc)return rc;
++#endif
++    }
++#else
+     Nprg2QnnRunEntry t={e->command,0,0,e->dma_event_id,e->dma_event_kind};
+     int rc=prepared_qnn_command(run,&t,list);
+     if(rc)return rc;
++#endif
+ #ifdef LANE_PUBLISH
+     if(!e->publish)return NPRG2_EXEC_OK;
+ #endif
+@@ -896,12 +954,17 @@ static int prepared_lane_step(QdQnnListRun *run,const Nprg2QnnLaneEntry *e,uint3
+ static void prepared_qnn_worker_list(void *opaque,uint32_t tid,uint32_t parts) {
+     QdQnnListRun *run=opaque;
+ #if QDS_QNN_LANES
+-    if((tid!=1 && tid!=2) || parts<2)return;
++    if((tid!=1 && tid!=2 && !(QDS_MERGE_LANE && tid==3)) || parts<2)return;
+ #if QDS_PREPARED_PROFILE
+     uint64_t w0=now_ns();
+ #endif
++#if QDS_MERGE_LANE
++    const Nprg2QnnLaneEntry *list=tid==1?nprg2_qnn_lane1:tid==2?nprg2_qnn_lane2:nprg2_qnn_lane3;
++    uint32_t count=tid==1?QD_QNN_LANE1_COUNT:tid==2?QD_QNN_LANE2_COUNT:QD_QNN_LANE3_COUNT,rng=0x9e3779b9u*tid;
++#else
+     const Nprg2QnnLaneEntry *list=tid==1?nprg2_qnn_lane1:nprg2_qnn_lane2;
+     uint32_t count=tid==1?QD_QNN_LANE1_COUNT:QD_QNN_LANE2_COUNT,rng=0x9e3779b9u*tid;
++#endif
+     for(uint32_t i=0;i<count;i++) {
+         int rc=prepared_lane_step(run,&list[i],tid,i,&rng);
+         if(rc){run->error=(uint32_t)rc;__asm__ volatile("barrier":::"memory");return;}
+@@ -960,7 +1023,7 @@ static int prepared_qnn_runlists(QdgGraph *g,QdPreparedState *s,uint32_t first,u
+         (void *)QDS_QNN_WORKER2_SCRATCH,QDS_REFERENCE_SCRATCH_BYTES,
+         (void *)QDS_QNN_WORKER2_NEAR,QDS_REFERENCE_NEAR_BYTES,&run.requests[2]))
+         return NPRG2_EXEC_ARGUMENT;
+-    for(uint32_t i=0;i<3u;i++)prepared_lane_progress[i*QDS_LANE_STRIDE]=0;
++    for(uint32_t i=0;i<QD_QNN_LANE_COUNT;i++)prepared_lane_progress[i*QDS_LANE_STRIDE]=0;
+     {Nprg2Parallel *wp=&s->qnn_worker2_parallel;
+      memset(wp->jobs_parallel,0,sizeof wp->jobs_parallel);memset(wp->jobs_serial,0,sizeof wp->jobs_serial);
+      memset(wp->parts_run,0,sizeof wp->parts_run);wp->not_ready=wp->declined=0;}
+@@ -1112,7 +1175,7 @@ static int prepared_qnn_runlists(QdgGraph *g,QdPreparedState *s,uint32_t first,u
+     if(completed!=QD_QNN_PRIMARY_MAIN_COUNT)return prepared_qnn_dma_finish(s,NPRG2_EXEC_REJECTED);
+ #endif
+ #if QDS_QNN_LANES
+-    if(run.completed[1]!=QD_QNN_LANE1_COUNT || run.completed[2]!=QD_QNN_LANE2_COUNT)return prepared_qnn_dma_finish(s,NPRG2_EXEC_REJECTED);
++    if(run.completed[1]!=QD_QNN_LANE1_COUNT || run.completed[2]!=QD_QNN_LANE2_COUNT || run.completed[3]!=QD_QNN_LANE3_COUNT)return prepared_qnn_dma_finish(s,NPRG2_EXEC_REJECTED);
+ #else
+     for(uint32_t i=0;i<QD_QNN_PRIMARY_CHECKPOINT_COUNT;i++)
+         if(run.checkpoints[i])return prepared_qnn_dma_finish(s,NPRG2_EXEC_REJECTED);

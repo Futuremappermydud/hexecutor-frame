@@ -793,6 +793,38 @@ About 0.6 ms outside the lists comes on top. So memory reuse and ordering appear
 
 **Parking idle threads: not attempted.** With no spare wake-up mechanism proven safe, a lost `resume` would hang the DSP. Back-off shows waits are latency-sensitive, so it only helps if wake-up is nearly instant. Rough best case about 0.2 ms, an estimate.
 
+### 13.5g Batch after `l8`: nothing beat it
+
+`l8` stays the best build. Every run below was byte-exact on smoke. Times are means of 3 alternating rounds of 6 runs, except `b1`, `ms2` and `r1`, which come from their own pairs against `l8`. `l8` itself read 9.65 to 9.66 ms across the batches.
+
+| Build | Change | Warm median | Against `l8` |
+|---|---|---:|---:|
+| `p4` | 4 parts | 9.647 ms | -0.02, wins 2 of 3, noise |
+| `m1` | Conv split threshold 1M MACs | 9.665 ms | 0 |
+| `r1` | Slide merge in row order: 2 VTCM loads per output, not 3 | 9.650 ms | 0 |
+| `z128` | Pause 128 | 9.679 ms | +0.02 |
+| `c1` | Non-conv commands off main, DMA kept | 9.687 ms | +0.02 |
+| `ml2` | Merge split, 2 ring slots, HT5 merge lane | 9.862 ms | +0.21 |
+| `ms2` | Merge split, 2 ring slots | 9.85 ms | +0.19 |
+| `v2` | `ml2`, pause 64 | 9.872 ms | +0.22 |
+| `v1` | `ml2`, serial merges | 9.886 ms | +0.24 |
+| `v3` | `ml2`, schedule from merge factor 1.2 | 9.966 ms | +0.32 |
+| `v4` | `ml2`, steal limit 3 µs | 9.987 ms | +0.34 |
+| `b1` | `4/30` copied by CPU, no DMA, non-conv off main | 10.03 ms | +0.39 |
+| `c2` | `4/30` by CPU, no DMA | 10.035 ms | +0.38 |
+| `c3` | `4/30` by CPU, DMA kept | 10.046 ms | +0.39 |
+| `v5` | `ml2`, serial merges, merge factor 3 | 10.077 ms | +0.43 |
+
+- **DMA:** `c2` and `c3` match, so dropping DMA does not change the time. Every build that copies `4/30` by CPU costs about 0.38 ms, so keep that copy on DMA.
+- **Merge split:** each u8 conv became `H` on main (staging, MAC) and `M` on any lane (plane merge, output writes), with the conversion planes in a ring at the top of the VTCM tail. All 926 convs deferred and output stayed byte-exact. Merge time on main fell from 2.27 to 0.19 ms and conv time on main from 6.69 to 4.77 ms, yet main wall time rose from 9.17 to 9.37 ms: waits and stolen work filled the gap.
+- **The schedule model does not predict this change.** It gave 7.38 ms for `v3` against 8.58 ms for `l8`, and the Frame gave 9.97 against 9.65. Treat its gains from new thread handoffs as unproven until measured.
+- **Why the split lost is not settled.** Threads do not slow each other's commands: per-command costs measured alone sum to 19.31 ms, the same as the 19.3 ms of handler time in a concurrent run. A shorter pause (`v2`) did not help, so wait polling alone does not explain it.
+- **Not tested:** 3 or more ring slots. A slot needs up to 164 KiB (`0x29000`, including its head). The tail has 504 KiB, and the conv workspace needs the rest. Every pool 1 block is touched at some point, so more slots would need memory that is dead only for part of the run, with ordering edges added.
+- **The merge loop is limited by compute, not VTCM loads.** Removing a third of its loads (`r1`) changed nothing. It compiles to about 7 packets per output.
+- Slot sizes matter. A slot too small for a conv pushes it off the sliding path onto the staged one: 15.8 ms at `0x23000`, with output still exact.
+
+The split, the row-order merge and the generator options for this batch are in `bench/lanes/rejected_merge_split.patch`, against commit `b7b70c4`. They are not in the tree, which still builds `eng-l8.elf` byte for byte. Measured costs are in `build/ab/planes-20261105/cmdcost-l8.json`.
+
 ### 13.6 Provenance
 
 Source: the main working tree, **uncommitted** (merged from `/tmp/frame-speed-runlist/depth-model`, which is now stale). Snapshots in `build/ab/planes-20261105/`: `source-l3p.tar.gz` (the `l3` code), `source-l4.tar.gz` (later, including the signature check). The generated header `native_program/qnn_lanes_primary.generated.h` belongs to the last generator run, so regenerate it to rebuild a specific schedule.

@@ -77,3 +77,7 @@ Only the lane tables changed: no memory moved, and the kernels are the same.
 | Serial order "random", `advr` | 54/54 exact |
 
 The model predicted 10.37 -> 8.58 ms, a gain of about 1.8 ms. Measured gain: about 1.3 ms.
+
+## Is any VTCM free for more workspace?
+
+Not permanently. With active block footprints and the memory in vector words, all 3,840 pool 1 blocks are touched at some point. The tail holds 504 KiB after its control area, and that is all the fixed workspace there is. Anything larger has to use blocks that are dead for part of the run, with ordering edges so it stays safe. See `PERF_BASELINE_PRIMARY_20261105.md` section 13.5g, where this limited the merge ring to 2 slots.
