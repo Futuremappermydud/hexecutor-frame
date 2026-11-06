@@ -170,3 +170,79 @@ qd_hmx_slide3_n:
     { p0 = cmp.gt(r5,#0) }
     { if (p0) jump 1b }
     { jumpr r31 }
+/* Exact u8 planes (NPRG2_PLANES): native int8 tiles, two conversions per tile
+ * from one accumulator (QNN hmx_v75_convbbh1x1_stride1's scheme). Selector
+ * bit 0 keeps the accumulator, bit 1 wraps instead of clipping, bits 12..13
+ * pick the bias bank. Bank 0 (r2): low byte, floor(x/2^pre) mod 256. Bank 1
+ * (r2+256): floor(x/2^pre/256)+16 clipped, the offset being in its bias.
+ * As qd_hmx_native_n; out[t] = low plane, the high plane 2048 bytes after it. */
+    .globl qd_hmx_nativep_n
+qd_hmx_nativep_n:
+    { r11 = asl(r4,#11); r7 = #3; r12 = #32 }
+    { r6 = #4096; r14 = add(r2,#257) }
+    { mxclracc }
+    { bias = mxmem2(r14) }
+    { bias = mxmem2(r2) }
+2:
+    { mxclracc }
+    { r8 = r4; r13 = r0; r14 = r1 }
+3:
+    { r9 = min(r8,r12) }
+    { r15 = asl(r9,#11); r28 = asl(r9,#10) }
+    { r15 = add(r15,#-1); r28 = add(r28,#-1) }
+    { activation.ub = mxmem(r13,r15):deep:cm
+      weight.b = mxmem(r14,r28) }
+    { r15 = add(r15,#1); r28 = add(r28,#1) }
+    { r13 = add(r13,r15); r14 = add(r14,r28) }
+    { r8 = sub(r8,r9) }
+    { p0 = cmp.gt(r8,#0) }
+    { if (p0) jump 3b }
+    { r10 = memw(r3++#4); r9 = #0 }
+    { cvt.ub = acc(r7) }
+    { mxmem(r10,r9):cm = cvt }
+    { r10 = add(r10,#2048) }
+    { cvt.ub = acc(r6) }
+    { mxmem(r10,r9):cm = cvt }
+    { r0 = add(r0,r11); r5 = add(r5,#-1) }
+    { p0 = cmp.gt(r5,#0) }
+    { if (p0) jump 2b }
+    { jumpr r31 }
+/* qd_hmx_slide3_n with the two conversions above. r2 = Fi (bank 0, bank 1 256
+ * bytes after it); r3 = per column {low, high} plane tile addresses (low 0: no
+ * store). The split store (Rs|0xe0, Rt 0x700) combines consecutive conversions,
+ * so with alternating planes the tiles are stored whole: tile c pixel k is the
+ * output's column 8*(c-1)+k-1 and the merge realigns them by one pixel. */
+    .globl qd_hmx_slide3p_n
+qd_hmx_slide3p_n:
+    { r7 = #3; r6 = #4096; r28 = #0 }
+    { r10 = #3071; r11 = #6143; r14 = add(r2,#257) }
+    { mxclracc }
+    { bias = mxmem2(r14) }
+    { bias = mxmem2(r2) }
+1:
+    { r8 = r4; r9 = r1 }
+2:
+    { r12 = memw(r0+#0); r13 = memw(r0+#4) }
+    { r14 = memw(r0+#8); r15 = memw(r0+#12) }
+    { activation.ub = mxmem(r12,r13):above:cm
+      weight.b = mxmem(r9,r10) }
+    { r9 = add(r9,#3072) }
+    { activation.ub = mxmem(r14,r15):cm
+      weight.b = mxmem(r9,r11) }
+    { r9 = add(r9,#6144); r0 = add(r0,#16); r8 = add(r8,#-1) }
+    { p0 = cmp.gt(r8,#0) }
+    { if (p0) jump 2b }
+    { r12 = memw(r3+#0); r13 = memw(r3+#4); r3 = add(r3,#8) }
+    { p1 = cmp.eq(r12,#0)
+      cvt.ub = acc(r7) }
+    { if (p1) jump 3f }
+    { mxmem(r12,r28):cm = cvt }
+3:
+    { cvt.ub = acc(r6) }
+    { if (p1) jump 4f }
+    { mxmem(r13,r28):cm = cvt }
+4:
+    { r5 = add(r5,#-1) }
+    { p0 = cmp.gt(r5,#0) }
+    { if (p0) jump 1b }
+    { jumpr r31 }

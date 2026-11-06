@@ -90,6 +90,10 @@ typedef struct Nprg2HmxOps {
      * block over one 8-row strip: rec = {rsA, rtA, rsC, rtC} per (column, cb),
      * st = {rsO, rtO} store words per column (qd_hmx_ops.S). */
     void (*slide3_n)(const uint32_t *rec, const void *b, const void *fi, const uint32_t *st, uint32_t cbs, uint32_t ncol);
+    /* NPRG2_PLANES builds: as native_n and slide3_n, two conversions per tile
+     * (qd_hmx_ops.S). native: out[t] = low plane, high plane 2048 bytes after it. */
+    void (*nativep_n)(void *a, void *b, void *fi, void *const *out, uint32_t kb, uint32_t mt);
+    void (*slide3p_n)(const uint32_t *rec, const void *b, const void *fi, const uint32_t *st, uint32_t cbs, uint32_t ncol);
 } Nprg2HmxOps;
 /* Fuse hook registered with the conv keys: the conv handler can run the
  * REQUANT_U8/70 or ADD_U8/13 command `epilogue` fused into its output step
