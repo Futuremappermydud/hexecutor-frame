@@ -717,7 +717,20 @@ static int prepared_qnn_command(QdQnnListRun *run,const Nprg2QnnRunEntry *entry,
 #if QDS_PREPARED_PROFILE
     {uint64_t pr=now_ns();nprg2_lane_prehandler[list]-=pr;run->pre[list]+=pr-p1;}
 #endif
-    int rc=nprg2_executor_run_preflighted_command_prepared(&s->executor,
+    int rc=0;
+#if NPRG2_PLANES && !defined(NO_CONV_PLANS)
+    int planned=0;
+    if(list==0) {
+        int32_t perr=0;
+        planned=nprg2_exec_reference_plan_run(entry->command,run->requests[0].parallel,&perr);
+        if(planned<0)return NPRG2_EXEC_HANDLER_ERROR;
+#if QDS_PREPARED_PROFILE
+        if(planned && nprg2_lane_clock)nprg2_lane_prehandler[0]+=nprg2_lane_clock();
+#endif
+    }
+    if(!planned)
+#endif
+    rc=nprg2_executor_run_preflighted_command_prepared(&s->executor,
         &run->requests[list],entry->command);
 #if QDS_QNN_EXCLUSIVE
     __asm__ volatile("barrier":::"memory");run->excl_flag[list]=0;__asm__ volatile("barrier":::"memory");
@@ -1053,6 +1066,15 @@ static int prepared_run(QdgGraph *g,QdPreparedState *s,uint32_t first,uint32_t l
     if(prepared_qnn_matches(s,first,last) && !nprg2_exec_reference_clone_lane(0,1)) {
         e=NPRG2_EXEC_ARGUMENT;goto failed;
     }
+#if NPRG2_PLANES && !defined(NO_CONV_PLANS)
+    if(prepared_qnn_matches(s,first,last)) {
+        Nprg2ExecRequest q;
+        if(!nprg2_runner_prepare_preflighted_request(&s->runner,&s->executor,0,QD_QNN_PRIMARY_COMMAND_COUNT,
+               QD_DIRECT_ACTIVE_BYTES,s->inputs,4,s->outputs,2,g,s->scratch,QDS_REFERENCE_SCRATCH_BYTES,&s->stats,0,NULL,
+               s->scratch,QDS_REFERENCE_SCRATCH_BYTES,s->runner.extra_scratch[0].data,s->runner.extra_scratch[0].bytes,&q))
+            (void)nprg2_exec_reference_plan_begin(&q,&s->conv);
+    }
+#endif
 #endif
     trace[1]=1;
 #if QDS_L2_CACHE

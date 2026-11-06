@@ -107,6 +107,12 @@ int nprg2_exec_reference_conv_measure(const Nprg2ExecCall *call, const Nprg2Refe
 /* Duplicate the main preflight memo into an independent lane before threaded
  * run lists start. Only the owner lane mutates each per-command memo afterward. */
 int nprg2_exec_reference_clone_lane(uint8_t source_lane,uint8_t destination_lane);
+/* NPRG2_PLANES on Hexagon: repeat 3x3 u8 convs from a per-command plan captured by
+ * their first full run (prepared_hmx_conv.inc, ConvPlan). begin before a run list,
+ * with the list's request and the registered conv; run returns 1 ran, 0 use the
+ * normal path, -1 error. */
+int nprg2_exec_reference_plan_begin(const Nprg2ExecRequest *request, const Nprg2ReferenceConv *conv);
+int nprg2_exec_reference_plan_run(uint32_t command, Nprg2Parallel *parallel, int32_t *err);
 /* Path the most recently measured or run convolution took: 0 reference,
  * 1 fast with the workspace only, 2 fast with near, 3 HMX (diagnostics only). */
 uint32_t nprg2_exec_reference_conv_path(void);
