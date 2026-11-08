@@ -79,6 +79,8 @@ runs/
 *_partial_oracle.h
 space_to_depth_cases.h
 
+/priv-experiments/
+
 # Host scratch products and caches.
 /runtime/artifacts/
 /runtime/bin/

@@ -46,3 +46,16 @@ IR-to-RGB projection needs the session's measured stereo yaw, extrinsics, and ex
 Compositor loss and DSP cleanup failures are retained in session logs. The launcher blocks another NPU capture in a boot marked by failed cleanup. After reboot, restore ptrace/memory prerequisites before recording again.
 
 These dataset tools remain local work in progress: `runtime/scripts/room_dataset.py`, `model_offline_batch.py`, `pull_room_dataset.py`, and `ir_dot_lib.py`. They are separate from the committed executor restructuring.
+
+## Offline IR yaw normalization
+
+`runtime/tools/ir_yaw_normalization.py` scores saved motion-stereo matches using each right-image ray's spherical yaw sensitivity. It leaves feature matches and their support unchanged. The right rectifier's fixed roll is included; an image-wide pixels-per-degree scale is only correct for a restricted set of rays. Python here is offline analysis and is not part of the live depth path.
+
+From `runtime/`, using a Python environment with NumPy:
+
+```sh
+python3 tools/ir_yaw_normalization.py --samples /path/to/motion-stereo-samples.npy --out /path/to/yaw-results --correction-deg 0
+python3 -m unittest discover -s tools -p test_ir_yaw_normalization.py
+```
+
+The input format is documented in the tool's module docstring. Supply the recorded image dimensions, angular step and right-camera roll if they differ from the defaults. `--correction-deg` defaults to zero and can apply an explicitly supplied, previously validated additive correction; the tool never fits it. Output records input/source hashes, frame-resampled uncertainty, distance-bin coverage and spread. Missing distance bins remain missing. The scorer does not declare acceptance: compare against an independent reference and a frozen protocol, and keep development results separate from fresh held-out evidence.
