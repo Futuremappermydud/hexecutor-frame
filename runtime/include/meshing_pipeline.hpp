@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <unordered_map>
+#include <stdexcept>
+#include <utility>
 #include "depth_pipeline.hpp"
 #include "cloud_worker.hpp"
 #include "openxr_geometry.hpp"
@@ -31,21 +33,32 @@ inline const char* viewerModeName(ViewerMode mode) {
 // Power-mean (L^p, p=4) separable depth filter inspired by Meta's Zelda depth post-processing.
 // Evaluates power-mean accumulation on inverse depth (1/Z) to strongly bias
 // smoothed edges toward the foreground surface, preventing background depth bleed.
-inline std::vector<float> powerMeanFilterDepth(
-    const std::vector<float>& depth, int width, int height,
+struct DepthFilterWorkspace {
+    std::vector<float> invP, validMask, tempVal, tempWeight, filtered;
+};
+
+// Workspace is owned by the depth worker, never shared with the render thread.
+// The returned reference remains valid until the next call using this workspace.
+inline const std::vector<float>& powerMeanFilterDepth(
+    const std::vector<float>& depth, int width, int height, DepthFilterWorkspace& workspace,
     uint32_t p = 4, int radius = 2, float minDepth = 0.25f, float maxDepth = 5.0f) {
 
     if (width <= 0 || height <= 0 || depth.size() != size_t(width) * height) return depth;
+
+    if (radius < 0 || radius > 2) throw std::invalid_argument("depth filter radius must be in [0,2]");
 
     // Precomputed 1D Gaussian kernel weights (radius 2 -> 5 taps, sigma ~ 1.0)
     constexpr float kKernel[5] = {0.06136f, 0.24477f, 0.38774f, 0.24477f, 0.06136f};
 
     // Convert valid depth to inverse depth and encode into power-mean space (x^p)
-    std::vector<float> invP(width * height, 0.0f);
-    std::vector<float> validMask(width * height, 0.0f);
+    auto& invP = workspace.invP;
+    auto& validMask = workspace.validMask;
+    invP.resize(depth.size()); validMask.resize(depth.size());
 
     #pragma omp parallel for
     for (size_t i = 0; i < depth.size(); ++i) {
+        invP[i] = 0.0f;
+        validMask[i] = 0.0f;
         float z = depth[i];
         if (std::isfinite(z) && z >= minDepth && z <= maxDepth) {
             float inv = 1.0f / z;
@@ -57,8 +70,9 @@ inline std::vector<float> powerMeanFilterDepth(
     }
 
     // Pass 1: Horizontal Gaussian in power-mean space
-    std::vector<float> tempVal(width * height, 0.0f);
-    std::vector<float> tempWeight(width * height, 0.0f);
+    auto& tempVal = workspace.tempVal;
+    auto& tempWeight = workspace.tempWeight;
+    tempVal.resize(depth.size()); tempWeight.resize(depth.size());
 
     #pragma omp parallel for
     for (int y = 0; y < height; ++y) {
@@ -69,11 +83,10 @@ inline std::vector<float> powerMeanFilterDepth(
                 int nx = x + k;
                 if (nx >= 0 && nx < width) {
                     size_t idx = size_t(y) * width + nx;
-                    if (validMask[idx] > 0.0f) {
-                        float w = kKernel[k + radius];
-                        vSum += invP[idx] * w;
-                        wSum += w;
-                    }
+                    // Invalid samples carry zero value and zero weight.
+                    float w = kKernel[k + radius];
+                    vSum += invP[idx] * w;
+                    wSum += validMask[idx] * w;
                 }
             }
             size_t outIdx = size_t(y) * width + x;
@@ -83,7 +96,8 @@ inline std::vector<float> powerMeanFilterDepth(
     }
 
     // Pass 2: Vertical Gaussian + decode p-th root
-    std::vector<float> filtered(width * height, 0.0f);
+    auto& filtered = workspace.filtered;
+    filtered.resize(depth.size());
 
     #pragma omp parallel for
     for (int y = 0; y < height; ++y) {
@@ -94,14 +108,13 @@ inline std::vector<float> powerMeanFilterDepth(
                 int ny = y + k;
                 if (ny >= 0 && ny < height) {
                     size_t idx = size_t(ny) * width + x;
-                    if (tempWeight[idx] > 0.0f) {
-                        float w = kKernel[k + radius];
-                        vSum += tempVal[idx] * w;
-                        wSum += tempWeight[idx] * w;
-                    }
+                    float w = kKernel[k + radius];
+                    vSum += tempVal[idx] * w;
+                    wSum += tempWeight[idx] * w;
                 }
             }
             size_t outIdx = size_t(y) * width + x;
+            filtered[outIdx] = 0.0f;
             // Require minimum weight support to produce a valid depth pixel (and inpaint small holes)
             if (wSum >= 0.12f) {
                 float avgP = vSum / wSum;
@@ -125,20 +138,33 @@ inline std::vector<float> powerMeanFilterDepth(
     return filtered;
 }
 
+inline std::vector<float> powerMeanFilterDepth(
+    const std::vector<float>& depth, int width, int height,
+    uint32_t p = 4, int radius = 2, float minDepth = 0.25f, float maxDepth = 5.0f) {
+    DepthFilterWorkspace workspace;
+    powerMeanFilterDepth(depth, width, height, workspace, p, radius, minDepth, maxDepth);
+    if (width <= 0 || height <= 0 || depth.size() != size_t(width) * height) return depth;
+    return std::move(workspace.filtered);
+}
+
 // Generate continuous 3D surface mesh triangles with depth-discontinuity tear gating.
 // Prevents "rubber sheeting" across foreground/background silhouettes.
-inline std::vector<FrameSpatialCloud::PointVertex> triangulateDepthMap(
+inline void triangulateDepthMap(
     const std::vector<float>& depth,
     const std::vector<uint8_t>& luma,
     const DepthPipeline& rectifier,
     const XrPosef& headPose,
     int width, int height,
+    std::vector<FrameSpatialCloud::PointVertex>& vertices,
     int step = 2,
     float maxRelDepthJump = 0.045f,
     float maxAbsDepthJump = 0.05f) {
 
-    std::vector<FrameSpatialCloud::PointVertex> vertices;
-    if (width <= 0 || height <= 0 || depth.size() != size_t(width) * height) return vertices;
+    vertices.clear();
+    if (width <= 0 || height <= 0 || depth.size() != size_t(width) * height) return;
+    if (step <= 0) throw std::invalid_argument("mesh step must be positive");
+    if (!luma.empty() && luma.size() != depth.size())
+        throw std::invalid_argument("mesh luma dimensions do not match depth");
 
     vertices.reserve(size_t(width / step) * (height / step) * 6);
 
@@ -161,6 +187,24 @@ inline std::vector<FrameSpatialCloud::PointVertex> triangulateDepthMap(
             headPose.position.y + rotated[1],
             headPose.position.z + rotated[2]
         };
+    };
+
+    // Each grid point is shared by up to six triangles. Keep two lazily
+    // projected rows, so tear-rejected triangles still avoid projection work.
+    const size_t columns = (size_t(width) - 1) / step + 1;
+    std::vector<std::array<float, 3>> projected[2];
+    std::vector<uint8_t> projectedValid[2];
+    for (int row = 0; row < 2; ++row) {
+        projected[row].resize(columns);
+        projectedValid[row].assign(columns, 0);
+    }
+    const auto projectedPoint = [&](int x, int y, float z) -> const std::array<float, 3>& {
+        const size_t row = size_t(y / step) & 1, col = size_t(x / step);
+        if (!projectedValid[row][col]) {
+            projected[row][col] = unprojectToStage(x, y, z);
+            projectedValid[row][col] = 1;
+        }
+        return projected[row][col];
     };
 
     const auto makeColor = [](uint8_t lumaVal, const std::array<float, 3>& norm) -> uint32_t {
@@ -188,9 +232,9 @@ inline std::vector<FrameSpatialCloud::PointVertex> triangulateDepthMap(
         float tearThreshold = std::max(maxAbsDepthJump, zMin * maxRelDepthJump);
         if (zMax - zMin > tearThreshold) return;
 
-        auto v0 = unprojectToStage(x0, y0, z0);
-        auto v1 = unprojectToStage(x1, y1, z1);
-        auto v2 = unprojectToStage(x2, y2, z2);
+        const auto& v0 = projectedPoint(x0, y0, z0);
+        const auto& v1 = projectedPoint(x1, y1, z1);
+        const auto& v2 = projectedPoint(x2, y2, z2);
 
         // Triangle face normal
         std::array<float, 3> d1 = {v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]};
@@ -217,6 +261,10 @@ inline std::vector<FrameSpatialCloud::PointVertex> triangulateDepthMap(
     };
 
     for (int y = 0; y + step < height; y += step) {
+        // The top row was the preceding strip's bottom row; only the new
+        // bottom row needs invalidating as its ring-buffer slot is reused.
+        auto& valid = projectedValid[size_t(y / step + 1) & 1];
+        std::fill(valid.begin(), valid.end(), uint8_t(0));
         for (int x = 0; x + step < width; x += step) {
             float z00 = depth[size_t(y) * width + x];
             float z10 = depth[size_t(y) * width + (x + step)];
@@ -250,6 +298,15 @@ inline std::vector<FrameSpatialCloud::PointVertex> triangulateDepthMap(
             }
         }
     }
+}
+
+inline std::vector<FrameSpatialCloud::PointVertex> triangulateDepthMap(
+    const std::vector<float>& depth, const std::vector<uint8_t>& luma,
+    const DepthPipeline& rectifier, const XrPosef& headPose, int width, int height,
+    int step = 2, float maxRelDepthJump = 0.045f, float maxAbsDepthJump = 0.05f) {
+    std::vector<FrameSpatialCloud::PointVertex> vertices;
+    triangulateDepthMap(depth, luma, rectifier, headPose, width, height, vertices,
+                        step, maxRelDepthJump, maxAbsDepthJump);
     return vertices;
 }
 

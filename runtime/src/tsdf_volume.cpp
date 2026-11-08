@@ -39,7 +39,7 @@ bool TsdfVolume::voxelAt(int ix, int iy, int iz, float& sdf, float& weight) cons
 
 TsdfStats TsdfVolume::integrate(const float* depth, const uint8_t* luma, int width, int height,
                                 float focal, float cx, float cy, const TsdfPose& pose,
-                                const float* confidence) {
+                                const float* confidence, const TsdfIntegrateOptions& options) {
     TsdfStats stats;
     ++frame_;
     const float mu = config_.truncation, voxel = config_.voxel;
@@ -47,10 +47,12 @@ TsdfStats TsdfVolume::integrate(const float* depth, const uint8_t* luma, int wid
     const auto& T = pose.translation;
 
     // 1. Leaves within +-mu of every sampled measurement, along its ray.
-    std::vector<uint64_t> touched;
-    touched.reserve(size_t(width) * height / (config_.allocationStride * config_.allocationStride));
     const int stride = std::max(1, config_.allocationStride);
+    auto& touched = touched_;
+    touched.clear();
+    touched.reserve(size_t(width) * height / (size_t(stride) * stride));
     const float leafSize = voxel * kLeaf;
+    const int steps = int(std::ceil(2 * mu / (0.5f * leafSize)));
     uint64_t recent[4]{~0ull, ~0ull, ~0ull, ~0ull};
     unsigned next = 0;
     for (int y = 0; y < height; y += stride) {
@@ -59,7 +61,6 @@ TsdfStats TsdfVolume::integrate(const float* depth, const uint8_t* luma, int wid
             if (!(z >= config_.minDepth && z <= config_.maxDepth)) continue;
             const float rx = (x - cx) / focal, ry = (y - cy) / focal;
             // Sample the band at half-leaf spacing so no crossed leaf is skipped.
-            const int steps = int(std::ceil(2 * mu / (0.5f * leafSize)));
             for (int s = 0; s <= steps; ++s) {
                 const float zz = z - mu + 2 * mu * s / steps;
                 if (zz <= 0) continue;
@@ -99,7 +100,8 @@ TsdfStats TsdfVolume::integrate(const float* depth, const uint8_t* luma, int wid
     touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
     stats.touchedLeaves = touched.size();
 
-    std::vector<std::pair<uint64_t, Leaf*>> work;
+    auto& work = work_;
+    work.clear();
     work.reserve(touched.size());
     for (const uint64_t k : touched) {
         auto [it, inserted] = leaves_.try_emplace(k);
@@ -107,6 +109,7 @@ TsdfStats TsdfVolume::integrate(const float* depth, const uint8_t* luma, int wid
             std::fill(std::begin(it->second.sdf), std::end(it->second.sdf), __fp16(1.0f));
             std::fill(std::begin(it->second.weight), std::end(it->second.weight), __fp16(0.0f));
             std::fill(std::begin(it->second.luma), std::end(it->second.luma), uint8_t(0));
+            std::fill(std::begin(it->second.contradict), std::end(it->second.contradict), uint8_t(0));
             ++stats.allocatedLeaves;
         }
         work.push_back({k, &it->second});
@@ -142,11 +145,34 @@ TsdfStats TsdfVolume::integrate(const float* depth, const uint8_t* luma, int wid
                     const float sdf = d - pz;
                     if (sdf < -mu) continue;  // occluded: leave unknown/behind untouched
                     const float s = std::min(1.0f, sdf / mu);
-                    const float cos2 = pz * pz / (px * px + py * py + pz * pz);
+                    float cos2 = pz * pz / (px * px + py * py + pz * pz);
+                    if (options.normalIncidence && options.normal) {
+                        const float* nrm = options.normal + 3 * pixel;
+                        const float rl = std::sqrt(px * px + py * py + pz * pz);
+                        const float c = std::fabs(nrm[0] * px + nrm[1] * py + nrm[2] * pz) / rl;
+                        cos2 = c * c;
+                    }
                     float w = std::max(2.0f * cos2 - 1.0f, 0.1f) / (d * d);
                     if (confidence) w *= confidence[pixel];
+                    if (options.robust) {
+                        const float a = std::min(std::fabs(s), 1.0f);
+                        w *= (1.0f - a) * (1.0f - a);
+                    }
+                    if (options.frameWeightCap) w = std::min(w, options.frameWeightCapValue);
+                    if (!(w > 0.0f)) continue;
                     const int idx = voxelIndex(vx, vy, vz);
                     const float W = float(leaf.weight[idx]);
+                    const float stored = float(leaf.sdf[idx]);
+                    // A full free-space sample (s > 0.5) on an established surface is a
+                    // contradiction. Smaller residuals, including the far side of a thin
+                    // sheet, update immediately.
+                    if (s > 0.5f && W >= config_.minMeshWeight && stored < 0.5f) {
+                        const int seen = std::min(255, int(leaf.contradict[idx]) + 1);
+                        leaf.contradict[idx] = uint8_t(seen);
+                        if (seen < options.carveAfter) continue;
+                    } else {
+                        leaf.contradict[idx] = 0;
+                    }
                     const float total = W + w;
                     leaf.sdf[idx] = __fp16((float(leaf.sdf[idx]) * W + s * w) / total);
                     if (luma && s < 1.0f)
@@ -188,6 +214,7 @@ void TsdfVolume::evict() {
 void TsdfVolume::extractMesh(std::vector<TsdfVertex>& out, size_t maxTriangles,
                              const float* focus) const {
     out.clear();
+    if (maxTriangles < 2) return;  // surface nets emits complete two-triangle quads
     std::vector<std::pair<float, const std::pair<const uint64_t, Leaf>*>> order;
     order.reserve(leaves_.size());
     const float leafSize = config_.voxel * kLeaf;
@@ -229,6 +256,7 @@ void TsdfVolume::extractMesh(std::vector<TsdfVertex>& out, size_t maxTriangles,
                 for (int dx = -1; dx <= 1; ++dx)
                     neighbor[(dz + 1) * 9 + (dy + 1) * 3 + dx + 1] =
                         (dx | dy | dz) ? find(lx + dx, ly + dy, lz + dz) : &self;
+        bool negative = false, positive = false;
         for (int z = -1; z < G - 1; ++z)
             for (int y = -1; y < G - 1; ++y)
                 for (int x = -1; x < G - 1; ++x) {
@@ -238,7 +266,14 @@ void TsdfVolume::extractMesh(std::vector<TsdfVertex>& out, size_t maxTriangles,
                     if (!leaf) { s[i] = 1; w[i] = 0; l[i] = 0; continue; }
                     const int v = voxelIndex(x - ox * kLeaf, y - oy * kLeaf, z - oz * kLeaf);
                     s[i] = float(leaf->sdf[v]); w[i] = float(leaf->weight[v]); l[i] = leaf->luma[v];
+                    if (w[i] >= minW) {
+                        negative |= s[i] < 0;
+                        positive |= s[i] >= 0;
+                    }
                 }
+        // Entirely interior leaves can contain well-observed negative SDF but
+        // cannot emit a surface. Avoid building all 125 cells for those leaves.
+        if (!negative || !positive) continue;
         // Cell vertices: mean of the edge crossings of each mixed-sign cell.
         static const int corner[8][3]{{0,0,0},{1,0,0},{0,1,0},{1,1,0},{0,0,1},{1,0,1},{0,1,1},{1,1,1}};
         static const int edge[12][2]{{0,1},{2,3},{4,5},{6,7},{0,2},{1,3},{4,6},{5,7},{0,4},{1,5},{2,6},{3,7}};

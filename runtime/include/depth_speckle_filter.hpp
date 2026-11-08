@@ -7,14 +7,21 @@
 
 namespace FrameSpatial {
 
+// Scratch belongs to one depth worker and retains capacity between frames.
 // Reject disconnected stereo patches before they can accumulate in world space.
 // Use eight-connectivity to preserve diagonal/slanted surfaces. Never fill holes.
+struct DepthSpeckleWorkspace {
+    std::vector<unsigned char> visited;
+    std::vector<size_t> component;
+};
 inline void removeDepthSpeckles(std::vector<float>& depth, int width, int height,
-                               size_t minimumPixels = 32) {
+                               DepthSpeckleWorkspace& workspace, size_t minimumPixels = 32) {
     if (width <= 0 || height <= 0 ||
         depth.size() != static_cast<size_t>(width) * height) return;
-    std::vector<unsigned char> visited(depth.size(), 0);
-    std::vector<size_t> component;
+    if (minimumPixels <= 1) return;
+    auto& visited = workspace.visited;
+    auto& component = workspace.component;
+    visited.assign(depth.size(), 0);
     component.reserve(depth.size());
     for (size_t seed = 0; seed < depth.size(); ++seed) {
         if (visited[seed] || !std::isfinite(depth[seed]) || depth[seed] <= 0.0f) continue;
@@ -44,6 +51,12 @@ inline void removeDepthSpeckles(std::vector<float>& depth, int width, int height
             for (size_t index : component) depth[index] = 0.0f;
         }
     }
+}
+
+inline void removeDepthSpeckles(std::vector<float>& depth, int width, int height,
+                               size_t minimumPixels = 32) {
+    DepthSpeckleWorkspace workspace;
+    removeDepthSpeckles(depth, width, height, workspace, minimumPixels);
 }
 
 } // namespace FrameSpatial

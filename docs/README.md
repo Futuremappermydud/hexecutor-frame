@@ -45,6 +45,6 @@ This is the maintained handbook for the spatial application, Hexecutor DSP execu
 ## Models and repository policy
 
 - [Depth model](model-development/depth.md), [CPU reference](model-development/cpu-reference.md), and [hand tracking](model-development/hand-tracking.md), including its [optimization checkpoint](model-development/hand-tracking-progress.md) and the [Mercury QNN run-list plan](model-development/mercury-hand-tracking.md); [controller FeatureNN](model-development/controller-featurenn.md) on the tensor backend.
-- [Training and local artifacts](model-development/training-and-artifacts.md): future model replacement, ignored assets, and history policy.
+- [Repository checks](development.md#practical-local-checks) and [model artifact policy](../tools/model_artifact_policy.py).
 
 The temporal-fusion report and related working notes remain in their original locations and are outside this rewrite. Both fusion handoffs are also preserved unchanged. Superseded session diaries are available in Git history and the external documentation recovery copy; they are not the primary navigation system.

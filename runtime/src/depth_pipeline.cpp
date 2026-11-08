@@ -1,4 +1,5 @@
 #include "depth_pipeline.hpp"
+#include <vector>
 #include "calibration.hpp"
 #include <iostream>
 #include <cmath>
@@ -53,10 +54,18 @@ Mat3 quaternionMatrix(float x, float y, float z, float w) {
 
 // XRService continuously refines this seven-value transform:
 // [translation xyz, quaternion xyzw], passthroughCam0 (right) from
-// passthroughCam1 (left). Reading its latest entry keeps epipolar alignment
-// tied to the headset rather than to a calibration copied from another unit.
+// passthroughCam1 (left). XRService appends one rotation-only estimate per
+// alignment run; individual stereo estimates scatter by about +-0.15 deg of yaw
+// (about +-1.1 px of disparity), and XRService itself applies stereo only when a
+// cluster of entries agrees (docs/xrservice_passthrough_alignment.md).
+// Policy "medoid" (default for the stereo transform) takes the entry with the
+// smallest summed rotation distance to the others; "latest" takes the newest.
+// NOTE: neither tracks the short-timescale yaw drift measured against tags
+// (E02/E02b, ~0.35 deg within 15 min after a cold boot); see the room
+// reconstruction plan, deferred item "stereo yaw drift".
 bool loadStereoTransform(const std::string& name, Vec3& translation,
-                         std::array<float, 4>& quaternion) {
+                         std::array<float, 4>& quaternion, std::string* sourceOut = nullptr,
+                         bool medoid = false, int* chosenIndex = nullptr, int* entryCount = nullptr) {
     const char* overridePath = std::getenv("FRAME_STEREO_CALIBRATION");
     const std::string path = overridePath && *overridePath
         ? overridePath
@@ -66,28 +75,47 @@ bool loadStereoTransform(const std::string& name, Vec3& translation,
     if (!input) return false;
     const std::string json((std::istreambuf_iterator<char>(input)),
                            std::istreambuf_iterator<char>());
+    if (sourceOut) *sourceOut = json;
     const std::string key = "\"" + name + "\"";
+    std::vector<std::array<float, 7>> entries;
     size_t position = 0;
-    size_t latest = std::string::npos;
     while ((position = json.find(key, position)) != std::string::npos) {
-        latest = position++;
+        const size_t bracket = json.find('[', position + key.size());
+        position += key.size();
+        if (bracket == std::string::npos) break;
+        const char* cursor = json.c_str() + bracket + 1;
+        std::array<float, 7> values{};
+        bool ok = true;
+        for (float& value : values) {
+            while (*cursor && !std::isdigit(static_cast<unsigned char>(*cursor)) &&
+                   *cursor != '-' && *cursor != '+' && *cursor != '.') ++cursor;
+            char* end = nullptr;
+            if (!*cursor) { ok = false; break; }
+            value = std::strtof(cursor, &end);
+            if (end == cursor) { ok = false; break; }
+            cursor = end;
+        }
+        if (ok) entries.push_back(values);
     }
-    if (latest == std::string::npos) return false;
-    const size_t bracket = json.find('[', latest + key.size());
-    if (bracket == std::string::npos) return false;
-    const char* cursor = json.c_str() + bracket + 1;
-    float values[7]{};
-    for (float& value : values) {
-        while (*cursor && !std::isdigit(static_cast<unsigned char>(*cursor)) &&
-               *cursor != '-' && *cursor != '+' && *cursor != '.') ++cursor;
-        if (!*cursor) return false;
-        char* end = nullptr;
-        value = std::strtof(cursor, &end);
-        if (end == cursor) return false;
-        cursor = end;
+    if (entries.empty()) return false;
+    size_t chosen = entries.size() - 1;
+    if (medoid && entries.size() > 2) {
+        const auto angle = [](const std::array<float, 7>& a, const std::array<float, 7>& b) {
+            const double dot = std::abs(double(a[3]) * b[3] + double(a[4]) * b[4] + double(a[5]) * b[5] + double(a[6]) * b[6]);
+            return 2.0 * std::acos(std::min(1.0, dot));
+        };
+        double best = 1e30;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            double sum = 0;
+            for (size_t j = 0; j < entries.size(); ++j) sum += angle(entries[i], entries[j]);
+            if (sum < best - 1e-12) { best = sum; chosen = i; }
+        }
     }
-    translation = {values[0], values[1], values[2]};
-    quaternion = {values[3], values[4], values[5], values[6]};
+    const auto& v = entries[chosen];
+    translation = {v[0], v[1], v[2]};
+    quaternion = {v[3], v[4], v[5], v[6]};
+    if (chosenIndex) *chosenIndex = int(chosen);
+    if (entryCount) *entryCount = int(entries.size());
     return true;
 }
 
@@ -127,9 +155,16 @@ void DepthPipeline::initialize() {
     Vec3 rightFromLeftTranslation{0.00228127f, 0.06266509f, -0.01230039f};
     std::array<float, 4> rightFromLeftQuaternion{
         -0.00618799f, 0.18649586f, 0.98183560f, 0.03434955f};
+    const char* policy = std::getenv("FRAME_STEREO_CALIBRATION_POLICY");
+    m_calibrationPolicy = policy && std::string(policy) == "latest" ? "latest" : "medoid";
     const bool loadedAlignment = loadStereoTransform(
         "passthroughCam0FromPassthroughCam1Extrinsics",
-        rightFromLeftTranslation, rightFromLeftQuaternion);
+        rightFromLeftTranslation, rightFromLeftQuaternion, &m_calibrationSource,
+        m_calibrationPolicy == "medoid", &m_calibrationEntry, &m_calibrationEntries);
+    // XRService rewrites this history online (E02: about +-1.1 px of disparity
+    // between entries). The exact text used here is kept for per-capture provenance.
+    m_stereoQuaternion = rightFromLeftQuaternion;
+    m_stereoTranslation = {rightFromLeftTranslation[0], rightFromLeftTranslation[1], rightFromLeftTranslation[2]};
     const Mat3 rightFromLeft = quaternionMatrix(
         rightFromLeftQuaternion[0], rightFromLeftQuaternion[1],
         rightFromLeftQuaternion[2], rightFromLeftQuaternion[3]);
@@ -253,7 +288,8 @@ void DepthPipeline::initialize() {
     std::cout << "[DepthPipeline] Stereo alignment source: "
               << (loadedAlignment ? "XRService latest history" : "built-in fallback")
               << ", baseline=" << m_rectifiedBaseline
-              << " m" << std::endl;
+              << " m, stereo policy=" << m_calibrationPolicy << " (entry " << m_calibrationEntry
+              << " of " << m_calibrationEntries << ")" << std::endl;
 }
 
 std::array<float, 3> DepthPipeline::rectifiedPointInHead(int x, int y, float z) const {

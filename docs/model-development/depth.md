@@ -28,4 +28,4 @@ The retained device bridge runs the prepared native paths. CPU reference tools r
 
 For distillation/fine-tuning, put new training definitions and export/evaluation recipes in `depth-model/training/`. Establish preprocessing, eye order, projection, output units, state, and uncertainty semantics as part of the new model contract. Updating weights alone does not establish compatibility with an old compiled schedule.
 
-Read [CPU reference](cpu-reference.md), [training/artifacts](training-and-artifacts.md), and [live integration](../runtime/model-depth.md). This workspace does not distribute legacy model assets or claim independent provenance for a replacement solely because its code has generic names.
+Read [CPU reference](cpu-reference.md), [model artifact policy](../../tools/model_artifact_policy.py), and [live integration](../runtime/model-depth.md). This workspace does not distribute legacy model assets or claim independent provenance for a replacement solely because its code has generic names.

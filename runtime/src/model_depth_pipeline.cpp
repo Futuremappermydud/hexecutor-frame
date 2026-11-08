@@ -219,24 +219,29 @@ bool ModelDepthPipeline::process(const std::vector<uint8_t>& left,const std::vec
                          <<"; splat "<<temporalState_->splatFraction()<<", warp "<<temporalWarpMs_<<" ms, inference "
                          <<milliseconds_<<" ms"<<std::endl;
         }
-        const auto confidenceOf=[&](float u){return std::clamp((maxUncertainty_-u)/float(maxUncertainty_-50),.05f,1.f);};
-        confidence_.assign(size_t(RECT_WIDTH)*RECT_HEIGHT,.05f);
+        const auto postprocessBegin=std::chrono::steady_clock::now();
+        std::array<float,256> confidenceOf;
+        for(size_t u=0;u<confidenceOf.size();++u)
+            confidenceOf[u]=std::clamp((maxUncertainty_-float(u))/float(maxUncertainty_-50),.05f,1.f);
+        confidence_.resize(size_t(RECT_WIDTH)*RECT_HEIGHT);
         if(useSpherical) {
             if(sphericalMap_.step!=sphericalStep)
                 sphericalMap_=modelSphericalMap(sphericalStep,FOCAL_BASELINE/RECT_FOCAL,RECT_WIDTH,RECT_HEIGHT,
                                                 RECT_FOCAL,RECT_CX,RECT_CY);
             depth=modelSphericalDepth(disparity_,uncertainty_,sphericalMap_,maxUncertainty_);
             for(size_t i=0;i<confidence_.size();i++)
-                if(sphericalMap_.modelIndex[i]>=0)confidence_[i]=confidenceOf(uncertainty_[sphericalMap_.modelIndex[i]]);
+                confidence_[i]=sphericalMap_.modelIndex[i]>=0 ?
+                    confidenceOf[uncertainty_[sphericalMap_.modelIndex[i]]] : .05f;
         } else {
             depth=modelMetricDepth(disparity_,l,r,RECT_WIDTH,RECT_HEIGHT,FOCAL_BASELINE,.25f,5.f,
                                    censusGate_?nullptr:&uncertainty_,maxUncertainty_);
             for(int y=0;y<RECT_HEIGHT;y++)for(int x=0;x<RECT_WIDTH;x++) {
                 const int mx=std::min(MODEL_WIDTH-1,int((x+.5f)*MODEL_WIDTH/RECT_WIDTH));
                 const int my=std::min(MODEL_HEIGHT-1,int((y+.5f)*MODEL_HEIGHT/RECT_HEIGHT));
-                confidence_[size_t(y)*RECT_WIDTH+x]=confidenceOf(uncertainty_[size_t(my)*MODEL_WIDTH+mx]);
+                confidence_[size_t(y)*RECT_WIDTH+x]=confidenceOf[uncertainty_[size_t(my)*MODEL_WIDTH+mx]];
             }
         }
+        postprocessMs_=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-postprocessBegin).count();
         if(secondDisparity_ && recordedV2_<recordLimit_) {
             const auto directory=std::filesystem::path(recordV2Directory_);
             const std::string prefix="frame-"+std::to_string(sequence_);

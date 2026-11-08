@@ -69,7 +69,25 @@ int main() {
     size_t remaining = 0; double worstWall = 0;
     for (const auto& v : mesh) { if (std::abs(v.z - WALL) > 0.1f) ++remaining; worstWall = std::max(worstWall, double(surfaceDistance(v, false))); }
     std::printf("after removal: %zu tris, sphere vertices %zu, max wall error %.4f m\n", mesh.size() / 3, remaining, worstWall);
-    const bool pass = !mesh.empty() && mean < 0.01 && worst < 0.03 && nearSphere > 1000 && remaining == 0;
+    bool pass = !mesh.empty() && mean < 0.01 && worst < 0.03 && nearSphere > 1000 && remaining == 0;
+    // Complete quads respect odd/even triangle caps, including zero work.
+    for (size_t cap : {size_t(0), size_t(1), size_t(2), size_t(17), size_t(1000)}) {
+        const float focus[3]{0, 0, WALL};
+        volume.extractMesh(mesh, cap, focus);
+        pass = pass && mesh.size() <= cap * 3 && mesh.size() % 6 == 0;
+    }
+    // Reusing integration scratch after clear must not retain old leaf pointers.
+    volume.clear();
+    pass = pass && volume.leafCount() == 0;
+    volume.extractMesh(mesh, 1000000);
+    pass = pass && mesh.empty();
+    const auto depth = render(poses[0], {false});
+    // Several observations are needed to reach minMeshWeight at this range.
+    for (int i = 0; i < 8; ++i)
+        volume.integrate(depth.data(), nullptr, N, N, F, CX, CY, poses[0]);
+    volume.extractMesh(mesh, 1000000);
+    pass = pass && !mesh.empty();
+    for (const auto& v : mesh) pass = pass && surfaceDistance(v, false) < .01f;
     std::printf("%s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

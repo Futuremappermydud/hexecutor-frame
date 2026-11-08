@@ -13,14 +13,20 @@ CXXFLAGS += -DFRAME_WITH_MNN -I$(MNN_PREFIX)/include
 LDFLAGS += -L$(MNN_PREFIX)/lib -lMNN -Wl,-rpath,$(MNN_PREFIX)/lib
 endif
 
-SRC = src/main.cpp src/dma_capture.cpp src/overlay_renderer.cpp src/vk_detile.cpp src/depth_pipeline.cpp src/gpu_depth_pipeline.cpp src/vulkan_stereo_pipeline.cpp
+OPENXR_INC ?= $(HOME)/frame-spatial-components/third_party/openxr/include
+ifneq ($(wildcard $(OPENXR_INC)/openxr/openxr.h),)
+CXXFLAGS += -I$(OPENXR_INC)
+endif
+
+SRC = src/main.cpp src/dma_capture.cpp src/timed_stereo_capture.cpp src/v4l2_capture_clock.cpp src/overlay_renderer.cpp src/vk_detile.cpp src/depth_pipeline.cpp src/gpu_depth_pipeline.cpp src/vulkan_stereo_pipeline.cpp
 OBJ = $(SRC:.cpp=.o)
 DEP = $(OBJ:.o=.d)
 TARGET = bin/frame_spatial_runtime
 SPV = shaders/stereo_census.spv shaders/stereo_match.spv shaders/stereo_filter.spv shaders/stereo_support.spv
 OPENXR_TARGET = bin/frame_openxr_point_cloud
 MESH_TARGET = bin/frame_openxr_mesh_viewer
-OPENXR_SRC = src/openxr_point_cloud.cpp src/cloud_worker.cpp src/tsdf_volume.cpp src/model_depth_pipeline.cpp src/model_temporal.cpp src/persistent_depth.cpp src/vulkan_guarded_stereo_pipeline.cpp src/dma_capture.cpp src/vk_detile.cpp src/depth_pipeline.cpp src/vulkan_stereo_pipeline.cpp
+ROOM_REPLAY_TARGET = bin/replay_room_tsdf
+OPENXR_SRC = src/openxr_point_cloud.cpp src/cloud_worker.cpp src/tsdf_volume.cpp src/model_depth_pipeline.cpp src/model_temporal.cpp src/ir_pair_capture.cpp src/ir_dot_bridge.cpp src/ir_dot_refine.cpp src/persistent_depth.cpp src/vulkan_guarded_stereo_pipeline.cpp src/dma_capture.cpp src/timed_stereo_capture.cpp src/v4l2_capture_clock.cpp src/vk_detile.cpp src/depth_pipeline.cpp src/vulkan_stereo_pipeline.cpp
 OPENXR_OBJ = $(OPENXR_SRC:.cpp=.o)
 POINT_SPV = shaders/point_cloud.vert.spv shaders/point_cloud.frag.spv shaders/occlusion_demo.frag.spv
 MESH_SPV = shaders/mesh.vert.spv shaders/mesh.frag.spv
@@ -39,6 +45,9 @@ $(OPENXR_TARGET): $(OPENXR_OBJ) | dirs $(SPV) $(POINT_SPV) $(MESH_SPV)
 
 $(MESH_TARGET): $(OPENXR_TARGET) | dirs
 	ln -sf frame_openxr_point_cloud $(MESH_TARGET)
+
+$(ROOM_REPLAY_TARGET): tools/replay_room_tsdf.cpp src/tsdf_volume.cpp | dirs
+	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread -lm
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -98,9 +107,9 @@ shaders/hand_joints.vert.spv: shaders/hand_joints.vert
 shaders/hand_joints.frag.spv: shaders/hand_joints.frag
 	@if command -v $(GLSLC) >/dev/null 2>&1; then $(GLSLC) -O $< -o $@; elif [ -f $@ ]; then echo "glslc not found; using existing $@"; else echo "Error: glslc not found and $@ missing" >&2; exit 1; fi
 
-bin/frame_hand_viewer: tools/frame_hand_viewer.cpp src/hand_viewer_xr.o ../hand-tracking/include/hand_tracking/viewer_geometry.hpp src/dma_capture.o src/vk_detile.o src/depth_pipeline.o hand-viewer-host | dirs
+bin/frame_hand_viewer: tools/frame_hand_viewer.cpp src/hand_viewer_xr.o ../hand-tracking/include/hand_tracking/viewer_geometry.hpp src/dma_capture.o src/timed_stereo_capture.o src/v4l2_capture_clock.o src/vk_detile.o src/depth_pipeline.o hand-viewer-host | dirs
 	$(CXX) $(CXXFLAGS) -I../hand-tracking/include -I../hand-tracking/mercury/include -I../hexecutor/include \
-		tools/frame_hand_viewer.cpp src/hand_viewer_xr.o src/dma_capture.o src/vk_detile.o src/depth_pipeline.o \
+		tools/frame_hand_viewer.cpp src/hand_viewer_xr.o src/dma_capture.o src/timed_stereo_capture.o src/v4l2_capture_clock.o src/vk_detile.o src/depth_pipeline.o \
 		$(HAND_NATIVE_BUILD)/libhand_tracking_host.a $(HAND_NATIVE_BUILD)/libmercury_executor_networks.a \
 		$(HAND_NATIVE_BUILD)/libmercury_hand_tracking.a $(HAND_NATIVE_BUILD)/libhexecutor_host.a \
 		-L/opt/steamvr/bin/linuxarm64 -lopenxr_loader -Wl,-rpath,/opt/steamvr/bin/linuxarm64 -lvulkan -lpthread -o $@
@@ -108,7 +117,7 @@ bin/frame_hand_viewer: tools/frame_hand_viewer.cpp src/hand_viewer_xr.o ../hand-
 -include src/hand_viewer_xr.d
 
 OCCLUSION_TARGET = bin/libframe_openxr_occlusion.so
-OCCLUSION_SRC = src/openxr_occlusion_layer.cpp src/occlusion_renderer.cpp src/cloud_worker.cpp src/tsdf_volume.cpp src/model_depth_pipeline.cpp src/model_temporal.cpp src/persistent_depth.cpp src/vulkan_guarded_stereo_pipeline.cpp src/dma_capture.cpp src/vk_detile.cpp src/depth_pipeline.cpp src/vulkan_stereo_pipeline.cpp
+OCCLUSION_SRC = src/openxr_occlusion_layer.cpp src/occlusion_renderer.cpp src/cloud_worker.cpp src/tsdf_volume.cpp src/model_depth_pipeline.cpp src/model_temporal.cpp src/ir_pair_capture.cpp src/ir_dot_bridge.cpp src/ir_dot_refine.cpp src/persistent_depth.cpp src/vulkan_guarded_stereo_pipeline.cpp src/dma_capture.cpp src/timed_stereo_capture.cpp src/v4l2_capture_clock.cpp src/vk_detile.cpp src/depth_pipeline.cpp src/vulkan_stereo_pipeline.cpp
 OCCLUSION_OBJ = $(OCCLUSION_SRC:.cpp=.pic.o)
 OCCLUSION_SPV = shaders/occlusion.vert.spv shaders/occlusion.frag.spv
 
@@ -132,6 +141,41 @@ shaders/occlusion.frag.spv: shaders/occlusion.frag
 bin/test_tsdf_volume: tools/test_tsdf_volume.cpp src/tsdf_volume.cpp include/tsdf_volume.hpp | dirs
 	$(CXX) -O3 -std=c++17 -Wall -Wextra -fopenmp -Iinclude tools/test_tsdf_volume.cpp src/tsdf_volume.cpp -o $@
 
+bin/test_depth_postprocess: tools/test_depth_postprocess.cpp include/model_depth_geometry.hpp include/depth_speckle_filter.hpp | dirs
+	$(CXX) $(CXXFLAGS) -UNDEBUG $< -o $@
+
+bin/test_meshing_pipeline: tools/test_meshing_pipeline.cpp include/meshing_pipeline.hpp | dirs
+	$(CXX) $(CXXFLAGS) -UNDEBUG $< -o $@
+
+bin/benchmark_depth_processing: tools/benchmark_depth_processing.cpp src/tsdf_volume.cpp include/meshing_pipeline.hpp include/model_depth_geometry.hpp include/depth_speckle_filter.hpp include/tsdf_volume.hpp | dirs
+	$(CXX) $(CXXFLAGS) tools/benchmark_depth_processing.cpp src/tsdf_volume.cpp -o $@
+
+bin/test_tsdf_e07: tools/test_tsdf_e07.cpp src/tsdf_volume.cpp include/tsdf_volume.hpp | dirs
+	$(CXX) -O3 -std=c++17 -Wall -Wextra -fopenmp -Iinclude tools/test_tsdf_e07.cpp src/tsdf_volume.cpp -o $@
+
+IR_DOT_TEST_SRC = src/ir_dot_refine.cpp src/ir_dot_bridge.cpp src/ir_pair_capture.cpp src/v4l2_capture_clock.cpp
+
+bin/test_ir_dot_plane: tools/test_ir_dot_plane.cpp $(IR_DOT_TEST_SRC) include/ir_dot_refine.hpp include/ir_dot_bridge.hpp | dirs
+	$(CXX) -O3 -std=c++17 -Wall -Wextra -Iinclude tools/test_ir_dot_plane.cpp $(IR_DOT_TEST_SRC) -lpthread -o $@
+
+bin/test_ir_dot_bridge: tools/test_ir_dot_bridge.cpp src/ir_dot_bridge.cpp include/ir_dot_bridge.hpp | dirs
+	$(CXX) -O2 -std=c++17 -Wall -Wextra -Iinclude tools/test_ir_dot_bridge.cpp src/ir_dot_bridge.cpp -lpthread -o $@
+
+bin/probe_ir_pair: tools/probe_ir_pair.cpp src/ir_pair_capture.cpp src/v4l2_capture_clock.cpp include/ir_pair_capture.hpp | dirs
+	$(CXX) -O2 -std=c++17 -Wall -Wextra -Iinclude tools/probe_ir_pair.cpp src/ir_pair_capture.cpp src/v4l2_capture_clock.cpp -lpthread -o $@
+
+bin/record_ir_pairs: tools/record_ir_pairs.cpp src/ir_pair_capture.cpp src/v4l2_capture_clock.cpp include/ir_pair_capture.hpp | dirs
+	$(CXX) -O2 -std=c++17 -Wall -Wextra -Iinclude tools/record_ir_pairs.cpp src/ir_pair_capture.cpp src/v4l2_capture_clock.cpp -lpthread -o $@
+
+bin/record_head_poses: tools/record_head_poses.cpp | dirs
+	$(CXX) -O2 -std=c++17 -Wall -Wextra -I/opt/steamvr/tools/hellovr_vulkan_linux/src/openvr/headers $< -L/opt/steamvr/bin/linuxarm64 -lopenvr_api -Wl,-rpath=/opt/steamvr/bin/linuxarm64 -o $@
+
+bin/mark_surfaces: tools/mark_surfaces.cpp | dirs
+	$(CXX) -O2 -std=c++17 -Wall -Wextra -I/opt/steamvr/tools/hellovr_vulkan_linux/src/openvr/headers $< -L/opt/steamvr/bin/linuxarm64 -lopenvr_api -Wl,-rpath=/opt/steamvr/bin/linuxarm64 -o $@
+
+bin/model_batch_to_v2: tools/model_batch_to_v2.cpp include/model_depth_geometry.hpp | dirs
+	$(CXX) -O2 -std=c++17 -Wall -Wextra -Iinclude $< -o $@
+
 bin/test_persistent_depth: tools/test_persistent_depth.cpp src/persistent_depth.cpp include/persistent_depth.hpp | dirs
 	$(CXX) -O3 -std=c++17 -Wall -Wextra -Iinclude tools/test_persistent_depth.cpp src/persistent_depth.cpp -o $@
 
@@ -144,8 +188,8 @@ bin/evaluate_occlusion_completion: tools/evaluate_occlusion_completion.cpp src/v
 bin/test_vulkan_stereo: tools/test_vulkan_stereo.cpp src/vulkan_stereo_pipeline.o | dirs $(SPV)
 	$(CXX) $(CXXFLAGS) tools/test_vulkan_stereo.cpp src/vulkan_stereo_pipeline.o -lvulkan -o $@
 
-bin/capture_rectified_pair: tools/capture_rectified_pair.cpp src/dma_capture.o src/vk_detile.o src/depth_pipeline.o | dirs
-	$(CXX) $(CXXFLAGS) tools/capture_rectified_pair.cpp src/dma_capture.o src/vk_detile.o src/depth_pipeline.o -lvulkan -lpthread -o $@
+bin/capture_rectified_pair: tools/capture_rectified_pair.cpp src/dma_capture.o src/timed_stereo_capture.o src/v4l2_capture_clock.o src/vk_detile.o src/depth_pipeline.o | dirs
+	$(CXX) $(CXXFLAGS) tools/capture_rectified_pair.cpp src/dma_capture.o src/timed_stereo_capture.o src/v4l2_capture_clock.o src/vk_detile.o src/depth_pipeline.o -lvulkan -lpthread -o $@
 
 shaders/occlusion_demo.frag.spv: shaders/occlusion_demo.frag
 	glslc -O $< -o $@
@@ -179,7 +223,7 @@ bin/analyze_occlusion_mesh: tools/analyze_occlusion_mesh.cpp include/occlusion_b
 	$(CXX) $(CXXFLAGS) $< -lpthread -o $@
 
 # The layer tests include its implementation to exercise intercepted calls.
-OCCLUSION_TEST_SUPPORT = src/vulkan_guarded_stereo_pipeline.o src/occlusion_renderer.o src/cloud_worker.o src/dma_capture.o src/vk_detile.o src/depth_pipeline.o src/vulkan_stereo_pipeline.o
+OCCLUSION_TEST_SUPPORT = src/vulkan_guarded_stereo_pipeline.o src/occlusion_renderer.o src/cloud_worker.o src/dma_capture.o src/timed_stereo_capture.o src/v4l2_capture_clock.o src/vk_detile.o src/depth_pipeline.o src/vulkan_stereo_pipeline.o
 bin/test_occlusion_renderer: tools/test_occlusion_renderer.cpp src/occlusion_renderer.o | dirs $(OCCLUSION_SPV)
 	$(CXX) $(CXXFLAGS) $^ -lvulkan -lpthread -o $@
 
@@ -195,7 +239,7 @@ bin/evaluate_occlusion_completion: include/occlusion_stage_diagnostics.hpp inclu
 bin/test_occlusion_history_events: tools/test_occlusion_history_events.cpp include/occlusion_surface.hpp | dirs
 	$(CXX) $(CXXFLAGS) $< -o $@
 
-bin/test_occlusion_capture_generation: tools/test_occlusion_capture_generation.cpp src/vulkan_guarded_stereo_pipeline.o src/cloud_worker.o src/dma_capture.o src/vk_detile.o src/depth_pipeline.o src/vulkan_stereo_pipeline.o | dirs $(SPV)
+bin/test_occlusion_capture_generation: tools/test_occlusion_capture_generation.cpp src/vulkan_guarded_stereo_pipeline.o src/cloud_worker.o src/dma_capture.o src/timed_stereo_capture.o src/v4l2_capture_clock.o src/vk_detile.o src/depth_pipeline.o src/vulkan_stereo_pipeline.o | dirs $(SPV)
 	$(CXX) $(CXXFLAGS) $^ -lvulkan -lpthread -o $@
 
 -include $(OCCLUSION_TEST_SUPPORT:.o=.d) $(wildcard bin/*.d)
@@ -222,8 +266,8 @@ bin/test_stereo_guarded: tools/test_stereo_guarded.cpp include/stereo_matcher_ex
 GUARDED_SPV = shaders/stereo_guarded_arms.spv shaders/stereo_guarded_seed.spv shaders/stereo_guarded_anchors.spv shaders/stereo_guarded_masks.spv shaders/stereo_guarded_match.spv
 GUARDED_DIAGNOSTIC_SPV = shaders/stereo_guarded_match_diagnostic.spv
 
-bin/preview_stereo_guarded: tools/preview_stereo_guarded.cpp src/overlay_renderer.o src/dma_capture.o src/vk_detile.o src/depth_pipeline.o src/vulkan_stereo_pipeline.o src/vulkan_guarded_stereo_pipeline.o include/stereo_matcher_experiment.hpp include/depth_speckle_filter.hpp | dirs $(SPV) $(GUARDED_SPV)
-	$(CXX) $(CXXFLAGS) tools/preview_stereo_guarded.cpp src/overlay_renderer.o src/dma_capture.o src/vk_detile.o src/depth_pipeline.o src/vulkan_stereo_pipeline.o src/vulkan_guarded_stereo_pipeline.o -L/opt/steamvr/bin/linuxarm64 -lopenvr_api -Wl,-rpath,/opt/steamvr/bin/linuxarm64 -lpthread -lm -lvulkan -o $@
+bin/preview_stereo_guarded: tools/preview_stereo_guarded.cpp src/overlay_renderer.o src/dma_capture.o src/timed_stereo_capture.o src/v4l2_capture_clock.o src/vk_detile.o src/depth_pipeline.o src/vulkan_stereo_pipeline.o src/vulkan_guarded_stereo_pipeline.o include/stereo_matcher_experiment.hpp include/depth_speckle_filter.hpp | dirs $(SPV) $(GUARDED_SPV)
+	$(CXX) $(CXXFLAGS) tools/preview_stereo_guarded.cpp src/overlay_renderer.o src/dma_capture.o src/timed_stereo_capture.o src/v4l2_capture_clock.o src/vk_detile.o src/depth_pipeline.o src/vulkan_stereo_pipeline.o src/vulkan_guarded_stereo_pipeline.o -L/opt/steamvr/bin/linuxarm64 -lopenvr_api -Wl,-rpath,/opt/steamvr/bin/linuxarm64 -lpthread -lm -lvulkan -o $@
 
 bin/test_vulkan_guarded: tools/test_vulkan_guarded.cpp src/vulkan_guarded_stereo_pipeline.o include/stereo_matcher_experiment.hpp include/vulkan_guarded_stereo_pipeline.hpp | dirs $(SPV) $(DIAGNOSTIC_SPV) $(GUARDED_SPV) $(GUARDED_DIAGNOSTIC_SPV)
 	$(CXX) $(CXXFLAGS) tools/test_vulkan_guarded.cpp src/vulkan_guarded_stereo_pipeline.o -lvulkan -o $@
@@ -241,8 +285,26 @@ bin/benchmark_stereo_guarded: tools/benchmark_stereo_guarded.cpp src/vulkan_guar
 bin/test_model_depth_geometry: tools/test_model_depth_geometry.cpp include/model_depth_geometry.hpp | dirs
 	$(CXX) $(CXXFLAGS) $< -o $@
 
-bin/test_model_depth_pipeline: tools/test_model_depth_pipeline.cpp src/model_depth_pipeline.o src/vulkan_stereo_pipeline.o | dirs $(SPV)
-	$(CXX) $(CXXFLAGS) tools/test_model_depth_pipeline.cpp src/model_depth_pipeline.o src/vulkan_stereo_pipeline.o -lvulkan -lpthread -o $@
+bin/test_depth_features: tools/test_depth_features.cpp src/depth_features.cpp include/depth_features.hpp include/depth_observation.hpp | dirs
+	$(CXX) $(CXXFLAGS) tools/test_depth_features.cpp src/depth_features.cpp -o $@
+
+bin/test_model_depth_pipeline: tools/test_model_depth_pipeline.cpp src/model_depth_pipeline.o src/model_temporal.o src/vulkan_stereo_pipeline.o | dirs $(SPV)
+	$(CXX) $(CXXFLAGS) tools/test_model_depth_pipeline.cpp src/model_depth_pipeline.o src/model_temporal.o src/vulkan_stereo_pipeline.o -lvulkan -lpthread -o $@
+
+bin/test_model_temporal: tools/test_model_temporal.cpp src/model_temporal.cpp include/model_temporal.hpp | dirs
+	$(CXX) $(CXXFLAGS) tools/test_model_temporal.cpp src/model_temporal.cpp -o $@
+
+bin/probe_timed_pairs: tools/probe_timed_pairs.cpp src/dma_capture.o src/timed_stereo_capture.o src/v4l2_capture_clock.o src/vk_detile.o | dirs
+	$(CXX) $(CXXFLAGS) $^ -lvulkan -lpthread -o $@
+
+bin/capture_model_inputs: tools/capture_model_inputs.cpp src/dma_capture.o src/timed_stereo_capture.o src/v4l2_capture_clock.o src/vk_detile.o src/depth_pipeline.o | dirs
+	$(CXX) $(CXXFLAGS) $^ -lvulkan -lpthread -o $@
+
+bin/rectify_raw_pair: tools/rectify_raw_pair.cpp src/depth_pipeline.o | dirs
+	$(CXX) $(CXXFLAGS) $^ -lpthread -o $@
+
+bin/probe_capture_timing: tools/probe_capture_timing.cpp src/dma_capture.o src/timed_stereo_capture.o src/v4l2_capture_clock.o src/vk_detile.o | dirs
+	$(CXX) $(CXXFLAGS) $^ -lvulkan -lpthread -o $@
 
 # Native learned-depth worker; all host/model dependencies are built from the monorepo.
 bin/frame_depth_worker: ../CMakeLists.txt ../hexecutor/host/cpp/executor.cpp ../hexecutor/host/cpp/frame_transport.cpp ../hexecutor/host/cpp/detail.hpp ../hexecutor/include/hexecutor/executor.hpp ../hexecutor/native/program/nprg2_runtime.c tools/frame_depth_worker.cpp include/depth_worker_protocol.hpp src/depth_worker_protocol.cpp ../depth-model/include/depth_model/deployment.hpp ../depth-model/deployment/cpp/package.cpp | dirs

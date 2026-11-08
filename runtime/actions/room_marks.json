@@ -1,0 +1,13 @@
+{
+  "default_bindings": [{"controller_type": "frame_controller", "binding_url": "room_marks_frame_controller.json"}],
+  "action_sets": [{"name": "/actions/marks", "usage": "leftright"}],
+  "actions": [
+    {"name": "/actions/marks/in/left_trigger", "type": "boolean"},
+    {"name": "/actions/marks/in/left_grip", "type": "boolean"},
+    {"name": "/actions/marks/in/right_trigger", "type": "boolean"},
+    {"name": "/actions/marks/in/right_grip", "type": "boolean"}
+  ],
+  "localization": [{"language_tag": "en_US", "/actions/marks": "Room surface marks",
+    "/actions/marks/in/left_trigger": "Mark left", "/actions/marks/in/left_grip": "Label left",
+    "/actions/marks/in/right_trigger": "Mark right", "/actions/marks/in/right_grip": "Label right"}]
+}

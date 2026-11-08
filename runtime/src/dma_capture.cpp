@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <algorithm>
+#include <string>
 
 #ifndef __NR_pidfd_open
 #define __NR_pidfd_open 434
@@ -68,16 +69,20 @@ bool DMACapture::autoDiscoverCameraGroups(pid_t compositorPid,
         }
     }
     closedir(dir);
-    if (!splitCameraGroups(camBuffers, VkYDetile::kMaxSlots, outRightFds, outLeftFds)) {
+    // Keep both candidate pools when initialization can check which one is live.
+    const size_t slotsPerEye = camBuffers.size() == 4 * VkYDetile::kMaxSlots
+        ? 2 * VkYDetile::kMaxSlots : VkYDetile::kMaxSlots;
+    if (!splitCameraGroups(camBuffers, slotsPerEye, outRightFds, outLeftFds)) {
         std::cerr << "[DMACapture] Failed to find camera dmabufs (found " << camBuffers.size() << ")" << std::endl;
         return false;
     }
     if (camBuffers.size() > outRightFds.size() + outLeftFds.size())
         std::cout << "[DMACapture] Ignoring " << camBuffers.size() - outRightFds.size() - outLeftFds.size()
                   << " older camera dmabufs" << std::endl;
-    std::cout << "[DMACapture] Right slots:";
+    std::cout << (slotsPerEye == VkYDetile::kMaxSlots
+        ? "[DMACapture] Right slots:" : "[DMACapture] First pool:");
     for (int fd : outRightFds) std::cout << " " << fd;
-    std::cout << " | Left slots:";
+    std::cout << (slotsPerEye == VkYDetile::kMaxSlots ? " | Left slots:" : " | Second pool:");
     for (int fd : outLeftFds) std::cout << " " << fd;
     std::cout << std::endl;
     return true;
@@ -112,7 +117,49 @@ bool DMACapture::initialize(pid_t compositorPid, int rightFd, int leftFd) {
         m_localLeftFds.push_back(local);
     }
 
-    if (!m_detile.importStereoGroups(m_localLeftFds, m_localRightFds)) {
+    std::vector<int> selectedRight = m_localRightFds, selectedLeft = m_localLeftFds;
+    if (rightFd <= 0 && leftFd <= 0 && m_localRightFds.size() == 8 && m_localLeftFds.size() == 8) {
+        // Each 8-buffer pool has 4 right and 4 left slots. Select the one
+        // with image content in both eyes, regardless of allocation order.
+        const auto active = [&](const std::vector<int>& pool) {
+            const std::vector<int> r(pool.begin(), pool.begin() + 4), l(pool.begin() + 4, pool.end());
+            if (!m_detile.importStereoGroups(l, r) || !m_detile.copyYPlanes(false)) return false;
+            const auto nonzero = [&](const uint8_t* d) {
+                return d && std::any_of(d, d + size_t(m_detile.width()) * m_detile.height(), [](uint8_t v) { return v != 0; });
+            };
+            return nonzero(m_detile.leftY()) && nonzero(m_detile.rightY());
+        };
+        const bool first = active(m_localRightFds), second = active(m_localLeftFds);
+        if (first == second) {
+            std::cerr << "[DMACapture] Ambiguous 16-buffer camera pools; refusing to guess eye pairing" << std::endl;
+            release();
+            return false;
+        }
+        const auto& pool = first ? m_localRightFds : m_localLeftFds;
+        selectedRight.assign(pool.begin(), pool.begin() + 4);
+        selectedLeft.assign(pool.begin() + 4, pool.end());
+        std::cout << "[DMACapture] 16 buffers: selected active pool " << (first ? 0 : 1) << std::endl;
+    } else if (rightFd <= 0 && leftFd <= 0 && (m_localRightFds.size() != 4 || m_localLeftFds.size() != 4)) {
+        std::cerr << "[DMACapture] Unsupported camera FD count " << m_localRightFds.size() << "+"
+                  << m_localLeftFds.size() << "; refusing to guess eye pairing" << std::endl;
+        release();
+        return false;
+    }
+
+    if (const char* timing = std::getenv("FRAME_CAPTURE_TIMING"); timing && std::string(timing) == "v4l2") {
+        try {
+            m_timed = std::make_unique<TimedStereoCapture>(selectedLeft, selectedRight, 2464, 2464);
+        } catch (const std::exception& e) {
+            std::cerr << "[DMACapture] V4L2-timed capture unavailable: " << e.what() << std::endl;
+            release();
+            return false;
+        }
+        m_isReady = true;
+        std::cout << "[DMACapture] Hardware cameras bound; V4L2-sequence-paired capture (E02b)" << std::endl;
+        return true;
+    }
+
+    if (!m_detile.importStereoGroups(selectedLeft, selectedRight)) {
         std::cerr << "[DMACapture] Vulkan UBWC import/detile failed" << std::endl;
         release();
         return false;
@@ -131,21 +178,35 @@ bool DMACapture::initialize(pid_t compositorPid, int rightFd, int leftFd) {
 
 bool DMACapture::captureFrame(bool includeUV, bool leftOnly) {
     if (!m_isReady) return false;
+    if (m_timed) {
+        // Timed capture verifies both eyes against the same sequence.
+        TimedStereoPair pair;
+        if (!m_timed->acquire(pair, 200, includeUV)) {
+            const auto error = m_timed->error();
+            if (!error.empty()) std::cerr << "[DMACapture] timed capture error: " << error << std::endl;
+            return false;
+        }
+        m_timedPair = pair;
+        return true;
+    }
     return m_detile.copyYPlanes(includeUV, leftOnly);
 }
 
-const uint8_t* DMACapture::getLeftBuffer() const { return m_activeDetile ? m_activeDetile->leftY() : nullptr; }
-const uint8_t* DMACapture::getRightBuffer() const { return m_activeDetile ? m_activeDetile->rightY() : nullptr; }
-const uint8_t* DMACapture::getLeftUV() const { return m_activeDetile ? m_activeDetile->leftUV() : nullptr; }
-const uint8_t* DMACapture::getRightUV() const { return m_activeDetile ? m_activeDetile->rightUV() : nullptr; }
-uint64_t DMACapture::leftHash() const { return m_activeDetile ? m_activeDetile->leftHash() : 0; }
-uint64_t DMACapture::rightHash() const { return m_activeDetile ? m_activeDetile->rightHash() : 0; }
-int DMACapture::leftSlot() const { return m_activeDetile ? m_activeDetile->leftSlot() : -1; }
-int DMACapture::rightSlot() const { return m_activeDetile ? m_activeDetile->rightSlot() : -1; }
-int DMACapture::width() const { return m_activeDetile ? m_activeDetile->width() : 0; }
-int DMACapture::height() const { return m_activeDetile ? m_activeDetile->height() : 0; }
+// In timed mode the "hash" is the shared camera sequence: equal values mean the same frame.
+const uint8_t* DMACapture::getLeftBuffer() const { return m_timed ? m_timed->leftY() : m_activeDetile ? m_activeDetile->leftY() : nullptr; }
+const uint8_t* DMACapture::getRightBuffer() const { return m_timed ? m_timed->rightY() : m_activeDetile ? m_activeDetile->rightY() : nullptr; }
+const uint8_t* DMACapture::getLeftUV() const { return m_timed ? m_timed->leftUV() : m_activeDetile ? m_activeDetile->leftUV() : nullptr; }
+const uint8_t* DMACapture::getRightUV() const { return m_timed ? m_timed->rightUV() : m_activeDetile ? m_activeDetile->rightUV() : nullptr; }
+uint64_t DMACapture::leftHash() const { return m_timed ? m_timedPair.sequence : m_activeDetile ? m_activeDetile->leftHash() : 0; }
+uint64_t DMACapture::rightHash() const { return m_timed ? m_timedPair.sequence : m_activeDetile ? m_activeDetile->rightHash() : 0; }
+int DMACapture::leftSlot() const { return m_timed ? m_timedPair.leftSlot : m_activeDetile ? m_activeDetile->leftSlot() : -1; }
+int DMACapture::rightSlot() const { return m_timed ? m_timedPair.rightSlot : m_activeDetile ? m_activeDetile->rightSlot() : -1; }
+int DMACapture::width() const { return m_timed ? 2464 : m_activeDetile ? m_activeDetile->width() : 0; }
+int DMACapture::height() const { return m_timed ? 2464 : m_activeDetile ? m_activeDetile->height() : 0; }
 
 void DMACapture::release() {
+    m_timed.reset();
+    m_timedPair = {};
     m_detile.release();
     m_activeDetile = nullptr;
     m_isReady = false;

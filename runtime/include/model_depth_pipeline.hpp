@@ -64,6 +64,8 @@ public:
     const std::vector<float>& lastDisparity() const {return disparity_;}
     const std::vector<uint8_t>& lastUncertainty() const {return uncertainty_;}
     float lastComputeMs() const {return milliseconds_;}
+    // CPU disparity validation, metric reprojection and confidence expansion.
+    float lastPostprocessMs() const {return postprocessMs_;}
     const std::string& lastError() const {return error_;}
 private:
     bool transfer(void* data,size_t bytes,bool sending);
@@ -93,6 +95,7 @@ private:
     uint32_t recordLimit_=0,recorded_=0;
     uint32_t sequence_=0;
     float milliseconds_=0;
+    float postprocessMs_=0;
     std::string error_;
 };
 }

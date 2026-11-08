@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Room mesh comparison</title>
+<style>
+  :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #11171c; color: #e7ecef; }
+  * { box-sizing: border-box; }
+  body { margin: 0; }
+  header { padding: 18px 24px 12px; border-bottom: 1px solid #354049; display: flex; align-items: baseline; gap: 20px; }
+  h1 { font-size: 20px; margin: 0; font-weight: 620; }
+  header span, .hint, .meta { color: #a8b5bf; font-size: 13px; }
+  .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 20px; padding: 12px 24px; }
+  button, select, .file-label { border: 1px solid #53626d; border-radius: 5px; background: #202a31; color: inherit; padding: 7px 9px; font: inherit; font-size: 13px; }
+  button, .file-label { cursor: pointer; }
+  button:hover, .file-label:hover { background: #30404a; }
+  label { font-size: 13px; }
+  input[type=file] { display: none; }
+  .panels { display: grid; grid-template-columns: 1fr 1fr; min-height: calc(100vh - 145px); border-top: 1px solid #354049; }
+  .panel { min-width: 0; display: flex; flex-direction: column; }
+  .panel + .panel { border-left: 1px solid #354049; }
+  .panel-head { padding: 12px 16px; display: flex; align-items: center; gap: 10px; }
+  .panel-head strong { min-width: 74px; font-size: 13px; }
+  select { flex: 1; min-width: 0; max-width: 100%; }
+  .stage { position: relative; flex: 1; min-height: 360px; }
+  canvas { width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+  .readout { position: absolute; bottom: 12px; left: 14px; right: 14px; pointer-events: none; font-size: 12px; color: #dbe6eb; text-shadow: 0 1px 3px #000; }
+  .readout.error { color: #ff9f93; }
+  @media (max-width: 800px) { .panels { grid-template-columns: 1fr; } .panel + .panel { border-left: 0; border-top: 1px solid #354049; } .stage { height: 42vh; flex: none; } }
+</style>
+</head>
+<body>
+<header><h1>Room mesh comparison</h1><span>Local PLY outputs · synchronized camera</span></header>
+<div class="toolbar">
+  <button id="refresh">Refresh meshes</button>
+  <button id="fit">Fit both</button>
+  <label><input id="wire" type="checkbox"> Show edges</label>
+  <label class="file-label" for="files">Open PLY files</label><input id="files" type="file" accept=".ply" multiple>
+  <span class="hint">Drag to orbit · wheel to zoom · double-click to fit</span>
+</div>
+<div class="panels">
+  <section class="panel"><div class="panel-head"><strong>Reference</strong><select id="select0" aria-label="Reference mesh"></select></div><div class="stage"><canvas id="view0"></canvas><div class="readout" id="info0"></div></div></section>
+  <section class="panel"><div class="panel-head"><strong>Candidate</strong><select id="select1" aria-label="Candidate mesh"></select></div><div class="stage"><canvas id="view1"></canvas><div class="readout" id="info1"></div></div></section>
+</div>
+<script>
+"use strict";
+const select = [document.getElementById("select0"), document.getElementById("select1")];
+const info = [document.getElementById("info0"), document.getElementById("info1")];
+const canvas = [document.getElementById("view0"), document.getElementById("view1")];
+const colors = [[0.34,0.69,0.87], [0.96,0.63,0.35]];
+const camera = {center:[0,0,2], yaw:-0.65, pitch:0.3, distance:3};
+const meshes = [null, null], views = [], loadedVersion = [null, null];
+let catalog = [], localFiles = new Map(), dirty = true;
+
+function parsePly(text) {
+  const lines = text.split(/\r?\n/);
+  if (lines[0].trim() !== "ply") throw Error("Expected a PLY file");
+  let vertexCount = 0, faceCount = 0, inVertices = false, format = false, end = -1;
+  const properties = [];
+  for (let i=1; i<lines.length; i++) {
+    const line = lines[i].trim();
+    if (line === "end_header") { end=i+1; break; }
+    const words = line.split(/\s+/);
+    if (words[0] === "format") format = words[1] === "ascii";
+    if (words[0] === "element") {
+      inVertices = words[1] === "vertex";
+      if (inVertices) vertexCount = Number(words[2]);
+      if (words[1] === "face") faceCount = Number(words[2]);
+    }
+    if (words[0] === "property" && inVertices) properties.push(words.at(-1));
+  }
+  if (!format || end < 0) throw Error("This viewer supports ASCII PLY files");
+  if (!vertexCount || vertexCount > 3000000 || faceCount > 3000000) throw Error("Invalid or oversized PLY");
+  const xi=properties.indexOf("x"), yi=properties.indexOf("y"), zi=properties.indexOf("z");
+  if (Math.min(xi,yi,zi) < 0) throw Error("PLY needs x, y, z vertex properties");
+  const vertices = new Float32Array(vertexCount*3);
+  const lo=[Infinity,Infinity,Infinity], hi=[-Infinity,-Infinity,-Infinity];
+  for (let i=0; i<vertexCount; i++) {
+    const fields=lines[end+i].trim().split(/\s+/);
+    const p=[Number(fields[xi]),Number(fields[yi]),Number(fields[zi])];
+    if (!p.every(Number.isFinite)) throw Error("Nonfinite vertex coordinate");
+    for (let k=0;k<3;k++) { vertices[i*3+k]=p[k]; lo[k]=Math.min(lo[k],p[k]); hi[k]=Math.max(hi[k],p[k]); }
+  }
+  const positions=[], normals=[], edges=[];
+  let triangles=0;
+  for (let i=0;i<faceCount;i++) {
+    const fields=lines[end+vertexCount+i].trim().split(/\s+/).map(Number);
+    const n=fields[0];
+    if (!Number.isInteger(n) || n<3 || n>64) throw Error("Invalid PLY face");
+    for (let j=1;j<n-1;j++) {
+      const ids=[fields[1], fields[1+j], fields[2+j]];
+      if (ids.some(id=>!Number.isInteger(id) || id<0 || id>=vertexCount)) throw Error("Face index out of range");
+      const p=ids.map(id=>[vertices[id*3],vertices[id*3+1],vertices[id*3+2]]);
+      const a=p[0], b=p[1], c=p[2];
+      const u=[b[0]-a[0],b[1]-a[1],b[2]-a[2]], v=[c[0]-a[0],c[1]-a[1],c[2]-a[2]];
+      const cross=[u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]];
+      const length=Math.hypot(...cross) || 1, normal=cross.map(x=>x/length);
+      for(const q of p) { positions.push(...q); normals.push(...normal); }
+      edges.push(...a,...b,...b,...c,...c,...a); triangles++;
+    }
+  }
+  return {positions:faceCount ? new Float32Array(positions) : vertices,
+          normals:new Float32Array(normals), edges:new Float32Array(edges),
+          pointCloud:faceCount===0, triangles, vertices:vertexCount, lo, hi};
+}
+
+function shader(gl, type, source) {
+  const s=gl.createShader(type); gl.shaderSource(s,source); gl.compileShader(s);
+  if (!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw Error(gl.getShaderInfoLog(s)); return s;
+}
+function setupView(element) {
+  const gl=element.getContext("webgl2",{antialias:true});
+  if (!gl) throw Error("WebGL2 is unavailable in this browser");
+  const vs=shader(gl,gl.VERTEX_SHADER,`#version 300 es
+    precision highp float; in vec3 aPosition; in vec3 aNormal;
+    uniform vec3 uEye,uRight,uUp,uForward; uniform float uAspect,uTanHalf,uNear,uFar;
+    out vec3 vNormal;
+    void main(){ vec3 q=aPosition-uEye; float x=dot(q,uRight),y=dot(q,uUp),z=dot(q,uForward);
+      gl_Position=vec4(x/(uAspect*uTanHalf),y/uTanHalf,((uFar+uNear)*z-2.0*uFar*uNear)/(uFar-uNear),z);
+      gl_PointSize=3.0; vNormal=aNormal; }`);
+  const fs=shader(gl,gl.FRAGMENT_SHADER,`#version 300 es
+    precision highp float; in vec3 vNormal; uniform vec3 uColor; uniform bool uFlat; out vec4 outColor;
+    void main(){ float light=uFlat?1.0:(0.35+0.65*abs(dot(normalize(vNormal),normalize(vec3(0.45,0.8,0.6)))));
+      outColor=vec4(uColor*light,1.0); }`);
+  const program=gl.createProgram(); gl.attachShader(program,vs); gl.attachShader(program,fs); gl.linkProgram(program);
+  if (!gl.getProgramParameter(program,gl.LINK_STATUS)) throw Error(gl.getProgramInfoLog(program));
+  return {gl,program,attrs:{pos:gl.getAttribLocation(program,"aPosition"),norm:gl.getAttribLocation(program,"aNormal")},
+          uniforms:Object.fromEntries(["uEye","uRight","uUp","uForward","uAspect","uTanHalf","uNear","uFar","uColor","uFlat"].map(x=>[x,gl.getUniformLocation(program,x)])),
+          buffers:null};
+}
+function buffer(gl,data){ const b=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,b); gl.bufferData(gl.ARRAY_BUFFER,data,gl.STATIC_DRAW); return b; }
+function setMesh(index,mesh){
+  if(!views[index])throw Error("WebGL2 is unavailable in this browser");
+  const view=views[index], gl=view.gl;
+  if(view.buffers) for(const b of Object.values(view.buffers)) gl.deleteBuffer(b);
+  view.buffers={pos:buffer(gl,mesh.positions),norm:buffer(gl,mesh.normals),edge:buffer(gl,mesh.edges)};
+  meshes[index]=mesh; dirty=true;
+  info[index].classList.remove("error");
+  info[index].textContent=`${mesh.triangles.toLocaleString()} triangles · ${mesh.vertices.toLocaleString()} vertices · X ${mesh.lo[0].toFixed(2)}–${mesh.hi[0].toFixed(2)} m`;
+}
+const sub=(a,b)=>a.map((x,i)=>x-b[i]);
+const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+const norm=a=>{const l=Math.hypot(...a)||1;return a.map(x=>x/l);};
+function draw(index){
+  if(!views[index])return;
+  const view=views[index], gl=view.gl, element=canvas[index], mesh=meshes[index];
+  const dpr=Math.min(devicePixelRatio||1,2), width=Math.max(1,Math.round(element.clientWidth*dpr)), height=Math.max(1,Math.round(element.clientHeight*dpr));
+  if(element.width!==width || element.height!==height){element.width=width;element.height=height;}
+  gl.viewport(0,0,width,height); gl.clearColor(0.07,0.10,0.12,1); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  if(!mesh) return;
+  gl.enable(gl.DEPTH_TEST); gl.useProgram(view.program);
+  const c=camera, eye=[c.center[0]+c.distance*Math.sin(c.yaw)*Math.cos(c.pitch),c.center[1]+c.distance*Math.sin(c.pitch),c.center[2]+c.distance*Math.cos(c.yaw)*Math.cos(c.pitch)];
+  const forward=norm(sub(c.center,eye)), right=norm(cross(forward,[0,1,0])), up=norm(cross(right,forward));
+  const u=view.uniforms;
+  gl.uniform3fv(u.uEye,eye); gl.uniform3fv(u.uRight,right); gl.uniform3fv(u.uUp,up); gl.uniform3fv(u.uForward,forward);
+  gl.uniform1f(u.uAspect,width/height); gl.uniform1f(u.uTanHalf,Math.tan(Math.PI/6)); gl.uniform1f(u.uNear,0.01); gl.uniform1f(u.uFar,Math.max(100,c.distance*20));
+  gl.uniform3fv(u.uColor,colors[index]); gl.uniform1i(u.uFlat,mesh.pointCloud?1:0);
+  gl.bindBuffer(gl.ARRAY_BUFFER,view.buffers.pos); gl.enableVertexAttribArray(view.attrs.pos); gl.vertexAttribPointer(view.attrs.pos,3,gl.FLOAT,false,0,0);
+  if(mesh.pointCloud){gl.disableVertexAttribArray(view.attrs.norm);gl.vertexAttrib3f(view.attrs.norm,0,1,0);gl.drawArrays(gl.POINTS,0,mesh.vertices);}
+  else {gl.bindBuffer(gl.ARRAY_BUFFER,view.buffers.norm);gl.enableVertexAttribArray(view.attrs.norm);gl.vertexAttribPointer(view.attrs.norm,3,gl.FLOAT,false,0,0);gl.enable(gl.POLYGON_OFFSET_FILL);gl.polygonOffset(1,1);gl.drawArrays(gl.TRIANGLES,0,mesh.triangles*3);gl.disable(gl.POLYGON_OFFSET_FILL);}
+  if(document.getElementById("wire").checked && mesh.triangles){
+    gl.uniform3fv(u.uColor,[0.07,0.08,0.09]);gl.uniform1i(u.uFlat,1);gl.disableVertexAttribArray(view.attrs.norm);
+    gl.vertexAttrib3f(view.attrs.norm,0,1,0);gl.bindBuffer(gl.ARRAY_BUFFER,view.buffers.edge);
+    gl.vertexAttribPointer(view.attrs.pos,3,gl.FLOAT,false,0,0);gl.drawArrays(gl.LINES,0,mesh.triangles*6);
+  }
+}
+function render(){if(dirty){draw(0);draw(1);dirty=false;}requestAnimationFrame(render);} 
+function fit(){
+  const active=meshes.filter(Boolean); if(!active.length)return;
+  const lo=[0,1,2].map(k=>Math.min(...active.map(m=>m.lo[k]))),hi=[0,1,2].map(k=>Math.max(...active.map(m=>m.hi[k])));
+  camera.center=lo.map((x,k)=>(x+hi[k])/2);camera.distance=Math.max(0.35,Math.hypot(...sub(hi,lo))*1.35);dirty=true;
+}
+async function load(index){
+  const key=select[index].value;if(!key)return;
+  info[index].textContent="Loading mesh…";
+  try{
+    const text=key.startsWith("local:") ? await localFiles.get(key).text() : await fetch("/api/mesh?path="+encodeURIComponent(key),{cache:"no-store"}).then(r=>{if(!r.ok)throw Error(`HTTP ${r.status}`);return r.text();});
+    setMesh(index,parsePly(text)); if(!meshes[1-index])fit();
+    loadedVersion[index]=catalog.find(item=>item.path===key)?.modified_ns ?? null;
+  }catch(e){info[index].classList.add("error");info[index].textContent=String(e.message||e);}
+}
+function populate(index,previous){
+  select[index].replaceChildren();
+  for(const item of catalog){const option=new Option(item.path,item.path);select[index].add(option);}
+  for(const [key,file] of localFiles){const option=new Option(file.name+" (local)",key);select[index].add(option);}
+  if(previous && [...select[index].options].some(o=>o.value===previous))select[index].value=previous;
+}
+async function refresh(){
+  const previous=select.map(s=>s.value);
+  try{catalog=await fetch("/api/meshes",{cache:"no-store"}).then(r=>r.json());}
+  catch(e){info[0].classList.add("error");info[0].textContent="Cannot load mesh list: "+e.message;return;}
+  populate(0,previous[0]);populate(1,previous[1]);
+  if(!previous[0]){
+    const a=catalog.find(x=>x.path.endsWith("/wall-raw.ply"));
+    const b=catalog.find(x=>x.path.endsWith("/wall-grown.ply"));
+    if(a && b){select[0].value=a.path;select[1].value=b.path;}
+  }
+  for(let i=0;i<2;i++){
+    const key=select[i].value, version=catalog.find(item=>item.path===key)?.modified_ns ?? null;
+    if(key && (key!==previous[i] || (version!==null && version!==loadedVersion[i])))await load(i);
+  }
+  if(!previous[0] && meshes[0] && meshes[1])fit();
+}
+for(let i=0;i<2;i++){
+  try{views[i]=setupView(canvas[i]);}catch(e){info[i].classList.add("error");info[i].textContent=e.message;}
+  select[i].addEventListener("change",()=>load(i));
+  let last=null;
+  canvas[i].addEventListener("pointerdown",e=>{last=[e.clientX,e.clientY];canvas[i].setPointerCapture(e.pointerId);});
+  canvas[i].addEventListener("pointerup",()=>last=null);
+  canvas[i].addEventListener("pointermove",e=>{if(!last)return;camera.yaw+=(e.clientX-last[0])*0.008;camera.pitch=Math.max(-1.5,Math.min(1.5,camera.pitch+(e.clientY-last[1])*0.008));last=[e.clientX,e.clientY];dirty=true;});
+  canvas[i].addEventListener("wheel",e=>{e.preventDefault();camera.distance=Math.max(0.08,Math.min(100,camera.distance*Math.exp(e.deltaY*0.001)));dirty=true;},{passive:false});
+  canvas[i].addEventListener("dblclick",fit);
+}
+document.getElementById("refresh").onclick=refresh;
+document.getElementById("fit").onclick=fit;
+document.getElementById("wire").onchange=()=>dirty=true;
+document.getElementById("files").onchange=e=>{const before=select.map(s=>s.value);for(const file of e.target.files)localFiles.set("local:"+file.name+":"+file.lastModified,file);populate(0,before[0]);populate(1,before[1]);for(let i=0;i<2;i++)if(!meshes[i]&&select[i].value)load(i);};
+new ResizeObserver(()=>dirty=true).observe(document.querySelector(".panels"));
+refresh();setInterval(refresh,15000);render();
+</script>
+</body>
+</html>

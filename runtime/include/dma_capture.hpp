@@ -2,6 +2,8 @@
 
 #include "spatial_types.hpp"
 #include "vk_detile.hpp"
+#include "timed_stereo_capture.hpp"
+#include <memory>
 #include <sys/types.h>
 #include <cstddef>
 #include <cstdint>
@@ -38,6 +40,12 @@ public:
                                          std::vector<int>& outLeftFds);
     static pid_t findCompositorPid();
 
+    // FRAME_CAPTURE_TIMING=v4l2 (E02b): pairs share one V4L2 camera sequence and carry
+    // kernel end-of-readout times. Null in the legacy hash-selected mode.
+    const TimedStereoPair* timedPair() const { return m_timed && m_timedPair.valid ? &m_timedPair : nullptr; }
+    bool timedMode() const { return bool(m_timed); }
+    TimedStereoStats timedStats() const { return m_timed ? m_timed->stats() : TimedStereoStats{}; }
+
 private:
     pid_t m_compositorPid;
     int m_pidFd;
@@ -47,6 +55,8 @@ private:
     bool m_isReady;
     VkYDetile m_detile;
     VkYDetile* m_activeDetile;
+    std::unique_ptr<TimedStereoCapture> m_timed;
+    TimedStereoPair m_timedPair;
 };
 
 } // namespace FrameSpatial

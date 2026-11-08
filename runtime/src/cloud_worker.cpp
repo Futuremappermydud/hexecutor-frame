@@ -19,6 +19,8 @@
 #include "vulkan_stereo_pipeline.hpp"
 #include "vulkan_guarded_stereo_pipeline.hpp"
 #include "model_depth_pipeline.hpp"
+#include "model_depth_geometry.hpp"
+#include "ir_dot_refine.hpp"
 
 #include <algorithm>
 #include <array>
@@ -28,6 +30,8 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <iomanip>
+#include <filesystem>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -304,6 +308,7 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
     FrameSpatial::VulkanStereoPipeline baselineStereo;
     FrameSpatial::VulkanGuardedStereoPipeline guardedStereo;
     FrameSpatial::ModelDepthPipeline modelStereo;
+    FrameSpatial::IrDotRefine irDot;
     // Capture-time pose of the previous Model pair, for the temporal warp.
     TimedHeadPose previousModelPose;
     bool previousModelAtCapture = false;
@@ -325,10 +330,56 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
         gRunning.store(false);
         return;
     }
+    const auto rectifiedCameraPose = [&rectifier](const XrPosef& headPose) {
+        const int cx = int(FrameSpatial::RECT_CX), cy = int(FrameSpatial::RECT_CY);
+        const int f = int(FrameSpatial::RECT_FOCAL);
+        const auto origin = rectifier.rectifiedPointInHead(cx, cy, 0);
+        const auto forward = rectifier.rectifiedPointInHead(cx, cy, 1);
+        const auto rightAxis = rectifier.rectifiedPointInHead(cx + f, cy, 1);
+        const auto downAxis = rectifier.rectifiedPointInHead(cx, cy + f, 1);
+        std::array<float, 3> columns[3];
+        for (int i = 0; i < 3; ++i) {
+            columns[0][i] = rightAxis[i] - forward[i];
+            columns[1][i] = downAxis[i] - forward[i];
+            columns[2][i] = forward[i] - origin[i];
+        }
+        FrameSpatial::TsdfPose pose{};
+        for (int col = 0; col < 3; ++col) {
+            const auto world = rotateVector(headPose.orientation, columns[col]);
+            for (int row = 0; row < 3; ++row) pose.rotation[row][col] = world[row];
+        }
+        const auto originWorld = rotateVector(headPose.orientation, origin);
+        pose.translation[0] = headPose.position.x + originWorld[0];
+        pose.translation[1] = headPose.position.y + originWorld[1];
+        pose.translation[2] = headPose.position.z + originWorld[2];
+        return pose;
+    };
+    irDot.setPoseLocator([&rectifiedCameraPose](int64_t monotonicNs, FrameSpatial::TsdfPose& pose) {
+        if (!gLocateSpace || !gConvertTimespecTime || gXrInstance == XR_NULL_HANDLE ||
+            gViewSpace == XR_NULL_HANDLE || gStageSpace == XR_NULL_HANDLE)
+            return false;
+        timespec when{};
+        when.tv_sec = monotonicNs / 1000000000ll;
+        when.tv_nsec = monotonicNs % 1000000000ll;
+        XrTime time = 0;
+        XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+        const XrSpaceLocationFlags required =
+            XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+        if (XR_FAILED(gConvertTimespecTime(gXrInstance, &when, &time)) ||
+            XR_FAILED(gLocateSpace(gViewSpace, gStageSpace, time, &location)) ||
+            (location.locationFlags & required) != required)
+            return false;
+        pose = rectifiedCameraPose(location.pose);
+        return true;
+    });
+    if (model && !irDot.initialize()) {
+        std::cerr << "[Cloud] IR-dot refine disabled: " << irDot.lastError() << std::endl;
+    }
     std::cout << "[Cloud] Stereo matcher: "
               << (model ? "Model learned depth (experimental, census-validated disparity)"
                        : sgbm ? "sgbm, persistent confirmed voxels"
                        : guarded ? "guarded GPU g3/e1 (experimental)" : "baseline GPU")
+              << (model && irDot.active() ? " + IR-dot refine" : "")
               << std::endl;
 
     constexpr float kVoxelSize = 0.020f;
@@ -351,8 +402,24 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
     constexpr size_t kTsdfMaxTriangles = 480000;  // renderer holds 1.5M mesh vertices
     double tsdfIntegrateMs = 0, tsdfMeshMs = 0;
     size_t tsdfTriangles = 0;
+    FrameSpatial::DepthFilterWorkspace meshFilterWorkspace;
+    FrameSpatial::DepthSpeckleWorkspace speckleWorkspace;
+    std::vector<FrameSpatial::TsdfVertex> tsdfMeshScratch;
+    std::vector<PointVertex> meshPublicationScratch;
 
     uint32_t frame = 0;
+    const bool boundedModelCapture=model && std::getenv("FRAME_DEPTH_RECORD_V2");
+    const std::string liveRgbDirectory=std::getenv("FRAME_ROOM_RGB_DIR") ? std::getenv("FRAME_ROOM_RGB_DIR") : "";
+    const std::string roomStopFile=std::getenv("FRAME_ROOM_STOP_FILE") ? std::getenv("FRAME_ROOM_STOP_FILE") : "";
+    const uint32_t modelCaptureLimit=boundedModelCapture ?
+        uint32_t(std::max(0,std::atoi(std::getenv("FRAME_DEPTH_RECORD_FRAMES") ?
+                                   std::getenv("FRAME_DEPTH_RECORD_FRAMES") : "200"))) : 0;
+    const auto modelCaptureSpacing=std::chrono::milliseconds(boundedModelCapture ?
+        std::max(0,std::atoi(std::getenv("FRAME_ROOM_SPACING_MS") ?
+                             std::getenv("FRAME_ROOM_SPACING_MS") : "0")) : 0);
+    const auto modelCaptureIdle=std::max(std::chrono::milliseconds(4000),
+                                         modelCaptureSpacing+std::chrono::milliseconds(2000));
+    auto lastModelCapture=std::chrono::steady_clock::now();
     double lastVisibilityCheck = 0.0;
     uint64_t totalPurged = 0;
     uint64_t lastLeftHash = 0, lastRightHash = 0;
@@ -430,6 +497,20 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
     }
     uint64_t historyGeneration=gCaptureGeneration.load();
     while (gRunning.load()) {
+        if(!roomStopFile.empty() && std::filesystem::exists(roomStopFile)) {
+            std::cout<<"[RoomDataset] stop requested at depth frame boundary"<<std::endl;
+            gRunning.store(false);
+            break;
+        }
+        if(boundedModelCapture && modelCaptureLimit && Clock::now()-lastModelCapture>modelCaptureIdle) {
+            std::cout<<"[ModelDepth] capture idle for 4 s; stopping before DSP idle shutdown"<<std::endl;
+            gRunning.store(false);
+            break;
+        }
+        if(boundedModelCapture && frame>0 && Clock::now()-lastModelCapture<modelCaptureSpacing) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
         const uint64_t captureGeneration=gCaptureGeneration.load();
         timingProfile.reportEvents(false,captureGeneration);
         if(gOcclusionOnly && resetOcclusionHistoryOnCaptureChange(occlusionHistory,historyGeneration)) {
@@ -480,7 +561,15 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
                                     1000000000ll + captureStart.tv_nsec;
             const int64_t endNs = static_cast<int64_t>(captureEnd.tv_sec) *
                                   1000000000ll + captureEnd.tv_nsec;
-            const int64_t middleNs = startNs + (endNs - startNs) / 2;
+            // E02b: with V4L2-paired capture, locate the pose at the estimated
+            // image-centre exposure (end of readout minus a fitted offset)
+            // instead of the midpoint of our DMA read.
+            const auto* timed = capture->timedPair();
+            static const int64_t exposureOffsetNs = int64_t(1e6 * std::atof(
+                std::getenv("FRAME_EXPOSURE_OFFSET_MS") ? std::getenv("FRAME_EXPOSURE_OFFSET_MS") : "8"));
+            const int64_t middleNs = timed && timed->leftEndOfReadoutNs > 0
+                ? timed->leftEndOfReadoutNs - exposureOffsetNs
+                : startNs + (endNs - startNs) / 2;
             timespec midpoint{};
             midpoint.tv_sec = middleNs / 1000000000ll;
             midpoint.tv_nsec = middleNs % 1000000000ll;
@@ -509,6 +598,7 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
             if(gOcclusionOnly) clearPublishedCloud();
             occlusionHistory.reset();
             previousOcclusionPose.valid = false;
+            previousModelAtCapture = false;  // the next pair must not warp across the loss
             continue;
         }
 
@@ -519,6 +609,23 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
         metadata.timings[FrameSpatial::OcclusionBenchmark::Capture]=float((metadata.captureEndNs-metadata.captureBeginNs)*1e-6);
         auto stageStart=Clock::now();
         rectifier.rectify(capture->getLeftBuffer(), capture->getRightBuffer());
+        if(boundedModelCapture) {
+            // Calibration provenance: the exact XRService history the rectifier loaded.
+            static bool calibrationSaved=false;
+            if(!calibrationSaved) {
+                const std::string dir=std::getenv("FRAME_DEPTH_RECORD_V2");
+                std::filesystem::create_directories(dir);
+                std::ofstream(dir+"/calibration-history-at-init.json")<<rectifier.calibrationSource();
+                const auto& q=rectifier.stereoQuaternion();const auto& t=rectifier.stereoTranslation();
+                std::ofstream info(dir+"/calibration-used.json");
+                info<<std::setprecision(9)<<"{\"stereo_quaternion_xyzw\":["<<q[0]<<","<<q[1]<<","<<q[2]<<","<<q[3]
+                    <<"],\"stereo_translation_m\":["<<t[0]<<","<<t[1]<<","<<t[2]<<"],\"stereo_policy\":\""<<rectifier.calibrationPolicy()<<"\",\"stereo_entry\":"<<rectifier.calibrationEntry()
+                    <<",\"stereo_entries\":"<<rectifier.calibrationEntries()<<",\"capture_timing\":\""
+                    <<(capture->timedMode()?"v4l2":"legacy-hash")<<"\",\"exposure_offset_ms\":"
+                    <<(std::getenv("FRAME_EXPOSURE_OFFSET_MS")?std::getenv("FRAME_EXPOSURE_OFFSET_MS"):"8")<<"}\n";
+                calibrationSaved=true;
+            }
+        }
         metadata.timings[FrameSpatial::OcclusionBenchmark::Rectify]=milliseconds(stageStart);
         stageStart=Clock::now();
         std::vector<float> depth;
@@ -533,9 +640,53 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
                     modelMotion.translation[i] = motion.translation[i];
                 }
             }
+            FrameSpatial::ModelCaptureMetadata modelCapture;
+            modelCapture.captureBeginNs=metadata.captureBeginNs;
+            modelCapture.captureEndNs=metadata.captureEndNs;
+            modelCapture.poseTimeNs=head.time;
+            modelCapture.captureTimePose=locatedAtCapture;
+            modelCapture.poseValid=head.valid;
+            modelCapture.position[0]=head.pose.position.x;
+            modelCapture.position[1]=head.pose.position.y;
+            modelCapture.position[2]=head.pose.position.z;
+            modelCapture.orientation[0]=head.pose.orientation.x;
+            modelCapture.orientation[1]=head.pose.orientation.y;
+            modelCapture.orientation[2]=head.pose.orientation.z;
+            modelCapture.orientation[3]=head.pose.orientation.w;
+            if(const auto* timed=capture->timedPair()) {
+                modelCapture.cameraSequence=timed->sequence;
+                modelCapture.leftEndOfReadoutNs=timed->leftEndOfReadoutNs;
+                modelCapture.rightEndOfReadoutNs=timed->rightEndOfReadoutNs;
+                modelCapture.leftWriteStartNs=timed->leftWriteStartNs;
+                modelCapture.rightWriteStartNs=timed->rightWriteStartNs;
+                modelCapture.skippedSequences=timed->skippedSequences;
+            }
+            modelCapture.leftSlot=capture->leftSlot();
+            modelCapture.rightSlot=capture->rightSlot();
+            if(boundedModelCapture && locatedAtCapture) {
+                for(int s=0;s<FrameSpatial::ModelCaptureMetadata::POSE_SAMPLES;s++) {
+                    XrSpaceLocation sample{XR_TYPE_SPACE_LOCATION};
+                    const XrTime when=head.time+XrTime(FrameSpatial::ModelCaptureMetadata::poseSampleOffsetMs[s])*1000000;
+                    const XrSpaceLocationFlags required=XR_SPACE_LOCATION_POSITION_VALID_BIT|XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+                    if(XR_SUCCEEDED(gLocateSpace(gViewSpace,gStageSpace,when,&sample)) &&
+                       (sample.locationFlags&required)==required) {
+                        modelCapture.poseSampleValid[s]=true;
+                        const auto& p=sample.pose;
+                        modelCapture.poseSamplePosition[s][0]=p.position.x;modelCapture.poseSamplePosition[s][1]=p.position.y;modelCapture.poseSamplePosition[s][2]=p.position.z;
+                        modelCapture.poseSampleOrientation[s][0]=p.orientation.x;modelCapture.poseSampleOrientation[s][1]=p.orientation.y;
+                        modelCapture.poseSampleOrientation[s][2]=p.orientation.z;modelCapture.poseSampleOrientation[s][3]=p.orientation.w;
+                    }
+                }
+            }
+            const FrameSpatial::TsdfPose modelPose=rectifiedCameraPose(head.pose);
+            for(int row=0;row<3;row++)
+                for(int col=0;col<3;col++)modelCapture.cameraToWorldRotation[row*3+col]=modelPose.rotation[row][col];
+            for(int i=0;i<3;i++)modelCapture.cameraToWorldTranslation[i]=modelPose.translation[i];
             matched = modelStereo.process(rectifier.getRectifiedLeft(), rectifier.getRectifiedRight(),
                                           depth, modelMotion, &rectifier.getSphericalLeft(),
-                                          &rectifier.getSphericalRight(), rectifier.sphericalStepRadians());
+                                          &rectifier.getSphericalRight(), rectifier.sphericalStepRadians(), &modelCapture);
+            if (matched && locatedAtCapture && irDot.active())
+                irDot.submit(modelStereo.lastDisparity(), modelStereo.lastUncertainty(), modelPose);
             previousModelPose = head;
             previousModelAtCapture = locatedAtCapture;
         } else if (sgbm) {
@@ -565,9 +716,85 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
         metadata.timings[FrameSpatial::OcclusionBenchmark::Stereo]=milliseconds(stageStart);
         stageStart=Clock::now();
         FrameSpatial::removeDepthSpeckles(depth, FrameSpatial::RECT_WIDTH,
-                                           FrameSpatial::RECT_HEIGHT);
+                                           FrameSpatial::RECT_HEIGHT, speckleWorkspace);
         metadata.timings[FrameSpatial::OcclusionBenchmark::Speckles]=milliseconds(stageStart);
         ++frame;
+        if(boundedModelCapture && !liveRgbDirectory.empty()) {
+            const auto rgb=std::filesystem::path(liveRgbDirectory);
+            std::filesystem::create_directories(rgb);
+            const std::string pre="frame-"+std::to_string(frame);
+            const size_t yBytes=size_t(capture->width())*capture->height();
+            const auto putBytes=[&](const std::string& suffix,const uint8_t* ptr,size_t bytes) {
+                std::ofstream f(rgb/(pre+suffix),std::ios::binary);
+                f.write(reinterpret_cast<const char*>(ptr),bytes);
+                return bool(f);
+            };
+            bool saved=true;
+            if(captureUV) {
+                const auto putNv12=[&](const std::string& suffix,const uint8_t* y,const uint8_t* uv) {
+                    std::ofstream f(rgb/(pre+suffix),std::ios::binary);
+                    if(!y || !uv) return false;
+                    f.write(reinterpret_cast<const char*>(y),yBytes);
+                    f.write(reinterpret_cast<const char*>(uv),yBytes/2);
+                    return bool(f);
+                };
+                saved=putNv12("-raw-left.nv12",capture->getLeftBuffer(),capture->getLeftUV()) &&
+                      putNv12("-raw-right.nv12",capture->getRightBuffer(),capture->getRightUV());
+            }
+            const auto& rl=rectifier.getRectifiedLeft();const auto& rr=rectifier.getRectifiedRight();
+            const auto& sl=rectifier.getSphericalLeft();const auto& sr=rectifier.getSphericalRight();
+            saved=saved && putBytes("-rect-left.u8",rl.data(),rl.size()) &&
+                  putBytes("-rect-right.u8",rr.data(),rr.size()) &&
+                  putBytes("-spherical-left.u8",sl.data(),sl.size()) &&
+                  putBytes("-spherical-right.u8",sr.data(),sr.size());
+            const auto pl=FrameSpatial::modelResize(rl,FrameSpatial::RECT_WIDTH,FrameSpatial::RECT_HEIGHT);
+            const auto pr=FrameSpatial::modelResize(rr,FrameSpatial::RECT_WIDTH,FrameSpatial::RECT_HEIGHT);
+            saved=saved && putBytes("-pinhole-left.u8",pl.data(),pl.size()) &&
+                  putBytes("-pinhole-right.u8",pr.data(),pr.size());
+            if(frame==1) {
+                std::ofstream(rgb/"calibration-history-at-init.json")<<rectifier.calibrationSource();
+                std::ofstream(rgb/"calibration-used.json")<<"{\"stereo_policy\":\""<<rectifier.calibrationPolicy()
+                    <<"\",\"stereo_entry\":"<<rectifier.calibrationEntry()<<",\"stereo_entries\":"<<rectifier.calibrationEntries()<<"}\n";
+                const int cx=int(FrameSpatial::RECT_CX),cy=int(FrameSpatial::RECT_CY),f=int(FrameSpatial::RECT_FOCAL);
+                const auto origin=rectifier.rectifiedPointInHead(cx,cy,0);
+                const auto forward=rectifier.rectifiedPointInHead(cx,cy,1);
+                const auto right=rectifier.rectifiedPointInHead(cx+f,cy,1);
+                const auto down=rectifier.rectifiedPointInHead(cx,cy+f,1);
+                std::ofstream extrinsic(rgb/"rectified-camera-in-head.json");
+                extrinsic<<std::setprecision(9)<<"{\"rotation_row_major\":[";
+                for(int row=0;row<3;row++)for(int col=0;col<3;col++){
+                    const auto& axis=col==0?right:col==1?down:forward;
+                    extrinsic<<(row||col?",":"")<<(axis[row]-(col==2?origin[row]:forward[row]));
+                }
+                extrinsic<<"],\"translation_m\":["<<origin[0]<<','<<origin[1]<<','<<origin[2]<<"]}\n";
+                saved=saved && bool(extrinsic);
+            }
+            const auto* timed=capture->timedPair();
+            std::ofstream meta(rgb/(pre+".json"));
+            meta<<std::setprecision(9)<<"{\"sequence\":"<<frame<<",\"capture_begin_ns\":"<<metadata.captureBeginNs
+                <<",\"capture_end_ns\":"<<metadata.captureEndNs<<",\"left_slot\":"<<capture->leftSlot()
+                <<",\"right_slot\":"<<capture->rightSlot()<<",\"spherical_step_rad\":"<<rectifier.sphericalStepRadians()
+                <<",\"timed\":"<<(timed?"true":"false");
+            if(timed)meta<<",\"camera_sequence\":"<<timed->sequence
+                <<",\"left_end_of_readout_ns\":"<<timed->leftEndOfReadoutNs
+                <<",\"right_end_of_readout_ns\":"<<timed->rightEndOfReadoutNs
+                <<",\"left_write_start_ns\":"<<timed->leftWriteStartNs
+                <<",\"right_write_start_ns\":"<<timed->rightWriteStartNs
+                <<",\"copy_begin_ns\":"<<timed->copyBeginNs
+                <<",\"copy_end_ns\":"<<timed->copyEndNs
+                <<",\"skipped_sequences\":"<<timed->skippedSequences;
+            meta<<",\"raw_color\":"<<(captureUV?"true":"false")
+                <<",\"raw_color_format\":\"NV12\",\"raw_color_shape\":["<<capture->height()<<','<<capture->width()<<"]}\n";
+            saved=saved && bool(meta);
+            if(!saved) {std::cerr<<"[RoomDataset] RGB recording failed at "<<pre<<std::endl;gRunning.store(false);break;}
+        }
+        if(boundedModelCapture) {
+            lastModelCapture=Clock::now();
+            if(modelCaptureLimit && frame>=modelCaptureLimit) {
+                std::cout<<"[ModelDepth] bounded capture complete: "<<frame<<" frames"<<std::endl;
+                gRunning.store(false);
+            }
+        }
         if (gOcclusionOnly) {
             const auto surfaceStart = std::chrono::steady_clock::now();
             const double captureSeconds = captureEnd.tv_sec + captureEnd.tv_nsec * 1e-9;
@@ -718,47 +945,45 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
             continue;
         }
 
+        // Compute camera-to-world pose from tracking pose
+        FrameSpatial::TsdfPose cameraToWorld{};
+        bool haveCameraPose = false;
+        if (head.valid) {
+            cameraToWorld = rectifiedCameraPose(head.pose);
+            haveCameraPose = true;
+        }
+
+        static const std::vector<float> noConfidence;
+        const std::vector<float>& modelConfidence = model ? modelStereo.lastConfidence() : noConfidence;
+        if (irDot.active())
+            irDot.apply(depth, rectifier.getRectifiedLeft(), locatedAtCapture && haveCameraPose ? &cameraToWorld : nullptr);
+
         // Reimplemented Meshing Pipeline: Power-mean filtering + Discontinuity-gated Triangulation
         const int activeMeshMode = gMeshViewerMode.load();
         if (activeMeshMode == 2) {
             FrameSpatial::TsdfStats tsdfStats;
+            // Each IR depth map is one measurement: integrated once, at its own pose.
+            FrameSpatial::IrDotRefine::Observation irObservation;
+            if (irDot.active() && irDot.takeObservation(irObservation))
+                tsdf.integrate(irObservation.depth->data(), nullptr, FrameSpatial::RECT_WIDTH,
+                    FrameSpatial::RECT_HEIGHT, FrameSpatial::RECT_FOCAL, FrameSpatial::RECT_CX,
+                    FrameSpatial::RECT_CY, irObservation.pose);
             // Integrate only with a capture-time pose: a fallback pose would smear the volume.
-            if (locatedAtCapture) {
-                const int cx = int(FrameSpatial::RECT_CX), cy = int(FrameSpatial::RECT_CY);
-                const int f = int(FrameSpatial::RECT_FOCAL);
-                const auto origin = rectifier.rectifiedPointInHead(cx, cy, 0);
-                const auto forward = rectifier.rectifiedPointInHead(cx, cy, 1);
-                const auto rightAxis = rectifier.rectifiedPointInHead(cx + f, cy, 1);
-                const auto downAxis = rectifier.rectifiedPointInHead(cx, cy + f, 1);
-                FrameSpatial::TsdfPose cameraToWorld;
-                std::array<float, 3> columns[3];
-                for (int i = 0; i < 3; ++i) {
-                    columns[0][i] = rightAxis[i] - forward[i];
-                    columns[1][i] = downAxis[i] - forward[i];
-                    columns[2][i] = forward[i] - origin[i];
-                }
-                for (int col = 0; col < 3; ++col) {
-                    const auto world = rotateVector(head.pose.orientation, columns[col]);
-                    for (int row = 0; row < 3; ++row) cameraToWorld.rotation[row][col] = world[row];
-                }
-                const auto originWorld = rotateVector(head.pose.orientation, origin);
-                cameraToWorld.translation[0] = head.pose.position.x + originWorld[0];
-                cameraToWorld.translation[1] = head.pose.position.y + originWorld[1];
-                cameraToWorld.translation[2] = head.pose.position.z + originWorld[2];
+            if (locatedAtCapture && haveCameraPose) {
                 const auto integrateStart = Clock::now();
                 tsdfStats = tsdf.integrate(depth.data(), rectifier.getRectifiedLeft().data(),
                     FrameSpatial::RECT_WIDTH, FrameSpatial::RECT_HEIGHT, FrameSpatial::RECT_FOCAL,
                     FrameSpatial::RECT_CX, FrameSpatial::RECT_CY, cameraToWorld,
-                    model && modelStereo.lastConfidence().size() == depth.size() ?
-                        modelStereo.lastConfidence().data() : nullptr);
+                    modelConfidence.size() == depth.size() ? modelConfidence.data() : nullptr);
                 tsdfIntegrateMs = milliseconds(integrateStart);
             }
             if (frame == 1 || frame % kTsdfMeshEvery == 0) {
                 const auto meshStart = Clock::now();
-                std::vector<FrameSpatial::TsdfVertex> triangles;
+                auto& triangles = tsdfMeshScratch;
                 const float focus[3]{head.pose.position.x, head.pose.position.y, head.pose.position.z};
                 tsdf.extractMesh(triangles, kTsdfMaxTriangles, focus);
-                std::vector<PointVertex> meshVertices;
+                auto& meshVertices = meshPublicationScratch;
+                meshVertices.clear();
                 meshVertices.reserve(triangles.size());
                 for (const auto& v : triangles)
                     meshVertices.push_back({v.x, v.y, v.z, packGray(v.luma, 8)});
@@ -775,6 +1000,8 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
             gStereoMs.store(stereoMs());
             if (frame == 1 || frame % ((guarded || model) ? 5u : 30u) == 0u)
                 std::cout << "[TSDF] frame=" << frame << " stereo=" << stereoMs()
+                          << " ms, postprocess=" << (model ? modelStereo.lastPostprocessMs() : 0.f)
+                          << " ms, speckles=" << metadata.timings[FrameSpatial::OcclusionBenchmark::Speckles]
                           << " ms, integrate=" << tsdfIntegrateMs << " ms (touched "
                           << tsdfStats.touchedLeaves << ", new " << tsdfStats.allocatedLeaves
                           << ", evicted " << tsdfStats.evictedLeaves << "), leaves=" << tsdf.leafCount()
@@ -783,16 +1010,22 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
             continue;
         }
         if (activeMeshMode == 1 || activeMeshMode == 3) {
+            const auto filterStart = Clock::now();
             // 1. Meta-style power-mean filter (p=4) on inverse depth to prevent edge bleeding
-            const auto smoothedDepth = FrameSpatial::powerMeanFilterDepth(
-                depth, FrameSpatial::RECT_WIDTH, FrameSpatial::RECT_HEIGHT, 4, 2, kMinDepth, kMaxDepth);
+            const auto& smoothedDepth = FrameSpatial::powerMeanFilterDepth(
+                depth, FrameSpatial::RECT_WIDTH, FrameSpatial::RECT_HEIGHT, meshFilterWorkspace,
+                4, 2, kMinDepth, kMaxDepth);
+            const auto filterMs = milliseconds(filterStart);
 
             // 2. Continuous 3D surface mesh generation with depth tear rejection
             const auto& luma = rectifier.getRectifiedLeft();
-            auto meshSurface = FrameSpatial::triangulateDepthMap(
+            const auto meshStart = Clock::now();
+            auto& meshSurface = meshPublicationScratch;
+            FrameSpatial::triangulateDepthMap(
                 smoothedDepth, luma, rectifier, head.pose,
-                FrameSpatial::RECT_WIDTH, FrameSpatial::RECT_HEIGHT,
+                FrameSpatial::RECT_WIDTH, FrameSpatial::RECT_HEIGHT, meshSurface,
                 2, 0.045f, 0.05f);
+            const auto meshMs = milliseconds(meshStart);
 
             const uint32_t triangleCount = static_cast<uint32_t>(meshSurface.size() / 3);
             {
@@ -807,6 +1040,9 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
 
             if (frame == 1 || (frame % ((guarded || model) ? 5u : 30u)) == 0u) {
                 std::cout << "[Mesh] frame=" << frame << " stereo=" << stereoMs()
+                          << " ms, postprocess=" << (model ? modelStereo.lastPostprocessMs() : 0.f)
+                          << " ms, speckles=" << metadata.timings[FrameSpatial::OcclusionBenchmark::Speckles]
+                          << " ms, filter=" << filterMs << " ms, mesh=" << meshMs
                           << " ms, triangles=" << triangleCount
                           << ", vertices=" << triangleCount * 3
                           << ", pose=" << (locatedAtCapture ? "capture-time" : "latest")

@@ -1,4 +1,5 @@
 #pragma once
+#include <string>
 
 #include "spatial_types.hpp"
 #include <vector>
@@ -17,11 +18,20 @@ public:
     // Calibrated luma rectification shared by both the CPU matcher and the
     // asynchronous learned Vulkan backend.
     void rectify(const uint8_t* leftRaw, const uint8_t* rightRaw);
+    // Calibration provenance (valid after the first rectify/initialize): the
+    // XRService history text read at initialization, empty for the built-in fallback.
+    const std::string& calibrationSource() const { return m_calibrationSource; }
+    const std::array<float, 4>& stereoQuaternion() const { return m_stereoQuaternion; }
+    const std::array<float, 3>& stereoTranslation() const { return m_stereoTranslation; }
+    // FRAME_STEREO_CALIBRATION_POLICY=medoid (default) | latest; chosen history index.
+    const std::string& calibrationPolicy() const { return m_calibrationPolicy; }
+    int calibrationEntry() const { return m_calibrationEntry; }
+    int calibrationEntries() const { return m_calibrationEntries; }
 
     // RGB view of the left NV12 camera, using the same calibrated LUT as luma.
     // Chroma is interleaved UV at half resolution. No raw DMA storage is retained.
     std::vector<uint8_t> rectifyLeftRgb(const uint8_t* y, const uint8_t* uv);
-    
+
     // Process stereo pair into 3D metric point cloud in world coordinates
     std::vector<Point3D> process(const uint8_t* leftRaw,
                                 const uint8_t* rightRaw,
@@ -63,6 +73,11 @@ private:
     std::array<std::array<float, 3>, 3> m_headFromRectified{};
     std::array<float, 3> m_leftOriginInHead{};
     bool m_initialized;
+    std::string m_calibrationSource;
+    std::string m_calibrationPolicy = "medoid";
+    int m_calibrationEntry = -1, m_calibrationEntries = 0;
+    std::array<float, 4> m_stereoQuaternion{};
+    std::array<float, 3> m_stereoTranslation{};
     uint64_t m_frameCount = 0;
 };
 

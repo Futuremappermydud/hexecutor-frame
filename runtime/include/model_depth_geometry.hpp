@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -122,15 +123,24 @@ inline std::vector<float> modelSphericalDepth(const std::vector<float>& disparit
     if(disparity.size()!=pixels || uncertainty.size()!=pixels || !(map.step>0))
         throw std::invalid_argument("invalid Model spherical depth input");
     std::vector<float> rho(pixels,0),supported(pixels,0);
+    // These depend only on the column/row, not on the predicted disparity.
+    std::array<float,MODEL_WIDTH> azimuth{},tanAzimuth{};
+    std::array<float,MODEL_HEIGHT> cosElevation{};
+    for(int u=0;u<MODEL_WIDTH;++u) {
+        azimuth[u]=(u-(MODEL_WIDTH-1)*.5f)*map.step;
+        tanAzimuth[u]=std::tan(azimuth[u]);
+    }
+    for(int v=0;v<MODEL_HEIGHT;++v)
+        cosElevation[v]=std::cos((v-(MODEL_HEIGHT-1)*.5f)*map.step);
     for(int v=2;v<MODEL_HEIGHT-2;v++)for(int u=2;u<MODEL_WIDTH-2;u++) {
         const size_t i=size_t(v)*MODEL_WIDTH+u;const float d=disparity[i];
         if(!std::isfinite(d) || d<=0 || uncertainty[i]>=maxUncertainty || u-d<2)continue;
-        const float al=(u-(MODEL_WIDTH-1)*.5f)*map.step,ar=al-d*map.step;
+        const float al=azimuth[u],ar=al-d*map.step;
         if(al>1.5f || ar<-1.5f)continue;
-        const float gap=std::tan(al)-std::tan(ar);
+        const float gap=tanAzimuth[u]-std::tan(ar);
         if(!(gap>0))continue;
         const float r=map.baseline/gap;
-        const float z=r*std::cos((v-(MODEL_HEIGHT-1)*.5f)*map.step);
+        const float z=r*cosElevation[v];
         if(z<minDepth || z>maxDepth)continue;
         rho[i]=r;
     }

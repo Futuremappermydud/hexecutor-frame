@@ -33,6 +33,10 @@ public:
     uint64_t rightHash() const { return m_rightHash; }
     int leftSlot() const { return m_curLeft; }
     int rightSlot() const { return m_curRight; }
+    // Sampled Y hash of every imported slot from the latest copy (diagnostics).
+    int leftSlotCount() const { return m_nLeft; }
+    int rightSlotCount() const { return m_nRight; }
+    uint64_t slotHash(bool left, int i) const { return left ? m_prevLeftHash[i] : m_prevRightHash[i]; }
     int width() const { return m_width; }
     int height() const { return m_height; }
     bool isReady() const { return m_imported; }

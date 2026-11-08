@@ -31,6 +31,8 @@ link_directories(
 add_executable(frame_spatial_runtime
     src/main.cpp
     src/dma_capture.cpp
+    src/timed_stereo_capture.cpp
+    src/v4l2_capture_clock.cpp
     src/overlay_renderer.cpp
     src/vk_detile.cpp
     src/depth_pipeline.cpp
@@ -43,8 +45,14 @@ add_executable(frame_openxr_point_cloud
     src/openxr_point_cloud.cpp
     src/vulkan_guarded_stereo_pipeline.cpp
     src/cloud_worker.cpp
+    src/tsdf_volume.cpp
     src/model_depth_pipeline.cpp src/model_temporal.cpp
+    src/ir_pair_capture.cpp
+    src/ir_dot_bridge.cpp
+    src/ir_dot_refine.cpp
     src/dma_capture.cpp
+    src/timed_stereo_capture.cpp
+    src/v4l2_capture_clock.cpp
     src/vk_detile.cpp
     src/depth_pipeline.cpp
     src/persistent_depth.cpp
@@ -123,8 +131,11 @@ if(EXISTS "${MNN_PREFIX}/include/MNN/Interpreter.hpp")
 endif()
 
 add_library(frame_openxr_occlusion SHARED
-    src/openxr_occlusion_layer.cpp src/occlusion_renderer.cpp src/cloud_worker.cpp src/model_depth_pipeline.cpp src/model_temporal.cpp src/vulkan_guarded_stereo_pipeline.cpp
-    src/dma_capture.cpp src/vk_detile.cpp src/depth_pipeline.cpp src/persistent_depth.cpp src/vulkan_stereo_pipeline.cpp)
+    src/openxr_occlusion_layer.cpp src/occlusion_renderer.cpp src/cloud_worker.cpp src/model_depth_pipeline.cpp src/model_temporal.cpp
+    src/ir_pair_capture.cpp src/ir_dot_bridge.cpp src/ir_dot_refine.cpp src/vulkan_guarded_stereo_pipeline.cpp
+    src/dma_capture.cpp
+    src/timed_stereo_capture.cpp
+    src/v4l2_capture_clock.cpp src/vk_detile.cpp src/depth_pipeline.cpp src/persistent_depth.cpp src/vulkan_stereo_pipeline.cpp)
 
 add_executable(test_persistent_depth
     tools/test_persistent_depth.cpp
@@ -149,6 +160,15 @@ set_target_properties(frame_openxr_occlusion PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin")
 
 add_executable(test_model_depth_geometry tools/test_model_depth_geometry.cpp)
+add_executable(test_meshing_pipeline tools/test_meshing_pipeline.cpp)
+target_compile_options(test_meshing_pipeline PRIVATE -O3 -Wall -Wextra -UNDEBUG)
+target_link_libraries(test_meshing_pipeline PRIVATE OpenMP::OpenMP_CXX)
+add_executable(benchmark_depth_processing tools/benchmark_depth_processing.cpp src/tsdf_volume.cpp)
+target_compile_options(benchmark_depth_processing PRIVATE -O3 -Wall -Wextra)
+target_link_libraries(benchmark_depth_processing PRIVATE OpenMP::OpenMP_CXX)
+add_executable(replay_room_tsdf tools/replay_room_tsdf.cpp src/tsdf_volume.cpp)
+target_include_directories(replay_room_tsdf PRIVATE include)
+target_link_libraries(replay_room_tsdf PRIVATE OpenMP::OpenMP_CXX)
 target_compile_options(test_model_depth_geometry PRIVATE -O3 -Wall -Wextra)
 add_executable(test_model_depth_pipeline tools/test_model_depth_pipeline.cpp src/model_depth_pipeline.cpp src/model_temporal.cpp src/vulkan_stereo_pipeline.cpp)
 target_compile_options(test_model_depth_pipeline PRIVATE -O3 -Wall -Wextra)
@@ -164,7 +184,9 @@ add_dependencies(frame_spatial_runtime frame_depth_worker)
 
 set_target_properties(frame_depth_worker PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
-add_executable(frame_hand_viewer tools/frame_hand_viewer.cpp src/hand_viewer_xr.cpp src/dma_capture.cpp src/vk_detile.cpp src/depth_pipeline.cpp)
+add_executable(frame_hand_viewer tools/frame_hand_viewer.cpp src/hand_viewer_xr.cpp
+    src/dma_capture.cpp src/timed_stereo_capture.cpp src/v4l2_capture_clock.cpp
+    src/vk_detile.cpp src/depth_pipeline.cpp)
 target_include_directories(frame_hand_viewer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../hand-tracking/include
