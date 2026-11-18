@@ -1401,7 +1401,9 @@ static void shortconv_fp16(const HxGraph *g, const HxOp *o, uint32_t part, uint3
 
     if ((c0 % 32u == 0) && (c1 % 32u == 0)) {
         for (uint32_t ch = c0; ch < c1; ch += 32u) {
-            HVX_Vector acc = bias ? *(const HVX_UVector *)(bias + ch) : Q6_V_vzero();
+            /* The bias is IEEE float; the accumulator is qf32, so convert it (a raw sf reads as ~0). */
+            HVX_Vector acc = bias ? Q6_Vqf32_vadd_VsfVsf(*(const HVX_UVector *)(bias + ch), Q6_V_vzero())
+                                  : Q6_V_vzero();
             for (uint32_t j = 0; j < s_len; j++) {
                 HVX_Vector sv = *(const HVX_UVector *)(s_buf + j * st->stride + ch);
                 HVX_Vector wv = *(const HVX_UVector *)(w + j * b->stride + ch);

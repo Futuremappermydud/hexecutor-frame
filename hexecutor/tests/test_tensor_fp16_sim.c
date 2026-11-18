@@ -198,6 +198,45 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
             ((float *)(constants + 0x98000))[c] = .125f * (float)((int)(c % 5) - 2);
         }
     }
+    else if (kind == HX_RMSNORM) {
+        /* axis 1 adds a beta vector. Gamma at 0x90000, beta at 0x98000, epsilon 1e-5. */
+        o.p[0] = 0x3727c5acu;
+        o.p[1] = 0x90000;
+        o.p[2] = axis ? 0x98000 : HXFG_NONE;
+        for (uint32_t c = 0; c < ci; c++) {
+            ((float *)(constants + 0x90000))[c] = .5f + .25f * (float)(c % 3);
+            ((float *)(constants + 0x98000))[c] = .125f * (float)((int)(c % 5) - 2);
+        }
+    } else if (kind == HX_ROPE) {
+        /* step is head_dim; axis packs mode (bit 0) and position (axis >> 1) for p[2]; kh stays 1
+         * because the generic weight fill below writes kh*kh rows. x and out are h x 1 x ci. */
+        o.p[0] = step;
+        o.p[1] = ci / step;
+        o.p[2] = axis >> 1;
+        o.p[3] = axis & 1u;
+    } else if (kind == HX_LINEAR_Q) {
+        /* One token: ci is K, co is N, kh is the format (0 Q4_0, 1 Q8_0), axis the activation.
+         * Blocks of 32 weights per output row, fp16 scale last; bias at 0x98000. */
+        const uint32_t block_bytes = kh ? 34u : 18u, blocks = ci / 32u;
+        uint8_t *w = constants + 0xa0000;
+        for (uint32_t r = 0; r < co; r++)
+            for (uint32_t b = 0; b < blocks; b++) {
+                uint8_t *blk = w + ((uint64_t)r * blocks + b) * block_bytes;
+                for (uint32_t j = 0; j < block_bytes - 2u; j++)
+                    blk[j] = (uint8_t)((r * 131u + b * 17u + j * 29u + 7u) & 0xffu);
+                blk[block_bytes - 2u] = 0x00;
+                /* Q8 weights reach +-128, Q4 +-8: scale 2^-9 and 2^-6 keep outputs near 5. */
+                blk[block_bytes - 1u] = kh ? 0x18 : 0x24;
+            }
+        for (uint32_t c = 0; c < co; c++)
+            ((float *)(constants + 0x98000))[c] = .125f * (float)((int)(c % 5) - 2);
+        o.p[0] = kh;
+        o.p[1] = 0xa0000;
+        o.p[2] = 0x98000;
+        o.p[3] = ci;
+        o.p[4] = co;
+        o.p[5] = axis;
+    }
     uint32_t stride = t[2].stride;
     float *wf = (float *)constants;
     for (uint32_t k = 0; k < kh * kh * (kind == HX_CONV ? ci : 1); k++)
@@ -292,6 +331,127 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
                 return 1;
             }
         }
+    free(actual);
+    free(reference);
+    free(constants);
+    return 0;
+}
+/* Persistent state in the FP16 plan: a causal short convolution (conv ring, optional gate, SiLU or
+ * none) followed by a KV write at a position that changes every step. The FP32 reference and the
+ * FP16 plan each keep their own state buffer; outputs and both state buffers must agree after
+ * every step, so the ring shift and the cache append are checked across run() calls. */
+static int check_state(uint32_t base, uint32_t c, uint32_t taps, uint32_t steps, uint32_t gated,
+                       uint32_t act) {
+    const uint32_t stride = (c + 31u) & ~31u, ring = taps - 1u, cache_rows = steps + 2u;
+    uint8_t *constants = aligned_alloc(128, 0x100000);
+    float *reference = aligned_alloc(128, 0x200000), *actual = aligned_alloc(128, 0x200000);
+    float *state_ref = aligned_alloc(128, 0x40000), *state_dsp = aligned_alloc(128, 0x40000);
+    uint8_t *arena = (uint8_t *)base;
+    if (!constants || !reference || !actual || !state_ref || !state_dsp)
+        return 1;
+    memset(constants, 0, 0x100000);
+    memset(state_ref, 0, 0x40000);
+    memset(state_dsp, 0, 0x40000);
+    float *w = (float *)constants;
+    for (uint32_t j = 0; j < taps; j++)
+        for (uint32_t ch = 0; ch < stride; ch++)
+            w[j * stride + ch] = ch < c ? ((int)((j * 5 + ch * 3) % 7) - 3) * .125f : 0;
+    for (uint32_t ch = 0; ch < stride; ch++)
+        ((float *)(constants + 0x50000))[ch] = ch < c ? .0625f * (float)(ch % 3) : 0;
+    HxHeader header = {0};
+    header.tensors = 5;
+    header.inputs = 2;
+    header.outputs = 1;
+    header.ops = 2;
+    uint32_t io[3] = {0, 4, 1};
+    HxTensor t[5] = {{0, 1, 1, c, stride, {0}},
+                     {0x80000, 1, 1, c, stride, {0}},
+                     {0, ring, 1, c, stride, {HX_TENSOR_PERSISTENT, 0x1001, 0}},
+                     {0x20000, cache_rows, 1, c, stride, {HX_TENSOR_PERSISTENT, 0x1002, 0}},
+                     {0x100000, 1, 1, c, stride, {0}}};
+    HxOp ops[2];
+    memset(ops, 0, sizeof ops);
+    ops[0].kind = HX_SHORTCONV;
+    ops[0].x = 0;
+    ops[0].y = 2;
+    ops[0].z = gated ? 4 : HXFG_NONE;
+    ops[0].out = 1;
+    ops[0].p[0] = taps;
+    ops[0].p[1] = 0;
+    ops[0].p[2] = 0x50000;
+    ops[0].p[3] = act;
+    ops[1].kind = HX_KV_WRITE;
+    ops[1].x = 0;
+    ops[1].y = ops[1].z = HXFG_NONE;
+    ops[1].out = 3;
+    HxGraph g = {&header, t, ops, io, constants, arena, NULL};
+    static uint32_t tables[4096];
+    static struct HxFp16Plan plan;
+    g.state = (uint8_t *)state_dsp;
+    g.state_bytes = 0x40000;
+    if (!hx_fp16_plan(&g, &plan, tables, arena + vtcm_size)) {
+        printf("FAIL plan state c%u taps%u\n", (unsigned)c, (unsigned)taps);
+        return 1;
+    }
+    g.fp16 = &plan;
+    hx_fp16_stage(&g, NULL);
+    for (uint32_t step = 0; step < steps; step++) {
+        float *xr = reference + t[0].offset / 4, *gr = reference + t[4].offset / 4;
+        for (uint32_t ch = 0; ch < stride; ch++) {
+            xr[ch] = ch < c ? ((int)((step * 11 + ch * 7) % 23) - 11) * .125f : 0;
+            gr[ch] = ch < c ? ((int)((step * 3 + ch * 5) % 9) - 4) * .25f : 0;
+        }
+        for (uint32_t k = 0; k < 2; k++) {
+            ops[1].p[0] = step;
+            if (k == 0) {
+                g.arena = (uint8_t *)reference;
+                g.state = (uint8_t *)state_ref;
+                g.fp16 = NULL;
+                for (uint32_t o = 0; o < 2; o++)
+                    for (uint32_t p = 0; p < 3; p++)
+                        hx_execute_op(&g, o, p, 3);
+            } else {
+                g.arena = arena;
+                g.state = (uint8_t *)state_dsp;
+                g.fp16 = &plan;
+                hx_fp16_import(&g, 0, xr, NULL);
+                if (gated)
+                    hx_fp16_import(&g, 4, gr, NULL);
+                for (uint32_t o = 0; o < 2; o++) {
+                    for (uint32_t p = 0; p < 3; p++)
+                        hx_fp16_op(&g, o, p, 3);
+                    hx_fp16_complete(&g, o);
+                }
+                hx_fp16_export(&g, 1, actual, NULL);
+            }
+        }
+        const float *expected = reference + t[1].offset / 4;
+        for (uint32_t ch = 0; ch < c; ch++)
+            if (fabsf(actual[ch] - expected[ch]) > .004f) {
+                printf("FAIL state output c%u taps%u gate%u act%u step%u ch%u got%f expected%f\n",
+                       (unsigned)c, (unsigned)taps, (unsigned)gated, (unsigned)act,
+                       (unsigned)step, (unsigned)ch, actual[ch], expected[ch]);
+                return 1;
+            }
+        /* The persistent buffers hold float32 in both runs; the FP16 path may differ only by
+         * the rounding of its half-precision input. */
+        for (uint32_t r = 0; r < ring + cache_rows + 4; r++) {
+            const uint32_t off = r < ring ? (t[2].offset / 4 + r * stride)
+                                          : (t[3].offset / 4 + (r - ring) * stride);
+            if (r >= ring + cache_rows)
+                break;
+            for (uint32_t ch = 0; ch < c; ch++)
+                if (fabsf(state_dsp[off + ch] - state_ref[off + ch]) > .004f) {
+                    printf("FAIL state buffer c%u taps%u gate%u step%u row%u ch%u got%f "
+                           "expected%f\n",
+                           (unsigned)c, (unsigned)taps, (unsigned)gated, (unsigned)step,
+                           (unsigned)r, (unsigned)ch, state_dsp[off + ch], state_ref[off + ch]);
+                    return 1;
+                }
+        }
+    }
+    free(state_dsp);
+    free(state_ref);
     free(actual);
     free(reference);
     free(constants);
@@ -492,6 +652,41 @@ int main(void) {
         errors += check_rgb(base, 16, 16, kh, 24);
         errors += check_rgb(base, 13, 17, kh, 64);
     }
+    /* LFM ops in the FP16 plan: RMSNorm (HVX and scalar), RoPE (HVX head_dim 64 and generic),
+     * quantised linear (Q4_0 and Q8_0). */
+    errors += check(base, HX_RMSNORM, 3, 1, 64, 64, 1, 1, 0);
+    errors += check(base, HX_RMSNORM, 5, 1, 2048, 2048, 1, 1, 1);
+    {
+        const int e = check(base, HX_RMSNORM, 1, 1, 2048, 2048, 1, 1, 1);
+        errors += e;
+        printf("RMSNORM D2048 1 token: %s, %llu pcycles (3 parts)\n", e ? "FAIL" : "ok",
+               (unsigned long long)op_pcycles);
+    }
+    errors += check(base, HX_RMSNORM, 4, 1, 33, 33, 1, 1, 1);
+    errors += check(base, HX_RMSNORM, 3, 2, 40, 40, 1, 1, 0);
+    errors += check(base, HX_ROPE, 3, 1, 128, 128, 1, 64, 5 << 1);
+    {
+        const int e = check(base, HX_ROPE, 1, 1, 2048, 2048, 1, 64, 17 << 1);
+        errors += e;
+        printf("ROPE 32 heads x 64, 1 token: %s, %llu pcycles (3 parts)\n", e ? "FAIL" : "ok",
+               (unsigned long long)op_pcycles);
+    }
+    errors += check(base, HX_ROPE, 2, 1, 96, 96, 1, 32, 3 << 1);
+    errors += check(base, HX_ROPE, 2, 1, 128, 128, 1, 64, (9 << 1) | 1);
+    for (uint32_t fmt = 0; fmt <= 1; fmt++)
+        for (uint32_t act = 0; act <= 3; act += 3) {
+            errors += check(base, HX_LINEAR_Q, 1, 1, 256, 64, fmt, 1, act);
+            errors += check(base, HX_LINEAR_Q, 1, 1, 96, 32, fmt, 1, act);
+        }
+    /* Persistent state across steps: conv ring plus KV append, FP16 plan versus reference. */
+    errors += check_state(base, 64, 3, 6, 0, 0);
+    errors += check_state(base, 96, 3, 4, 0, 0);
+    errors += check_state(base, 64, 7, 4, 0, 0);
+    errors += check_state(base, 64, 3, 4, 1, 0);
+    errors += check_state(base, 64, 3, 4, 0, 3);
+    errors += check_state(base, 96, 7, 9, 1, 3);
+    errors += check_state(base, 33, 4, 6, 0, 3);
+    errors += check_state(base, 2048, 7, 8, 1, 0);
     /* Matrix product of two runtime tensors: transB 0 and 1, scale 1 and 0.5, odd sizes. */
     for (uint32_t trans = 0; trans <= 1; trans++)
         for (uint32_t scaled = 0; scaled <= 1; scaled++) {
