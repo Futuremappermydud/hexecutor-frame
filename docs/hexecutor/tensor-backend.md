@@ -1,0 +1,42 @@
+# Generic tensor execution
+
+The `tensor_f32` backend accepts static batch-one HXFG graphs with variable input/output counts. Multiple graphs share one `Session`; `run(buffers, program_index)` switches graphs while retaining the verified device lease. Neural-model semantics belong to the calling component. The live host and kernels do not import model tooling or launch Python.
+
+QDRX/NPRG remains the existing prepared backend with its four-input/two-output ABI. Its depth package and generated schedules are unchanged. HXFG does not imply support for arbitrary TFLite or QNN contexts.
+
+## Contracts and preflight
+
+`load_tensor_program(image, constants)` checks the HXFG structure, constant SHA-256 and ordered float32 external I/O. `Session` independently reads/preflights its own immutable snapshots before device access. The DSP validates the same image and private allocation contract before dispatch.
+
+HXFG v1 has a 256-byte header, 32-byte tensor records, 64-byte operation records and an ordered tensor-ID I/O table. It stores metadata and constant offsets; weights live in a separate pool. Channels are padded to 32 float32 values. Compact RGB is permitted at convolution inputs. Shapes, sizes, offsets, unused fields, constants, producer ordering, live aliases and per-op scratch limits are checked. Unsupported operations reject the graph; no older scratch fallback is used.
+
+Supported families are convolution/fully connected, multiplier-one depthwise convolution, equal-shape add, channel PReLU, max pooling, spatial/channel padding, bilinear resize, logical reshape, two-input concatenation, spatial mean and logistic, plus three added 2026-11-17: standalone activations (`HX_ACT`: ReLU, ReLU6, hard-swish, hard-sigmoid with alpha/beta, SiLU, tanh, leaky ReLU, exact GELU), broadcasting binary arithmetic (`HX_BINARY`: add, sub, mul, reversible, with a tensor operand whose h/w/c are each the output's or one, or a per-channel constant) and average pooling (`HX_AVGPOOL`, padding counted or not). Same-shape tensor adds keep the original `HX_ADD` and its fused ReLU. Scalar activation semantics live in one function, `hx_activation` (graph.c), used by the portable path, the FP32 DSP path and the FP16 DSP path. The FP16 plan runs the new operations in its scalar-lane path (the same one the logistic uses), not in HVX: they are correct but slow on large tensors, and the FP16 code is checked only by syntax on the host. It has not been built for or run on the DSP or the simulator. The offline TFLite lowering rejects unsupported dilation, broadcasting, dynamic shapes, quantized graphs and option variants. It reuses dead activation allocations and precomputes float/FP16 convolution weight layouts. See [the format header](../../hexecutor/native/tensor/graph.h) and [lowering tool](../../hexecutor/offline/lower_tflite.py). [`lower_onnx.py`](../../hexecutor/offline/lower_onnx.py) lowers static QLinear ONNX graphs (onnxruntime's static quantizer output) the same way: it dequantizes weights offline, infers ReLU/ReLU6/linear from each quantized output range, and records those ranges in the manifest. The float graph therefore approximates the u8 arithmetic rather than reproducing it. It splits a wide final Gemm into several outputs so every convolution keeps HMX weights within the per-op budget, as the FP16 plan requires. Both front ends share [`hxfg_writer.py`](../../hexecutor/offline/hxfg_writer.py) for the constant pool, HMX packing, allocation and serialization.
+
+## Device memory and execution
+
+The shared bootstrap preserves the full 8 MiB VTCM lease, validates mappings and owns worker stacks/restoration. The tensor configuration is separate from depth's QDRX pool/I/O schema:
+
+| Relative private DDR region | Use |
+| --- | --- |
+| 0–1 MiB | Engine |
+| 1–16 MiB | Graph images |
+| 16–32 MiB | Host exchange/activation arenas |
+| 32–64 MiB | Immutable constants |
+
+Allocations include guards and cannot overlap. The existing VTCM backup, protected stack and restoration regions remain reserved. Without the FP16 plan, a graph with an arena at most 7 MiB uses `0x31000000..0x31700000` for its activations and the upper MiB as kernel scratch; larger valid graphs keep DDR activations. Inputs/outputs transfer through the private host exchange arena. Small immutable graph metadata and the FP16 plan are staged in the lower L2 TCM region, away from worker stacks/control state.
+
+Worker zero owns HMX; four HVX workers (hthreads 0, 1, 2 and 5) split independent outputs for other operators. Tensor sessions keep HT5's stack in L2. The host requires an engine and bootstrap that both use four workers. Dispatch joins every operation; idle workers use bounded pauses between polls. The HMX leaf splits deep loads at 32 K tiles, preserving its accumulator for larger channel counts. Completion stores have their own tile-aligned scratch region.
+
+Public I/O and the HXFG file remain FP32. Eligible graphs use a private FP16 layout planned at session open: `[channel block][pixel pair][channel][2 pixels]` in whole 32-pixel tiles, with rows padded to an even physical width and the pad column kept zero. Pointwise convolutions read and write this layout in place with one completion per operation; every deep load covers one tile-aligned tile, so none crosses the 4 MiB VTCM TLB page boundary. HMX weights, depthwise filters, bias tables and PReLU slopes stay resident in VTCM between runs of a graph and are re-staged after a graph switch or an FP32 run. The compact RGB input is staged inside zero padding so that every window is contiguous. Depthwise copies each worker's rows into a zero-padded window and uses generated, hand-scheduled loops; `gen_depthwise.py` produces `fp16_depthwise.S`.
+
+`hexecutor/offline/compact_hxfg.py` removes channels that are exactly zero or never read, and orders the remaining internal channels by descending weight magnitude, because HMX accumulation is order-sensitive. See the [optimization checkpoint](../model-development/hand-tracking-progress.md) for evidence and remaining validation. `Artifacts::tensor_fp16=false` selects FP32 intermediates with HMX, and `Artifacts::tensor_hmx=false` selects the float DSP comparison path. The tensor runner exposes these as `HEXECUTOR_TENSOR_F32=1` and `HEXECUTOR_TENSOR_PRECISE=1`. Its separate portable CPU reference is explicitly selected; there is no automatic CPU/Python fallback.
+
+`Session::profile()` reports DSP cycles, 19.2 MHz architectural timer ticks, HMX operation count, blocked-layout selection and per-op cycle totals. Host `run()` latency also includes packing/unpacking, publication/polling and guard verification. Warm inference, session initialization/close and application latency are distinct measurements.
+
+## Build and validation
+
+Use `hexecutor/build-scripts/build_tensor.sh` with explicit `HEXECUTOR_SDK_ROOT` and `HEXECUTOR_TOOLCHAIN_IMAGE`. It emits a generic engine, preserving tensor bootstrap and the correct chunk-map probe under `hexecutor/native/build/tensor/`; it never rebuilds/replaces the verified loader.
+
+`make check` exercises portable format, arithmetic, ownership, tracker and existing worker behavior. `hexecutor/build-scripts/test_tensor_sim.sh` requires the SDK and checks actual HMX/HVX instructions, including K>1,024, FP16 conversion boundaries and RGB channel/padding tails. The [hand-tracking guide](../model-development/hand-tracking.md) describes reproducible model/device comparisons.
+
+Offline QNN inspection lives under `hexecutor/offline/`: `compile_qnn.py` records an explicit target configuration and hashes; `inspect_qnn.py` parses literal schematic data with bounded scalar arithmetic. It ignores executable expansion loops and never executes a compiler dump. Generated contexts/schematics stay ignored. A compiled topology or host simulator duration is not a measured device benchmark.
