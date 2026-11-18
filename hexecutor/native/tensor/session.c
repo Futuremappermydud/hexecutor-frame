@@ -23,5 +23,16 @@ int hx_session_config_valid(const HxSessionConfig *c) {
                 return 0;
         }
     }
+    if (c->state_bytes) {
+        if ((c->state & 127u) || c->state < 0x2000000u)
+            return 0;
+        for (uint32_t i = 0; i < c->graphs; i++) {
+            const HxGraphConfig *g = &c->graph[i];
+            if (overlap(c->state, c->state_bytes, g->image, g->image_bytes) ||
+                overlap(c->state, c->state_bytes, g->constants, g->constant_bytes) ||
+                overlap(c->state, c->state_bytes, g->arena, g->arena_bytes))
+                return 0;
+        }
+    }
     return 1;
 }

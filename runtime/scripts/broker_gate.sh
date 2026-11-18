@@ -47,7 +47,7 @@ set -euo pipefail
 REMOTE=$1 MODELS=$2 DSP=$3 LOADER=$4 REPEAT=$5 HAVE_FNN=$6
 cd "$REMOTE"
 fail() { echo "[gate] STOP: $*" >&2; exit 3; }
-[[ -e /dev/cdsp_mem && "$(cat /sys/module/cdsp_mem/parameters/size_mb)" == 128 ]] ||
+[[ -e /dev/cdsp_mem && "$(cat /sys/module/cdsp_mem/parameters/size_mb)" -ge 128 ]] ||
     fail "cdsp_mem 128 MB lease is not loaded (runtime/scripts/setup_frame.sh --qnn)"
 S=/home/steamos/.config/openvr/config/cv/xrservice/XRServiceSettings.json
 grep -q '"enableForLogic": *false' "$S" || fail "XRService controller FeatureNN may use the CDSP ($S)"

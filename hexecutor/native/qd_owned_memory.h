@@ -7,12 +7,15 @@
 #include <stdint.h>
 #define QDO_BASE 0xa0000000u
 /* The mapped window is QDO_SLOTS 16 MiB JTLB entries. The shipped engines use 8 (128 MiB, the
- * cdsp_mem size they require); larger values are for window probes and need a larger cdsp_mem. */
+ * cdsp_mem size they require); larger values are for window probes and dynamic reservations
+ * up to 96 slots (1536 MiB = 1.5 GiB). */
 #ifndef QDO_SLOTS
 #define QDO_SLOTS 8u
 #endif
 #define QDO_BYTES (QDO_SLOTS * 0x01000000u)
-#define QDO_FIRST 64u
+#ifndef QDO_FIRST
+#define QDO_FIRST (QDO_SLOTS > 64u ? (128u - QDO_SLOTS) : 64u)
+#endif
 #define QDO_STATE 3072u
 #define QDO_MAGIC 0x314d4451u
 #ifndef QDO_SCALAR_CACHE

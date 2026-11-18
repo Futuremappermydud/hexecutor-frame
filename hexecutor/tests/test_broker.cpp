@@ -300,12 +300,131 @@ static void single_context_benchmark_test() {
     ::rmdir(dir);
 }
 
+struct StatefulFake : broker::Backend {
+    std::mutex m;
+    float state_val = 0.0f;
+    bool lost = false;
+    size_t state_size = 1024;
+
+    std::vector<GraphInfo> graphs() const override {
+        return {{"accum", {4}, {4}, state_size}, {"scale", {4}, {4}, state_size}};
+    }
+    std::vector<Bytes> run(size_t graph, const std::vector<Buffer> &in, double &dsp_ms) override {
+        std::lock_guard<std::mutex> l(m);
+        if (lost)
+            throw std::runtime_error("persistent state was lost: session was released/failed; reset required");
+        float arg = 0.0f;
+        std::memcpy(&arg, in[0].data, 4);
+        dsp_ms = 0.1;
+        if (graph == 0) {
+            state_val += arg;
+            float out = state_val;
+            return {Bytes(reinterpret_cast<uint8_t *>(&out), reinterpret_cast<uint8_t *>(&out) + 4)};
+        } else {
+            float out = arg * state_val;
+            return {Bytes(reinterpret_cast<uint8_t *>(&out), reinterpret_cast<uint8_t *>(&out) + 4)};
+        }
+    }
+    void reset_state() override {
+        std::lock_guard<std::mutex> l(m);
+        state_val = 0.0f;
+        lost = false;
+    }
+    size_t state_bytes() const override {
+        return state_size;
+    }
+    void set_lost(bool l) {
+        std::lock_guard<std::mutex> lock(m);
+        lost = l;
+    }
+};
+
+static void persistent_state_broker_test() {
+    char dir[] = "/tmp/hxbrokerXXXXXX";
+    require(::mkdtemp(dir) != nullptr, "temp dir");
+    std::filesystem::path sock = std::string(dir) + "/ps.sock";
+    auto owner = std::make_unique<StatefulFake>();
+    StatefulFake &fake = *owner;
+    ServerOptions o;
+    o.socket = sock;
+    o.idle_close_ms = 60000;
+    Server server(std::move(owner), o);
+    server.start();
+    {
+        Client c(sock);
+        StreamSpec accum_spec;
+        accum_spec.graph = "accum";
+        auto accum = c.open(accum_spec);
+
+        StreamSpec scale_spec;
+        scale_spec.graph = "scale";
+        auto scale = c.open(scale_spec);
+
+        // 1. State survives across run() of the same graph (accumulate 2.0 then 3.0 then 10.0)
+        float x1 = 2.0f;
+        auto r1 = c.run(accum, {{&x1, 4}});
+        require(first(r1[0]) == 2.0f, "step 1 accum");
+
+        float x2 = 3.0f;
+        auto r2 = c.run(accum, {{&x2, 4}});
+        require(first(r2[0]) == 5.0f, "step 2 accum (2.0 + 3.0)");
+
+        float x3 = 10.0f;
+        auto r3 = c.run(accum, {{&x3, 4}});
+        require(first(r3[0]) == 15.0f, "step 3 accum (5.0 + 10.0)");
+
+        // 2. Running graph B (scale) after graph A (accum) while keeping persistent state
+        float s1 = 2.0f;
+        auto out_scaled = c.run(scale, {{&s1, 4}});
+        require(first(out_scaled[0]) == 30.0f, "graph B reads shared state from graph A (15.0 * 2.0)");
+
+        float s2 = 0.5f;
+        out_scaled = c.run(scale, {{&s2, 4}});
+        require(first(out_scaled[0]) == 7.5f, "graph B reads shared state (15.0 * 0.5)");
+
+        // 3. Reset state request
+        c.reset_state();
+        float s_after_reset = 1.0f;
+        auto out_reset = c.run(scale, {{&s_after_reset, 4}});
+        require(first(out_reset[0]) == 0.0f, "state reset to 0");
+
+        float x_new = 4.0f;
+        auto r_new = c.run(accum, {{&x_new, 4}});
+        require(first(r_new[0]) == 4.0f, "accum after reset starts from 0");
+
+        // 4. Error handling / state loss refusal
+        fake.set_lost(true);
+        bool failed_as_expected = false;
+        try {
+            c.run(accum, {{&x_new, 4}});
+        } catch (const std::exception &e) {
+            failed_as_expected = std::string(e.what()).find("persistent state was lost") != std::string::npos;
+        }
+        require(failed_as_expected, "refuse further work after state lost");
+
+        // Recover by resetting state
+        c.reset_state();
+        auto r_recovered = c.run(accum, {{&x_new, 4}});
+        require(first(r_recovered[0]) == 4.0f, "recovered after reset_state");
+    }
+
+    // 5. Check stats report state_bytes
+    auto stats = server.stats();
+    require(stats.size() == 2, "2 graph stats");
+    require(stats[0].state_bytes == 1024, "graph 0 state_bytes in stats");
+    require(stats[1].state_bytes == 1024, "graph 1 state_bytes in stats");
+
+    server.stop();
+    ::rmdir(dir);
+}
+
 int main() {
     try {
         scheduler_tests();
         server_tests();
         release_test();
         single_context_benchmark_test();
+        persistent_state_broker_test();
     } catch (const std::exception &e) {
         std::cerr << "test_broker: " << e.what() << '\n';
         return 1;

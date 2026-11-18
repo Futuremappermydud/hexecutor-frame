@@ -41,8 +41,16 @@ enum {
     HX_ZEROINSERT, /* reserved: zero-insert upsample, p[0]=sh p[1]=sw (ConvTranspose) */
     HX_TRANSPOSE,  /* permute (h,w,c) axes, p[0..2] = source axis of each output axis */
     HX_REDUCE,     /* unary reduction over a subset of (h,w,c); see HX_RED_* below */
-    HX_NORM        /* normalisation; see HX_NORM_* below (p[0..4]) */
+    HX_NORM,       /* normalisation; see HX_NORM_* below (p[0..4]) */
+    HX_MATMUL,     /* 2026-11-17: runtime matrix product, see the HX_MATMUL note below */
+    HX_RMSNORM,    /* 22: RMSNorm, p[0]=eps float bits, p[1]=gamma constant, p[2]=beta constant or HXFG_NONE */
+    HX_ROPE,       /* 23: Rotary position embedding, p[0]=head_dim, p[1]=heads, p[2]=pos/table, p[3]=mode */
+    HX_SHORTCONV,  /* 24: Causal short conv with persistent state y, p[0]=k taps, p[1]=w, p[2]=bias, p[3]=act */
+    HX_LINEAR_Q,   /* 25: Quantized linear matvec (Q4_0 / INT8), p[0]=fmt, p[1]=w, p[2]=bias, p[3]=K, p[4]=N, p[5]=act */
+    HX_KV_WRITE    /* 26: KV cache write/append at pos: x [1,Lin,C], out [1,Lmax,C], y pos tensor or p[0] */
 };
+#define HX_TENSOR_PERSISTENT 1u
+
 /* HX_ACT p[0] functions. */
 enum {
     HX_ACT_RELU = 0,
@@ -105,7 +113,25 @@ typedef struct {
  * z is reserved; all unused fields must be zero (y/z use HXFG_NONE). Conv/depthwise only: z is
  * HXFG_NONE (dilation 1,1) or (dh << 8) | dw with 1 <= dh, dw <= 8 and at least one above 1; the
  * effective kernel extent is (k - 1) * d + 1 and tap (ky, kx) reads input row oy * sh + ky * dh -
- * pad_top, column ox * sw + kx * dw - pad_left. */
+ * pad_top, column ox * sw + kx * dw - pad_left.
+ * Matmul (HX_MATMUL, 21): x = A, a [L,K] tensor (h = L, w = 1, c = K); y = B, a runtime tensor
+ * (not a constant), read as the second operand; out = [L,N] (h = L, w = 1, c = N). p[0] transB:
+ * 0 means B is [K,N] and out = A.B; 1 means B is [N,K] and out = A.B^T (for example Q.K^T).
+ * p[1] is the float32 bit pattern of a scalar applied to the result (0 selects 1.0f). All other
+ * p fields and z are zero; there is no bias and no activation. All three tensors have w = 1 and
+ * K <= 4096. Accumulation is float32.
+ * RMSNorm (HX_RMSNORM, 22): x in, out same shape. p[0] eps float bits, p[1] gamma constant offset,
+ * p[2] optional beta constant offset or HXFG_NONE.
+ * RoPE (HX_ROPE, 23): x in, out same shape. p[0] head_dim, p[1] num_heads, p[2] pos or table offset,
+ * p[3] mode (0 NeoX interleaved, 1 split). y optional scalar position tensor.
+ * ShortConv (HX_SHORTCONV, 24): x token [1, 1, C], y persistent state tensor [1, k-1, C], z optional
+ * gate token [1, 1, C] or HXFG_NONE, out [1, 1, C]. p[0] k taps, p[1] weight offset [k, C],
+ * p[2] optional bias offset, p[3] activation. State y is shifted and updated in-place.
+ * QuantLinear (HX_LINEAR_Q, 25): x [1, 1, K], out [1, 1, N]. p[0] format (0 Q4_0, 1 Q8_0),
+ * p[1] weights offset, p[2] bias offset or HXFG_NONE, p[3] K, p[4] N, p[5] activation.
+ * KVWrite (HX_KV_WRITE, 26): x token slice [1, Lin, C], out persistent KV cache [1, Lmax, C] or
+ * [Lmax, 1, C]. y optional runtime pos scalar [1, 1, 1] (or HXFG_NONE with static pos in p[0]).
+ * Writes x into out at pos along sequence axis. */
 typedef struct {
     uint32_t kind, x, y, z, out, p[11];
 } HxOp;
@@ -122,6 +148,7 @@ typedef struct {
 typedef struct {
     uint32_t magic, version, code_bytes, graphs;
     HxGraphConfig graph[HXFG_MAX_GRAPHS];
+    uint32_t state, state_bytes; /* Persistent state region in private DDR lease */
 } HxSessionConfig;
 struct HxFp16Plan;
 typedef struct {
@@ -132,9 +159,12 @@ typedef struct {
     const uint8_t *constants;
     uint8_t *arena;
     const struct HxFp16Plan *fp16; /* DSP-private; NULL selects FP32 storage */
+    uint8_t *state;                /* DSP/Host persistent state; NULL uses arena */
+    uint32_t state_bytes;
 } HxGraph;
 uint32_t hx_tensor_bytes(const HxTensor *t);
 uint32_t hx_tensor_elements(const HxTensor *t);
+void hx_graph_set_state(HxGraph *g, void *state, uint32_t state_bytes);
 uint32_t hx_graph_open(HxGraph *, const void *image, uint32_t image_bytes, const void *constants,
                        uint32_t constant_bytes, void *arena, uint32_t arena_bytes,
                        uint32_t *bad_op);

@@ -56,6 +56,24 @@ static int op_valid(const HxGraph *g, const HxOp *o) {
     case HX_NORM:
         used = 5;
         break;
+    case HX_MATMUL:
+        used = 2;
+        break;
+    case HX_RMSNORM:
+        used = 3;
+        break;
+    case HX_ROPE:
+        used = 4;
+        break;
+    case HX_SHORTCONV:
+        used = 4;
+        break;
+    case HX_LINEAR_Q:
+        used = 6;
+        break;
+    case HX_KV_WRITE:
+        used = 3;
+        break;
     case HX_ADD:
     case HX_PRELU:
     case HX_CONCAT:
@@ -173,6 +191,12 @@ static int op_valid(const HxGraph *g, const HxOp *o) {
         return p[0] < HX_RED_COUNT && p[1] && p[1] < 8u &&
                b->h == ((p[1] & 1u) ? 1u : a->h) && b->w == ((p[1] & 2u) ? 1u : a->w) &&
                b->c == ((p[1] & 4u) ? 1u : a->c);
+    case HX_MATMUL: { /* y is B: [K,N] (transB 0) or [N,K] (transB 1); all tensors have w = 1 */
+        const HxTensor *bm = &g->tensors[o->y];
+        if (p[0] > 1 || a->w != 1 || b->w != 1 || bm->w != 1 || a->c > 4096 || a->h != b->h)
+            return 0;
+        return p[0] ? bm->c == a->c && bm->h == b->c : bm->h == a->c && bm->c == b->c;
+    }
     case HX_ACT:
         return same(a, b) && p[0] < HX_ACT_COUNT &&
                ((p[0] == HX_ACT_LEAKY && !p[2]) || (p[0] == HX_ACT_HARDSIGMOID) ||
@@ -186,6 +210,58 @@ static int op_valid(const HxGraph *g, const HxOp *o) {
         return !p[2] && (c->h == b->h || c->h == 1) && (c->w == b->w || c->w == 1) &&
                (c->c == b->c || c->c == 1);
     }
+    case HX_RMSNORM:
+        return same(a, b) && constant(g, p[1], b->stride * 4u) &&
+               (p[2] == HXFG_NONE || constant(g, p[2], b->stride * 4u));
+    case HX_ROPE: {
+        if (!same(a, b) || !p[0] || (p[0] & 1u) || !p[1] || p[0] * p[1] > a->c)
+            return 0;
+        if (o->y != HXFG_NONE) {
+            const HxTensor *yt = &g->tensors[o->y];
+            if (yt->h != 1 || yt->w != 1 || yt->c < 1)
+                return 0;
+        }
+        return p[3] <= 1;
+    }
+    case HX_SHORTCONV: {
+        const HxTensor *st = &g->tensors[o->y];
+        const uint32_t k = p[0], s = k - 1u;
+        if (!k || k < 2 || k > 15 || !same(a, b) || a->h != 1 || a->w != 1)
+            return 0;
+        if (st->c != a->c || (st->h * st->w != s))
+            return 0;
+        if (!constant(g, p[1], (uint64_t)k * b->stride * 4u))
+            return 0;
+        if (p[2] != HXFG_NONE && !constant(g, p[2], b->stride * 4u))
+            return 0;
+        if (o->z != HXFG_NONE && !same(a, &g->tensors[o->z]))
+            return 0;
+        return p[3] <= 3;
+    }
+    case HX_LINEAR_Q: {
+        const uint32_t fmt = p[0], k = p[3], n = p[4];
+        if (a->h != b->h || a->w != 1 || b->w != 1 || !k || !n || (k & 31u) || (n & 31u) ||
+            a->c != k || b->c != n || fmt > 1)
+            return 0;
+        const uint64_t block_bytes = fmt == 0 ? 18u : 34u;
+        const uint64_t total_w_bytes = (uint64_t)(k / 32u) * n * block_bytes;
+        if (!constant(g, p[1], total_w_bytes))
+            return 0;
+        if (p[2] != HXFG_NONE && !constant(g, p[2], b->stride * 4u))
+            return 0;
+        return p[5] <= 3;
+    }
+    case HX_KV_WRITE: {
+        const HxTensor *outt = &g->tensors[o->out];
+        if (a->c != outt->c || !(outt->reserved[0] & HX_TENSOR_PERSISTENT))
+            return 0;
+        if (o->y != HXFG_NONE) {
+            const HxTensor *yt = &g->tensors[o->y];
+            if (yt->h != 1 || yt->w != 1 || yt->c < 1)
+                return 0;
+        }
+        return 1;
+    }
     default:
         return 0;
     }
@@ -197,7 +273,11 @@ uint32_t hx_graph_open(HxGraph *g, const void *image, uint32_t image_bytes, cons
         *bad_op = HXFG_NONE;
     if (!g || !image || ((uintptr_t)image & 3) || image_bytes < sizeof(HxHeader))
         return HX_HEADER;
+    uint8_t *saved_state = g->state;
+    uint32_t saved_state_bytes = g->state_bytes;
     memset(g, 0, sizeof *g);
+    g->state = saved_state;
+    g->state_bytes = saved_state_bytes;
     const HxHeader *h = (const HxHeader *)image;
     if (h->magic != HXFG_MAGIC || h->version != HXFG_VERSION || h->bytes != image_bytes ||
         !h->tensors || h->tensors > HXFG_MAX_TENSORS || !h->ops || h->ops > HXFG_MAX_OPS ||
@@ -223,14 +303,19 @@ uint32_t hx_graph_open(HxGraph *g, const void *image, uint32_t image_bytes, cons
     g->arena = arena;
     for (uint32_t i = 0; i < h->tensors; i++) {
         const HxTensor *t = &g->tensors[i];
+        uint32_t limit = ((t->reserved[0] & HX_TENSOR_PERSISTENT) && g->state) ? g->state_bytes : h->arena_bytes;
         if (!t->h || !t->w || !t->c || t->h > 4096 || t->w > 4096 || t->c > 4096 ||
             (t->stride != ((t->c + 31u) & ~31u) && !(t->c == 3 && t->stride == 3)) ||
             (t->offset & 127u) || !hx_tensor_bytes(t) ||
-            !span(t->offset, hx_tensor_bytes(t), h->arena_bytes) || t->reserved[0] ||
-            t->reserved[1] || t->reserved[2])
+            !span(t->offset, hx_tensor_bytes(t), limit) || (t->reserved[0] > 1u) ||
+            t->reserved[2])
             return HX_SHAPE;
     }
     uint8_t live[HXFG_MAX_TENSORS] = {0}, produced[HXFG_MAX_TENSORS] = {0};
+    for (uint32_t i = 0; i < h->tensors; i++) {
+        if (g->tensors[i].reserved[0] & HX_TENSOR_PERSISTENT)
+            live[i] = 1;
+    }
     for (uint32_t i = 0; i < h->inputs + h->outputs; i++) {
         if (g->io[i] >= h->tensors)
             return HX_RANGE;
@@ -251,8 +336,11 @@ uint32_t hx_graph_open(HxGraph *g, const void *image, uint32_t image_bytes, cons
         const HxOp *o = &g->ops[i];
         if (bad_op)
             *bad_op = i;
-        int binary = o->kind == HX_ADD || o->kind == HX_CONCAT ||
+        int binary = o->kind == HX_ADD || o->kind == HX_CONCAT || o->kind == HX_MATMUL ||
                      (o->kind == HX_BINARY && !o->p[1]);
+        int has_y = binary || o->kind == HX_SHORTCONV || (o->kind == HX_ROPE && o->y != HXFG_NONE) ||
+                    (o->kind == HX_KV_WRITE && o->y != HXFG_NONE);
+        int has_z = (o->kind == HX_SHORTCONV && o->z != HXFG_NONE);
         /* z is NONE, or a dilation (dh << 8) | dw on conv/depthwise only (1..8 each, not both 1). */
         const int conv_like = o->kind == HX_CONV || o->kind == HX_DEPTHWISE;
         const int dilated_z = o->z != HXFG_NONE && conv_like && (o->z >> 16) == 0 &&
@@ -260,19 +348,25 @@ uint32_t hx_graph_open(HxGraph *g, const void *image, uint32_t image_bytes, cons
                               hx_dilation_w(o) >= 1 && hx_dilation_w(o) <= 8 &&
                               (hx_dilation_h(o) > 1 || hx_dilation_w(o) > 1);
         if (o->x >= h->tensors || o->out >= h->tensors ||
-            (o->z != HXFG_NONE && !dilated_z) ||
-            (binary ? o->y >= h->tensors : o->y != HXFG_NONE))
+            (o->z != HXFG_NONE && !dilated_z && !has_z) ||
+            (has_y ? o->y >= h->tensors : o->y != HXFG_NONE))
             return HX_OPERATOR;
-        if (!live[o->x] || (binary && !live[o->y]) || produced[o->out])
+        if (!live[o->x] || (has_y && !live[o->y]) || (has_z && !live[o->z]) ||
+            (produced[o->out] && !(g->tensors[o->out].reserved[0] & HX_TENSOR_PERSISTENT)))
             return HX_UNINITIALIZED;
         const HxTensor *out = &g->tensors[o->out];
+        const int out_pers = (out->reserved[0] & HX_TENSOR_PERSISTENT) != 0;
         for (uint32_t j = 0; j < h->tensors; j++)
             if (live[j]) {
                 const HxTensor *t = &g->tensors[j];
-                if (overlap(out->offset, hx_tensor_bytes(out), t->offset, hx_tensor_bytes(t))) {
-                    if (j == o->x || (binary && j == o->y))
-                        return HX_ALIAS;
-                    live[j] = 0;
+                const int t_pers = (t->reserved[0] & HX_TENSOR_PERSISTENT) != 0;
+                if (out_pers == t_pers &&
+                    overlap(out->offset, hx_tensor_bytes(out), t->offset, hx_tensor_bytes(t))) {
+                    if (j == o->x || (has_y && j == o->y) || (has_z && j == o->z)) {
+                        if (!out_pers)
+                            return HX_ALIAS;
+                    } else
+                        live[j] = 0;
                 }
             }
         if (g->tensors[o->x].stride % 32u && o->kind != HX_CONV)
@@ -451,6 +545,193 @@ static void normalise(const HxGraph *g, const HxOp *o, const float *x, float *ou
                 out[i * b->stride + k] = (float)((x[i * a->stride + k] - mean) * inv * gamma[k] + beta[k]);
     }
 }
+static inline float hx_half_to_float(uint16_t h) {
+    union { uint32_t u; float f; } v;
+    uint32_t sign = ((uint32_t)h & 0x8000u) << 16, exp = (h >> 10) & 31u, mant = h & 1023u;
+    if (!exp) { float x = (float)mant * 0x1p-24f; return sign ? -x : x; }
+    v.u = sign | ((exp + 112u) << 23) | (mant << 13);
+    return v.f;
+}
+static void hx_rmsnorm_op(const HxGraph *g, const HxOp *o, const float *x, float *out,
+                          uint32_t lo, uint32_t hi) {
+    const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
+    const uint32_t *p = o->p, c = b->c;
+    const double eps = (double)hx_float(p[0]);
+    const float *gamma = (const float *)(g->constants + p[1]);
+    const float *beta = p[2] != HXFG_NONE ? (const float *)(g->constants + p[2]) : NULL;
+    for (uint32_t i = lo; i < hi; i++) {
+        const float *src = x + i * a->stride;
+        float *dst = out + i * b->stride;
+        double sum_sq = 0.0;
+        for (uint32_t k = 0; k < c; k++)
+            sum_sq += (double)src[k] * (double)src[k];
+        const double inv = 1.0 / sqrt(sum_sq / (double)c + eps);
+        for (uint32_t k = 0; k < c; k++)
+            dst[k] = (float)((double)src[k] * inv * (double)gamma[k] + (beta ? (double)beta[k] : 0.0));
+        for (uint32_t k = c; k < b->stride; k++)
+            dst[k] = 0.0f;
+    }
+}
+static void hx_rope_op(const HxGraph *g, const HxOp *o, const float *x, const float *y,
+                       float *out, uint32_t lo, uint32_t hi) {
+    const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
+    const uint32_t *p = o->p;
+    const uint32_t head_dim = p[0], num_heads = p[1], half = head_dim / 2u;
+    const uint32_t mode = p[3];
+    for (uint32_t i = lo; i < hi; i++) {
+        const float *src = x + i * a->stride;
+        float *dst = out + i * b->stride;
+        uint32_t pos = p[2];
+        if (o->y != HXFG_NONE && y) {
+            pos = (uint32_t)y[0];
+        }
+        for (uint32_t h = 0; h < num_heads; h++) {
+            const float *h_in = src + h * head_dim;
+            float *h_out = dst + h * head_dim;
+            for (uint32_t j = 0; j < half; j++) {
+                double theta = pow(10000.0, -2.0 * (double)j / (double)head_dim);
+                double angle = (double)pos * theta;
+                float cos_v = (float)cos(angle);
+                float sin_v = (float)sin(angle);
+                if (mode == 0) {
+                    float v0 = h_in[j], v1 = h_in[half + j];
+                    h_out[j] = v0 * cos_v - v1 * sin_v;
+                    h_out[half + j] = v0 * sin_v + v1 * cos_v;
+                } else {
+                    float v0 = h_in[2 * j], v1 = h_in[2 * j + 1];
+                    h_out[2 * j] = v0 * cos_v - v1 * sin_v;
+                    h_out[2 * j + 1] = v0 * sin_v + v1 * cos_v;
+                }
+            }
+        }
+        for (uint32_t k = num_heads * head_dim; k < b->c; k++)
+            dst[k] = src[k];
+        for (uint32_t k = b->c; k < b->stride; k++)
+            dst[k] = 0.0f;
+    }
+}
+static inline uint8_t *hx_tensor_base(const HxGraph *g, const HxTensor *t) {
+    if ((t->reserved[0] & HX_TENSOR_PERSISTENT) && g->state)
+        return g->state;
+    return g->arena;
+}
+static void hx_shortconv_op(const HxGraph *g, const HxOp *o, const float *x, float *out,
+                            uint32_t part, uint32_t parts) {
+    const HxTensor *b = &g->tensors[o->out];
+    const HxTensor *st = &g->tensors[o->y];
+    float *s_buf = (float *)(hx_tensor_base(g, st) + st->offset);
+    const float *w = (const float *)(g->constants + o->p[1]);
+    const float *bias = o->p[2] != HXFG_NONE ? (const float *)(g->constants + o->p[2]) : NULL;
+    const float *gate = o->z != HXFG_NONE ? (const float *)(hx_tensor_base(g, &g->tensors[o->z]) + g->tensors[o->z].offset) : NULL;
+    const uint32_t k_taps = o->p[0], s_len = k_taps - 1u, c = b->c;
+    const uint32_t c0 = c * part / parts, c1 = c * (part + 1u) / parts;
+
+    for (uint32_t d = c0; d < c1; d++) {
+        double acc = bias ? (double)bias[d] : 0.0;
+        for (uint32_t j = 0; j < s_len; j++) {
+            acc += (double)s_buf[j * st->stride + d] * (double)w[j * b->stride + d];
+        }
+        acc += (double)x[d] * (double)w[s_len * b->stride + d];
+
+        for (uint32_t j = 0; j < s_len - 1u; j++) {
+            s_buf[j * st->stride + d] = s_buf[(j + 1u) * st->stride + d];
+        }
+        s_buf[(s_len - 1u) * st->stride + d] = x[d];
+
+        float val = (float)acc;
+        if (o->p[3] == 1) val = fmaxf(0.0f, val);
+        else if (o->p[3] == 3) val = val / (1.0f + expf(-val));
+
+        if (gate)
+            val *= gate[d];
+        out[d] = val;
+    }
+    if (part == 0) {
+        for (uint32_t d = c; d < b->stride; d++)
+            out[d] = 0.0f;
+    }
+}
+static void hx_linear_q_op(const HxGraph *g, const HxOp *o, const float *x, float *out,
+                           uint32_t part, uint32_t parts) {
+    const HxTensor *b = &g->tensors[o->out];
+    const uint32_t fmt = o->p[0], k = o->p[3], n = o->p[4];
+    const float *bias = o->p[2] != HXFG_NONE ? (const float *)(g->constants + o->p[2]) : NULL;
+    const uint32_t blocks = k / 32u;
+    const uint32_t r0 = n * part / parts, r1 = n * (part + 1u) / parts;
+
+    for (uint32_t r = r0; r < r1; r++) {
+        double sum = bias ? (double)bias[r] : 0.0;
+        if (fmt == 0) {
+            const uint8_t *w_row = (const uint8_t *)(g->constants + o->p[1]) + (uint64_t)r * blocks * 18u;
+            for (uint32_t b_idx = 0; b_idx < blocks; b_idx++) {
+                const uint8_t *blk = w_row + b_idx * 18u;
+                const uint16_t d16 = (uint16_t)blk[16] | ((uint16_t)blk[17] << 8);
+                const float scale = hx_half_to_float(d16);
+                const float *x_blk = x + b_idx * 32u;
+                double blk_acc = 0.0;
+                for (uint32_t j = 0; j < 16u; j++) {
+                    const uint8_t byte = blk[j];
+                    const int32_t q0 = (int32_t)(byte & 0x0fu) - 8;
+                    const int32_t q1 = (int32_t)(byte >> 4u) - 8;
+                    blk_acc += (double)x_blk[2u * j] * (double)q0 + (double)x_blk[2u * j + 1u] * (double)q1;
+                }
+                sum += blk_acc * (double)scale;
+            }
+        } else {
+            const uint8_t *w_row = (const uint8_t *)(g->constants + o->p[1]) + (uint64_t)r * blocks * 34u;
+            for (uint32_t b_idx = 0; b_idx < blocks; b_idx++) {
+                const uint8_t *blk = w_row + b_idx * 34u;
+                const uint16_t d16 = (uint16_t)blk[32] | ((uint16_t)blk[33] << 8);
+                const float scale = hx_half_to_float(d16);
+                const float *x_blk = x + b_idx * 32u;
+                double blk_acc = 0.0;
+                for (uint32_t j = 0; j < 32u; j++) {
+                    const int8_t q = (int8_t)blk[j];
+                    blk_acc += (double)x_blk[j] * (double)q;
+                }
+                sum += blk_acc * (double)scale;
+            }
+        }
+        float val = (float)sum;
+        if (o->p[5] == 1) val = fmaxf(0.0f, val);
+        else if (o->p[5] == 3) val = val / (1.0f + expf(-val));
+        out[r] = val;
+    }
+    if (part == 0) {
+        for (uint32_t r = n; r < b->stride; r++)
+            out[r] = 0.0f;
+    }
+}
+static void hx_kv_write_op(const HxGraph *g, const HxOp *o, const float *x, const float *y,
+                           float *out, uint32_t part, uint32_t parts) {
+    const HxTensor *xt = &g->tensors[o->x];
+    const HxTensor *outt = &g->tensors[o->out];
+    uint32_t pos = o->p[0];
+    if (o->y != HXFG_NONE && y) {
+        pos = (uint32_t)(*y);
+    }
+    uint32_t tokens = xt->h * xt->w;
+    uint32_t max_tokens = outt->h * outt->w;
+    if (pos >= max_tokens)
+        return;
+    if (pos + tokens > max_tokens)
+        tokens = max_tokens - pos;
+    uint32_t c = xt->c;
+    uint32_t c0 = c * part / parts, c1 = c * (part + 1u) / parts;
+    for (uint32_t t = 0; t < tokens; t++) {
+        const float *src = x + t * xt->stride;
+        float *dst = out + (pos + t) * outt->stride;
+        for (uint32_t ch = c0; ch < c1; ch++)
+            dst[ch] = src[ch];
+    }
+    if (part == 0 && outt->stride > c) {
+        for (uint32_t t = 0; t < tokens; t++) {
+            float *dst = out + (pos + t) * outt->stride;
+            for (uint32_t ch = c; ch < outt->stride; ch++)
+                dst[ch] = 0.0f;
+        }
+    }
+}
 void hx_execute_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts) {
     const HxOp *o = &g->ops[index];
     const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
@@ -466,9 +747,9 @@ void hx_execute_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t par
         }
     }
 #endif
-    const float *x = (const float *)(g->arena + a->offset);
-    const float *y = o->y == HXFG_NONE ? NULL : (const float *)(g->arena + g->tensors[o->y].offset);
-    float *out = (float *)(g->arena + b->offset);
+    const float *x = (const float *)(hx_tensor_base(g, a) + a->offset);
+    const float *y = o->y == HXFG_NONE ? NULL : (const float *)(hx_tensor_base(g, &g->tensors[o->y]) + g->tensors[o->y].offset);
+    float *out = (float *)(hx_tensor_base(g, b) + b->offset);
     const uint32_t *p = o->p;
     const uint32_t dil_h = hx_dilation_h(o), dil_w = hx_dilation_w(o);
     uint32_t pixels = b->h * b->w, lo = pixels * part / parts, hi = pixels * (part + 1u) / parts;
@@ -494,9 +775,46 @@ void hx_execute_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t par
         normalise(g, o, x, out, lo, hi);
         return;
     }
+    if (o->kind == HX_RMSNORM) {
+        hx_rmsnorm_op(g, o, x, out, lo, hi);
+        return;
+    }
+    if (o->kind == HX_ROPE) {
+        hx_rope_op(g, o, x, y, out, lo, hi);
+        return;
+    }
+    if (o->kind == HX_SHORTCONV) {
+        hx_shortconv_op(g, o, x, out, part, parts);
+        return;
+    }
+    if (o->kind == HX_LINEAR_Q) {
+        hx_linear_q_op(g, o, x, out, part, parts);
+        return;
+    }
+    if (o->kind == HX_KV_WRITE) {
+        hx_kv_write_op(g, o, x, y, out, part, parts);
+        return;
+    }
     for (uint32_t i = lo; i < hi; i++) {
         uint32_t oy = i / b->w, ox = i % b->w;
         float *dst = out + i * b->stride;
+        if (o->kind == HX_MATMUL) {
+            /* Row i of A against B (float32 accumulate), then the scalar; padding lanes zero. */
+            const float *src = x + i * a->stride;
+            const float scale = p[1] ? hx_float(p[1]) : 1.0f;
+            for (uint32_t c = 0; c < b->stride; c++) {
+                float v = 0;
+                if (c < b->c) {
+                    float acc = 0;
+                    for (uint32_t k = 0; k < a->c; k++)
+                        acc += src[k] * (p[0] ? y[c * g->tensors[o->y].stride + k]
+                                              : y[k * g->tensors[o->y].stride + c]);
+                    v = acc * scale;
+                }
+                dst[c] = v;
+            }
+            continue;
+        }
         if (o->kind == HX_ACT) {
             const float *src = x + i * a->stride;
             for (uint32_t c = 0; c < b->stride; c++)
@@ -809,3 +1127,10 @@ void hx_execute_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t par
         }
     }
 }
+void hx_graph_set_state(HxGraph *g, void *state, uint32_t state_bytes) {
+    if (g) {
+        g->state = (uint8_t *)state;
+        g->state_bytes = state_bytes;
+    }
+}
+

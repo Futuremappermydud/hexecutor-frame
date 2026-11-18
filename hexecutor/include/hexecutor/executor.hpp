@@ -43,6 +43,11 @@ struct Artifacts {
     bool tensor_fp16 = true; // Persistent blocked intermediates when the graph is supported.
     // Only the stock Gazenet broker adapter may keep the eye client running.
     bool keep_eye_running = false;
+    // Memory reservation for CDSP: 0 = automatic based on workload requirements (min 128 MiB).
+    size_t cdsp_memory_mb = 0;
+    // Configurable persistent state region (0 = auto-allocated based on graph state tensors)
+    size_t persistent_state_bytes = 0;
+    uint32_t persistent_state_offset = 0;
 };
 // Read and preflight an HXFG image; the external I/O is compact float32.
 Program load_tensor_program(const std::filesystem::path &image,
@@ -75,6 +80,8 @@ class Session {
     Session &operator=(const Session &) = delete;
     std::vector<Bytes> run(const std::vector<Buffer> &inputs, size_t program_index = 0);
     const ExecutionProfile &profile() const;
+    void reset_state();
+    size_t state_bytes() const;
     void close();
 
   private:

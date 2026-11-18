@@ -1,4 +1,5 @@
 #include "detail.hpp"
+#include "hexecutor/workload_memory.hpp"
 #include "tensor/graph.h"
 #include "qnn16/program.h"
 #include <algorithm>
@@ -12,6 +13,7 @@
 #include <utility>
 #ifdef __linux__
 #include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -206,6 +208,9 @@ struct Session::Impl {
     size_t last_graph = SIZE_MAX;
     uint32_t last_generation = 0;
     uint8_t *memory = nullptr;
+    WorkloadLease lease;
+    size_t mapped_bytes = 128u << 20;
+    int pin_fd = -1;
     std::array<uint32_t, 7> sizes{}, pools{};
     std::array<uint32_t, 4> inputs{}, input_bytes{};
     std::array<uint32_t, 2> outputs{}, output_bytes{};
@@ -343,17 +348,23 @@ struct Session::Impl {
     void open() {
 #ifdef __linux__
         verify_chunk_map(artifacts);
+        size_t workload_mb = calculate_workload_size_mb(programs, artifacts);
+        lease = WorkloadMemoryManager::instance().acquire_lease(workload_mb);
+        size_t lease_mb = WorkloadMemoryManager::instance().current_size_mb();
+        mapped_bytes = lease_mb << 20;
+
         transport = std::make_unique<Transport>(artifacts, artifacts.bootstrap, fourth);
         transport->set_exit_check([this] { verify_exit(true); });
-        require(std::stoul(std::string(read_text("/sys/module/cdsp_mem/parameters/size_mb"))) ==
-                    128,
-                "requires a 128 MB cdsp_mem allocation");
+        require(lease_mb >= 128, "requires a cdsp_mem allocation of at least 128 MB");
+        require(lease_mb >= workload_mb, "cdsp_mem reservation smaller than workload requirement");
         require(std::stoull(read_text("/sys/module/cdsp_mem/parameters/iova")) == 0xa0000000,
                 "wrong CDSP IOVA");
         int fd = ::open("/dev/cdsp_mem", O_RDWR | O_CLOEXEC);
         require(fd >= 0, "cannot open cdsp_mem");
-        void *mapped = mmap(nullptr, 128u << 20, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        ::close(fd);
+        uint32_t pin_mb = static_cast<uint32_t>(lease_mb);
+        ::ioctl(fd, CDSP_MEM_IOC_PIN, &pin_mb);
+        pin_fd = fd;
+        void *mapped = mmap(nullptr, mapped_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         require(mapped != MAP_FAILED, "cannot map cdsp_mem");
         memory = static_cast<uint8_t *>(mapped);
         std::copy(engine.begin(), engine.end(), memory);
@@ -382,9 +393,9 @@ struct Session::Impl {
             cursor = 32u << 20;
             /* The Q16P engine keeps its private, L1-cached scratch in
              * [56 MiB, 64 MiB - 4 KiB) of the same page (engine.c). */
-            /* Tensor graphs may use relative [32, 96) MiB for constants; the Q16P engine keeps
-             * its scratch in [56, 64) MiB. */
-            allocation_limit = q ? (56u << 20) - 128 : (96u << 20) - 4096;
+            /* Tensor graphs may use relative [32, 96) MiB for constants (or higher when cdsp_mem > 128 MiB);
+             * the Q16P engine keeps its scratch in [56, 64) MiB. */
+            allocation_limit = q ? (56u << 20) - 128 : (mapped_bytes > (128u << 20) ? (mapped_bytes - (32u << 20) - 4096) : (96u << 20) - 4096);
             max_allocation = q ? 32u << 20 : HXFG_MAX_CONSTANT_BYTES + 1u;
             for (size_t i = 0; i < programs.size(); i++) {
                 auto &c = tensor_config.graph[i];
@@ -392,6 +403,51 @@ struct Session::Impl {
                 c.constants = allocate(c.constant_bytes);
                 std::copy(tensor_constants[i].begin(), tensor_constants[i].end(),
                           memory + c.constants);
+            }
+            size_t max_state_bytes = 0;
+            std::map<uint32_t, uint32_t> shared_state_offsets;
+            for (size_t i = 0; !q && i < programs.size(); i++) {
+                const auto *h = graphs[i].header;
+                for (uint32_t j = 0; j < h->tensors; j++) {
+                    const auto &t = graphs[i].tensors[j];
+                    if (t.reserved[0] & HX_TENSOR_PERSISTENT) {
+                        uint32_t off = t.offset;
+                        if (t.reserved[1] != 0) {
+                            auto it = shared_state_offsets.find(t.reserved[1]);
+                            if (it != shared_state_offsets.end())
+                                off = it->second;
+                            else
+                                shared_state_offsets[t.reserved[1]] = off;
+                        }
+                        max_state_bytes = std::max(max_state_bytes, size_t(off + hx_tensor_bytes(&t)));
+                    }
+                }
+            }
+            if (artifacts.persistent_state_bytes > 0)
+                max_state_bytes = std::max(max_state_bytes, artifacts.persistent_state_bytes);
+            if (max_state_bytes > 0) {
+                max_state_bytes = (max_state_bytes + 127) & ~127u;
+                if (artifacts.persistent_state_offset > 0) {
+                    tensor_config.state = artifacts.persistent_state_offset;
+                } else {
+                    tensor_config.state = allocate(max_state_bytes);
+                }
+                tensor_config.state_bytes = uint32_t(max_state_bytes);
+                std::memset(memory + tensor_config.state, 0, tensor_config.state_bytes);
+                for (size_t i = 0; !q && i < programs.size(); i++) {
+                    graphs[i].state = memory + tensor_config.state;
+                    graphs[i].state_bytes = tensor_config.state_bytes;
+                    if (!shared_state_offsets.empty()) {
+                        auto *img_tensors = reinterpret_cast<HxTensor *>(memory + tensor_config.graph[i].image + graphs[i].header->tensor_offset);
+                        for (uint32_t j = 0; j < graphs[i].header->tensors; j++) {
+                            if ((img_tensors[j].reserved[0] & HX_TENSOR_PERSISTENT) && img_tensors[j].reserved[1] != 0) {
+                                auto it = shared_state_offsets.find(img_tensors[j].reserved[1]);
+                                if (it != shared_state_offsets.end())
+                                    img_tensors[j].offset = it->second;
+                            }
+                        }
+                    }
+                }
             }
             require(hx_session_config_valid(&tensor_config), "invalid tensor memory config");
             guard_floor = cursor; /* canaries in [64, 96) MiB must not overwrite constants */
@@ -444,7 +500,7 @@ struct Session::Impl {
                  {(80u << 20) - 4096, 4096},
                  {88u << 20, 4096},
                  {(64u << 20) - 4096, 4096},
-                 {(128u << 20) - 4096, 4096},
+                 {uint32_t(mapped_bytes - 4096), 4096},
                  {(96u << 20) - 128, 128},
                  {104u << 20, 128}})
             if (g.first >= guard_floor)
@@ -663,6 +719,13 @@ struct Session::Impl {
                         require(std::equal(constants.begin(), constants.end(), memory + pools[5]),
                                 "constant pool changed");
                 }
+#ifdef __linux__
+                if (pin_fd >= 0) {
+                    ::ioctl(pin_fd, CDSP_MEM_IOC_UNPIN);
+                    ::close(pin_fd);
+                    pin_fd = -1;
+                }
+#endif
             }
         } catch (...) {
             auto failure = std::current_exception();
@@ -690,10 +753,15 @@ struct Session::Impl {
     }
     void release_memory() {
 #ifdef __linux__
+        if (pin_fd >= 0) {
+            ::close(pin_fd);
+            pin_fd = -1;
+        }
         if (memory)
-            munmap(memory, 128u << 20);
+            munmap(memory, mapped_bytes);
 #endif
         memory = nullptr;
+        lease.release();
     }
     ~Impl() {
         try {
@@ -701,6 +769,38 @@ struct Session::Impl {
         } catch (const std::exception &e) {
             std::cerr << "[Hexecutor] " << e.what() << '\n';
         }
+    }
+    void reset_state() {
+        if (tensor_config.state_bytes) {
+            if (memory) {
+                std::memset(memory + tensor_config.state, 0, tensor_config.state_bytes);
+            }
+            for (auto &g : graphs) {
+                if (g.state)
+                    std::memset(g.state, 0, g.state_bytes);
+            }
+#ifdef __linux__
+            if (transport && initialized) {
+                auto guard = transport->lock();
+                auto *arena = transport->arena();
+                transport->submit([&](uint32_t sequence) {
+                    std::memset(arena + 128, 0, 48);
+                    uint32_t packet[7] = {0x32564451, 6, sequence - 1, 4, 0, 0, 0};
+                    std::memcpy(arena, packet, sizeof(packet));
+                    put<uint32_t>(arena, 3840, 0);
+                    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+                    put<uint32_t>(arena, 8, sequence);
+                    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+                });
+                require(get<uint32_t>(arena, 2048) == HXFG_RESULT_MAGIC &&
+                            get<uint32_t>(arena, 2052) == HX_OK,
+                        "reset_state command failed");
+            }
+#endif
+        }
+    }
+    size_t state_bytes() const {
+        return tensor_config.state_bytes;
     }
 };
 Session::Session(Program p, Artifacts a)
@@ -714,5 +814,7 @@ std::vector<Bytes> Session::run(const std::vector<Buffer> &values, size_t index)
     return impl_->run(values, index);
 }
 const ExecutionProfile &Session::profile() const { return impl_->profile; }
+void Session::reset_state() { impl_->reset_state(); }
+size_t Session::state_bytes() const { return impl_->state_bytes(); }
 void Session::close() { impl_->close(); }
 } // namespace hexecutor

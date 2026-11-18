@@ -803,18 +803,18 @@ void verify_chunk_map(const Artifacts &artifacts) {
         auto b = read_file(p);
         return std::string(b.begin(), b.end());
     };
-    /* Shipped engines map exactly 128 MiB. HEXECUTOR_CHUNK_WINDOW_MB (probe experiments only)
+    /* Shipped engines map the first 128 MiB of the lease. HEXECUTOR_CHUNK_WINDOW_MB (probe experiments only)
      * widens the window and needs a probe built with a matching QDO_SLOTS and a cdsp_mem lease
      * of at least that size. */
     size_t window_mb = 128;
     const char *window_env = std::getenv("HEXECUTOR_CHUNK_WINDOW_MB");
     if (window_env)
         window_mb = std::stoul(window_env);
-    require(window_mb >= 32 && window_mb % 16 == 0 && window_mb <= 1024, "bad probe window");
+    require(window_mb >= 32 && window_mb % 16 == 0 && window_mb <= 1536, "bad probe window");
     const size_t lease_mb = std::stoul(text("/sys/module/cdsp_mem/parameters/size_mb"));
-    require(window_env ? lease_mb >= window_mb : lease_mb == 128,
-            window_env ? "memory lease smaller than the probe window"
-                       : "requires a 128 MB memory lease");
+    /* A lease above the window is fine: the engines map only the first window_mb of it. */
+    require(lease_mb >= window_mb, window_env ? "memory lease smaller than the probe window"
+                                              : "requires a memory lease of at least 128 MB");
     require(std::stoull(text("/sys/module/cdsp_mem/parameters/iova")) == 0xa0000000,
             "wrong CDSP IOVA");
     const unsigned chunks = unsigned(window_mb / 2);
@@ -828,8 +828,8 @@ void verify_chunk_map(const Artifacts &artifacts) {
     ::close(fd);
     require(p != MAP_FAILED, "cannot map probe window");
     try {
-        /* Keep the chunk-index bits of the nonce clear (7 bits cover 128 chunks, 8 cover 256). */
-        const uint32_t keep = window_mb > 256 ? ~0x1fe00000u : ~0x0fe00000u;
+        /* Keep the chunk-index bits of the nonce clear (7 bits cover 128 chunks, 8 cover 256, 10 cover up to 1024/1536). */
+        const uint32_t keep = window_mb > 512 ? ~0x7fe00000u : (window_mb > 256 ? ~0x1fe00000u : ~0x0fe00000u);
         uint32_t nonce = std::random_device{}() & keep;
         for (unsigned i = 0; i < chunks; i++)
             put<uint32_t>(p, size_t(i) << 21, (i << 21) ^ nonce);

@@ -13,6 +13,15 @@ static uint32_t pad_shift;
 static uint32_t vtcm_size = 0x800000;
 /* z of the next convolution/depthwise check(): HXFG_NONE or (dh << 8) | dw. */
 static uint32_t dilation_z = HXFG_NONE;
+/* Simulator pcycles spent in the FP16 operator calls of the last check(), summed over parts. */
+static uint64_t op_pcycles;
+/* Simulator processor cycles: the service call behind hexagon_sim_read_pcycles, inlined because
+ * the tensor build does not link libhexagon. */
+static uint64_t pcycles(void) {
+    uint64_t c;
+    __asm__ volatile("r0 = #0x52\n\ttrap0(#0x0)\n\t%0 = combine(r1,r0)" : "=r"(c) : : "r0", "r1");
+    return c;
+}
 static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t ci, uint32_t co,
                  uint32_t kh, uint32_t step, uint32_t axis) {
     uint8_t *constants = aligned_alloc(128, 0x100000);
@@ -37,7 +46,8 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
     if (kind == HX_CONV || kind == HX_DEPTHWISE)
         o.z = dilation_z;
     o.out = 2;
-    if (kind == HX_ADD || kind == HX_CONCAT || (kind == HX_BINARY && step != 4))
+    if (kind == HX_ADD || kind == HX_CONCAT || kind == HX_MATMUL ||
+        (kind == HX_BINARY && step != 4))
         o.y = 1;
     if (kind == HX_CONV || kind == HX_DEPTHWISE || kind == HX_MAXPOOL || kind == HX_AVGPOOL) {
         o.p[0] = o.p[1] = kh;
@@ -163,6 +173,18 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
             for (uint32_t c = 0; c < 64; c++)
                 ((float *)(constants + 0x70000))[c] = ((int)(c % 5) - 2) * .5f;
         }
+    } else if (kind == HX_MATMUL) {
+        /* h x 1 x ci is A and co is N; step is transB (B is [ci,co], or [co,ci] when 1); axis 1
+         * scales the product by 0.5, otherwise p[1] stays zero (1.0). */
+        o.p[0] = step;
+        o.p[1] = axis ? 0x3f000000u : 0u;
+        t[0].w = t[1].w = t[2].w = 1;
+        t[1].h = step ? co : ci;
+        t[1].c = step ? ci : co;
+        t[1].stride = (t[1].c + 31) & ~31u;
+        t[2].h = h;
+        t[2].c = co;
+        t[2].stride = (co + 31) & ~31u;
     } else if (kind == HX_NORM) {
         /* axis: mode (HX_NORM_CHANNEL or HX_NORM_GROUP). step: group count (GROUP only).
          * Epsilon 1e-5; gamma and beta are per-channel vectors at 0x90000 and 0x98000. */
@@ -207,8 +229,11 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
         float *v = reference + t[n].offset / 4;
         for (uint32_t i = 0; i < t[n].h * t[n].w; i++)
             for (uint32_t c = 0; c < t[n].stride; c++)
+                /* Matrix products use small values so the FP16 result stays within .004. */
                 v[i * t[n].stride + c] =
-                    c < t[n].c ? ((int)((i * 7 + c * 3 + n) % 23) - 11) * .25f : 0;
+                    c >= t[n].c ? 0
+                    : kind == HX_MATMUL ? ((int)((i * 7 + c * 3 + n) % 5) - 2) * .125f
+                                        : ((int)((i * 7 + c * 3 + n) % 23) - 11) * .25f;
         /* HX_ACT_SQRT takes |x|: signed inputs are NaN, which check() cannot compare. */
         if (kind == HX_ACT && axis == HX_ACT_SQRT)
             for (uint32_t j = 0; j < t[n].h * t[n].w * t[n].stride; j++)
@@ -224,11 +249,13 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
     for (uint32_t p = 0; p < 3; p++)
         hx_execute_op(&g, 0, p, 3);
     g.arena = arena;
+    const uint64_t op_begin = pcycles();
     if (kind == HX_CONV)
         hx_fp16_conv(&g, 0, NULL);
     else
         for (uint32_t p = 0; p < 3; p++)
             hx_fp16_op(&g, 0, p, 3);
+    op_pcycles = pcycles() - op_begin;
     hx_fp16_complete(&g, 0);
     if (t[2].w & 1u) {
         /* The pad column must read as zero for any later border tap. */
@@ -457,9 +484,40 @@ int main(void) {
         errors += check_rgb(base, 16, 16, kh, 24);
         errors += check_rgb(base, 13, 17, kh, 64);
     }
+    /* Matrix product of two runtime tensors: transB 0 and 1, scale 1 and 0.5, odd sizes. */
+    for (uint32_t trans = 0; trans <= 1; trans++)
+        for (uint32_t scaled = 0; scaled <= 1; scaled++) {
+            errors += check(base, HX_MATMUL, 7, 1, 33, 19, 1, trans, scaled);
+            errors += check(base, HX_MATMUL, 40, 1, 64, 40, 1, trans, scaled);
+            errors += check(base, HX_MATMUL, 1, 1, 96, 65, 1, trans, scaled);
+        }
+    /* Attention-sized products: Q.K^T (K = 64) and attn.V (K = 197 tokens), with timing. */
+    static const struct {
+        uint32_t l, k, n;
+    } attn[] = {{197, 64, 197}, {197, 197, 64}};
+    for (unsigned i = 0; i < sizeof attn / sizeof attn[0]; i++)
+        for (uint32_t trans = 0; trans <= 1; trans++)
+            for (uint32_t scaled = 0; scaled <= 1; scaled++) {
+                const int e = check(base, HX_MATMUL, attn[i].l, 1, attn[i].k, attn[i].n, 1, trans,
+                                    scaled);
+                printf("MATMUL L%u K%u N%u transB%u scale%u: %s, %llu pcycles\n",
+                       (unsigned)attn[i].l, (unsigned)attn[i].k, (unsigned)attn[i].n,
+                       (unsigned)trans, (unsigned)scaled, e ? "FAIL" : "ok",
+                       (unsigned long long)op_pcycles);
+                errors += e;
+            }
+    /* Workspace slices too small for the operands: the scalar-lane product (N 64) and the
+     * per-element loop (N 197) run instead, and must match the reference. */
+    vtcm_size = 0x58000;
+    for (uint32_t trans = 0; trans <= 1; trans++)
+        errors += check(base, HX_MATMUL, 8, 1, 197, 64, 1, trans, 1);
+    vtcm_size = 0x80000;
+    for (uint32_t trans = 0; trans <= 1; trans++)
+        errors += check(base, HX_MATMUL, 8, 1, 197, 197, 1, trans, 0);
+    vtcm_size = 0x800000;
     if (errors)
         return 1;
     puts("PASS blocked FP16 RGB entry, convolution, depthwise, elementwise, pooling, resize, transforms, "
-         "reductions and channel/pixel tails");
+         "reductions, matrix products and channel/pixel tails");
     return 0;
 }

@@ -1032,11 +1032,148 @@ static void norm_scalar(const HxGraph *g, const HxOp *o, uint32_t lo, uint32_t h
             }
     }
 }
+/* HX_MATMUL in vector lanes, same scratch slice as matmul_scalar. B is kept as float blocks
+ * [K][NBP] (32 lanes each, zero beyond N and beyond NB blocks, NBP = NB rounded up to 4). Each A
+ * row is converted once by HVX, and each output row accumulates four 32-channel blocks at a time
+ * in qf32 registers. Returns 0 when the slice is too small. */
+static int matmul_vector(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
+    const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out], *t = &g->tensors[o->y];
+    const uint32_t K = a->c, N = b->c, NB = (N + 31u) / 32u, NBP = (NB + 3u) & ~3u;
+    const uint32_t KB = (K + 31u) / 32u, bytes_b = K * NBP * 128u, bytes_a = KB * 128u;
+    /* transB 1 converts B rows (N x KB vectors) into a float temporary before the transpose. */
+    const uint32_t bytes_t = o->p[0] ? N * KB * 128u : 0u;
+    const uint32_t slice = (g->fp16->workspace_bytes / parts) & ~2047u;
+    if (bytes_b + bytes_a + bytes_t > slice)
+        return 0;
+    const uint32_t lo = b->h * part / parts, hi = b->h * (part + 1u) / parts;
+    if (lo == hi)
+        return 1;
+    uint8_t *ws = g->fp16->workspace + part * slice;
+    HVX_Vector *bf = (HVX_Vector *)ws, *arow = (HVX_Vector *)(ws + bytes_b);
+    const HVX_Vector *xv = (const HVX_Vector *)tensor_data(g, o->x);
+    HVX_Vector *out = (HVX_Vector *)tensor_data(g, o->out);
+    float scale = 1.0f;
+    if (o->p[1])
+        memcpy(&scale, &o->p[1], sizeof scale);
+    const uint32_t plane_a = plane_bytes(a) / 128u, plane_b = plane_bytes(b) / 128u;
+    if (!o->p[0]) {
+        /* B is [K,N]: block nb of row k is one vector of the blocked operand. */
+        const HVX_Vector *yvec = (const HVX_Vector *)tensor_data(g, o->y);
+        const uint32_t plane_t = plane_bytes(t) / 128u;
+        for (uint32_t k = 0; k < K; k++) {
+            for (uint32_t nb = 0; nb < NB; nb++) {
+                HVX_Vector v = float_words(yvec[nb * plane_t + k]);
+                if (nb == NB - 1u && (N & 31u))
+                    v = Q6_V_vand_VV(v, rgb_mask(0, N & 31u));
+                bf[k * NBP + nb] = v;
+            }
+            for (uint32_t nb = NB; nb < NBP; nb++)
+                bf[k * NBP + nb] = Q6_V_vzero();
+        }
+    } else {
+        /* B is [N,K]: HVX converts each row to float (row n at tmp + n * KB * 32), then the
+         * transpose is a scalar copy into the same layout as above. */
+        const HVX_Vector *yvec = (const HVX_Vector *)tensor_data(g, o->y);
+        const uint32_t plane_t = plane_bytes(t) / 128u, row_stride = KB * 32u;
+        float *tmp = (float *)(ws + bytes_b + bytes_a), *bfs = (float *)bf;
+        for (uint32_t n = 0; n < N; n++)
+            for (uint32_t kb = 0; kb < KB; kb++)
+                ((HVX_Vector *)(tmp + n * row_stride))[kb] = float_words(yvec[kb * plane_t + n]);
+        for (uint32_t k = 0; k < K; k++) {
+            float *dst = bfs + k * NBP * 32u;
+            for (uint32_t n = 0; n < N; n++)
+                dst[n] = tmp[n * row_stride + k];
+            for (uint32_t n = N; n < NBP * 32u; n++)
+                dst[n] = 0.0f;
+        }
+    }
+    for (uint32_t i = lo; i < hi; i++) {
+        for (uint32_t kb = 0; kb < KB; kb++) {
+            HVX_Vector v = float_words(xv[kb * plane_a + i]);
+            if (scale != 1.0f)
+                v = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(v, splat(scale)));
+            arow[kb] = v;
+        }
+        const float *ar = (const float *)arow;
+        for (uint32_t nb0 = 0; nb0 < NBP; nb0 += 4u) {
+            HVX_Vector c0 = Q6_V_vzero(), c1 = Q6_V_vzero(), c2 = Q6_V_vzero(), c3 = Q6_V_vzero();
+            for (uint32_t k = 0; k < K; k++) {
+                const HVX_Vector s = splat(ar[k]), *r = bf + k * NBP + nb0;
+                c0 = Q6_Vqf32_vadd_Vqf32Vqf32(c0, Q6_Vqf32_vmpy_VsfVsf(s, r[0]));
+                c1 = Q6_Vqf32_vadd_Vqf32Vqf32(c1, Q6_Vqf32_vmpy_VsfVsf(s, r[1]));
+                c2 = Q6_Vqf32_vadd_Vqf32Vqf32(c2, Q6_Vqf32_vmpy_VsfVsf(s, r[2]));
+                c3 = Q6_Vqf32_vadd_Vqf32Vqf32(c3, Q6_Vqf32_vmpy_VsfVsf(s, r[3]));
+            }
+            const HVX_Vector res[4] = {c0, c1, c2, c3};
+            for (uint32_t j = 0; j < 4u && nb0 + j < NB; j++)
+                out[(nb0 + j) * plane_b + i] = half_words(Q6_Vsf_equals_Vqf32(res[j]));
+        }
+    }
+    return 1;
+}
+
+/* HX_MATMUL in the scalar lanes, one row at a time. Each part keeps B as float in its own
+ * workspace slice ([K][NP], NP = 32 * ceil(N / 32), zero beyond N), converts each A row once, and
+ * accumulates a whole output row in float. Returns 0 without writing when the slice cannot hold
+ * these operands; the caller then tries the scalar-lane version or the per-element loop. */
+static int matmul_scalar(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
+    const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out], *t = &g->tensors[o->y];
+    const uint32_t K = a->c, N = b->c, NP = (N + 31u) & ~31u;
+    const uint32_t bytes_b = (K * NP * 4u + 127u) & ~127u, bytes_a = (K * 4u + 127u) & ~127u;
+    const uint32_t slice = (g->fp16->workspace_bytes / parts) & ~2047u;
+    if (bytes_b + bytes_a + NP * 4u > slice)
+        return 0;
+    const uint32_t lo = b->h * part / parts, hi = b->h * (part + 1u) / parts;
+    if (lo == hi)
+        return 1;
+    uint8_t *ws = g->fp16->workspace + part * slice;
+    float *bf = (float *)ws, *arow = (float *)(ws + bytes_b), *acc = (float *)(ws + bytes_b + bytes_a);
+    const uint16_t *x = (const uint16_t *)tensor_data(g, o->x);
+    const uint16_t *yv = (const uint16_t *)tensor_data(g, o->y);
+    uint16_t *out = (uint16_t *)tensor_data(g, o->out);
+    float scale = 1.0f;
+    if (o->p[1])
+        memcpy(&scale, &o->p[1], sizeof scale);
+    /* B row-major: bf[k * NP + n] = B[k][n]. With transB 1, B is stored [N,K] and element (n, k)
+     * is read instead. */
+    for (uint32_t k = 0; k < K; k++)
+        for (uint32_t n = 0; n < NP; n++) {
+            float v = 0.0f;
+            if (n < N)
+                v = scalar(o->p[0] ? yv[at(t, n * physical_width(t), k)]
+                                   : yv[at(t, k * physical_width(t), n)]);
+            bf[k * NP + n] = v;
+        }
+    const uint32_t plane = plane_bytes(b) / 128u;
+    for (uint32_t i = lo; i < hi; i++) {
+        for (uint32_t k = 0; k < K; k++)
+            arow[k] = scalar(x[at(a, i * physical_width(a), k)]) * scale;
+        for (uint32_t n = 0; n < NP; n++)
+            acc[n] = 0.0f;
+        for (uint32_t k = 0; k < K; k++) {
+            const float l = arow[k];
+            const float *row = bf + k * NP;
+            for (uint32_t n = 0; n < NP; n++)
+                acc[n] += l * row[n];
+        }
+        /* Blocked output: one vector per 32 channels, lanes = halves at even positions. */
+        for (uint32_t nb = 0; nb < NP / 32u; nb++)
+            ((HVX_Vector *)out)[nb * plane + i] = half_words(*(const HVX_Vector *)(acc + nb * 32u));
+    }
+    return 1;
+}
+
 void hx_fp16_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts) {
     const HxOp *o = &g->ops[index];
     const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
     const uint32_t *p = o->p;
     switch (o->kind) {
+    case HX_MATMUL:
+        /* Vector lanes if the slice holds B as float blocks, else scalar lanes, else the
+         * per-element loop below. */
+        if (matmul_vector(g, o, part, parts) || matmul_scalar(g, o, part, parts))
+            return;
+        break;
     case HX_DEPTHWISE:
         if (dw_fast(o)) {
             blocked_depthwise(g, index, part, parts);
@@ -1248,6 +1385,21 @@ void hx_fp16_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts)
                             u = s;
                         }
                         v = half(p[0] == HX_BIN_ADD ? l + u : (p[0] == HX_BIN_SUB ? l - u : l * u));
+                    } else if (o->kind == HX_MATMUL) {
+                        /* Row oy of A against B in scalar lanes, float accumulate. transB 0 reads
+                         * B element (k, c) at pixel k; transB 1 reads (c, k) at pixel c. */
+                        const HxTensor *t = &g->tensors[o->y];
+                        const uint16_t *yv = (const uint16_t *)tensor_data(g, o->y);
+                        float scale = 1.0f, acc = 0.0f;
+                        if (p[1])
+                            memcpy(&scale, &p[1], sizeof scale);
+                        for (uint32_t k = 0; k < a->c; k++) {
+                            const float l = scalar(x[at(a, oy * physical_width(a), k)]);
+                            const float u = p[0] ? scalar(yv[at(t, c * physical_width(t), k)])
+                                                 : scalar(yv[at(t, k * physical_width(t), c)]);
+                            acc += l * u;
+                        }
+                        v = half(acc * scale);
                     } else if (o->kind == HX_AVGPOOL) {
                         float sum = 0;
                         uint32_t taps = 0;

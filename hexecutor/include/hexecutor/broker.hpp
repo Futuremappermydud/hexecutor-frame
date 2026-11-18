@@ -40,6 +40,7 @@ struct Result {
 struct GraphInfo {
     std::string name;
     std::vector<size_t> input_bytes, output_bytes;
+    size_t state_bytes = 0;
 };
 class Backend {
   public:
@@ -52,6 +53,8 @@ class Backend {
     virtual void idle() {}
     // Forced release for a stock firmware job; unlike idle(), cannot be pinned.
     virtual void release() { idle(); }
+    virtual void reset_state() {}
+    virtual size_t state_bytes() const { return 0; }
 };
 
 // Portable scheduling core: earliest deadline first; ties go to the more urgent
@@ -115,6 +118,7 @@ class Server {
     struct GraphStats {
         uint64_t runs = 0;
         double mean_run_ms = 0, mean_dsp_ms = 0;
+        size_t state_bytes = 0;
     };
     std::vector<GraphStats> stats() const;
 
@@ -139,6 +143,7 @@ class Client {
     Result wait(uint64_t ticket);
     // submit + wait; throws unless the result is ok. Drop-in for Session::run.
     std::vector<Bytes> run(const Stream &, const std::vector<Buffer> &inputs);
+    void reset_state();
 
   private:
     int fd_ = -1;

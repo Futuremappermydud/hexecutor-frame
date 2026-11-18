@@ -65,7 +65,8 @@ class ResidentDSP:
                                       worker_tids=self.worker_tids)
         self.transport.__enter__()
         try:
-            if int(Path('/sys/module/cdsp_mem/parameters/size_mb').read_text())!=128:raise ValueError('requires a private 128 MB cdsp_mem allocation')
+            if int(Path('/sys/module/cdsp_mem/parameters/size_mb').read_text()) < 128:
+                raise ValueError('requires a private cdsp_mem allocation of at least 128 MB')
             if int(Path('/sys/module/cdsp_mem/parameters/iova').read_text())!=BASE:raise ValueError('wrong CDSP IOVA')
             fd=os.open('/dev/cdsp_mem',os.O_RDWR)
             try:self.mem=mmap.mmap(fd,SIZE,flags=mmap.MAP_SHARED,prot=mmap.PROT_READ|mmap.PROT_WRITE)

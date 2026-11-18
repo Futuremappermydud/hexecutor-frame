@@ -149,7 +149,10 @@ __attribute__((section(".text.resident_entry"))) void resident_entry(uint32_t ti
     volatile uint32_t *result = (volatile uint32_t *)((uint8_t *)SERVICE + 2048);
     memset(s, 0, sizeof *s);
     uint32_t init_error = hx_session_config_valid(cfg) ? HX_OK : HX_HEADER, bad = HXFG_NONE;
-    if (!init_error)
+    if (!init_error) {
+        if (cfg->state_bytes) {
+            memset((void *)(QDO_BASE + cfg->state), 0, cfg->state_bytes);
+        }
         for (uint32_t i = 0; i < cfg->graphs; i++) {
             const HxGraphConfig *c = &cfg->graph[i];
             init_error =
@@ -158,7 +161,12 @@ __attribute__((section(".text.resident_entry"))) void resident_entry(uint32_t ti
                               (void *)(QDO_BASE + c->arena), c->arena_bytes, &bad);
             if (init_error)
                 break;
+            if (cfg->state_bytes) {
+                GRAPHS[i].state = (uint8_t *)(QDO_BASE + cfg->state);
+                GRAPHS[i].state_bytes = cfg->state_bytes;
+            }
         }
+    }
     /* Each selected graph reuses the same preserved VTCM activation arena.
      * DDR remains the host exchange area. The upper MiB is disjoint kernel
      * scratch, never a live tensor alias. Large graphs keep their DDR arena.
@@ -212,6 +220,23 @@ __attribute__((section(".text.resident_entry"))) void resident_entry(uint32_t ti
         last = seq;
         if (SERVICE[3] == QDC_OP_EXIT)
             break;
+        if (SERVICE[3] == 4u /* QDS_OP_RESET_STATE */) {
+            if (cfg->state_bytes)
+                memset((void *)(QDO_BASE + cfg->state), 0, cfg->state_bytes);
+            result[0] = HXFG_RESULT_MAGIC;
+            result[1] = HX_OK;
+            result[2] = 0;
+            result[3] = 0;
+            result[4] = 0;
+            result[5] = 0;
+            result[6] = 0;
+            result[7] = 0;
+            result[8] = 0;
+            result[9] = 0;
+            dispatch(0, HXFG_NONE, seq);
+            status(0, seq);
+            continue;
+        }
         uint32_t error = init_error, graph = SERVICE[4], completed = 0;
         uint64_t start = cycles(), timer_start = timer_ticks();
         if (!error &&

@@ -103,7 +103,7 @@ double Admission::utilization() const {
 namespace {
 constexpr uint32_t magic = 0x31425848; // "HXB1"
 constexpr size_t max_payload = 64u << 20, max_count = 16;
-enum Type : uint32_t { OPEN = 1, OPENED, ERROR, SUBMIT, RESULT, CLOSE };
+enum Type : uint32_t { OPEN = 1, OPENED, ERROR, SUBMIT, RESULT, CLOSE, RESET, RESET_DONE };
 struct Header {
     uint32_t magic, type, stream, count;
     uint64_t ticket, value;
@@ -262,6 +262,8 @@ struct Server::Impl {
             throw std::runtime_error("broker needs a backend");
         graphs = backend->graphs();
         stats.resize(graphs.size());
+        for (size_t i = 0; i < graphs.size(); i++)
+            stats[i].state_bytes = graphs[i].state_bytes ? graphs[i].state_bytes : backend->state_bytes();
     }
     void reply(const std::shared_ptr<Conn> &c, const Job &job, Status status, const Result &r) {
         std::lock_guard<std::mutex> g(c->send);
@@ -412,6 +414,19 @@ struct Server::Impl {
             }
             for (auto &j : dropped)
                 reply_status(j, Status::error, "stream closed");
+        } else if (f.h.type == RESET) {
+            std::string err;
+            try {
+                backend->reset_state();
+            } catch (const std::exception &e) {
+                err = e.what();
+            }
+            std::lock_guard<std::mutex> lock(c->send);
+            if (!err.empty()) {
+                send_frame(c->fd, ERROR, 0, f.h.ticket, 0, {view(err)});
+            } else {
+                send_frame(c->fd, RESET_DONE, 0, f.h.ticket, 0, nullptr, 0);
+            }
         } else
             throw std::runtime_error("unexpected frame type from client");
     }
@@ -777,5 +792,27 @@ std::vector<Bytes> Client::run(const Stream &s, const std::vector<Buffer> &input
         throw std::runtime_error(std::string("broker job ") + to_string(r.status) +
                                  (r.error.empty() ? "" : ": " + r.error));
     return std::move(r.outputs);
+}
+void Client::reset_state() {
+    uint64_t request = next_ticket_++;
+    send_frame(fd_, RESET, 0, request, 0, nullptr, 0);
+    for (;;) {
+        auto f = read_frame(fd_);
+        if (!f)
+            throw std::runtime_error("broker closed the connection");
+        if (f->h.type == RESULT) {
+            pending_[f->h.ticket] = decode_result(*f);
+            continue;
+        }
+        if (f->h.ticket != request)
+            throw std::runtime_error("unexpected broker reply");
+        if (f->h.type == ERROR)
+            throw std::runtime_error(
+                "broker: " + std::string(f->parts.empty() ? "" : std::string(f->parts[0].begin(),
+                                                                             f->parts[0].end())));
+        if (f->h.type == RESET_DONE)
+            return;
+        throw std::runtime_error("unexpected broker reply to reset_state");
+    }
 }
 } // namespace hexecutor::broker

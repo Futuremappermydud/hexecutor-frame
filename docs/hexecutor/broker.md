@@ -142,6 +142,19 @@ Either Gazenet option sets `Artifacts::keep_eye_running`, so opening the broker 
 
 `--long-wake` does not enable the CPU-setting tripwire in adapter mode, because stock CDSP activity is expected. `hexecutor/tests/test_xrservice_featurenn.cpp` checks the FeatureNN and Gazenet conversion/result ABIs without a device. No Gazenet model lowering, output equivalence, live camera evaluation, or firmware handoff has been validated yet. Controller/gaze tracking quality on real inputs and long worn sessions remain release gates, as does absence of `(2,0,8)`.
 
+## Persistent state
+
+Autoregressive decode workloads (e.g., LFM3-VL-2B / LFM3-1.7B) require resident per-layer state (such as KV caches and conv-state rings) to survive across sequential `run()` invocations on the DSP without exchanging whole state tensors with the host.
+
+- **Resident DDR Lease Allocation:** Persistent state is allocated outside the per-run activation scratch arena in the private DDR lease (`state` region placed after constants). Because it resides in the mapped DDR lease, persistent state survives across inference steps and routine worker wake rotations.
+- **Session Lifecycle & Idle Timeout:** For sessions registered with persistent state (`state_bytes > 0`), `hexecutord`'s idle monitor keeps the session open and holds the DDR lease across idle periods (`--idle-close-ms`). If an unrecoverable device error or explicit release occurs, `hexecutord` flags the state as lost (`state_lost_ = true`) and refuses subsequent `run()` jobs with an explicit error until the client reinitializes state via `reset_state()`.
+- **Wire Protocol & APIs:**
+  - Control frames: Wire types `RESET = 7` and `RESET_DONE = 8` allow clients to request an explicit state wipe.
+  - `Client::reset_state()` and `Session::reset_state()` submit `QDS_OP_RESET_STATE` (4) to the DSP resident engine entry, zeroing the persistent DDR state buffer.
+  - Per-step scalar and vector inputs (such as sequence position `pos` or attention mask slices) are submitted cheaply within the inline request frame.
+  - Prefill and decode graphs registered under the same `Session` share state tensors by matching non-zero name hashes (`reserved[1]`).
+  - Monitoring: Server and client statistics expose `state_bytes` per graph.
+
 ## Failure handling
 
 - The broker is the only process that restores firmware state. A fatal device error fails every outstanding ticket with the same error and closes the session through the normal restoration path. The rule in [operations](operations.md) still applies: after a failed restoration the broker does not reopen automatically.

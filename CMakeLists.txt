@@ -7,6 +7,7 @@ option(FRAME_BUILD_TESTS "Build portable host/protocol tests" ON)
 find_package(Threads REQUIRED)
 add_library(hexecutor_host
     hexecutor/host/cpp/executor.cpp
+    hexecutor/host/cpp/workload_memory.cpp
     hexecutor/host/cpp/frame_transport.cpp
     hexecutor/host/cpp/broker.cpp
     hexecutor/host/cpp/xrservice_featurenn.cpp
@@ -18,6 +19,7 @@ target_include_directories(hexecutor_host PUBLIC hexecutor/include)
 target_include_directories(hexecutor_host PRIVATE hexecutor/native/program hexecutor/native)
 target_link_libraries(hexecutor_host PUBLIC Threads::Threads)
 target_compile_options(hexecutor_host PRIVATE -Wall -Wextra -Wpedantic)
+set_target_properties(hexecutor_host PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_executable(hexecutor_chunk_probe hexecutor/host/cpp/chunk_probe_run.cpp)
 target_include_directories(hexecutor_chunk_probe PRIVATE hexecutor/host/cpp)
 target_link_libraries(hexecutor_chunk_probe PRIVATE hexecutor_host)
@@ -61,6 +63,13 @@ if(FRAME_BUILD_TESTS)
 endif()
 add_executable(hexecutord hexecutor/host/cpp/hexecutord.cpp)
 add_executable(hexecutor_broker_bench hexecutor/host/cpp/broker_bench.cpp)
+    add_executable(test_dynamic_cdsp_mem hexecutor/tests/test_dynamic_cdsp_mem.cpp)
+    target_link_libraries(test_dynamic_cdsp_mem PRIVATE hexecutor_host Threads::Threads)
+    add_test(NAME dynamic_cdsp_mem COMMAND test_dynamic_cdsp_mem)
+    add_executable(test_cdsp_mem_core hexecutor/tests/test_cdsp_mem_core.cpp hexecutor/device/kmod/cdsp_mem_core.c)
+    target_include_directories(test_cdsp_mem_core PRIVATE hexecutor/device/kmod hexecutor/include)
+    target_link_libraries(test_cdsp_mem_core PRIVATE Threads::Threads)
+    add_test(NAME cdsp_mem_core COMMAND test_cdsp_mem_core)
 target_link_libraries(hexecutor_broker_bench PRIVATE hexecutor_host)
 set_target_properties(hexecutor_broker_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 target_link_libraries(hexecutord PRIVATE hexecutor_host)

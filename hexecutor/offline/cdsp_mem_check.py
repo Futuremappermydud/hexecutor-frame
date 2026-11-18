@@ -36,7 +36,7 @@ def chunk_map():
         try:mem=mmap.mmap(fd,WINDOW,flags=mmap.MAP_SHARED,prot=mmap.PROT_READ|mmap.PROT_WRITE)
         finally:os.close(fd)
         try:
-            nonce=secrets.randbits(32)&~0x0fe00000  # keep the chunk-index bits clean
+            nonce=secrets.randbits(32)&~0x7fe00000  # keep chunk-index bits clean (covers up to 1024 chunks / 1.5-2 GiB)
             words=np.ndarray((chunks,CHUNK//4),np.uint32,buffer=mem)
             words[:,0]=(np.arange(chunks,dtype=np.uint32)<<21)^np.uint32(nonce)
             del words

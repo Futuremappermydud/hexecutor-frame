@@ -27,6 +27,6 @@ The reference prepared path executes a serial schedule with optional data-parall
 
 Before execution, validate the image and trusted hashes, bind non-overlapping pools, establish ownership and scratch capacity, and preflight every requested command. A matching opcode name is insufficient: shapes, storage class, quantization, aliases, and worker scratch must fit the selected handler's contract. Unsupported commands reject the requested execution range rather than falling back into an old VTCM scratch path.
 
-Firmware state is borrowed. Loader identity, TLB entries, L2 contents, stacks, vector context, callback registration, clocks, and the eye client all belong to the session's restoration contract. See [operations](operations.md) and [memory layout](memory-layout.md).
+Firmware state is borrowed. Loader identity, TLB entries, L2 contents, stacks, vector context, callback registration, clocks, and the eye client all belong to the session's restoration contract. See [operations](operations.md), [memory layout](memory-layout.md), and [dynamic memory](dynamic-memory.md).
 
 Peripheral directories retain focused roles: `research/bringup/` contains early callback probes; `research/qurt-boot/` explores boot/runtime behavior; `native/kernels/adapters/` and `native/kernels/stride2/` investigate shape-specific kernels; `examples/llm/` demonstrates another DSP client. These do not independently expand the prepared executor's supported graph contract.

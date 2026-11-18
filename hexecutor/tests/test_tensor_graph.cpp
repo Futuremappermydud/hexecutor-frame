@@ -877,6 +877,328 @@ int main() {
             check(cz.open() == HX_OPERATOR);
         }
     }
+    // Matrix product (HX_MATMUL): A [L,K] times B as [K,N] (transB 0) or [N,K] (transB 1), with
+    // an optional scalar. L=7, K=33, N=19 covers padded channel strides and odd sizes.
+    {
+        constexpr uint32_t L = 7, K = 33, N = 19;
+        std::vector<float> a(L * K), bk(K * N), bn(N * K);
+        for (uint32_t i = 0; i < L; i++)
+            for (uint32_t k = 0; k < K; k++)
+                a[i * K + k] = ((int)((i * 5 + k * 3) % 13) - 6) * 0.125f;
+        for (uint32_t k = 0; k < K; k++)
+            for (uint32_t n = 0; n < N; n++)
+                bk[k * N + n] = ((int)((k * 7 + n * 2) % 11) - 5) * 0.25f;
+        for (uint32_t n = 0; n < N; n++)
+            for (uint32_t k = 0; k < K; k++)
+                bn[n * K + k] = bk[k * N + n];
+        auto reference = [&](bool trans, float scale) {
+            std::vector<float> out(L * N);
+            for (uint32_t i = 0; i < L; i++)
+                for (uint32_t n = 0; n < N; n++) {
+                    double acc = 0;
+                    for (uint32_t k = 0; k < K; k++)
+                        acc += double(a[i * K + k]) * (trans ? bn[n * K + k] : bk[k * N + n]);
+                    out[i * N + n] = float(acc * scale);
+                }
+            return out;
+        };
+        auto bits = [](float f) {
+            uint32_t u;
+            std::memcpy(&u, &f, 4);
+            return u;
+        };
+        auto mm = [&](uint32_t trans, uint32_t scale_bits) {
+            auto o = op(HX_MATMUL, 2, 1);
+            o.p[0] = trans;
+            o.p[1] = scale_bits;
+            return o;
+        };
+        struct Case {
+            bool trans;
+            uint32_t scale_bits;
+            float scale;
+        };
+        // p[1] == 0 selects 1.0f; the explicit 1.0f pattern must agree with it.
+        for (Case c : {Case{false, 0, 1.0f}, Case{true, 0, 1.0f}, Case{true, bits(1.0f), 1.0f},
+                       Case{false, bits(0.5f), 0.5f}, Case{true, bits(-2.0f), -2.0f}}) {
+            Fixture fx({shape(L, 1, K), c.trans ? shape(N, 1, K) : shape(K, 1, N), shape(L, 1, N)},
+                       mm(c.trans, c.scale_bits), {0, 1});
+            fx.input(0, a);
+            fx.input(1, c.trans ? bn : bk);
+            auto got = fx.run();
+            auto want = reference(c.trans, c.scale);
+            check(got.size() == want.size());
+            for (size_t i = 0; i < want.size(); i++)
+                check(std::abs(got[i] - want[i]) < 1e-4f);
+        }
+        // Rejections: transB and scalar fields, unused fields, width, operand liveness, aliasing.
+        Fixture bad({shape(L, 1, K), shape(K, 1, N), shape(L, 1, N)}, mm(0, 0), {0, 1});
+        bad.input(0, a);
+        bad.input(1, bk);
+        bad.op().p[0] = 2;
+        check(bad.open() == HX_SHAPE);
+        bad.op().p[0] = 1;  // [K,N] is not [N,K] unless N == K
+        check(bad.open() == HX_SHAPE);
+        bad.op().p[0] = 0;
+        bad.op().p[2] = 1;
+        check(bad.open() == HX_SHAPE);
+        bad.op().p[2] = 0;
+        check(bad.run().size() == L * N);
+        bad.op().y = HXFG_NONE;
+        check(bad.open() == HX_OPERATOR);
+        bad.op().y = 1;
+        bad.tensor(2).offset = bad.tensor(1).offset;  // output over the live operand B
+        check(bad.open() == HX_ALIAS);
+        Fixture wide({shape(L, 2, K), shape(K, 1, N), shape(L, 1, N)}, mm(0, 0), {0, 1});
+        check(wide.open() == HX_SHAPE);
+        Fixture unset({shape(L, 1, K), shape(K, 1, N), shape(L, 1, N)}, mm(0, 0), {0});
+        check(unset.open() == HX_UNINITIALIZED);
+        Fixture big({shape(1, 1, 4097), shape(4097, 1, 1), shape(1, 1, 1)}, mm(0, 0), {0, 1});
+        check(big.open() == HX_SHAPE);
+    }
+    // RMSNorm (HX_RMSNORM, 22)
+    {
+        constexpr uint32_t D = 32;
+        auto rms = op(HX_RMSNORM);
+        float eps = 1e-5f;
+        uint32_t eps_u;
+        std::memcpy(&eps_u, &eps, 4);
+        rms.p[0] = eps_u;
+        rms.p[1] = 0;       // gamma offset
+        rms.p[2] = HXFG_NONE; // no beta
+        Fixture f({shape(1, 1, D), shape(1, 1, D)}, rms, {0});
+        std::vector<float> gamma(D, 1.5f), in(D);
+        for (uint32_t i = 0; i < D; i++) in[i] = (float)(i + 1) * 0.1f;
+        f.constant(0, {1.5f, 1.5f, 1.5f, 1.5f, 1.5f, 1.5f, 1.5f, 1.5f,
+                       1.5f, 1.5f, 1.5f, 1.5f, 1.5f, 1.5f, 1.5f, 1.5f,
+                       1.5f, 1.5f, 1.5f, 1.5f, 1.5f, 1.5f, 1.5f, 1.5f,
+                       1.5f, 1.5f, 1.5f, 1.5f, 1.5f, 1.5f, 1.5f, 1.5f});
+        f.input(0, in);
+        auto out = f.run();
+        check(out.size() == D);
+        double ssq = 0;
+        for (float v : in) ssq += double(v) * double(v);
+        float inv = (float)(1.0 / std::sqrt(ssq / double(D) + double(eps)));
+        for (uint32_t i = 0; i < D; i++)
+            check(std::abs(out[i] - (in[i] * inv * 1.5f)) < 1e-5f);
+    }
+    // RoPE (HX_ROPE, 23)
+    {
+        constexpr uint32_t head_dim = 16, num_heads = 2, C = head_dim * num_heads;
+        auto rope = op(HX_ROPE);
+        rope.p[0] = head_dim;
+        rope.p[1] = num_heads;
+        rope.p[2] = 5; // pos = 5
+        rope.p[3] = 0; // NeoX
+        Fixture f({shape(1, 1, C), shape(1, 1, C)}, rope, {0});
+        std::vector<float> in(C);
+        for (uint32_t i = 0; i < C; i++) in[i] = (float)(i + 1) * 0.2f;
+        f.input(0, in);
+        auto out = f.run();
+        check(out.size() == C);
+        for (uint32_t h = 0; h < num_heads; h++) {
+            for (uint32_t j = 0; j < head_dim / 2; j++) {
+                double theta = std::pow(10000.0, -2.0 * double(j) / double(head_dim));
+                double ang = 5.0 * theta;
+                float cos_v = float(std::cos(ang)), sin_v = float(std::sin(ang));
+                float v0 = in[h * head_dim + j], v1 = in[h * head_dim + head_dim / 2 + j];
+                float exp0 = v0 * cos_v - v1 * sin_v;
+                float exp1 = v0 * sin_v + v1 * cos_v;
+                check(std::abs(out[h * head_dim + j] - exp0) < 1e-4f);
+                check(std::abs(out[h * head_dim + head_dim / 2 + j] - exp1) < 1e-4f);
+            }
+        }
+    }
+    // ShortConv (HX_SHORTCONV, 24) with persistent state ring
+    {
+        constexpr uint32_t D = 32, K = 3, S = K - 1; // 2 state tokens
+        auto sc = op(HX_SHORTCONV, 2, 1); // out=2, state=1
+        sc.p[0] = K;
+        sc.p[1] = 0; // weights offset
+        sc.p[2] = HXFG_NONE; // no bias
+        sc.p[3] = 0; // no activation
+        // Tensors: 0: in [1, 1, D], 1: state [1, S, D], 2: out [1, 1, D]
+        std::vector<HxTensor> tensors = {shape(1, 1, D), shape(1, S, D), shape(1, 1, D)};
+        tensors[1].reserved[0] = 1; // persistent state tensor!
+        Fixture f(tensors, sc, {0});
+        // Weights: K * D = 3 * 32
+        // Tap 0: 0.25, Tap 1: 0.5, Tap 2: 1.0 (current token)
+        std::vector<float> w(K * D);
+        for (uint32_t d = 0; d < D; d++) {
+            w[0 * D + d] = 0.25f;
+            w[1 * D + d] = 0.5f;
+            w[2 * D + d] = 1.0f;
+        }
+        std::memcpy(f.constants.data(), w.data(), w.size() * 4);
+
+        // Step 1: feed token 1 (all 2.0f)
+        std::vector<float> tok1(D, 2.0f);
+        f.input(0, tok1);
+        auto out1 = f.run();
+        // Since state was 0, out = 0*0.25 + 0*0.5 + 2.0*1.0 = 2.0
+        check(out1.size() == D);
+        near(out1[0], 2.0f);
+
+        // Step 2: feed token 2 (all 4.0f)
+        std::vector<float> tok2(D, 4.0f);
+        f.input(0, tok2);
+        auto out2 = f.run();
+        // State now has [0, 2.0]. out = 0*0.25 + 2.0*0.5 + 4.0*1.0 = 1.0 + 4.0 = 5.0!
+        near(out2[0], 5.0f);
+
+        // Step 3: feed token 3 (all 8.0f)
+        std::vector<float> tok3(D, 8.0f);
+        f.input(0, tok3);
+        auto out3 = f.run();
+        // State now has [2.0, 4.0]. out = 2.0*0.25 + 4.0*0.5 + 8.0*1.0 = 0.5 + 2.0 + 8.0 = 10.5!
+        near(out3[0], 10.5f);
+    }
+    // QuantLinear Q4_0 (HX_LINEAR_Q, 25)
+    {
+        constexpr uint32_t K = 32, N = 32;
+        auto ql = op(HX_LINEAR_Q);
+        ql.p[0] = 0; // Q4_0
+        ql.p[1] = 0; // weights offset
+        ql.p[2] = HXFG_NONE; // no bias
+        ql.p[3] = K;
+        ql.p[4] = N;
+        ql.p[5] = 0; // no activation
+        Fixture f({shape(1, 1, K), shape(1, 1, N)}, ql, {0});
+        // 1 block of 32 inputs per row, N rows.
+        // Block has 16 bytes nibbles + 2 bytes fp16 scale = 18 bytes. Total = 32 * 18 = 576 bytes.
+        std::vector<uint8_t> qdata(N * 18);
+        for (uint32_t r = 0; r < N; r++) {
+            uint8_t *b = qdata.data() + r * 18;
+            // nibbles: 0x99 -> 9 and 9, which minus 8 is 1 and 1
+            std::memset(b, 0x99, 16);
+            // fp16 scale: 1.0f is 0x3c00
+            b[16] = 0x00;
+            b[17] = 0x3c;
+        }
+        std::memcpy(f.constants.data(), qdata.data(), qdata.size());
+        // input: all 1.0f
+        std::vector<float> in(K, 1.0f);
+        f.input(0, in);
+        auto out = f.run();
+        check(out.size() == N);
+        // Each weight is (9 - 8) * 1.0 = 1.0. Sum over 32 inputs is 32.0!
+        near(out[0], 32.0f);
+        near(out[N - 1], 32.0f);
+    }
+    // KV-cache write/append (HX_KV_WRITE, 26) with persistent state buffer
+    {
+        constexpr uint32_t D = 32, MAX_TOKENS = 4;
+        // Tensors:
+        // 0: in token [1, 1, D]
+        // 1: pos scalar [1, 1, 1]
+        // 2: persistent KV cache [1, MAX_TOKENS, D]
+        auto kvw = op(HX_KV_WRITE, 2, 1); // out=2, y=1
+        kvw.p[0] = 0; // static pos fallback
+        kvw.p[1] = 0; // axis
+        kvw.p[2] = MAX_TOKENS;
+        std::vector<HxTensor> tensors = {shape(1, 1, D), shape(1, 1, 1), shape(1, MAX_TOKENS, D)};
+        tensors[2].reserved[0] = HX_TENSOR_PERSISTENT;
+        tensors[2].reserved[1] = 0x1234; // state_id / name_hash
+
+        std::vector<uint8_t> state_buf(MAX_TOKENS * D * 4, 0);
+
+        Fixture f(tensors, kvw, {0, 1});
+        f.tensor(2).offset = 0; // offset within persistent state region
+        hx_graph_set_state(&f.graph, state_buf.data(), state_buf.size());
+
+        // Step 0: write token 0 at pos 0 (with value 3.0f)
+        std::vector<float> tok0(D, 3.0f);
+        f.input(0, tok0);
+        f.input(1, {0.0f});
+        f.run();
+        const float *state_f = reinterpret_cast<const float *>(state_buf.data());
+        near(state_f[0 * D], 3.0f);
+        near(state_f[1 * D], 0.0f);
+
+        // Step 1: write token 1 at pos 1 (with value 7.0f)
+        std::vector<float> tok1(D, 7.0f);
+        f.input(0, tok1);
+        f.input(1, {1.0f});
+        f.run();
+        near(state_f[0 * D], 3.0f);
+        near(state_f[1 * D], 7.0f);
+        near(state_f[2 * D], 0.0f);
+
+        // Step 2: write token 2 at pos 2 (with value 11.0f)
+        std::vector<float> tok2(D, 11.0f);
+        f.input(0, tok2);
+        f.input(1, {2.0f});
+        f.run();
+        near(state_f[0 * D], 3.0f);
+        near(state_f[1 * D], 7.0f);
+        near(state_f[2 * D], 11.0f);
+        near(state_f[3 * D], 0.0f);
+
+        // Verify rejection when target tensor is not marked persistent
+        Fixture bad_target(tensors, kvw, {0, 1});
+        bad_target.tensor(2).reserved[0] = 0; // NOT persistent
+        check(bad_target.open() == HX_SHAPE);
+    }
+    // Two graphs sharing persistent state by name/id (prefill -> decode)
+    {
+        constexpr uint32_t D = 32, MAX_TOKENS = 4;
+        // Shared state memory
+        std::vector<uint8_t> shared_state(MAX_TOKENS * D * 4, 0);
+
+        // Graph A (prefill): writes 2 tokens into persistent cache
+        // Tensor 0: input [1, 2, D], Tensor 1: pos [1, 1, 1], Tensor 2: persistent cache [1, MAX_TOKENS, D]
+        auto opA = op(HX_KV_WRITE, 2, 1);
+        opA.p[2] = MAX_TOKENS;
+        std::vector<HxTensor> tensorsA = {shape(1, 2, D), shape(1, 1, 1), shape(1, MAX_TOKENS, D)};
+        tensorsA[2].reserved[0] = HX_TENSOR_PERSISTENT;
+        tensorsA[2].reserved[1] = 0x9999; // shared name hash
+
+        Fixture gA(tensorsA, opA, {0, 1});
+        gA.tensor(2).offset = 0;
+        hx_graph_set_state(&gA.graph, shared_state.data(), shared_state.size());
+        std::vector<float> tokens_in(2 * D);
+        for (uint32_t d = 0; d < D; d++) {
+            tokens_in[0 * D + d] = 1.5f;
+            tokens_in[1 * D + d] = 2.5f;
+        }
+        gA.input(0, tokens_in);
+        gA.input(1, {0.0f});
+        gA.run();
+
+        // Graph B (decode): reads persistent cache via MatMul and appends 1 token at pos 2
+        // We'll test that Graph B sees the exact tokens written by Graph A!
+        auto opB = op(HX_KV_WRITE, 2, 1);
+        opB.p[2] = MAX_TOKENS;
+        std::vector<HxTensor> tensorsB = {shape(1, 1, D), shape(1, 1, 1), shape(1, MAX_TOKENS, D)};
+        tensorsB[2].reserved[0] = HX_TENSOR_PERSISTENT;
+        tensorsB[2].reserved[1] = 0x9999; // shared name hash
+
+        Fixture gB(tensorsB, opB, {0, 1});
+        gB.tensor(2).offset = 0;
+        hx_graph_set_state(&gB.graph, shared_state.data(), shared_state.size());
+
+        // Check that Graph B sees tokens written by Graph A
+        const float *shared_f = reinterpret_cast<const float *>(shared_state.data());
+        near(shared_f[0 * D], 1.5f);
+        near(shared_f[1 * D], 2.5f);
+        near(shared_f[2 * D], 0.0f);
+
+        // Now Graph B appends token at pos 2 (value 4.0f)
+        std::vector<float> tok_b(D, 4.0f);
+        gB.input(0, tok_b);
+        gB.input(1, {2.0f});
+        gB.run();
+
+        near(shared_f[0 * D], 1.5f);
+        near(shared_f[1 * D], 2.5f);
+        near(shared_f[2 * D], 4.0f);
+
+        // Reset state
+        std::memset(shared_state.data(), 0, shared_state.size());
+        near(shared_f[0 * D], 0.0f);
+        near(shared_f[1 * D], 0.0f);
+        near(shared_f[2 * D], 0.0f);
+    }
     std::cout
         << "Tensor kernels, padding, layout, aliases, ranges, and bootstrap ownership passed\n";
 }

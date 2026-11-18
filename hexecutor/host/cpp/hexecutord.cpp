@@ -46,9 +46,23 @@ class SessionBackend : public broker::Backend {
                 info.input_bytes.push_back(t.bytes());
             for (auto &t : g.program.outputs)
                 info.output_bytes.push_back(t.bytes());
+            info.state_bytes = state_bytes();
             out.push_back(std::move(info));
         }
         return out;
+    }
+    bool has_persistent_state() const {
+        if (session_)
+            return session_->state_bytes() > 0;
+        return artifacts_.persistent_state_bytes > 0;
+    }
+    size_t state_bytes() const override {
+        return session_ ? session_->state_bytes() : artifacts_.persistent_state_bytes;
+    }
+    void reset_state() override {
+        if (session_)
+            session_->reset_state();
+        state_lost_ = false;
     }
     // Called from the tripwire thread. The executor thread applies it: the open
     // session (if any) is closed by Server::release_device(), and every later
@@ -59,6 +73,8 @@ class SessionBackend : public broker::Backend {
                            double &dsp_ms) override {
         if (!failed_.empty())
             throw std::runtime_error("device session failed earlier: " + failed_);
+        if (state_lost_)
+            throw std::runtime_error("persistent state was lost: session was released or failed; reset required");
         if (tripped_ && artifacts_.max_wake_seconds > 1.0) {
             if (session_)
                 release();
@@ -79,10 +95,14 @@ class SessionBackend : public broker::Backend {
         }
     }
     void idle() override {
-        if (!hold_)
+        if (!hold_ && !has_persistent_state())
             close_session("idle");
     }
-    void release() override { close_session("release"); }
+    void release() override {
+        close_session("release");
+        if (has_persistent_state())
+            state_lost_ = true;
+    }
 
   private:
     void close_session(const char *reason) {
@@ -98,6 +118,7 @@ class SessionBackend : public broker::Backend {
     }
     void fail(const std::string &what) {
         failed_ = what;
+        state_lost_ = true;
         std::cerr << "[hexecutord] device failure, refusing further work: " << what << '\n';
         if (session_) {
             try {
@@ -113,7 +134,7 @@ class SessionBackend : public broker::Backend {
     Artifacts artifacts_;
     std::unique_ptr<Session> session_;
     std::string failed_;
-    std::atomic<bool> tripped_{false}, hold_{false};
+    std::atomic<bool> tripped_{false}, hold_{false}, state_lost_{false};
 };
 
 // Long wakes are only safe while XRService keeps controller FeatureNN off the

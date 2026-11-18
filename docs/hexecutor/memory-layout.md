@@ -4,7 +4,15 @@ The executor's performance depends on where metadata, tensor values, stacks, and
 
 ## Private DDR and address ownership
 
-`cdsp_mem` supplies private DDR at IOVA `0xa0000000`. The depth executor expects 128 MiB and installs eight 16 MiB mappings. `qd_owned_memory.h` checks for occupied mappings/aliases and saves/restores the previous TLB contents. It must not evict firmware entries to make a graph fit.
+`cdsp_mem` supplies private DDR at IOVA `0xa0000000`. The depth and hand-tracking executors operate on a 128 MiB baseline (eight 16 MiB mappings), while heavier workloads (multi-graph models, LFM3 text at 1024 MiB, and full LFM3-VL multimodal at 1536 MiB) dynamically grow the lease up to 1.5 GiB. The 1536 MiB ceiling (`0xa0000000 + 0x60000000 = 0x100000000`) spans the full remaining 32-bit IOVA space.
+
+`WorkloadMemoryManager` manages dynamic memory growth and shrinking:
+- **Growth on demand:** Automatically expands the kernel allocation in 2 MiB chunks and maps them into the CDSP SMMU domain before a workload starts.
+- **Shrinking on release:** Returns memory to the kernel (down to 128 MiB baseline) when the workload finishes or the session closes, preventing idle models from starving headset system RAM.
+- **JTLB slot allocation:** Hexagon JTLB entries are assigned dynamically based on slot count: 8 entries (64..71) for 128 MiB, 32 entries (64..95) for 512 MiB, 64 entries (64..127) for 1024 MiB, and 96 entries (32..127) for 1536 MiB.
+- **Interfaces:** Dynamic sizing is controllable via `/sys/module/cdsp_mem/parameters/size_mb` (0644) and ioctl `CDSP_MEM_IOC_SET_SIZE` on `/dev/cdsp_mem`.
+
+`qd_owned_memory.h` checks for occupied mappings/aliases and saves/restores the previous TLB contents. It must not evict firmware entries to make a graph fit.
 
 The configuration validator separates image/constants, graph pools and I/O, and the engine heap. In the current relative allocation contract, image/constants occupy the first 16 MiB, mutable pools/I/O the next 16 MiB, and the heap starts at relative `0x02000000`. Private page 7 contains L2-cacheable working metadata for the lease design. Consult the validator for exact bounds/alignment; these regions are not a general allocator for other clients.
 
