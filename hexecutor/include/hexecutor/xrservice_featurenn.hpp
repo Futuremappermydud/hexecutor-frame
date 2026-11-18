@@ -9,6 +9,7 @@
 #include <vector>
 
 namespace hexecutor::xrservice {
+constexpr size_t dma_bytes = 0x2000000;
 constexpr size_t featurenn_control_offset = 0x1522000;
 constexpr size_t featurenn_input_offset = 0x100;
 constexpr size_t featurenn_output_offset = 0x40080;
@@ -52,6 +53,9 @@ size_t write_gazenet_vector_output(const std::vector<Bytes> &graph_outputs, void
 
 struct AdapterOptions {
     std::string featurenn_graph, gazenet_graph, gazenet_vector_graph;
+
+    const std::string &stereo_featurenn_graph() const { return featurenn_graph; }
+    void set_stereo_featurenn_graph(std::string name) { featurenn_graph = std::move(name); }
 };
 
 // Adapts the unmodified stock shared-memory ABIs to ordinary broker streams.
@@ -59,7 +63,8 @@ struct AdapterOptions {
 class Adapter {
   public:
     Adapter(std::filesystem::path broker_socket, AdapterOptions,
-            std::function<void()> yield_device);
+            std::function<void()> yield_device, void *shared_memory = nullptr,
+            size_t shared_bytes = 0);
     ~Adapter();
     Adapter(const Adapter &) = delete;
     Adapter &operator=(const Adapter &) = delete;

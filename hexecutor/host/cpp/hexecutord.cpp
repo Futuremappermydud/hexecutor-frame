@@ -214,7 +214,8 @@ void watch_xrservice(std::atomic<bool> &stop, const std::function<void(const std
     std::cerr
         << "usage: hexecutord --socket PATH --loader ELF --engine ELF --bootstrap ELF\n"
            "         --chunk-probe ELF --graph NAME=IMAGE.hxfg,CONSTANTS.bin [--graph ...]\n"
-           "         [--xrservice-featurenn GRAPH]  (serve the built-in XRService job 8)\n"
+           "         [--xrservice-featurenn GRAPH]  (serve the built-in XRService stereoFeatureNN job 8)\n"
+           "         [--xrservice-stereofeaturenn GRAPH]  (alias for --xrservice-featurenn)\n"
            "         [--xrservice-gazenet GRAPH]  (serve stock Gazenet image evaluation)\n"
            "         [--xrservice-gazenet-vector GRAPH]  (serve stock Gazenet float vectors)\n"
            "         [--idle-close-ms 2000] [--utilization 0.7] [--max-wake-seconds 1]\n"
@@ -267,7 +268,9 @@ int main(int argc, char **argv) {
                         throw std::runtime_error("duplicate graph name " + name);
                 graphs.push_back({name, load_tensor_program(v.substr(eq + 1, comma - eq - 1),
                                                             v.substr(comma + 1))});
-            } else if (arg == "--xrservice-featurenn")
+            } else if (arg == "--xrservice-featurenn" ||
+                       arg == "--xrservice-stereofeaturenn" ||
+                       arg == "--xrservice-stereo-featurenn")
                 adapter_options.featurenn_graph = value();
             else if (arg == "--xrservice-gazenet")
                 adapter_options.gazenet_graph = value();
@@ -300,7 +303,7 @@ int main(int argc, char **argv) {
                                               [&](const NamedProgram &g) { return g.name == name; }))
                 throw std::runtime_error(std::string(what) + " graph is not registered");
         };
-        require_registered(adapter_options.featurenn_graph, "XRService FeatureNN");
+        require_registered(adapter_options.featurenn_graph, "XRService stereoFeatureNN");
         require_registered(adapter_options.gazenet_graph, "Gazenet image");
         require_registered(adapter_options.gazenet_vector_graph, "Gazenet vector");
         bool adapting = !adapter_options.featurenn_graph.empty() ||

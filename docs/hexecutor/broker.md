@@ -117,18 +117,18 @@ The broker holds one wake while it has admitted streams and closes after an idle
 
 `xrservice::Adapter` connects to `dsp_service`, maps the same stock DMA buffer, and uses ordinary broker `Client` streams; no process hook, binary patch, `LD_PRELOAD`, or second `Session` is involved. It warms and pins the tensor session, submits adapted work with tracking class and a 50 ms deadline, and stages every output before publishing completion. One adapter thread coordinates FeatureNN and Gazenet so they cannot compete for ownership. Weight loading, buffer acquisition, model information, benchmarks and unsupported requests release the session for stock firmware; the adapter reacquires and warms all registered graphs afterwards.
 
-### FeatureNN
+### FeatureNN (stereoFeatureNN)
 
-`hexecutord --xrservice-featurenn GRAPH` serves job 8 from the unmodified built-in XRService. Its shared block starts at DMA offset `0x1522000`. Its words are state, active, and taken/job id at offsets 0, 4, and 8. The request header is at cached offset `0x80`, packed u8 eye planes at `0x100`, and results at `0x40080`. Each eye has a 0x450-byte `cdsp_featurenn_output_data`: four contiguous 69-float arrays (center, uncertainty, plus-x, plus-z). The adapter converts u8 planes to normalized three-channel float NHWC and writes uncertainty as `2·min(raw,10)`; XRService applies the final exponential.
+`hexecutord --xrservice-featurenn GRAPH` (or `--xrservice-stereofeaturenn GRAPH`) serves job 8 from the unmodified built-in XRService. Its shared block starts at DMA offset `0x1522000`. Its words are state, active, and taken/job id at offsets 0, 4, and 8. The request header is at cached offset `0x80`, packed u8 eye planes at `0x100`, and results at `0x40080`. Each eye has a 0x450-byte `cdsp_featurenn_output_data`: four contiguous 69-float arrays (center, uncertainty, plus-x, plus-z). The adapter converts u8 planes to normalized three-channel float NHWC and writes uncertainty as `2·min(raw,10)`; XRService applies the final exponential.
 
 Enable XRService's normal FeatureNN path (not the GripNet/CPU test setting) and run, using the actual lowered prefix:
 
 ```sh
-FRAME_FEATURENN=/home/steamos/hexecutor-broker/featurenn \
+FRAME_STEREOFEATURENN=/home/steamos/hexecutor-broker/featurenn \
     runtime/scripts/run_hexecutord.sh --long-wake 30
 ```
 
-That launcher registers FeatureNN alone; add `--graph landmark=...` explicitly if desired. Palm, landmark and FeatureNN together still exceed the current tensor constant region. The CPU ONNX model that ships with XRService is the numerical reference. Our lowered graph differs from its u8 result by up to about 0.07 on the raw head.
+`FRAME_FEATURENN` is also accepted as an environment variable alias. That launcher registers stereoFeatureNN alone; add `--graph landmark=...` explicitly if desired. Palm, landmark and FeatureNN together still exceed the current tensor constant region. The CPU ONNX model that ships with XRService is the numerical reference. Our lowered graph differs from its u8 result by up to about 0.07 on the raw head.
 
 ### Gazenet
 

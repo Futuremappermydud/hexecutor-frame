@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Start the CDSP broker (hexecutord) on Frame with the hand graphs registered as
 # "palm" and "landmark", plus any extra --graph NAME=IMAGE,CONSTANTS arguments.
-# FRAME_FEATURENN, FRAME_GAZENET and FRAME_GAZENET_VECTOR instead register the
-# corresponding stock-protocol adapter graphs from HXFG prefixes (without
+# FRAME_FEATURENN (or FRAME_STEREOFEATURENN), FRAME_GAZENET and FRAME_GAZENET_VECTOR
+# instead register the corresponding stock-protocol adapter graphs from HXFG prefixes (without
 # .hxfg/.bin). Add hand graphs explicitly if desired; constant capacity is limited.
 # Clients: frame_hand_viewer --broker SOCKET, frame_hand_tracker --broker SOCKET.
 set -euo pipefail
@@ -21,7 +21,7 @@ DSP_DIR="${FRAME_HAND_DSP:-$(first_existing "$APP_ROOT/dsp" /home/steamos/hexecu
 LOADER="${FRAME_HAND_LOADER:-${FRAME_DSP_LOADER:-/home/steamos/frame-dsp/quest-depth/wave1-20261101/frame/build/qd_loader.elf}}"
 SOCKET="${HEXECUTORD_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/hexecutord.sock}"
 BIN="${HEXECUTORD:-$(first_existing "$APP_ROOT/build/bin/hexecutord" "$APP_ROOT/runtime/bin/hexecutord" || true)}"
-FEATURENN="${FRAME_FEATURENN:-}"
+FEATURENN="${FRAME_STEREOFEATURENN:-${FRAME_STEREO_FEATURENN:-${FRAME_FEATURENN:-}}}"
 GAZENET="${FRAME_GAZENET:-}"
 GAZENET_VECTOR="${FRAME_GAZENET_VECTOR:-}"
 
@@ -33,7 +33,7 @@ ADAPTER=()
 if [[ -n "$FEATURENN" || -n "$GAZENET" || -n "$GAZENET_VECTOR" ]]; then
     if [[ -n "$FEATURENN" ]]; then
         [[ -f "$FEATURENN.hxfg" && -f "$FEATURENN.bin" ]] ||
-            { echo "cannot find FeatureNN graph at $FEATURENN" >&2; exit 1; }
+            { echo "cannot find stereoFeatureNN graph at $FEATURENN" >&2; exit 1; }
         GRAPHS+=(--graph "featurenn=$FEATURENN.hxfg,$FEATURENN.bin")
         ADAPTER+=(--xrservice-featurenn featurenn)
     fi

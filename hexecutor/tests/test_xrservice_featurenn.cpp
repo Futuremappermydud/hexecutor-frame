@@ -1,11 +1,16 @@
 #include "hexecutor/xrservice_featurenn.hpp"
+#include "hexecutor/broker.hpp"
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 #include <vector>
+#include <unistd.h>
 
 using namespace hexecutor;
 using namespace hexecutor::xrservice;
@@ -21,6 +26,183 @@ template <class T> static T get(const void *base, size_t at) {
     T value;
     std::memcpy(&value, static_cast<const uint8_t *>(base) + at, sizeof value);
     return value;
+}
+
+struct FakeAdapterBackend : broker::Backend {
+    std::vector<broker::GraphInfo> graphs() const override {
+        return {
+            {"featurenn", {128 * 128 * 3 * sizeof(float)}, {352 * sizeof(float), 200 * sizeof(float)}},
+            {"gazenet", {128 * 128 * 3 * sizeof(float)}, {64 * sizeof(float)}},
+            {"gazenet_vector", {gazenet_vector_floats * sizeof(float)}, {5 * sizeof(float)}}
+        };
+    }
+    std::vector<Bytes> run(size_t graph, const std::vector<Buffer> &inputs, double &dsp_ms) override {
+        dsp_ms = 0.5;
+        if (graph == 0) {
+            require(inputs.size() == 1 && inputs[0].bytes == 128 * 128 * 3 * sizeof(float),
+                    "featurenn input shape");
+            std::vector<Bytes> out(2);
+            out[0].resize(352 * sizeof(float));
+            out[1].resize(200 * sizeof(float));
+            auto *p0 = reinterpret_cast<float *>(out[0].data());
+            for (size_t i = 0; i < 352; i++)
+                p0[i] = float(i) * 0.1f;
+            auto *p1 = reinterpret_cast<float *>(out[1].data());
+            for (size_t i = 0; i < 200; i++)
+                p1[i] = float(352 + i) * 0.1f;
+            return out;
+        } else if (graph == 1) {
+            require(inputs.size() == 1 && inputs[0].bytes == 128 * 128 * 3 * sizeof(float),
+                    "gazenet input shape");
+            std::vector<Bytes> out(1);
+            out[0].resize(64 * sizeof(float));
+            auto *p = reinterpret_cast<float *>(out[0].data());
+            for (size_t i = 0; i < 64; i++)
+                p[i] = float(i) * 0.5f;
+            return out;
+        } else if (graph == 2) {
+            require(inputs.size() == 1 && inputs[0].bytes == gazenet_vector_floats * sizeof(float),
+                    "gazenet_vector input shape");
+            std::vector<Bytes> out(1);
+            out[0].resize(5 * sizeof(float));
+            auto *p = reinterpret_cast<float *>(out[0].data());
+            for (size_t i = 0; i < 5; i++)
+                p[i] = float(i) + 42.0f;
+            return out;
+        }
+        throw std::runtime_error("unknown graph in FakeAdapterBackend");
+    }
+};
+
+static void test_adapter_bridge() {
+    std::string socket_path = "/tmp/test_xrservice_bridge_" + std::to_string(::getpid()) + ".sock";
+    ::unlink(socket_path.c_str());
+
+    struct Cleaner {
+        std::string path;
+        ~Cleaner() { ::unlink(path.c_str()); }
+    } cleaner{socket_path};
+
+    broker::ServerOptions server_options;
+    server_options.socket = socket_path;
+    broker::Server server(std::make_unique<FakeAdapterBackend>(), server_options);
+    server.start();
+
+    std::vector<uint8_t> dma(dma_bytes, 0);
+    put<uint64_t>(dma, 0xa90000, 0x1614df651d03f542ULL);
+    put<uint64_t>(dma, 0xa90008, 9ULL);
+
+    std::atomic<int> yields{0};
+    AdapterOptions opts;
+    opts.set_stereo_featurenn_graph("featurenn");
+    require(opts.stereo_featurenn_graph() == "featurenn", "stereo_featurenn alias works");
+    opts.gazenet_graph = "gazenet";
+    opts.gazenet_vector_graph = "gazenet_vector";
+
+    Adapter adapter(socket_path, opts, [&] { yields++; }, dma.data(), dma.size());
+    adapter.start();
+
+    // 1. StereoFeatureNN Job (job 8)
+    auto *fnn = dma.data() + featurenn_control_offset;
+    put<uint32_t>(dma, featurenn_control_offset + 0x80, 2);   // eyes = 2
+    put<uint32_t>(dma, featurenn_control_offset + 0x84, 2);   // views = 2
+    put<uint32_t>(dma, featurenn_control_offset + 0x88, 128); // width = 128
+    put<uint32_t>(dma, featurenn_control_offset + 0x8c, 128); // height = 128
+    for (size_t i = 0; i < 2 * 128 * 128; i++)
+        dma[featurenn_control_offset + featurenn_input_offset + i] = uint8_t(i & 0xff);
+
+    __atomic_store_n(reinterpret_cast<volatile uint32_t *>(fnn + 8), featurenn_job, __ATOMIC_SEQ_CST);
+    __atomic_store_n(reinterpret_cast<volatile uint32_t *>(fnn + 0), 2, __ATOMIC_SEQ_CST); // state = 2
+    __atomic_store_n(reinterpret_cast<volatile uint32_t *>(fnn + 4), 1, __ATOMIC_SEQ_CST); // active = 1
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (__atomic_load_n(reinterpret_cast<volatile uint32_t *>(fnn + 0), __ATOMIC_SEQ_CST) != 3 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    require(__atomic_load_n(reinterpret_cast<volatile uint32_t *>(fnn + 0), __ATOMIC_SEQ_CST) == 3,
+            "StereoFeatureNN job finished with state 3");
+
+    // Output check
+    float first_out = get<float>(dma.data(), featurenn_control_offset + featurenn_output_offset);
+    require(first_out == 0.0f, "StereoFeatureNN first output float");
+
+    // XRService consumes output: active = 0
+    __atomic_store_n(reinterpret_cast<volatile uint32_t *>(fnn + 4), 0, __ATOMIC_SEQ_CST);
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (__atomic_load_n(reinterpret_cast<volatile uint32_t *>(fnn + 8), __ATOMIC_SEQ_CST) != 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    require(__atomic_load_n(reinterpret_cast<volatile uint32_t *>(fnn + 8), __ATOMIC_SEQ_CST) == 0,
+            "StereoFeatureNN taken reset to 0");
+    require(__atomic_load_n(reinterpret_cast<volatile uint32_t *>(fnn + 0), __ATOMIC_SEQ_CST) == 1,
+            "StereoFeatureNN state reset to 1");
+
+    // 2. Gazenet Image Job: first job 4 yields to stock buffer acquisition
+    auto *gaze = dma.data() + gazenet_control_offset;
+    __atomic_store_n(reinterpret_cast<volatile uint32_t *>(gaze + 8), gazenet_job, __ATOMIC_SEQ_CST);
+    __atomic_store_n(reinterpret_cast<volatile uint32_t *>(gaze + 0), 2, __ATOMIC_SEQ_CST);
+    __atomic_store_n(reinterpret_cast<volatile uint32_t *>(gaze + 4), 1, __ATOMIC_SEQ_CST);
+
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (yields.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    require(yields.load() > 0, "Adapter yields on stock buffer acquisition");
+
+    // Simulate stock buffer acquisition completing:
+    __atomic_store_n(reinterpret_cast<volatile uint32_t *>(gaze + 0), 3, __ATOMIC_SEQ_CST);
+    __atomic_store_n(reinterpret_cast<volatile uint32_t *>(gaze + 4), 0, __ATOMIC_SEQ_CST);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    // Now post evaluation job 4:
+    for (size_t i = 0; i < 2 * 128 * 128; i++)
+        put<float>(dma, gazenet_control_offset + gazenet_input_offset + i * sizeof(float), float(i));
+    __atomic_store_n(reinterpret_cast<volatile uint32_t *>(gaze + 8), gazenet_job, __ATOMIC_SEQ_CST);
+    __atomic_store_n(reinterpret_cast<volatile uint32_t *>(gaze + 0), 2, __ATOMIC_SEQ_CST);
+    __atomic_store_n(reinterpret_cast<volatile uint32_t *>(gaze + 4), 1, __ATOMIC_SEQ_CST);
+
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (__atomic_load_n(reinterpret_cast<volatile uint32_t *>(gaze + 0), __ATOMIC_SEQ_CST) != 3 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    require(__atomic_load_n(reinterpret_cast<volatile uint32_t *>(gaze + 0), __ATOMIC_SEQ_CST) == 3,
+            "Gazenet image evaluation completed with state 3");
+    require(get<float>(dma.data(), gazenet_control_offset + gazenet_output_offset + sizeof(float)) == 0.5f,
+            "Gazenet output float layout");
+
+    // XRService consumes output: active = 0
+    __atomic_store_n(reinterpret_cast<volatile uint32_t *>(gaze + 4), 0, __ATOMIC_SEQ_CST);
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (__atomic_load_n(reinterpret_cast<volatile uint32_t *>(gaze + 0), __ATOMIC_SEQ_CST) != 1 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    require(__atomic_load_n(reinterpret_cast<volatile uint32_t *>(gaze + 0), __ATOMIC_SEQ_CST) == 1,
+            "Gazenet state reset to 1");
+
+    // 3. Gazenet Vector Job
+    for (size_t i = 0; i < gazenet_vector_floats; i++)
+        put<float>(dma, gazenet_control_offset + gazenet_vector_offset + i * sizeof(float), float(i));
+    __atomic_store_n(reinterpret_cast<volatile uint32_t *>(gaze + 8), uint32_t(gazenet_vector_floats), __ATOMIC_SEQ_CST);
+    __atomic_store_n(reinterpret_cast<volatile uint32_t *>(gaze + 0xc), 1, __ATOMIC_SEQ_CST); // ready = 1
+
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (__atomic_load_n(reinterpret_cast<volatile uint32_t *>(gaze + 0xc), __ATOMIC_SEQ_CST) != 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    require(__atomic_load_n(reinterpret_cast<volatile uint32_t *>(gaze + 0xc), __ATOMIC_SEQ_CST) == 0,
+            "Gazenet vector ready cleared");
+    require(__atomic_load_n(reinterpret_cast<volatile uint32_t *>(gaze + 8), __ATOMIC_SEQ_CST) == 5,
+            "Gazenet vector returned 5 floats");
+    require(get<float>(dma.data(), gazenet_control_offset + gazenet_vector_offset) == 42.0f,
+            "Gazenet vector output value");
+
+    adapter.stop();
+    server.stop();
 }
 
 int main() {
@@ -147,6 +329,8 @@ int main() {
             threw = true;
         }
         require(threw, "oversize Gazenet vector rejected");
+
+        test_adapter_bridge();
     } catch (const std::exception &e) {
         std::cerr << "test_xrservice_featurenn: " << e.what() << '\n';
         return 1;

@@ -8,14 +8,14 @@
 #include <iostream>
 #include <stdexcept>
 #include <thread>
-#ifdef __linux__
-#include <cerrno>
-#include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/mman.h>
 #endif
 
 namespace hexecutor::xrservice {
@@ -44,9 +44,6 @@ Bytes join_float_outputs(const std::vector<Bytes> &parts, size_t min_floats, siz
             throw std::runtime_error("stock adapter graph returned a non-finite output");
     return joined;
 }
-#ifdef __linux__
-constexpr size_t dma_bytes = 0x2000000;
-constexpr off_t dma_offset = 0x80000000;
 using Clock = std::chrono::steady_clock;
 
 template <class T> T get(const void *base, size_t offset) {
@@ -62,6 +59,8 @@ void store(uint8_t *memory, size_t offset, uint32_t value) {
     __atomic_store_n(reinterpret_cast<volatile uint32_t *>(memory + offset), value,
                      __ATOMIC_SEQ_CST);
 }
+#ifdef __linux__
+constexpr off_t dma_offset = 0x80000000;
 void send_all(int fd, const void *data, size_t size) {
     auto *p = static_cast<const uint8_t *>(data);
     while (size) {
@@ -202,7 +201,9 @@ struct Adapter::Impl {
     std::function<void()> yield;
     std::atomic<bool> stopping{false};
     std::thread thread;
-#ifdef __linux__
+    void *provided_memory = nullptr;
+    size_t provided_bytes = 0;
+    size_t dma_len = dma_bytes;
     int service = -1, descriptors[2] = {-1, -1};
     uint8_t *memory = nullptr;
     uint8_t *featurenn = nullptr, *gazenet = nullptr;
@@ -210,6 +211,7 @@ struct Adapter::Impl {
     broker::Client::Stream featurenn_stream, gazenet_stream, vector_stream;
 
     void map_service() {
+#ifdef __linux__
         service = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if (service < 0)
             throw std::runtime_error("cannot create stock service adapter socket");
@@ -253,6 +255,14 @@ struct Adapter::Impl {
         if (p == MAP_FAILED)
             throw std::runtime_error("cannot map stock shared DMA");
         memory = static_cast<uint8_t *>(p);
+        dma_len = dma_bytes;
+#else
+        throw std::runtime_error("stock service adapter requires Linux to map dsp_service");
+#endif
+    }
+    void check_header() {
+        if (!memory)
+            throw std::runtime_error("stock adapter shared memory is null");
         if (get<uint64_t>(memory, 0xa90000) != 0x1614df651d03f542 ||
             get<uint64_t>(memory, 0xa90008) != 9)
             throw std::runtime_error("unsupported stock CDSP protocol header");
@@ -391,8 +401,8 @@ struct Adapter::Impl {
             if (f_active && f_taken == featurenn_job && featurenn_stream.id && !owned && !failed &&
                 f_state != 3) {
                 try {
-                    auto request = read_featurenn_request(featurenn, dma_bytes - featurenn_control_offset);
-                    run_featurenn_request(request, featurenn, dma_bytes - featurenn_control_offset,
+                    auto request = read_featurenn_request(featurenn, dma_len - featurenn_control_offset);
+                    run_featurenn_request(request, featurenn, dma_len - featurenn_control_offset,
                                           [&](const Bytes &input) {
                                               return client->run(featurenn_stream,
                                                                  {{input.data(), input.size()}});
@@ -409,7 +419,7 @@ struct Adapter::Impl {
             if (g_active && g_taken == gazenet_job && gazenet_stream.id && gaze_grabbed &&
                 !gaze_owned && !gaze_failed && g_state != 3) {
                 try {
-                    run_gazenet_request(gazenet, dma_bytes - gazenet_control_offset,
+                    run_gazenet_request(gazenet, dma_len - gazenet_control_offset,
                                         [&](const Bytes &input) {
                                             return client->run(gazenet_stream,
                                                                {{input.data(), input.size()}});
@@ -425,11 +435,11 @@ struct Adapter::Impl {
             }
             if (g_ready && vector_shape && !vector_failed) {
                 try {
-                    auto input = make_gazenet_vector_input(gazenet, dma_bytes - gazenet_control_offset,
+                    auto input = make_gazenet_vector_input(gazenet, dma_len - gazenet_control_offset,
                                                            g_taken);
                     auto outputs = client->run(vector_stream, {{input.data(), input.size()}});
                     auto count = write_gazenet_vector_output(outputs, gazenet,
-                                                             dma_bytes - gazenet_control_offset);
+                                                             dma_len - gazenet_control_offset);
                     store(gazenet, 8, uint32_t(count));
                     __atomic_thread_fence(__ATOMIC_SEQ_CST);
                     store(gazenet, 0xc, 0);
@@ -447,46 +457,54 @@ struct Adapter::Impl {
         if (thread.joinable())
             thread.join();
         client.reset();
-        if (memory)
+        if (memory && !provided_memory) {
+#ifdef __linux__
             munmap(memory, dma_bytes);
+#endif
+        }
         memory = nullptr;
-        if (service >= 0)
+        if (service >= 0) {
             ::close(service);
-        service = -1;
+            service = -1;
+        }
         for (int &fd : descriptors) {
-            if (fd >= 0)
+            if (fd >= 0) {
                 ::close(fd);
-            fd = -1;
+                fd = -1;
+            }
         }
     }
-#endif
 };
 
-Adapter::Adapter(std::filesystem::path socket, AdapterOptions options, std::function<void()> yield)
+Adapter::Adapter(std::filesystem::path socket, AdapterOptions options, std::function<void()> yield,
+                 void *shared_memory, size_t shared_bytes)
     : impl_(std::make_unique<Impl>()) {
     impl_->socket = std::move(socket);
     impl_->options = std::move(options);
     impl_->yield = std::move(yield);
+    impl_->provided_memory = shared_memory;
+    impl_->provided_bytes = shared_bytes;
 }
 Adapter::~Adapter() { stop(); }
 void Adapter::start() {
-#ifdef __linux__
     if (!impl_->yield)
         throw std::runtime_error("stock service adapter needs a device-release callback");
     if (impl_->options.featurenn_graph.empty() && impl_->options.gazenet_graph.empty() &&
         impl_->options.gazenet_vector_graph.empty())
         throw std::runtime_error("stock service adapter needs at least one graph");
-    impl_->map_service();
+    if (impl_->provided_memory) {
+        impl_->memory = static_cast<uint8_t *>(impl_->provided_memory);
+        impl_->dma_len = impl_->provided_bytes ? impl_->provided_bytes : dma_bytes;
+        impl_->check_header();
+    } else {
+        impl_->map_service();
+        impl_->check_header();
+    }
     impl_->open_streams();
     impl_->warm_up();
     impl_->thread = std::thread([this] { impl_->run(); });
-#else
-    throw std::runtime_error("stock service adapter requires Linux");
-#endif
 }
 void Adapter::stop() {
-#ifdef __linux__
     impl_->close();
-#endif
 }
 } // namespace hexecutor::xrservice

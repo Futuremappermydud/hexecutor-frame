@@ -30,6 +30,7 @@ This is the maintained handbook for the spatial application, Hexecutor DSP execu
 | [Memory layout](hexecutor/memory-layout.md) | Private DDR, VTCM, L2 leases, aliasing, and workspace limits |
 | [Dynamic CDSP memory](hexecutor/dynamic-memory.md) | Dynamic memory growth and shrinking from 128 MiB to 1.5 GiB based on workloads |
 | [CDSP broker (proposed)](hexecutor/broker.md) | One owner for the CDSP: scheduling depth, hands, controller and eye work |
+| [XRService broker bridge](hexecutor/xrservice-broker-bridge.md) | Bridging and patching XRService StereoFeatureNN and Gazenet via shim library |
 | [Clocks and bandwidth](hexecutor/clocks.md) | AXI and HMX clock findings, controlled measurements, and restoration |
 | [Kernels and arithmetic](hexecutor/kernels.md) | HVX/HMX, blocked layouts, exact conversion, and adapters |
 | [Scheduling and optimizations](hexecutor/scheduling.md) | Dependencies, lane scheduling, plan replay, DMA, and rejected changes |
