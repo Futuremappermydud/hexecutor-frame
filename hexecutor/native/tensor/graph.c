@@ -281,8 +281,17 @@ static int op_valid(const HxGraph *g, const HxOp *o) {
     case HX_ZEROINSERT:
         used = 4;
         break;
-    case HX_GATHER:
+    case HX_GATHER_ELEMENTS:
         used = 4;
+        break;
+    case HX_GATHER_ND:
+        used = 6;
+        break;
+    case HX_SCATTER_ND:
+        used = 9;
+        break;
+    case HX_GATHER:
+        used = 10;
         break;
     case HX_WHERE:
         used = 4;
@@ -488,15 +497,127 @@ static int op_valid(const HxGraph *g, const HxOp *o) {
         }
         return 1;
     }
+    case HX_GATHER_ELEMENTS: {
+        if (p[0] > 2 || p[1] > 1 || p[2] > 2)
+            return 0;
+        if (p[2] == 2) {
+            if (!constant(g, p[3], hx_tensor_bytes(b)))
+                return 0;
+            if (p[0] == 0 && (b->w > a->w || b->c > a->c))
+                return 0;
+            if (p[0] == 1 && (b->h > a->h || b->c > a->c))
+                return 0;
+            if (p[0] == 2 && (b->h > a->h || b->w > a->w))
+                return 0;
+            return 1;
+        }
+        const HxTensor *yt = &g->tensors[o->y];
+        if (yt->h != b->h || yt->w != b->w || yt->c != b->c)
+            return 0;
+        if (p[0] == 0 && (yt->w > a->w || yt->c > a->c))
+            return 0;
+        if (p[0] == 1 && (yt->h > a->h || yt->c > a->c))
+            return 0;
+        if (p[0] == 2 && (yt->h > a->h || yt->w > a->w))
+            return 0;
+        if (p[2] == 1)
+            return constant(g, p[3], hx_tensor_bytes(a));
+        return 1;
+    }
+    case HX_GATHER_ND: {
+        if (p[1] > 1 || p[2] > 2)
+            return 0;
+        if (p[2] == 2) {
+            uint32_t k = p[4] ? p[4] : 1;
+            if (k < 1 || k > 3)
+                return 0;
+            uint32_t slice_size = p[5] ? p[5] : (k == 1 ? a->w * a->c : (k == 2 ? a->c : 1));
+            uint32_t total_out = hx_tensor_elements(b);
+            if (total_out % slice_size != 0)
+                return 0;
+            uint32_t M = total_out / slice_size;
+            return constant(g, p[3], (uint64_t)M * k * 4u);
+        }
+        const HxTensor *yt = &g->tensors[o->y];
+        uint32_t k = p[4] ? p[4] : yt->c;
+        if (k < 1 || k > 3)
+            return 0;
+        uint32_t total_elements = hx_tensor_elements(yt);
+        if (total_elements % k != 0)
+            return 0;
+        uint32_t M = total_elements / k;
+        uint32_t slice_size = p[5] ? p[5] : (k == 1 ? a->w * a->c : (k == 2 ? a->c : 1));
+        if (hx_tensor_elements(b) != M * slice_size)
+            return 0;
+        if (p[2] == 1)
+            return constant(g, p[3], hx_tensor_bytes(a));
+        return 1;
+    }
+    case HX_SCATTER_ND: {
+        uint32_t k = p[2] ? p[2] : ((p[5] & 1) ? 1 : g->tensors[o->y].c);
+        if (k < 1 || k > 3)
+            return 0;
+        uint32_t slice_size = p[3] ? p[3] : (k == 1 ? b->w * b->c : (k == 2 ? b->c : 1));
+        if (a->h != b->h || a->w != b->w || a->c != b->c)
+            return 0;
+        uint32_t M = p[8];
+        if (!M) {
+            if (p[5] & 1) {
+                if (!(p[5] & 2)) {
+                    uint32_t total_z = hx_tensor_elements(&g->tensors[o->z]);
+                    if (total_z % slice_size != 0)
+                        return 0;
+                    M = total_z / slice_size;
+                }
+            } else {
+                const HxTensor *yt = &g->tensors[o->y];
+                uint32_t total_elements = hx_tensor_elements(yt);
+                if (total_elements % k != 0)
+                    return 0;
+                M = total_elements / k;
+            }
+        }
+        if (p[5] & 1) {
+            if (!constant(g, p[6], (uint64_t)M * k * 4u))
+                return 0;
+        }
+        if (p[5] & 2) {
+            if (!constant(g, p[7], (uint64_t)M * slice_size * 4u))
+                return 0;
+        } else {
+            const HxTensor *zt = &g->tensors[o->z];
+            if (hx_tensor_elements(zt) != M * slice_size)
+                return 0;
+        }
+        return 1;
+    }
     case HX_GATHER: {
-        if (p[0] > 1 || p[3] > 1 || !p[2])
+        if (p[0] > 2 || p[3] > 1 || !p[2])
             return 0;
-        if ((uint64_t)b->h * b->w != hx_tensor_elements(a))
+        uint32_t n_indices = (p[0] == 2) ? p[9] : hx_tensor_elements(a);
+        if (p[0] == 2 && !constant(g, p[8], (uint64_t)n_indices * 4u))
             return 0;
-        if (p[0] == 1)
-            return constant(g, p[1], (uint64_t)p[2] * b->stride * 4u);
-        const HxTensor *tbl = &g->tensors[o->y];
-        return tbl->c >= b->c && (uint64_t)tbl->h * tbl->w >= p[2];
+        if (p[4] == 0 && (p[5] == 0 || p[5] == b->c)) {
+            if ((uint64_t)b->h * b->w != n_indices)
+                return 0;
+            if (p[0] == 1)
+                return constant(g, p[1], (uint64_t)p[2] * (p[7] ? p[7] : b->stride) * 4u);
+            if (p[0] == 2)
+                return a->c >= b->c && (uint64_t)a->h * a->w >= p[2];
+            const HxTensor *tbl = &g->tensors[o->y];
+            return tbl->c >= b->c && (uint64_t)tbl->h * tbl->w >= p[2];
+        } else {
+            uint32_t inner = p[5] ? p[5] : (p[4] == 2 ? 1 : b->c);
+            uint32_t outer = p[6] ? p[6] : 1;
+            if ((uint64_t)b->h * b->w * b->c < (uint64_t)outer * n_indices * inner)
+                return 0;
+            if (p[0] == 1)
+                return constant(g, p[1], (uint64_t)outer * p[2] * (p[7] ? p[7] : inner) * 4u);
+            if (p[0] == 2)
+                return hx_tensor_elements(a) >= (uint64_t)outer * p[2] * inner;
+            const HxTensor *tbl = &g->tensors[o->y];
+            return hx_tensor_elements(tbl) >= (uint64_t)outer * p[2] * inner;
+        }
     }
     case HX_WHERE: {
         if (p[0] > 3 || p[2] > 3)
@@ -614,11 +735,14 @@ uint32_t hx_graph_open(HxGraph *g, const void *image, uint32_t image_bytes, cons
             *bad_op = i;
         int binary = o->kind == HX_ADD || o->kind == HX_CONCAT || o->kind == HX_MATMUL ||
                      o->kind == HX_SDPA || (o->kind == HX_BINARY && !o->p[1]) ||
-                     (o->kind == HX_GATHER && !o->p[0]) || (o->kind == HX_WHERE && !o->p[0]);
+                     (o->kind == HX_GATHER && !o->p[0]) || (o->kind == HX_WHERE && !o->p[0]) ||
+                     ((o->kind == HX_GATHER_ELEMENTS || o->kind == HX_GATHER_ND) && o->p[2] != 2) ||
+                     (o->kind == HX_SCATTER_ND && !(o->p[5] & 1));
         int has_y = binary || o->kind == HX_SHORTCONV || (o->kind == HX_ROPE && o->y != HXFG_NONE) ||
                     (o->kind == HX_KV_WRITE && o->y != HXFG_NONE) ||
                     (o->kind == HX_ATTN_SOFTMAX && o->y != HXFG_NONE);
-        const int req_z = o->kind == HX_SDPA || (o->kind == HX_WHERE && !o->p[2]);
+        const int req_z = o->kind == HX_SDPA || (o->kind == HX_WHERE && !o->p[2]) ||
+                          (o->kind == HX_SCATTER_ND && !(o->p[5] & 2));
         int has_z = req_z || (o->kind == HX_SHORTCONV && o->z != HXFG_NONE);
         const int produces_z = (o->kind == HX_TOPK && o->z != HXFG_NONE);
         const int has_mask = o->kind == HX_SDPA && o->p[0] != HXFG_NONE;
@@ -648,7 +772,7 @@ uint32_t hx_graph_open(HxGraph *g, const void *image, uint32_t image_bytes, cons
                 if (out_pers == t_pers &&
                     overlap(out->offset, hx_tensor_bytes(out), t->offset, hx_tensor_bytes(t))) {
                     if (j == o->x || (has_y && j == o->y) || (has_z && j == o->z)) {
-                        if (!out_pers)
+                        if (!out_pers && !(o->kind == HX_SCATTER_ND && o->p[0] == 1 && j == o->x && o->out == o->x))
                             return HX_ALIAS;
                     } else
                         live[j] = 0;
@@ -1057,6 +1181,335 @@ static void hx_kv_write_op(const HxGraph *g, const HxOp *o, const float *x, cons
         }
     }
 }
+static void hx_gather_op(const HxGraph *g, const HxOp *o, const float *x_float, float *out,
+                         uint32_t part, uint32_t parts) {
+    const HxTensor *a = &g->tensors[o->x]; // indices or data
+    const HxTensor *b = &g->tensors[o->out]; // out
+    const uint32_t *p = o->p;
+    const uint32_t vocab = p[2];
+    const uint32_t axis = p[4];
+    const int int_indices = (p[3] == 0) || (p[0] == 2) || (a->dtype == HX_DTYPE_INT32);
+    const int32_t *x_int = (p[0] == 2) ? (const int32_t *)(g->constants + p[8]) : (const int32_t *)x_float;
+    const uint32_t n_indices = (p[0] == 2) ? p[9] : hx_tensor_elements(a);
+
+    if (axis == 0 && (p[5] == 0 || p[5] == b->c)) {
+        const uint32_t stride_tbl = p[7] ? p[7] : (p[0] == 1 ? b->stride : (p[0] == 2 ? a->stride : g->tensors[o->y].stride));
+        const float *tbl_base = (p[0] == 1)
+                                    ? ((const float *)(g->constants + p[1]))
+                                    : ((p[0] == 2) ? x_float : ((const float *)(hx_tensor_base(g, &g->tensors[o->y]) + g->tensors[o->y].offset)));
+        const uint32_t pixels = b->h * b->w;
+        const uint32_t lo = pixels * part / parts, hi = pixels * (part + 1u) / parts;
+        for (uint32_t i = lo; i < hi; i++) {
+            int32_t idx = 0;
+            if (p[0] == 2) {
+                idx = x_int[i % n_indices];
+            } else {
+                uint32_t a_pixel = a->c ? i / a->c : 0, a_c = a->c ? i % a->c : 0;
+                uint32_t idx_pos = a_pixel * a->stride + a_c;
+                idx = int_indices ? x_int[idx_pos] : (int32_t)lrintf(x_float[idx_pos]);
+            }
+            if (idx < 0) idx += (int32_t)vocab;
+            idx = idx < 0 ? 0 : (idx >= (int32_t)vocab ? (int32_t)vocab - 1 : idx);
+            const float *row = tbl_base + (uint32_t)idx * stride_tbl;
+            float *dst = out + i * b->stride;
+            for (uint32_t c = 0; c < b->stride; c++)
+                dst[c] = c < b->c ? row[c] : 0.0f;
+        }
+    } else {
+        const uint32_t inner = p[5] ? p[5] : (axis == 2 ? 1 : b->c);
+        const uint32_t outer = p[6] ? p[6] : 1;
+        const uint32_t stride_tbl = p[7] ? p[7] : (p[0] == 1 ? inner : (p[0] == 2 ? a->stride : g->tensors[o->y].stride));
+        const float *tbl_base = (p[0] == 1)
+                                    ? ((const float *)(g->constants + p[1]))
+                                    : ((p[0] == 2) ? x_float : ((const float *)(hx_tensor_base(g, &g->tensors[o->y]) + g->tensors[o->y].offset)));
+        const uint32_t total_tasks = outer * n_indices;
+        const uint32_t lo = total_tasks * part / parts, hi = total_tasks * (part + 1u) / parts;
+
+        for (uint32_t task = lo; task < hi; task++) {
+            uint32_t o_idx = task / n_indices;
+            uint32_t j = task % n_indices;
+            int32_t idx = 0;
+            if (p[0] == 2) {
+                idx = x_int[j];
+            } else {
+                uint32_t a_pixel = a->c ? j / a->c : 0, a_c = a->c ? j % a->c : 0;
+                uint32_t idx_pos = a_pixel * a->stride + a_c;
+                idx = int_indices ? x_int[idx_pos] : (int32_t)lrintf(x_float[idx_pos]);
+            }
+            if (idx < 0) idx += (int32_t)vocab;
+            idx = idx < 0 ? 0 : (idx >= (int32_t)vocab ? (int32_t)vocab - 1 : idx);
+
+            if (axis == 2 && inner == 1) {
+                uint32_t src_pos = o_idx * stride_tbl + (uint32_t)idx;
+                uint32_t dst_pos = o_idx * b->stride + j;
+                out[dst_pos] = tbl_base[src_pos];
+            } else {
+                const float *src_row = tbl_base + (o_idx * vocab + (uint32_t)idx) * stride_tbl;
+                float *dst_row = out + (o_idx * n_indices + j) * b->stride;
+                for (uint32_t k = 0; k < inner; k++)
+                    dst_row[k] = src_row[k];
+                for (uint32_t k = inner; k < b->stride; k++)
+                    dst_row[k] = 0.0f;
+            }
+        }
+    }
+}
+
+static void hx_gather_elements_op(const HxGraph *g, const HxOp *o, const float *data, const float *indices_raw,
+                                  float *out, uint32_t part, uint32_t parts) {
+    const HxTensor *dt = &g->tensors[o->x]; // data
+    const HxTensor *ot = &g->tensors[o->out]; // out
+    const uint32_t *p = o->p;
+    const uint32_t axis = p[0];
+    const int const_indices = (p[2] == 2);
+    const int int_indices = (p[1] == 0) || const_indices ||
+                            (!const_indices && (g->tensors[o->y].dtype == HX_DTYPE_INT32));
+    const int32_t *idx_int = const_indices ? (const int32_t *)(g->constants + p[3]) : (const int32_t *)indices_raw;
+    const float *data_base = (p[2] == 1) ? (const float *)(g->constants + p[3]) : data;
+
+    const uint32_t pixels = ot->h * ot->w;
+    const uint32_t lo = pixels * part / parts, hi = pixels * (part + 1u) / parts;
+
+    for (uint32_t px = lo; px < hi; px++) {
+        uint32_t oy = px / ot->w, ox = px % ot->w;
+        float *dst = out + px * ot->stride;
+        for (uint32_t c = 0; c < ot->stride; c++) {
+            if (c >= ot->c) {
+                dst[c] = 0.0f;
+                continue;
+            }
+            uint32_t idx_loc = const_indices ? (px * ot->c + c) : ((oy * g->tensors[o->y].w + ox) * g->tensors[o->y].stride + c);
+            int32_t k = int_indices ? idx_int[idx_loc] : (int32_t)lrintf(indices_raw[idx_loc]);
+            uint32_t sy = oy, sx = ox, sc = c;
+            if (axis == 0) {
+                if (k < 0) k += (int32_t)dt->h;
+                sy = k < 0 ? 0 : (k >= (int32_t)dt->h ? dt->h - 1 : (uint32_t)k);
+            } else if (axis == 1) {
+                if (k < 0) k += (int32_t)dt->w;
+                sx = k < 0 ? 0 : (k >= (int32_t)dt->w ? dt->w - 1 : (uint32_t)k);
+            } else {
+                if (k < 0) k += (int32_t)dt->c;
+                sc = k < 0 ? 0 : (k >= (int32_t)dt->c ? dt->c - 1 : (uint32_t)k);
+            }
+            uint32_t src_loc = (sy * dt->w + sx) * dt->stride + sc;
+            dst[c] = data_base[src_loc];
+        }
+    }
+}
+
+static void hx_gather_nd_op(const HxGraph *g, const HxOp *o, const float *data, const float *indices_raw,
+                            float *out, uint32_t part, uint32_t parts) {
+    const HxTensor *dt = &g->tensors[o->x]; // data
+    const HxTensor *ot = &g->tensors[o->out]; // out
+    const uint32_t *p = o->p;
+    const int const_indices = (p[2] == 2);
+    const int int_indices = (p[1] == 0) || const_indices ||
+                            (!const_indices && (g->tensors[o->y].dtype == HX_DTYPE_INT32));
+    const int32_t *idx_int = const_indices ? (const int32_t *)(g->constants + p[3]) : (const int32_t *)indices_raw;
+    const float *data_base = (p[2] == 1) ? (const float *)(g->constants + p[3]) : data;
+    const uint32_t k = p[4] ? p[4] : (const_indices ? 1 : g->tensors[o->y].c);
+    const uint32_t slice_size = p[5] ? p[5] : (k == 1 ? dt->w * dt->c : (k == 2 ? dt->c : 1));
+    const uint32_t total_elements = const_indices ? (hx_tensor_elements(ot) / slice_size * k) : hx_tensor_elements(&g->tensors[o->y]);
+    const uint32_t M = k ? total_elements / k : 0;
+
+    const uint32_t lo = M * part / parts, hi = M * (part + 1u) / parts;
+
+    for (uint32_t m = lo; m < hi; m++) {
+        int32_t coords[3] = {0, 0, 0};
+        for (uint32_t d = 0; d < k && d < 3; d++) {
+            uint32_t elem_idx = m * k + d;
+            int32_t val = 0;
+            if (const_indices) {
+                val = idx_int[elem_idx];
+            } else {
+                const HxTensor *it = &g->tensors[o->y];
+                uint32_t px = it->c ? elem_idx / it->c : 0, ch = it->c ? elem_idx % it->c : 0;
+                uint32_t loc = px * it->stride + ch;
+                val = int_indices ? idx_int[loc] : (int32_t)lrintf(indices_raw[loc]);
+            }
+            coords[d] = val;
+        }
+        int32_t sy = 0, sx = 0, sc = 0;
+        if (k == 1) {
+            sy = coords[0];
+        } else if (k == 2) {
+            if (dt->w == 1 && coords[0] == 0) {
+                sy = coords[1];
+                sx = 0;
+            } else {
+                sy = coords[0];
+                sx = coords[1];
+            }
+        } else {
+            if (dt->w == 1 && coords[0] == 0) {
+                sy = coords[1];
+                sx = 0;
+                sc = coords[2];
+            } else {
+                sy = coords[0];
+                sx = coords[1];
+                sc = coords[2];
+            }
+        }
+        if (sy < 0) sy += (int32_t)dt->h;
+        if (sx < 0) sx += (int32_t)dt->w;
+        if (sc < 0) sc += (int32_t)dt->c;
+
+        sy = sy < 0 ? 0 : (sy >= (int32_t)dt->h ? (int32_t)dt->h - 1 : sy);
+        sx = sx < 0 ? 0 : (sx >= (int32_t)dt->w ? (int32_t)dt->w - 1 : sx);
+        sc = sc < 0 ? 0 : (sc >= (int32_t)dt->c ? (int32_t)dt->c - 1 : sc);
+
+        if (k == 1) {
+            uint32_t y = (uint32_t)sy;
+            for (uint32_t x = 0; x < dt->w; x++) {
+                const float *src = data_base + (y * dt->w + x) * dt->stride;
+                float *dst = out + (m * dt->w + x) * ot->stride;
+                for (uint32_t c = 0; c < ot->stride; c++)
+                    dst[c] = c < dt->c ? src[c] : 0.0f;
+            }
+        } else if (k == 2) {
+            const float *src = data_base + ((uint32_t)sy * dt->w + (uint32_t)sx) * dt->stride;
+            float *dst = out + m * ot->stride;
+            for (uint32_t c = 0; c < ot->stride; c++)
+                dst[c] = c < ot->c ? src[c] : 0.0f;
+        } else {
+            float val = data_base[((uint32_t)sy * dt->w + (uint32_t)sx) * dt->stride + (uint32_t)sc];
+            uint32_t dst_px = ot->c ? m / ot->c : 0, dst_c = ot->c ? m % ot->c : 0;
+            out[dst_px * ot->stride + dst_c] = val;
+        }
+    }
+}
+
+static void hx_scatter_nd_op(const HxGraph *g, const HxOp *o, const float *data, const float *indices_raw,
+                             const float *updates, float *out, uint32_t part, uint32_t parts) {
+    const HxTensor *dt = &g->tensors[o->x]; // data
+    const HxTensor *ot = &g->tensors[o->out]; // out
+    const uint32_t *p = o->p;
+    const int in_place = (p[0] == 1) || (o->out == o->x);
+    const int const_indices = (p[5] & 1) != 0;
+    const int const_updates = (p[5] & 2) != 0;
+    const int int_indices = (p[1] == 0) || const_indices ||
+                            (!const_indices && (g->tensors[o->y].dtype == HX_DTYPE_INT32));
+    const int32_t *idx_int = const_indices ? (const int32_t *)(g->constants + p[6]) : (const int32_t *)indices_raw;
+    const float *upd_base = const_updates ? (const float *)(g->constants + p[7]) : updates;
+    const uint32_t k = p[2] ? p[2] : (const_indices ? 1 : g->tensors[o->y].c);
+    const uint32_t slice_size = p[3] ? p[3] : (k == 1 ? ot->w * ot->c : (k == 2 ? ot->c : 1));
+    const uint32_t reduction = p[4];
+
+    if (!in_place) {
+        const uint32_t pixels = ot->h * ot->w;
+        const uint32_t lo = pixels * part / parts, hi = pixels * (part + 1u) / parts;
+        for (uint32_t px = lo; px < hi; px++) {
+            const float *src = data + px * dt->stride;
+            float *dst = out + px * ot->stride;
+            for (uint32_t c = 0; c < ot->stride; c++)
+                dst[c] = c < ot->c ? src[c] : 0.0f;
+        }
+    }
+
+    if (part + 1 == parts) {
+        uint32_t M = p[8];
+        if (!M) {
+            if (const_indices) {
+                uint32_t total_u = const_updates ? (p[3] ? slice_size * 2 : slice_size) : hx_tensor_elements(&g->tensors[o->z]);
+                M = slice_size ? total_u / slice_size : 0;
+            } else {
+                const uint32_t total_elements = hx_tensor_elements(&g->tensors[o->y]);
+                M = k ? total_elements / k : 0;
+            }
+        }
+        for (uint32_t m = 0; m < M; m++) {
+            int32_t coords[3] = {0, 0, 0};
+            for (uint32_t d = 0; d < k && d < 3; d++) {
+                uint32_t elem_idx = m * k + d;
+                int32_t val = 0;
+                if (const_indices) {
+                    val = idx_int[elem_idx];
+                } else {
+                    const HxTensor *it = &g->tensors[o->y];
+                    uint32_t px = it->c ? elem_idx / it->c : 0, ch = it->c ? elem_idx % it->c : 0;
+                    uint32_t loc = px * it->stride + ch;
+                    val = int_indices ? idx_int[loc] : (int32_t)lrintf(indices_raw[loc]);
+                }
+                coords[d] = val;
+            }
+            if (coords[0] < 0) coords[0] += (int32_t)ot->h;
+            int32_t dy = 0, dx = 0, dc = 0;
+            if (k == 1) {
+                dy = coords[0];
+            } else if (k == 2) {
+                if (ot->w == 1 && coords[0] == 0) {
+                    dy = coords[1];
+                    dx = 0;
+                } else {
+                    dy = coords[0];
+                    dx = coords[1];
+                }
+            } else {
+                if (ot->w == 1 && coords[0] == 0) {
+                    dy = coords[1];
+                    dx = 0;
+                    dc = coords[2];
+                } else {
+                    dy = coords[0];
+                    dx = coords[1];
+                    dc = coords[2];
+                }
+            }
+            if (dy < 0) dy += (int32_t)ot->h;
+            if (dx < 0) dx += (int32_t)ot->w;
+            if (dc < 0) dc += (int32_t)ot->c;
+
+            dy = dy < 0 ? 0 : (dy >= (int32_t)ot->h ? (int32_t)ot->h - 1 : dy);
+            dx = dx < 0 ? 0 : (dx >= (int32_t)ot->w ? (int32_t)ot->w - 1 : dx);
+            dc = dc < 0 ? 0 : (dc >= (int32_t)ot->c ? (int32_t)ot->c - 1 : dc);
+
+            if (k == 1) {
+                uint32_t y = (uint32_t)dy;
+                for (uint32_t x = 0; x < ot->w; x++) {
+                    const float *u = const_updates ? (upd_base + (m * ot->w + x) * ot->c) :
+                                     (upd_base + (m * ot->w + x) * g->tensors[o->z].stride);
+                    float *dst = out + (y * ot->w + x) * ot->stride;
+                    for (uint32_t c = 0; c < ot->c; c++) {
+                        float uv = u[c];
+                        if (reduction == 1) dst[c] += uv;
+                        else if (reduction == 2) dst[c] *= uv;
+                        else if (reduction == 3) dst[c] = fmaxf(dst[c], uv);
+                        else if (reduction == 4) dst[c] = fminf(dst[c], uv);
+                        else dst[c] = uv;
+                    }
+                }
+            } else if (k == 2) {
+                const float *u = const_updates ? (upd_base + m * ot->c) : (upd_base + m * g->tensors[o->z].stride);
+                float *dst = out + ((uint32_t)dy * ot->w + (uint32_t)dx) * ot->stride;
+                for (uint32_t c = 0; c < ot->c; c++) {
+                    float uv = u[c];
+                    if (reduction == 1) dst[c] += uv;
+                    else if (reduction == 2) dst[c] *= uv;
+                    else if (reduction == 3) dst[c] = fmaxf(dst[c], uv);
+                    else if (reduction == 4) dst[c] = fminf(dst[c], uv);
+                    else dst[c] = uv;
+                }
+            } else {
+                float uv = 0.0f;
+                if (const_updates) {
+                    uv = upd_base[m];
+                } else {
+                    const HxTensor *ut = &g->tensors[o->z];
+                    uint32_t up_px = ut->c ? m / ut->c : 0, up_c = ut->c ? m % ut->c : 0;
+                    uv = upd_base[up_px * ut->stride + up_c];
+                }
+                float *dst = out + ((uint32_t)dy * ot->w + (uint32_t)dx) * ot->stride + (uint32_t)dc;
+                if (reduction == 1) *dst += uv;
+                else if (reduction == 2) *dst *= uv;
+                else if (reduction == 3) *dst = fmaxf(*dst, uv);
+                else if (reduction == 4) *dst = fminf(*dst, uv);
+                else *dst = uv;
+            }
+        }
+    }
+}
+
 static void hx_cubic_weights(float t, float w[4]) {
     const float A = -0.75f;
     for (int i = 0; i < 4; i++) {
@@ -1130,6 +1583,23 @@ void hx_execute_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t par
     }
     if (o->kind == HX_KV_WRITE) {
         hx_kv_write_op(g, o, x, y, out, part, parts);
+        return;
+    }
+    if (o->kind == HX_GATHER) {
+        hx_gather_op(g, o, x, out, part, parts);
+        return;
+    }
+    if (o->kind == HX_GATHER_ELEMENTS) {
+        hx_gather_elements_op(g, o, x, y, out, part, parts);
+        return;
+    }
+    if (o->kind == HX_GATHER_ND) {
+        hx_gather_nd_op(g, o, x, y, out, part, parts);
+        return;
+    }
+    if (o->kind == HX_SCATTER_ND) {
+        const float *z = (o->z != HXFG_NONE) ? (const float *)(hx_tensor_base(g, &g->tensors[o->z]) + g->tensors[o->z].offset) : NULL;
+        hx_scatter_nd_op(g, o, x, y, z, out, part, parts);
         return;
     }
     for (uint32_t i = lo; i < hi; i++) {
@@ -1303,23 +1773,7 @@ void hx_execute_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t par
             }
             continue;
         }
-        if (o->kind == HX_GATHER) {
-            uint32_t a_pixel = i / a->c, a_c = i % a->c;
-            int32_t idx = (p[3] == 0)
-                              ? ((const int32_t *)x)[a_pixel * a->stride + a_c]
-                              : (int32_t)lrintf(x[a_pixel * a->stride + a_c]);
-            const uint32_t vocab = p[2];
-            if (idx < 0)
-                idx += (int32_t)vocab;
-            idx = idx < 0 ? 0 : (idx >= (int32_t)vocab ? (int32_t)vocab - 1 : idx);
-            const float *row = (p[0] == 1)
-                                   ? ((const float *)(g->constants + p[1])) + (uint32_t)idx * b->stride
-                                   : ((const float *)(g->arena + g->tensors[o->y].offset)) +
-                                         (uint32_t)idx * g->tensors[o->y].stride;
-            for (uint32_t c = 0; c < b->stride; c++)
-                dst[c] = c < b->c ? row[c] : 0.0f;
-            continue;
-        }
+
         if (o->kind == HX_WHERE) {
             const HxTensor *cond_t = a;
             uint32_t cy = (cond_t->h == 1) ? 0 : oy, cx = (cond_t->w == 1) ? 0 : ox;

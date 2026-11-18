@@ -189,8 +189,17 @@ def kinds(tmp):
 
 @unittest.skipIf(onnx is None, "offline onnx package not installed")
 class FloatOnnxTests(unittest.TestCase):
-    def check_numeric(self, m, shape, tol=2e-4):
-        x = np.random.default_rng(11).normal(0, 1, shape).astype(np.float32)
+    def check_numeric(self, m, shape, tol=2e-4, x_input=None):
+        if x_input is not None:
+            x = x_input
+        else:
+            in_type = m.graph.input[0].type.tensor_type.elem_type
+            if in_type in (TensorProto.INT32, TensorProto.INT64):
+                x = np.random.default_rng(11).integers(0, 8, shape).astype(
+                    np.int32 if in_type == TensorProto.INT32 else np.int64
+                )
+            else:
+                x = np.random.default_rng(11).normal(0, 1, shape).astype(np.float32)
         want = onnxruntime.InferenceSession(
             m.SerializeToString(), providers=["CPUExecutionProvider"]
         ).run(None, {"x": x})
@@ -1043,6 +1052,54 @@ def model_gather_run_with_gap():
     return b.model([("x", [1, 4, 4])], [(out, [1, 2, 4])])
 
 
+def model_gather_embedding_lookup():
+    b = Builder(seed=50)
+    table = b.const(np.random.default_rng(1).normal(0, 1, (16, 8)).astype(np.float32))
+    g = b.node("Gather", [table, "x"], axis=0)
+    return b.model([("x", [1, 4], TensorProto.INT64)], [(g, [1, 4, 8])])
+
+
+def model_gather_arbitrary_axis():
+    b = Builder(seed=51)
+    indices = b.const(np.array([1, 3, 5], dtype=np.int64))
+    x = linear_token(b, "x", 6, 6)
+    g = b.node("Gather", [x, indices], axis=2)
+    out = b.node("Relu", [g])
+    return b.model([("x", [1, 4, 6])], [(out, [1, 4, 3])])
+
+
+def model_gather_elements():
+    b = Builder(seed=52)
+    idx_arr = np.array([[[1, 3, 0, 2, 4, 1],
+                         [0, 2, 4, 1, 3, 0],
+                         [2, 0, 1, 4, 2, 3],
+                         [3, 1, 2, 0, 1, 4]]], dtype=np.int64)
+    indices = b.const(idx_arr)
+    x = linear_token(b, "x", 6, 6)
+    g = b.node("GatherElements", [x, indices], axis=2)
+    out = b.node("Relu", [g])
+    return b.model([("x", [1, 4, 6])], [(out, [1, 4, 6])])
+
+
+def model_gather_nd():
+    b = Builder(seed=53)
+    indices = b.const(np.array([[[0, 1], [0, 3]]], dtype=np.int64))
+    x = linear_token(b, "x", 8, 8)
+    g = b.node("GatherND", [x, indices])
+    out = b.node("Relu", [g])
+    return b.model([("x", [1, 4, 8])], [(out, [1, 2, 8])])
+
+
+def model_scatter_nd():
+    b = Builder(seed=54)
+    indices = b.const(np.array([[[0, 1], [0, 3]]], dtype=np.int64))
+    updates = b.const(np.random.default_rng(6).normal(0, 1, (1, 2, 8)).astype(np.float32))
+    x = linear_token(b, "x", 8, 8)
+    s = b.node("ScatterND", [x, indices, updates])
+    out = b.node("Relu", [s])
+    return b.model([("x", [1, 4, 8])], [(out, [1, 4, 8])])
+
+
 def model_rms_normalization():
     length, dim = 4, 8
     b = Builder(seed=41)
@@ -1215,8 +1272,8 @@ class TransformerLoweringTests(unittest.TestCase):
     """Token layout, HX_MATMUL and the attention chain. Numeric checks reuse FloatOnnxTests'
     comparison against onnxruntime; structural checks read the lowered HXFG back."""
 
-    def numeric(self, m, shape, tol=2e-4):
-        return FloatOnnxTests.check_numeric(self, m, shape, tol)
+    def numeric(self, m, shape, tol=2e-4, x_input=None):
+        return FloatOnnxTests.check_numeric(self, m, shape, tol, x_input=x_input)
 
     def test_single_head_attention_matches_onnxruntime(self):
         m, length, dim = model_single_head_attention()
@@ -1335,6 +1392,31 @@ class TransformerLoweringTests(unittest.TestCase):
         m, length, dim = model_arbitrary_axis_softmax()
         _, ops = self.numeric(m, (1, length, dim), tol=5e-4)
         self.assertIn(hx.ATTN_SOFTMAX, ops)
+
+    def test_gather_embedding_lookup_matches_onnxruntime(self):
+        m = model_gather_embedding_lookup()
+        _, ops = self.numeric(m, (1, 4), tol=5e-4)
+        self.assertIn(hx.GATHER, ops)
+
+    def test_gather_arbitrary_axis_matches_onnxruntime(self):
+        m = model_gather_arbitrary_axis()
+        _, ops = self.numeric(m, (1, 4, 6), tol=5e-4)
+        self.assertIn(hx.GATHER, ops)
+
+    def test_gather_elements_matches_onnxruntime(self):
+        m = model_gather_elements()
+        _, ops = self.numeric(m, (1, 4, 6), tol=5e-4)
+        self.assertIn(hx.GATHER_ELEMENTS, ops)
+
+    def test_gather_nd_matches_onnxruntime(self):
+        m = model_gather_nd()
+        _, ops = self.numeric(m, (1, 4, 8), tol=5e-4)
+        self.assertIn(hx.GATHER_ND, ops)
+
+    def test_scatter_nd_matches_onnxruntime(self):
+        m = model_scatter_nd()
+        _, ops = self.numeric(m, (1, 4, 8), tol=5e-4)
+        self.assertIn(hx.SCATTER_ND, ops)
 
     def test_transformer_rejections_name_the_node(self):
 

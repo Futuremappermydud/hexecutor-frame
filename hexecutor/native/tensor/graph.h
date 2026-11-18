@@ -50,7 +50,9 @@ enum {
     HX_KV_WRITE,   /* 26: KV cache write/append at pos: x [1,Lin,C], out [1,Lmax,C], y pos tensor or p[0] */
     HX_SDPA = 27,  /* 27: fused scaled dot-product attention (Q, K, V) */
     HX_ATTN_SOFTMAX = 28, /* 28: attention softmax with key-axis and causal/additive mask */
-    /* Kinds 29-31 are free. */
+    HX_GATHER_ELEMENTS = 29, /* 29: GatherElements: x data, y indices, out; axis p[0] */
+    HX_GATHER_ND = 30,       /* 30: GatherND: x data, y indices, out; batch_dims p[0] */
+    HX_SCATTER_ND = 31,      /* 31: ScatterND: x data, y indices, z updates, out; p[0] in-place/copy mode */
     HX_GATHER = 32, /* token/embedding table lookup; x indices, y table or p[1] const, out */
     HX_WHERE = 33,  /* select x ? y : z; x condition, y/z tensors or scalars */
     HX_ARGMAX = 34, /* argmax over channel axis; p[0] select_last, p[1] dtype */
@@ -174,8 +176,27 @@ typedef struct {
  * tensor of shape [b->h, b->w, b->stride]), p[3] reversed (computes y op x; with the constant, c op x).
  * Each of y's h, w, c is the output's or 1 (NumPy broadcast); x and the output have the same shape.
  * Avg pool p: pool fields as max pool, p[6] count_include_pad.
- * Gather (HX_GATHER, 32): x indices, y table tensor (mode 0) or NONE with constant table offset in p[1]
- * (mode 1), out. p[0] mode, p[1] constant offset, p[2] vocab_size, p[3] index_dtype (0 int32, 1 float32).
+ * GatherElements (HX_GATHER_ELEMENTS, 29): x data, y indices (same rank as x/out), out.
+ * p[0] axis (0: H, 1: W, 2: C), p[1] index_dtype (0: int32, 1: float32),
+ * p[2] mode (0: both tensors; 1: x in constant pool at p[3], y is indices; 2: y in constant pool at p[3], x is data).
+ * GatherND (HX_GATHER_ND, 30): x data, y indices, out.
+ * p[0] batch_dims (default 0), p[1] index_dtype (0: int32, 1: float32),
+ * p[2] mode (0: both tensors; 1: x in constant pool at p[3], y is indices; 2: y in constant pool at p[3], x is data),
+ * p[3] constant offset, p[4] tuple_len (last dim of indices, 1..3), p[5] slice_elements (size of gathered slice).
+ * ScatterND (HX_SCATTER_ND, 31): x data, y indices, z updates, out.
+ * p[0] mode (0: out distinct from x, full copy then update; 1: in-place row update on persistent x==out),
+ * p[1] index_dtype (0: int32, 1: float32), p[2] tuple_len (1..3), p[3] slice_elements,
+ * p[4] reduction (0: assignment, 1: add, 2: mul, 3: max, 4: min),
+ * p[5] const_mask (bit 0: y in constant pool at p[6]; bit 1: z in constant pool at p[7]).
+ * Gather (HX_GATHER, 32): x indices or data, y table or NONE, out.
+ * p[0] mode (0: x indices, y table tensor; 1: x indices tensor, table in constant pool at p[1];
+ *            2: x data tensor, indices in constant pool at p[8], p[9] count).
+ * p[1] constant table offset, p[2] vocab_size, p[3] index_dtype (0 int32, 1 float32),
+ * p[4] axis (0: outer/vocab, 1: spatial/W, 2: channel/C; or arbitrary axis),
+ * p[5] inner_dim (elements after gathered axis; 0 selects default),
+ * p[6] outer_dim (elements before gathered axis; 0 selects default),
+ * p[7] table_stride (stride of table rows; 0 selects table/output stride),
+ * p[8] constant indices offset, p[9] constant indices count.
  * Where (HX_WHERE, 33): x condition, y X, z Y, out. p[0] X mode (0 tensor y, 1 scalar bits in p[1],
  * 2 per-channel const in p[1], 3 full-size const in p[1]), p[2] Y mode (0 tensor z, 1 scalar bits in p[3],
  * 2 per-channel const in p[3], 3 full-size const in p[3]). Integer/bool and float supported.

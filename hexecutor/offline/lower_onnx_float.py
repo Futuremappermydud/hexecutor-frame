@@ -89,7 +89,7 @@ ELEMENTWISE = frozenset({
 REDUCES = frozenset({"ReduceMean", "ReduceSum", "ReduceMax", "ReduceMin"})
 # Operators that pass token status from one of their inputs to their outputs.
 TOKEN_LINKED = ELEMENTWISE | REDUCES | frozenset({
-    "Concat", "Gather", "Reshape", "Squeeze", "Unsqueeze", "Flatten", "LayerNormalization",
+    "Concat", "Gather", "GatherElements", "GatherND", "ScatterND", "Reshape", "Squeeze", "Unsqueeze", "Flatten", "LayerNormalization",
     "RMSNormalization", "RMSNorm", "Softmax", "Split", "Slice",
 })
 TOKEN_OPS = TOKEN_LINKED | frozenset({"MatMul", "Transpose", "Einsum", "ScaledDotProductAttention", "sdpa"})
@@ -740,7 +740,7 @@ class Lowerer:
                 op = node.op_type
                 last_axis = (op in ("LayerNormalization", "RMSNormalization", "RMSNorm", "Softmax", "Split") and r3(node.input[0])
                              and int(self.attrs(node).get("axis", -1)) % 3 == 2)
-                seed = op == "MatMul" or last_axis or (op in REDUCES and r3(node.input[0]))
+                seed = op == "MatMul" or last_axis or (op in REDUCES and r3(node.input[0])) or (op == "Gather" and r3(node.output[0]))
                 link = op in TOKEN_LINKED and any(n in self.token for n in names)
                 if seed or link:
                     for n in names:
@@ -2310,34 +2310,275 @@ class Lowerer:
         out = node.output[0]
         axis = int(a.get("axis", 0))
         table_const = self.const(data)
-        d_shape = table_const.shape if table_const is not None else self.dims.get(data)
-        if axis < 0:
+        indices_const = self.const(indices)
+        d_shape = list(table_const.shape if table_const is not None else (self.dims.get(data) or ()))
+        if axis < 0 and d_shape:
             axis += len(d_shape)
-        if axis != 0:
-            self.fail(node, f"only Gather along axis 0 is supported (got {axis})")
-        vocab = int(d_shape[0])
-        emb_dim = int(d_shape[1]) if len(d_shape) > 1 else 1
+        vocab = int(d_shape[axis]) if d_shape and len(d_shape) > axis else 1
+        outer_dim = int(np.prod(d_shape[:axis])) if axis > 0 and d_shape else 1
+        inner_dim = int(np.prod(d_shape[axis + 1:])) if d_shape and axis + 1 < len(d_shape) else 1
+
         idx_type = self.types.get(indices)
         idx_dtype_code = 0 if idx_type in (onnx.TensorProto.INT32, onnx.TensorProto.INT64) else 1
-        stride = (emb_dim + 31) & ~31
-        if table_const is not None:
-            tbl = np.asarray(table_const, dtype=np.float32).reshape(vocab, emb_dim)
-            if stride > emb_dim:
-                tbl = np.pad(tbl, ((0, 0), (0, stride - emb_dim)))
+
+        i_dims = self.dims.get(indices)
+        if i_dims is None and indices_const is not None:
+            i_dims = list(indices_const.shape)
+        num_indices = int(np.prod(i_dims)) if i_dims is not None else 1
+
+        stride = (inner_dim + 31) & ~31
+
+        if out in self.dims:
+            self.shapes[self.tid(out)] = self.hwc(out)
+        elif axis == 0:
+            self.shapes[self.tid(out)] = [1, num_indices, inner_dim]
+        else:
+            self.shapes[self.tid(out)] = [outer_dim, num_indices, inner_dim]
+
+        if table_const is not None and indices_const is None:
+            tbl = np.asarray(table_const, dtype=np.float32).reshape(outer_dim, vocab, inner_dim)
+            if stride > inner_dim:
+                tbl = np.pad(tbl, ((0, 0), (0, 0), (0, stride - inner_dim)))
             offset = self.pool.emit(tbl.reshape(-1))
             mode = 1
+            x_tid = self.tid(indices)
             y_tid = NONE
+            table_stride = stride
+            const_idx_off = 0
+            const_idx_num = 0
+            if idx_dtype_code == 0:
+                self.set_dtype(x_tid, hx.DTYPE_INT32)
+            if x_tid not in self.shapes:
+                if i_dims is not None and len(i_dims) == 3:
+                    self.shapes[x_tid] = [int(i_dims[0]), int(i_dims[1]), int(i_dims[2])]
+                elif i_dims is not None and len(i_dims) == 2:
+                    self.shapes[x_tid] = [1, int(i_dims[0]), int(i_dims[1])]
+                else:
+                    self.shapes[x_tid] = [1, num_indices, 1]
+        elif indices_const is not None:
+            idx_arr = np.asarray(indices_const, dtype=np.int32).reshape(-1)
+            const_idx_off = self.pool.emit(idx_arr, "<i4")
+            const_idx_num = idx_arr.size
+            mode = 2
+            x_tid = self.tid(data)
+            y_tid = NONE
+            offset = 0
+            table_stride = 0
+            idx_dtype_code = 0
         else:
             mode = 0
             offset = 0
+            x_tid = self.tid(indices)
             y_tid = self.tid(data)
-        i_dims = self.dims.get(indices)
-        num_indices = int(np.prod(i_dims)) if i_dims is not None else 1
-        self.shapes[self.tid(out)] = [1, num_indices, emb_dim]
-        if self.tid(indices) not in self.shapes:
-            self.shapes[self.tid(indices)] = [1, num_indices, 1]
-        self.add(Op(hx.GATHER, self.tid(indices), y_tid, self.tid(out),
-                    [mode, offset, vocab, idx_dtype_code], node))
+            table_stride = 0
+            const_idx_off = 0
+            const_idx_num = 0
+            if idx_dtype_code == 0:
+                self.set_dtype(x_tid, hx.DTYPE_INT32)
+            if x_tid not in self.shapes:
+                if i_dims is not None and len(i_dims) == 3:
+                    self.shapes[x_tid] = [int(i_dims[0]), int(i_dims[1]), int(i_dims[2])]
+                elif i_dims is not None and len(i_dims) == 2:
+                    self.shapes[x_tid] = [1, int(i_dims[0]), int(i_dims[1])]
+                else:
+                    self.shapes[x_tid] = [1, num_indices, 1]
+
+        self.add(Op(hx.GATHER, x_tid, y_tid, self.tid(out),
+                    [mode, offset, vocab, idx_dtype_code, axis, inner_dim, outer_dim, table_stride,
+                     const_idx_off, const_idx_num], node))
+
+    def op_GatherElements(self, node):
+        a = self.attrs(node)
+        data, indices = node.input[0], node.input[1]
+        out = node.output[0]
+        axis = int(a.get("axis", 0))
+        d_shape = self.dims.get(data)
+        if d_shape is not None and axis < 0:
+            axis += len(d_shape)
+        d_rank = len(d_shape) if d_shape is not None else 3
+        if d_rank == 2:
+            hwc_axis = axis + 1
+        elif d_rank == 1:
+            hwc_axis = 2
+        elif d_rank == 4:
+            hwc_axis = max(0, axis - 1)
+        else:
+            hwc_axis = axis
+
+        idx_type = self.types.get(indices)
+        idx_dtype_code = 0 if idx_type in (onnx.TensorProto.INT32, onnx.TensorProto.INT64) else 1
+
+        idx_const = self.const(indices)
+        table_const = self.const(data)
+
+        if idx_const is not None:
+            mode = 2
+            idx_arr = np.asarray(idx_const, dtype=np.int32)
+            offset = self.pool.emit(idx_arr.reshape(-1), "<i4")
+            y_tid = NONE
+            idx_dtype_code = 0
+        elif table_const is not None:
+            mode = 1
+            arr = np.asarray(table_const, dtype=np.float32)
+            c = arr.shape[-1] if arr.ndim > 0 else 1
+            stride = (c + 31) & ~31
+            if stride > c:
+                pad_width = [(0, 0)] * (arr.ndim - 1) + [(0, stride - c)]
+                arr = np.pad(arr, pad_width)
+            offset = self.pool.emit(arr.reshape(-1))
+            y_tid = self.tid(indices)
+            if idx_dtype_code == 0:
+                self.set_dtype(y_tid, hx.DTYPE_INT32)
+        else:
+            mode = 0
+            offset = 0
+            y_tid = self.tid(indices)
+            if idx_dtype_code == 0:
+                self.set_dtype(y_tid, hx.DTYPE_INT32)
+
+        if out in self.dims:
+            self.shapes[self.tid(out)] = self.hwc(out)
+        else:
+            out_dims = self.dims.get(indices, [1, 1, 1])
+            self.shapes[self.tid(out)] = [1, int(np.prod(out_dims[:-1])), int(out_dims[-1])]
+        if y_tid != NONE and y_tid not in self.shapes:
+            self.shapes[y_tid] = self.shapes[self.tid(out)]
+
+        self.add(Op(hx.GATHER_ELEMENTS, self.tid(data), y_tid, self.tid(out),
+                    [hwc_axis, idx_dtype_code, mode, offset], node))
+
+    def op_GatherND(self, node):
+        a = self.attrs(node)
+        data, indices = node.input[0], node.input[1]
+        out = node.output[0]
+        batch_dims = int(a.get("batch_dims", 0))
+        d_shape = self.dims.get(data)
+        i_shape = self.dims.get(indices)
+        idx_const = self.const(indices)
+        table_const = self.const(data)
+        if i_shape is None and idx_const is not None:
+            i_shape = list(idx_const.shape)
+        tuple_len = int(i_shape[-1]) if i_shape is not None else 1
+        slice_elements = int(np.prod(d_shape[tuple_len:])) if d_shape is not None and len(d_shape) > tuple_len else 1
+
+        idx_type = self.types.get(indices)
+        idx_dtype_code = 0 if idx_type in (onnx.TensorProto.INT32, onnx.TensorProto.INT64) else 1
+
+        if idx_const is not None:
+            mode = 2
+            idx_arr = np.asarray(idx_const, dtype=np.int32)
+            offset = self.pool.emit(idx_arr.reshape(-1), "<i4")
+            y_tid = NONE
+            idx_dtype_code = 0
+        elif table_const is not None:
+            mode = 1
+            arr = np.asarray(table_const, dtype=np.float32)
+            c = arr.shape[-1] if arr.ndim > 0 else 1
+            stride = (c + 31) & ~31
+            if stride > c:
+                pad_width = [(0, 0)] * (arr.ndim - 1) + [(0, stride - c)]
+                arr = np.pad(arr, pad_width)
+            offset = self.pool.emit(arr.reshape(-1))
+            y_tid = self.tid(indices)
+            if idx_dtype_code == 0:
+                self.set_dtype(y_tid, hx.DTYPE_INT32)
+        else:
+            mode = 0
+            offset = 0
+            y_tid = self.tid(indices)
+            if idx_dtype_code == 0:
+                self.set_dtype(y_tid, hx.DTYPE_INT32)
+
+        if out in self.dims:
+            self.shapes[self.tid(out)] = self.hwc(out)
+        else:
+            self.shapes[self.tid(out)] = [1, int(np.prod(i_shape[:-1])), slice_elements]
+
+        if y_tid != NONE and y_tid not in self.shapes:
+            num_idx = int(np.prod(i_shape[:-1])) if i_shape is not None else 1
+            self.shapes[y_tid] = [1, num_idx, tuple_len]
+
+        self.add(Op(hx.GATHER_ND, self.tid(data), y_tid, self.tid(out),
+                    [batch_dims, idx_dtype_code, mode, offset, tuple_len, slice_elements], node))
+
+    def op_ScatterND(self, node):
+        a = self.attrs(node)
+        data, indices, updates = node.input[0], node.input[1], node.input[2]
+        out = node.output[0]
+        reduction_val = a.get("reduction", b"none")
+        if isinstance(reduction_val, bytes):
+            reduction_str = reduction_val.decode("utf-8")
+        else:
+            reduction_str = str(reduction_val)
+        reduction_map = {"none": 0, "add": 1, "mul": 2, "max": 3, "min": 4}
+        reduction_code = reduction_map.get(reduction_str.lower(), 0)
+
+        idx_const = self.const(indices)
+        upd_const = self.const(updates)
+
+        i_shape = self.dims.get(indices)
+        if i_shape is None and idx_const is not None:
+            i_shape = list(idx_const.shape)
+        tuple_len = int(i_shape[-1]) if i_shape is not None else 1
+
+        d_shape = self.dims.get(data)
+        slice_elements = int(np.prod(d_shape[tuple_len:])) if d_shape is not None and len(d_shape) > tuple_len else 1
+
+        idx_type = self.types.get(indices)
+        idx_dtype_code = 0 if idx_type in (onnx.TensorProto.INT32, onnx.TensorProto.INT64) else 1
+
+        mode_flags = 0
+        p6_idx_off = 0
+        p7_upd_off = 0
+        num_idx = int(np.prod(i_shape[:-1])) if i_shape is not None else 1
+
+        if idx_const is not None:
+            mode_flags |= 1
+            idx_arr = np.asarray(idx_const, dtype=np.int32)
+            p6_idx_off = self.pool.emit(idx_arr.reshape(-1), "<i4")
+            y_tid = NONE
+            idx_dtype_code = 0
+        else:
+            y_tid = self.tid(indices)
+            if idx_dtype_code == 0:
+                self.set_dtype(y_tid, hx.DTYPE_INT32)
+
+        if upd_const is not None:
+            mode_flags |= 2
+            upd_arr = np.asarray(upd_const, dtype=np.float32)
+            p7_upd_off = self.pool.emit(upd_arr.reshape(-1))
+            z_tid = NONE
+        else:
+            z_tid = self.tid(updates)
+
+        if out in self.dims:
+            self.shapes[self.tid(out)] = self.hwc(out)
+        else:
+            self.shapes[self.tid(out)] = self.hwc(data)
+
+        if y_tid != NONE and y_tid not in self.shapes:
+            self.shapes[y_tid] = [1, num_idx, tuple_len]
+        if z_tid != NONE and z_tid not in self.shapes:
+            if updates in self.dims:
+                self.shapes[z_tid] = self.hwc(updates)
+            else:
+                u_shape = self.dims.get(updates)
+                if u_shape is not None:
+                    if len(u_shape) == 3:
+                        self.shapes[z_tid] = [int(u_shape[0]), int(u_shape[1]), int(u_shape[2])]
+                    elif len(u_shape) == 2:
+                        self.shapes[z_tid] = [1, int(u_shape[0]), int(u_shape[1])]
+                    elif len(u_shape) == 1:
+                        self.shapes[z_tid] = [1, 1, int(u_shape[0])]
+                    else:
+                        self.shapes[z_tid] = [1, int(np.prod(u_shape[:-1])), int(u_shape[-1])]
+                else:
+                    self.shapes[z_tid] = [1, num_idx, slice_elements]
+
+        op = Op(hx.SCATTER_ND, self.tid(data), y_tid, self.tid(out),
+                [0, idx_dtype_code, tuple_len, slice_elements, reduction_code, mode_flags, p6_idx_off, p7_upd_off, num_idx],
+                node, z=z_tid)
+        self.add(op)
 
     def op_ArgMax(self, node):
         a = self.attrs(node)
@@ -2646,7 +2887,7 @@ def fp16_blockers(ops, inputs, outputs, hwc, stride):
     reasons, compact_conv = [], False
     for n, op in enumerate(ops):
         kind, x, p = op[0], op[1], op[5:]
-        if kind < 1 or kind > 26:
+        if kind < 1 or kind > 37:
             reasons.append(f"op {n}: op kind {kind} is not supported in blocked FP16 plan")
         if stride(x) == 3 and kind != hx.CONV:
             reasons.append(f"op {n}: compact RGB input feeds a non-convolution")

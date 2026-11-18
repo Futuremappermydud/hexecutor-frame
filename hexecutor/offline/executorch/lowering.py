@@ -49,6 +49,9 @@ KINDS = {
     "permute_copy.default": "transpose",
     "permute.default": "transpose",
     "cat.default": "concat",
+    "embedding.default": "embedding",
+    "index_select.default": "index_select",
+    "index.Tensor": "index",
     "mean.dim": "mean",
     "sum.dim_IntList": "reduce",
     "amax.default": "reduce",
@@ -149,12 +152,12 @@ def _is_nearest(node):
 
 
 def static_shape(node):
-    """Static float32 tensor shape from the exported FakeTensor metadata."""
+    """Static tensor shape from the exported FakeTensor metadata."""
     val = node.meta.get("val")
     if not isinstance(val, torch.Tensor):
         raise Unsupported(f"{node.name}: not a tensor")
-    if val.dtype != torch.float32:
-        raise Unsupported(f"{node.name}: dtype {val.dtype} is not float32")
+    if val.dtype not in (torch.float32, torch.int32, torch.int64, torch.bool):
+        raise Unsupported(f"{node.name}: dtype {val.dtype} is not supported")
     if not all(isinstance(d, int) for d in val.shape):
         raise Unsupported(f"{node.name}: dynamic shape")
     return tuple(int(d) for d in val.shape)
@@ -176,6 +179,10 @@ def hwc_of(shape, name="tensor", multihead=False):
         h, w, c = shape[1], 1, shape[2]
     elif len(shape) == 2 and shape[0] == 1:
         h, w, c = 1, 1, shape[1]
+    elif len(shape) == 2:
+        h, w, c = shape[0], 1, shape[1]
+    elif len(shape) == 1:
+        h, w, c = 1, shape[0], 1
     else:
         raise Unsupported(f"{name}: shape {shape} is not batch-one rank 2, 3 or 4")
     if min(h, w, c) < 1 or c > MAX_CHANNELS:
@@ -653,6 +660,23 @@ def check(kind, node, ep):
             idx = int(u.args[1])
             if idx < 0 or idx >= len(sizes):
                 raise Unsupported("split getitem index out of bounds")
+    elif kind == "embedding":
+        w, indices = args[0], args[1]
+        wshape = static_shape(w)
+        if len(wshape) != 2:
+            raise Unsupported("embedding weight must be rank 2")
+        _ = static_shape(indices)
+        _ = static_shape(node)
+    elif kind == "index_select":
+        x, dim, index = args[0], int(args[1]), args[2]
+        ishape = static_shape(index)
+        if len(ishape) != 1:
+            raise Unsupported("index_select index must be 1D")
+        _ = static_shape(node)
+    elif kind == "index":
+        x, indices = args[0], args[1]
+        _ = static_shape(x)
+        _ = static_shape(node)
     elif kind in ("add", "binary"):
         _binary_plan(node, ep)
     elif kind == "act":
@@ -1370,6 +1394,149 @@ def lower_program(ep, destination):
         elif kind == "softmax":
             b.emit(hx.SOFTMAX, b.tid(node.args[0]), NONE, node, [])
             b.record(node, name)
+        elif kind == "embedding":
+            w_arg, idx_arg = node.args[0], node.args[1]
+            try:
+                w_const = _constant(ep, w_arg, "embedding table")
+            except Exception:
+                w_const = None
+            wshape = static_shape(w_arg)
+            vocab = int(wshape[0])
+            dim = int(wshape[1])
+            stride = (dim + 31) & ~31
+            if w_const is not None:
+                tbl = np.asarray(w_const, dtype=np.float32).reshape(vocab, dim)
+                if stride > dim:
+                    tbl = np.pad(tbl, ((0, 0), (0, stride - dim)))
+                offset = b.pool.emit(tbl.reshape(-1))
+                mode = 1
+                y_tid = NONE
+                table_stride = stride
+            else:
+                mode = 0
+                offset = 0
+                y_tid = b.tid(w_arg)
+                table_stride = stride
+            b.emit(hx.GATHER, b.tid(idx_arg), y_tid, node,
+                   [mode, offset, vocab, 0, 0, dim, 1, table_stride])
+            b.record(node, name)
+        elif kind == "index_select":
+            x_arg, dim_arg, idx_arg = node.args[0], int(node.args[1]), node.args[2]
+            try:
+                idx_const = np.asarray(_const_value(ep, idx_arg), dtype=np.int32) if _is_constant(ep, idx_arg) else None
+            except Exception:
+                idx_const = None
+            try:
+                x_const = _constant(ep, x_arg, "index_select table") if _is_constant(ep, x_arg) else None
+            except Exception:
+                x_const = None
+            xshape = static_shape(x_arg)
+            dim_arg = dim_arg + len(xshape) if dim_arg < 0 else dim_arg
+            if len(xshape) == 4:
+                if dim_arg == 1:
+                    hwc_axis = 2
+                    vocab = int(xshape[1])
+                    outer_dim = int(xshape[2] * xshape[3])
+                    inner_dim = 1
+                elif dim_arg == 2:
+                    hwc_axis = 0
+                    vocab = int(xshape[2])
+                    outer_dim = 1
+                    inner_dim = int(xshape[3] * xshape[1])
+                else:
+                    hwc_axis = 1
+                    vocab = int(xshape[3])
+                    outer_dim = int(xshape[2])
+                    inner_dim = int(xshape[1])
+            elif len(xshape) == 3:
+                if dim_arg == 2:
+                    hwc_axis = 2
+                    vocab = int(xshape[2])
+                    outer_dim = int(xshape[1])
+                    inner_dim = 1
+                else:
+                    hwc_axis = 0
+                    vocab = int(xshape[1])
+                    outer_dim = 1
+                    inner_dim = int(xshape[2])
+            else:
+                hwc_axis = 2
+                vocab = int(xshape[-1])
+                outer_dim = 1
+                inner_dim = 1
+            stride = (inner_dim + 31) & ~31
+            if idx_const is not None:
+                idx_arr = idx_const.reshape(-1)
+                const_idx_off = b.pool.emit(idx_arr, "<i4")
+                const_idx_num = idx_arr.size
+                mode = 2
+                x_tid = b.tid(x_arg)
+                y_tid = NONE
+                b.emit(hx.GATHER, x_tid, y_tid, node,
+                       [mode, 0, vocab, 0, hwc_axis, inner_dim, outer_dim, 0, const_idx_off, const_idx_num])
+            elif x_const is not None:
+                tbl = np.asarray(x_const, dtype=np.float32).reshape(outer_dim, vocab, inner_dim)
+                if stride > inner_dim:
+                    tbl = np.pad(tbl, ((0, 0), (0, 0), (0, stride - inner_dim)))
+                offset = b.pool.emit(tbl.reshape(-1))
+                mode = 1
+                y_tid = NONE
+                table_stride = stride
+                b.emit(hx.GATHER, b.tid(idx_arg), y_tid, node,
+                       [mode, offset, vocab, 0, hwc_axis, inner_dim, outer_dim, table_stride])
+            else:
+                mode = 0
+                offset = 0
+                y_tid = b.tid(x_arg)
+                table_stride = stride
+                b.emit(hx.GATHER, b.tid(idx_arg), y_tid, node,
+                       [mode, offset, vocab, 0, hwc_axis, inner_dim, outer_dim, table_stride])
+            b.record(node, name)
+        elif kind == "index":
+            x_arg, indices_list = node.args[0], node.args[1]
+            if len(indices_list) == 1 and indices_list[0] is not None:
+                idx_arg = indices_list[0]
+                xshape = static_shape(x_arg)
+                vocab = int(xshape[0])
+                inner_dim = int(np.prod(xshape[1:])) if len(xshape) > 1 else 1
+                stride = (inner_dim + 31) & ~31
+                try:
+                    idx_const = np.asarray(_const_value(ep, idx_arg), dtype=np.int32) if _is_constant(ep, idx_arg) else None
+                except Exception:
+                    idx_const = None
+                try:
+                    x_const = _constant(ep, x_arg, "index table") if _is_constant(ep, x_arg) else None
+                except Exception:
+                    x_const = None
+                if idx_const is not None:
+                    idx_arr = idx_const.reshape(-1)
+                    const_idx_off = b.pool.emit(idx_arr, "<i4")
+                    const_idx_num = idx_arr.size
+                    mode = 2
+                    x_tid = b.tid(x_arg)
+                    y_tid = NONE
+                    b.emit(hx.GATHER, x_tid, y_tid, node,
+                           [mode, 0, vocab, 0, 0, inner_dim, 1, 0, const_idx_off, const_idx_num])
+                elif x_const is not None:
+                    tbl = np.asarray(x_const, dtype=np.float32).reshape(vocab, inner_dim)
+                    if stride > inner_dim:
+                        tbl = np.pad(tbl, ((0, 0), (0, stride - inner_dim)))
+                    offset = b.pool.emit(tbl.reshape(-1))
+                    mode = 1
+                    y_tid = NONE
+                    table_stride = stride
+                    b.emit(hx.GATHER, b.tid(idx_arg), y_tid, node,
+                           [mode, offset, vocab, 0, 0, inner_dim, 1, table_stride])
+                else:
+                    mode = 0
+                    offset = 0
+                    y_tid = b.tid(x_arg)
+                    table_stride = stride
+                    b.emit(hx.GATHER, b.tid(idx_arg), y_tid, node,
+                           [mode, offset, vocab, 0, 0, inner_dim, 1, table_stride])
+                b.record(node, name)
+            else:
+                raise Unsupported("only single-index aten.index.Tensor supported")
         elif kind == "activation":
             prod = fusable_producer(node, done, activation_of, ep)
             act = act_code(node)
