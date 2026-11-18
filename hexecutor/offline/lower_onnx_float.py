@@ -112,10 +112,13 @@ class Op:
         self.foldable = False  # a following affine node may be folded in
         self.fused = False  # an activation has been fused
         self.dilation = (1, 1)  # conv/depthwise only; encoded as the HXFG z field
+        self.z_id = None
 
     @property
     def z(self):
-        """HXFG z: NONE for dilation (1, 1), else (dh << 8) | dw."""
+        """HXFG z: NONE for dilation (1, 1), else (dh << 8) | dw, or tensor id."""
+        if self.z_id is not None:
+            return self.z_id
         dh, dw = self.dilation
         return NONE if (dh, dw) == (1, 1) else (dh << 8) | dw
 
@@ -126,15 +129,28 @@ def _infer_shapes(model):
 
 
 def _static_dims(graph):
-    """Tensor name -> static dimensions (None for non-float32 values, absent when dynamic)."""
+    """Tensor name -> static dimensions (None for unsupported types, absent when dynamic)."""
     dims = {}
     for v in list(graph.value_info) + list(graph.input) + list(graph.output):
         shape = v.type.tensor_type.shape.dim
-        if v.type.tensor_type.elem_type not in (0, onnx.TensorProto.FLOAT):
-            dims[v.name] = None  # non-float32 value
+        elem_type = v.type.tensor_type.elem_type
+        if elem_type not in (0, onnx.TensorProto.FLOAT):
+            if elem_type in (onnx.TensorProto.BOOL, onnx.TensorProto.INT32, onnx.TensorProto.INT64):
+                if all(d.HasField("dim_value") for d in shape):
+                    dims[v.name] = [d.dim_value for d in shape]
+            else:
+                dims[v.name] = None  # non-float32 value
         elif all(d.HasField("dim_value") for d in shape):
             dims[v.name] = [d.dim_value for d in shape]
     return dims
+
+
+def _elem_types(graph):
+    """Tensor name -> element type enum."""
+    types = {}
+    for v in list(graph.value_info) + list(graph.input) + list(graph.output):
+        types[v.name] = v.type.tensor_type.elem_type
+    return types
 
 
 class Lowerer:
@@ -150,6 +166,7 @@ class Lowerer:
             else:
                 self.nodes.append(node)
         self.dims = _static_dims(inferred)
+        self.types = _elem_types(inferred)
         self._fold_constants()
         self._refresh_dims()
         self.compact_input = compact_input
@@ -244,7 +261,9 @@ class Lowerer:
         model = onnx.helper.make_model(graph, opset_imports=self.model.opset_import)
         model.ir_version = self.model.ir_version
         try:
-            inferred = _static_dims(_infer_shapes(model))
+            inferred_graph = _infer_shapes(model)
+            inferred = _static_dims(inferred_graph)
+            inferred_types = _elem_types(inferred_graph)
         except Exception:  # keep the dimensions of the original graph
             return
         for name, dims in inferred.items():
@@ -317,6 +336,8 @@ class Lowerer:
                         wo = (s0[3] + pads[1] + pads[3] - dil[1] * (kw - 1) - 1) // strides[1] + 1
                         self.dims[out] = [s0[0], co, ho, wo]
                         changed = True
+        for name, t in inferred_types.items():
+            self.types.setdefault(name, t)
 
     def _evaluate(self, node, feeds, outs):
         """Run one node with onnx.reference on its constant inputs."""
@@ -346,6 +367,9 @@ class Lowerer:
 
     def hwc(self, name):
         name = self.canon(name)
+        cid = self.ids.get(name)
+        if cid is not None and cid in self.shapes:
+            return self.shapes[cid]
         s = self.dims.get(name)
         if s is None:
             raise ValueError(f"no static float32 shape for {name}")
@@ -363,7 +387,9 @@ class Lowerer:
             return [1, s[2], s[1]]
         if len(s) == 2 and s[0] == 1:
             return [1, 1, s[1]]
-        raise ValueError(f"unsupported shape {s} for {name} (batch-one rank 2, 3 or 4 only)")
+        if len(s) == 1:
+            return [1, s[0], 1]
+        raise ValueError(f"unsupported shape {s} for {name} (batch-one rank 1, 2, 3 or 4 only)")
 
     def tid(self, name):
         name = self.canon(name)
@@ -386,6 +412,8 @@ class Lowerer:
     def add(self, op):
         self.ops.append(op)
         self.producer[op.out] = op
+        if getattr(op, "z_id", None) is not None and op.z_id != NONE:
+            self.producer[op.z_id] = op
         return op
 
     def _is_token(self, name):
@@ -905,22 +933,43 @@ class Lowerer:
             if self.dims[tensor] != self.dims[out]:
                 self.fail(node, "a constant operand would broadcast the tensor")
             vec = self.channel_vector(node, const, out)
-            if vec is None:
-                self.fail(node, "a constant operand must be a per-channel vector")
-            if opcode == hx.BIN_MUL and not rev:
-                return self._affine(node, tensor, out, vec, np.zeros_like(vec))
-            if opcode == hx.BIN_ADD:
-                return self._affine(node, tensor, out, np.ones_like(vec), vec)
-            if opcode == hx.BIN_SUB and not rev:
-                return self._affine(node, tensor, out, np.ones_like(vec), -vec)
-            if opcode == hx.BIN_MUL:  # c * x
-                return self._affine(node, tensor, out, vec, np.zeros_like(vec))
-            # c - x: negate, then add c
-            neg = self.temp(out, self.hwc(out))
-            self.add(Op(hx.BINARY, self.tid(tensor), NONE, neg,
-                        [hx.BIN_MUL, 1, self.pool.emit(_pad32(-np.ones_like(vec))), 0], node))
-            self.add(Op(hx.BINARY, neg, NONE, self.tid(out),
-                        [hx.BIN_ADD, 1, self.pool.emit(_pad32(vec)), 0], node))
+            if vec is not None:
+                if opcode == hx.BIN_MUL and not rev:
+                    return self._affine(node, tensor, out, vec, np.zeros_like(vec))
+                if opcode == hx.BIN_ADD:
+                    return self._affine(node, tensor, out, np.ones_like(vec), vec)
+                if opcode == hx.BIN_SUB and not rev:
+                    return self._affine(node, tensor, out, np.ones_like(vec), -vec)
+                if opcode == hx.BIN_MUL:  # c * x
+                    return self._affine(node, tensor, out, vec, np.zeros_like(vec))
+                if opcode == hx.BIN_SUB and rev:
+                    # c - x: negate, then add c
+                    neg = self.temp(out, self.hwc(out))
+                    self.add(Op(hx.BINARY, self.tid(tensor), NONE, neg,
+                                [hx.BIN_MUL, 1, self.pool.emit(_pad32(-np.ones_like(vec))), 0], node))
+                    self.add(Op(hx.BINARY, neg, NONE, self.tid(out),
+                                [hx.BIN_ADD, 1, self.pool.emit(_pad32(vec)), 0], node))
+                    return None
+                return self.add(Op(hx.BINARY, self.tid(tensor), NONE, self.tid(out),
+                                   [opcode, 1, self.pool.emit(_pad32(vec)), rev], node))
+            # Full-size constant operand (mode 2)
+            try:
+                c_arr = np.broadcast_to(np.asarray(const, dtype=np.float32), self.dims[out])
+            except ValueError:
+                self.fail(node, f"cannot broadcast constant of shape {const.shape} to {self.dims[out]}")
+            h, w, c = self.hwc(out)
+            stride = (c + 31) & ~31
+            if len(self.dims[out]) == 4:
+                hwc_arr = c_arr[0].transpose(1, 2, 0)
+            elif len(self.dims[out]) == 3:
+                hwc_arr = c_arr[0].transpose(1, 0).reshape(1, w, c)
+            else:
+                hwc_arr = c_arr.reshape(h, w, c)
+            if stride > c:
+                hwc_arr = np.pad(hwc_arr, ((0, 0), (0, 0), (0, stride - c)))
+            offset = self.pool.emit(hwc_arr.reshape(-1))
+            self.add(Op(hx.BINARY, self.tid(tensor), NONE, self.tid(out),
+                        [opcode, 2, offset, rev], node))
             return None
         if self.canon(a_name) in self.heads or self.canon(b_name) in self.heads:
             self.fail(node, "elementwise operations on per-head attention tensors are unsupported")
@@ -956,17 +1005,42 @@ class Lowerer:
         self._binary(node, hx.BIN_MUL)
 
     def op_Div(self, node):
-        d = self.const(node.input[1])
-        if d is None or self.const(node.input[0]) is not None:
-            self.fail(node, "only division of a tensor by a constant is supported")
         source = node.input[0]
-        if np.asarray(d).size == 1 and (self._is_token(source) or self.canon(source) in self.heads):
+        d0 = self.const(node.input[1])
+        if (d0 is not None and self.const(node.input[0]) is None and np.asarray(d0).size == 1 and
+                (self._is_token(source) or self.canon(source) in self.heads)):
             return self._scale(node, source, node.output[0],
-                               1.0 / float(np.asarray(d, np.float64).reshape(())))
-        vec =self.channel_vector(node, 1.0 / np.asarray(d, dtype=np.float64), node.output[0])
-        if vec is None or self.dims[node.input[0]] != self.dims[node.output[0]]:
-            self.fail(node, "the divisor must be a per-channel vector")
-        self._affine(node, node.input[0], node.output[0], vec, np.zeros_like(vec))
+                               1.0 / float(np.asarray(d0, np.float64).reshape(())))
+        ca, cb = self.const(node.input[0]), self.const(node.input[1])
+        if ca is not None and cb is not None:
+            self.fail(node, "both operands are constants")
+        if cb is not None and ca is None:
+            try:
+                recip = 1.0 / np.asarray(cb, dtype=np.float64)
+                vec = self.channel_vector(node, recip, node.output[0])
+                if vec is not None and self.dims[node.input[0]] == self.dims[node.output[0]]:
+                    return self._affine(node, node.input[0], node.output[0], vec, np.zeros_like(vec))
+            except (ZeroDivisionError, FloatingPointError):
+                pass
+        self._binary(node, hx.BIN_DIV)
+
+    def op_Equal(self, node):
+        self._binary(node, hx.BIN_EQUAL)
+
+    def op_Greater(self, node):
+        self._binary(node, hx.BIN_GREATER)
+
+    def op_Less(self, node):
+        self._binary(node, hx.BIN_LESS)
+
+    def op_Min(self, node):
+        self._binary(node, hx.BIN_MIN)
+
+    def op_Max(self, node):
+        self._binary(node, hx.BIN_MAX)
+
+    def op_Pow(self, node):
+        self._binary(node, hx.BIN_POW)
 
     def op_Pow(self, node):
         exp = self.const(node.input[1])
@@ -1067,6 +1141,30 @@ class Lowerer:
 
     def op_Erf(self, node):
         self._emit_act(node, node.input[0], hx.FN_ERF)
+
+    def op_Log(self, node):
+        self._emit_act(node, node.input[0], hx.FN_LOG)
+
+    def op_Reciprocal(self, node):
+        self._emit_act(node, node.input[0], hx.FN_RECIPROCAL)
+
+    def op_Floor(self, node):
+        self._emit_act(node, node.input[0], hx.FN_FLOOR)
+
+    def op_Ceil(self, node):
+        self._emit_act(node, node.input[0], hx.FN_CEIL)
+
+    def op_Sin(self, node):
+        self._emit_act(node, node.input[0], hx.FN_SIN)
+
+    def op_Cos(self, node):
+        self._emit_act(node, node.input[0], hx.FN_COS)
+
+    def op_Not(self, node):
+        self._emit_act(node, node.input[0], hx.FN_NOT)
+
+    def op_Round(self, node):
+        self._emit_act(node, node.input[0], hx.FN_ROUND)
 
     def op_Sigmoid(self, node):
         self.add(Op(hx.LOGISTIC, self.tid(node.input[0]), NONE, self.tid(node.output[0]), [],
@@ -1561,7 +1659,7 @@ class Lowerer:
             self.add(Op(hx.CONCAT, acc_id, self.tid(n), out, [hwc_axis], node))
             acc_id, acc_shape = out, merged
 
-    def op_Gather(self, node):
+    def _gather_sequence(self, node):
         """Gather along the sequence axis of a token tensor [1, L, K] with constant indices that
         form a contiguous run: a scalar index gives [1, K], a run of m gives [1, m, K] (HX_SLICE)."""
         data, index, out = node.input[0], node.input[1], node.output[0]
@@ -1703,8 +1801,8 @@ class Lowerer:
         a = self.attrs(node)
         text = lambda k, d: (a.get(k, d).decode() if isinstance(a.get(k, d), bytes) else a.get(k, d))
         mode = text("mode", "nearest")
-        if mode not in ("linear", "nearest"):
-            self.fail(node, "only linear (bilinear) and nearest resize are supported")
+        if mode not in ("linear", "nearest", "cubic"):
+            self.fail(node, "only linear, nearest, and cubic resize are supported")
         if a.get("antialias", 0):
             self.fail(node, "antialias is unsupported")
         coord = text("coordinate_transformation_mode", "half_pixel")
@@ -1712,23 +1810,233 @@ class Lowerer:
         oh, ow, oc = self.hwc(node.output[0])
         if ic != oc:
             self.fail(node, "channels must not change")
-        if mode == "nearest":
-            # HX_RESIZE p[2]: source index floor(out * in / out) per axis.
-            rounding = text("nearest_mode", "round_prefer_floor")
-            if coord != "asymmetric" or rounding != "floor":
-                self.fail(node, "nearest resize needs coordinate_transformation_mode=asymmetric "
-                                f"and nearest_mode=floor (got {coord}, {rounding})")
-            flags = [0, 0, 1]
-        elif coord == "align_corners":
-            flags = [1, 0, 0]
-        elif coord == "half_pixel" or (coord == "pytorch_half_pixel" and oh > 1 and ow > 1):
-            flags = [0, 1, 0]
-        else:
+        coord_map = {
+            "asymmetric": 0,
+            "align_corners": 1,
+            "half_pixel": 2,
+            "pytorch_half_pixel": 3,
+        }
+        if coord not in coord_map:
             self.fail(node, f"coordinate transformation mode {coord} is unsupported")
+        coord_code = coord_map[coord]
+        if mode == "nearest":
+            near_map = {
+                "floor": 0,
+                "round_prefer_floor": 1,
+                "round_prefer_ceil": 2,
+                "ceil": 3,
+            }
+            rounding = text("nearest_mode", "round_prefer_floor")
+            if rounding not in near_map:
+                self.fail(node, f"nearest mode {rounding} is unsupported")
+            near_code = near_map[rounding]
+            flags = [0, 0, 1, coord_code, near_code, 0]
+        elif mode == "cubic":
+            flags = [0, 0, 0, coord_code, 0, 1]
+        else:  # linear
+            if coord == "align_corners":
+                flags = [1, 0, 0, 0, 0, 0]
+            elif coord in ("half_pixel", "pytorch_half_pixel"):
+                flags = [0, 1, 0, 0, 0, 0]
+            else:
+                flags = [0, 0, 0, 0, 0, 0]
         self.add(Op(hx.RESIZE, self.tid(node.input[0]), NONE, self.tid(node.output[0]), flags,
                     node))
 
+    def _where_operand(self, name, out):
+        c = self.const(name)
+        if c is None:
+            return 0, 0, self.tid(name)
+        arr = np.asarray(c, dtype=np.float32)
+        if arr.size == 1:
+            return 1, hx.f32_bits(float(arr.reshape(-1)[0])), NONE
+        vec = self.channel_vector(None, arr, out)
+        if vec is not None:
+            return 2, self.pool.emit(_pad32(vec)), NONE
+        h, w, ch = self.hwc(out)
+        stride = (ch + 31) & ~31
+        barr = np.broadcast_to(arr, self.dims[out])
+        if len(self.dims[out]) == 4:
+            barr = barr[0].transpose(1, 2, 0)
+        elif len(self.dims[out]) == 3:
+            barr = barr[0].transpose(1, 0).reshape(1, w, ch)
+        else:
+            barr = barr.reshape(h, w, ch)
+        if stride > ch:
+            barr = np.pad(barr, ((0, 0), (0, 0), (0, stride - ch)))
+        return 3, self.pool.emit(barr.reshape(-1)), NONE
+
+    def op_Where(self, node):
+        cond, x, y = node.input
+        out = node.output[0]
+        x_mode, x_val, y_tid = self._where_operand(x, out)
+        y_mode, y_val, z_tid = self._where_operand(y, out)
+        op = Op(hx.WHERE, self.tid(cond), y_tid, self.tid(out),
+                [x_mode, x_val, y_mode, y_val], node)
+        op.z_id = z_tid
+        self.add(op)
+
+    def op_Gather(self, node):
+        data = node.input[0]
+        if (data in self.dims and len(self.dims[data]) == 3 and self._is_token(data)
+                and int(self.attrs(node).get("axis", 0)) % 3 == 1):
+            return self._gather_sequence(node)
+        return self._gather_embedding(node)
+
+    def _gather_embedding(self, node):
+        a = self.attrs(node)
+        data, indices = node.input[0], node.input[1]
+        out = node.output[0]
+        axis = int(a.get("axis", 0))
+        table_const = self.const(data)
+        d_shape = table_const.shape if table_const is not None else self.dims.get(data)
+        if axis < 0:
+            axis += len(d_shape)
+        if axis != 0:
+            self.fail(node, f"only Gather along axis 0 is supported (got {axis})")
+        vocab = int(d_shape[0])
+        emb_dim = int(d_shape[1]) if len(d_shape) > 1 else 1
+        idx_type = self.types.get(indices)
+        idx_dtype_code = 0 if idx_type in (onnx.TensorProto.INT32, onnx.TensorProto.INT64) else 1
+        stride = (emb_dim + 31) & ~31
+        if table_const is not None:
+            tbl = np.asarray(table_const, dtype=np.float32).reshape(vocab, emb_dim)
+            if stride > emb_dim:
+                tbl = np.pad(tbl, ((0, 0), (0, stride - emb_dim)))
+            offset = self.pool.emit(tbl.reshape(-1))
+            mode = 1
+            y_tid = NONE
+        else:
+            mode = 0
+            offset = 0
+            y_tid = self.tid(data)
+        i_dims = self.dims.get(indices)
+        num_indices = int(np.prod(i_dims)) if i_dims is not None else 1
+        self.shapes[self.tid(out)] = [1, num_indices, emb_dim]
+        if self.tid(indices) not in self.shapes:
+            self.shapes[self.tid(indices)] = [1, num_indices, 1]
+        self.add(Op(hx.GATHER, self.tid(indices), y_tid, self.tid(out),
+                    [mode, offset, vocab, idx_dtype_code], node))
+
+    def op_ArgMax(self, node):
+        a = self.attrs(node)
+        x = node.input[0]
+        out = node.output[0]
+        h, w, c = self.hwc(x)
+        self.shapes[self.tid(out)] = [h, w, 1]
+        select_last = int(a.get("select_last_index", 0))
+        self.add(Op(hx.ARGMAX, self.tid(x), NONE, self.tid(out), [select_last, 0], node))
+
+    def op_TopK(self, node):
+        a = self.attrs(node)
+        x = node.input[0]
+        k_val = self.const(node.input[1]) if len(node.input) > 1 and node.input[1] else a.get("k")
+        if k_val is None:
+            self.fail(node, "K must be constant")
+        k = int(np.asarray(k_val).reshape(-1)[0])
+        largest = int(a.get("largest", 1))
+        sorted_flag = int(a.get("sorted", 1))
+        h, w, c = self.hwc(x)
+        values_out = node.output[0]
+        self.shapes[self.tid(values_out)] = [h, w, k]
+        indices_out = node.output[1] if len(node.output) > 1 and node.output[1] else None
+        z_id = NONE
+        if indices_out:
+            z_id = self.tid(indices_out)
+            self.shapes[z_id] = [h, w, k]
+        op = Op(hx.TOPK, self.tid(x), NONE, self.tid(values_out),
+                [k, largest, sorted_flag, 0], node)
+        op.z_id = z_id
+        self.add(op)
+
+    def op_Tile(self, node):
+        x = node.input[0]
+        repeats = self.const(node.input[1])
+        if repeats is None:
+            self.fail(node, "repeats must be constant")
+        out = node.output[0]
+        hi, wi, ci = self.hwc(x)
+        ho, wo, co = self.hwc(out)
+        if ho % hi != 0 or wo % wi != 0 or co % ci != 0:
+            self.fail(node, f"output shape {[ho, wo, co]} is not a tile multiple of {[hi, wi, ci]}")
+        self.add(Op(hx.TILE, self.tid(x), NONE, self.tid(out), [], node))
+
+    def op_Expand(self, node):
+        x = node.input[0]
+        out = node.output[0]
+        if self.dims.get(x) == self.dims.get(out):
+            self.alias[out] = self.canon(x)
+            return
+        hi, wi, ci = self.hwc(x)
+        ho, wo, co = self.hwc(out)
+        if ho % hi == 0 and wo % wi == 0 and co % ci == 0:
+            self.add(Op(hx.TILE, self.tid(x), NONE, self.tid(out), [], node))
+        else:
+            self.fail(node, f"Expand from {[hi, wi, ci]} to {[ho, wo, co]} is not integer tile")
+
+    def op_Cast(self, node):
+        a = self.attrs(node)
+        to_type = int(a.get("to", onnx.TensorProto.FLOAT))
+        from_type = self.types.get(node.input[0], onnx.TensorProto.FLOAT)
+        if to_type == from_type:
+            self.alias[node.output[0]] = self.canon(node.input[0])
+            return
+        out_dims = self.dims.get(node.output[0])
+        if to_type in (onnx.TensorProto.INT32, onnx.TensorProto.INT64):
+            if out_dims is not None and len(out_dims) > 2:
+                self.fail(node, "only casts to float32 or 1D/2D index tensors are lowered")
+            mode = 0  # float -> int
+        elif to_type == onnx.TensorProto.FLOAT and from_type in (onnx.TensorProto.INT32, onnx.TensorProto.INT64):
+            mode = 1  # int -> float
+        elif to_type == onnx.TensorProto.FLOAT and from_type == onnx.TensorProto.BOOL:
+            mode = 2  # bool -> float
+        elif to_type == onnx.TensorProto.BOOL and from_type == onnx.TensorProto.FLOAT:
+            mode = 3  # float -> bool
+        else:
+            self.alias[node.output[0]] = self.canon(node.input[0])
+            return
+        self.add(Op(hx.CAST, self.tid(node.input[0]), NONE, self.tid(node.output[0]), [mode], node))
+
     # ------------------------------------------------------------ finishing
+    def _split_deep(self, op):
+        """A dense convolution whose K = kh * kw * cin > 4032 is split into slices of input channels
+        joined by HX_ADD."""
+        if op.kind != hx.CONV or op.weights is None:
+            return [op]
+        co, cin, kh, kw = op.weights.shape
+        k = kh * kw * cin
+        if k <= 4032:
+            return [op]
+        max_cin_slice = 4032 // (kh * kw)
+        if max_cin_slice < 1:
+            return [op]
+        chunk = (max_cin_slice // 32) * 32 if max_cin_slice >= 32 else max_cin_slice
+        ih, iw, _ = self.shapes[op.x]
+        oh, ow, _ = self.shapes[op.out]
+        out = []
+        acc_id = None
+        for lo in range(0, cin, chunk):
+            hi = min(lo + chunk, cin)
+            last = (hi == cin)
+            part_in = self.temp("deep_slice", [ih, iw, hi - lo])
+            out.append(Op(hx.SLICE, op.x, NONE, part_in, [0, 0, lo], op.node))
+            w_slice = op.weights[:, lo:hi, :, :]
+            b_slice = op.bias if lo == 0 else np.zeros_like(op.bias)
+            part_out = self.temp("deep_conv", [oh, ow, co])
+            conv_piece = Op(hx.CONV, part_in, NONE, part_out, op.p, op.node)
+            conv_piece.dilation = op.dilation
+            conv_piece.weights = w_slice
+            conv_piece.bias = b_slice
+            conv_piece.no_hmx = True
+            out.append(conv_piece)
+            if acc_id is None:
+                acc_id = part_out
+                continue
+            sum_out = op.out if last else self.temp("deep_sum", [oh, ow, co])
+            add_op = Op(hx.ADD, acc_id, part_out, sum_out, [0], op.node)
+            out.append(add_op)
+            acc_id = sum_out
+        return out
     def _split_wide(self, op):
         """A dense convolution whose packed weights exceed the HMX budget becomes several
         convolutions over output-channel chunks joined by channel Concats."""
@@ -1765,6 +2073,10 @@ class Lowerer:
         pool and the p[] fields."""
         ops = []
         for op in self.ops:
+            ops.extend(self._split_deep(op))
+        self.ops = ops
+        ops = []
+        for op in self.ops:
             ops.extend(self._split_wide(op) if op.kind == hx.CONV and op.weights is not None
                        else [op])
         self.ops = ops
@@ -1774,13 +2086,13 @@ class Lowerer:
             w = op.weights
             co = w.shape[0]
             ostride = (co + 31) & ~31
-            if op.kind == hx.CONV:
+            if op.kind == hx.CONV and not getattr(op, "no_hmx", False):
                 wk = np.pad(w.transpose(2, 3, 1, 0), ((0, 0),) * 3 + ((0, ostride - co),))
             else:
                 wk = np.pad(w[:, 0].transpose(1, 2, 0), ((0, 0), (0, 0), (0, ostride - co)))
             op.p[6] = self.pool.emit(wk)
             op.p[7] = self.pool.emit(_pad32(op.bias))
-            if op.kind == hx.CONV:
+            if op.kind == hx.CONV and not getattr(op, "no_hmx", False):
                 packed, tiles = hx.pack_hmx_weights(wk)
                 if hx.hmx_fits(tiles, ostride):
                     op.p[9], op.p[10] = self.pool.emit(packed, "<f2"), tiles

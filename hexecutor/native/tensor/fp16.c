@@ -1191,13 +1191,6 @@ static int matmul_scalar(const HxGraph *g, const HxOp *o, uint32_t part, uint32_
     return 1;
 }
 
-static inline float hx_float(uint32_t u) {
-    union {
-        uint32_t u;
-        float f;
-    } v = {.u = u};
-    return v.f;
-}
 static inline HVX_Vector vsplatf(float f) {
     union {
         float f;
@@ -1614,6 +1607,8 @@ static void kv_write_fp16(const HxGraph *g, const HxOp *o, uint32_t part, uint32
             for (uint32_t ch = c; ch < outt->stride; ch++)
                 dst[ch] = 0.0f;
         }
+    }
+}
 
 /* HX_MATMUL in scalar lanes. Accumulates in float32 and converts to half. */
 static void matmul_fp16_scalar(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
