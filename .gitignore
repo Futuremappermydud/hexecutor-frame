@@ -87,3 +87,6 @@ space_to_depth_cases.h
 .DS_Store
 *.swp
 *~
+
+# Reverse engineering notes, excerpts, and investigative probes
+/re-archive/

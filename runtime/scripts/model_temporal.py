@@ -1,9 +1,5 @@
 """Model-style temporal state for the stereo model (hidden + t inputs).
 
-Reconstructed from depth_engine.so (RnnMotionCompensation, quality 5 as on the
-live Model: pyramidLevel=1, left/right saved separately). See depth-model
-metadata/model-runtime/HIDDEN_STATE.md.
-
 - No history (first frame, lost pose, reset): hidden = 0 and t = 0.
 - saveFrame: each disparity plane is 2x2 box-downsampled and its values halved.
 - Next frame: every saved pixel is triangulated in its own eye, moved by the

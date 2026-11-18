@@ -1,6 +1,5 @@
 #pragma once
-// Sparse TSDF modelled on Model's Vogon SdfFusion (depth_engine.so, see
-// depth-model/metadata/model-runtime/HIDDEN_STATE.md):
+// Sparse TSDF implementation:
 //  - 4x4x4 leaves, each voxel an fp16 SDF + fp16 weight (MaxSdfWeightBuffer),
 //  - projective integration with w = 1/z^2 * max(2cos^2(theta) - 1, 0.1),
 //    sdf <- (sdf*W + s*w)/(W + w), W <- min(W + w, maxWeight),

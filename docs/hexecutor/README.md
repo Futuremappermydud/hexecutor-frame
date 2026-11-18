@@ -29,4 +29,4 @@ Before execution, validate the image and trusted hashes, bind non-overlapping po
 
 Firmware state is borrowed. Loader identity, TLB entries, L2 contents, stacks, vector context, callback registration, clocks, and the eye client all belong to the session's restoration contract. See [operations](operations.md) and [memory layout](memory-layout.md).
 
-Peripheral directories retain focused roles: `research/bringup/` contains early callback probes; `research/qurt-boot/` explores boot/runtime behavior; `native/kernels/adapters/`, `native/kernels/stride2/`, and `native/kernels/u16/` investigate shape-specific kernels; `examples/llm/` demonstrates another DSP client. These do not independently expand the prepared executor's supported graph contract.
+Peripheral directories retain focused roles: `research/bringup/` contains early callback probes; `research/qurt-boot/` explores boot/runtime behavior; `native/kernels/adapters/` and `native/kernels/stride2/` investigate shape-specific kernels; `examples/llm/` demonstrates another DSP client. These do not independently expand the prepared executor's supported graph contract.

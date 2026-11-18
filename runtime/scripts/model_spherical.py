@@ -1,6 +1,4 @@
-"""Model-style rectified spherical camera for the stereo model (depth_engine
-StereoRectifier spherical model / SphericalTriangulator, see
-depth-model/metadata/model-runtime/HIDDEN_STATE.md).
+"""Model-style rectified spherical camera for the stereo model.
 
 Model pixel (u, v), W=256 x H=320, angular step k (rad/px, same on both axes):
   theta = (u - (W-1)/2) * k   azimuth inside the epipolar plane

@@ -7,7 +7,6 @@
 // op under a global mutex. After every op it compares VTCM with a shadow copy and
 // appends the changed 2 KB blocks to a write log. The VTCM base comes from
 // nn_os_vtcm_hmx_acquire (VtcmReq: size at +0x8, base at +0x20).
-// 
 //
 // Environment:
 //   QD_TRACE_LOG  text log: "seq list idx fn_offset thread nblocks"
