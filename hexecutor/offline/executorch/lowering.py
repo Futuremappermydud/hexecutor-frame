@@ -62,10 +62,29 @@ KINDS = {
     "getitem": "getitem",
     "native_layer_norm.default": "norm",
     "native_group_norm.default": "norm",
+    "instance_norm.default": "norm",
+    "native_instance_norm.default": "norm",
+    "_native_batch_norm_legit.no_stats": "norm",
+    "_native_batch_norm_legit.default": "norm",
+    "addmm.default": "addmm",
+    "slice_copy.Tensor": "slice",
+    "slice.Tensor": "slice",
+    "split_with_sizes_copy.default": "split",
+    "split_with_sizes.default": "split",
+    "split_copy.Tensor": "split",
+    "split.Tensor": "split",
     "sub.Tensor": "binary",
     "mul.Tensor": "binary",
     "bmm.default": "bmm",
     "scaled_dot_product_attention.default": "sdpa",
+    "div.Tensor": "binary",
+    "minimum.default": "binary",
+    "maximum.default": "binary",
+    "pow.Tensor_Tensor": "binary",
+    "pow.Tensor_Scalar": "binary",
+    "eq.Tensor": "binary",
+    "gt.Tensor": "binary",
+    "lt.Tensor": "binary",
     "hardswish.default": "act",
     "hardsigmoid.default": "act",
     "silu.default": "act",
@@ -77,6 +96,13 @@ KINDS = {
     "abs.default": "act",
     "neg.default": "act",
     "erf.default": "act",
+    "sin.default": "act",
+    "cos.default": "act",
+    "log.default": "act",
+    "reciprocal.default": "act",
+    "floor.default": "act",
+    "ceil.default": "act",
+    "round.default": "act",
     "avg_pool2d.default": "avgpool",
     "_adaptive_avg_pool2d.default": "gap",
 }
@@ -154,7 +180,11 @@ def hwc_of(shape, name="tensor", multihead=False):
 
 
 def _constant_fqn(ep, node):
-    """Qualified name of the constant behind a placeholder, or None for runtime values."""
+    """Qualified name of the constant behind a placeholder or constant-transform node, or None."""
+    if not isinstance(node, torch.fx.Node):
+        return None
+    if node.op == "call_function" and op_name(node.target) in ("repeat.default", "view_copy.default", "clone.default"):
+        return _constant_fqn(ep, node.args[0])
     if node.op != "placeholder":
         return None
     sig = ep.graph_signature
@@ -170,7 +200,22 @@ def _is_constant(ep, node):
 
 
 def _const_value(ep, node):
-    """The constant data behind a placeholder (lowering only; checks never read data)."""
+    """The constant data behind a placeholder or constant transform (lowering only; checks never read data)."""
+    if not isinstance(node, torch.fx.Node):
+        return None
+    if node.op == "call_function":
+        name = op_name(node.target)
+        if name in ("repeat.default", "view_copy.default", "clone.default"):
+            base = _const_value(ep, node.args[0])
+            if base is None:
+                return None
+            if name == "repeat.default":
+                repeats = [int(v) for v in node.args[1]]
+                return np.tile(base, repeats)
+            if name == "view_copy.default":
+                shape = [int(v) for v in node.args[1]]
+                return base.reshape(shape)
+            return base
     fqn = _constant_fqn(ep, node)
     if fqn is None:
         return None
@@ -239,6 +284,13 @@ def fusable_producer(node, done, activation_of, ep):
         return None
     if op_name(prod.target) not in FUSABLE:
         return None
+    if op_name(prod.target) == "convolution.default":
+        groups = int(prod.args[8]) if len(prod.args) > 8 else 1
+        wshape = static_shape(prod.args[1])
+        ishape = static_shape(prod.args[0])
+        depthwise = groups == wshape[0] == ishape[1] and wshape[1] == 1 and groups > 1
+        if groups > 1 and not depthwise:
+            return None  # grouped conv decomposes into slice+conv+concat
     if op_name(prod.target) == "add.Tensor" and not _plain_add(prod, ep):
         return None  # lowered to HX_BINARY, which has no fused activation
     if len(prod.users) != 1 or next(iter(prod.users)) is not node:
@@ -265,6 +317,13 @@ ACT_FUNCTIONS = {
     "abs.default": lambda n: (hx.FN_ABS, 0.0, 0.0),
     "neg.default": lambda n: (hx.FN_NEG, 0.0, 0.0),
     "erf.default": lambda n: (hx.FN_ERF, 0.0, 0.0),
+    "sin.default": lambda n: (hx.FN_SIN, 0.0, 0.0),
+    "cos.default": lambda n: (hx.FN_COS, 0.0, 0.0),
+    "log.default": lambda n: (hx.FN_LOG, 0.0, 0.0),
+    "reciprocal.default": lambda n: (hx.FN_RECIPROCAL, 0.0, 0.0),
+    "floor.default": lambda n: (hx.FN_FLOOR, 0.0, 0.0),
+    "ceil.default": lambda n: (hx.FN_CEIL, 0.0, 0.0),
+    "round.default": lambda n: (hx.FN_ROUND, 0.0, 0.0),
 }
 
 
@@ -288,7 +347,12 @@ def _binary_plan(node, ep, data=False):
     or a per-channel constant. Raises Unsupported for anything else.
     """
     name = op_name(node.target)
-    opcode = {"add.Tensor": hx.BIN_ADD, "sub.Tensor": hx.BIN_SUB, "mul.Tensor": hx.BIN_MUL}[name]
+    opcode = {
+        "add.Tensor": hx.BIN_ADD, "sub.Tensor": hx.BIN_SUB, "mul.Tensor": hx.BIN_MUL,
+        "div.Tensor": hx.BIN_DIV, "minimum.default": hx.BIN_MIN, "maximum.default": hx.BIN_MAX,
+        "pow.Tensor_Tensor": hx.BIN_POW, "pow.Tensor_Scalar": hx.BIN_POW,
+        "eq.Tensor": hx.BIN_EQUAL, "gt.Tensor": hx.BIN_GREATER, "lt.Tensor": hx.BIN_LESS,
+    }[name]
     a, b = node.args[0], node.args[1]
     alpha = node.args[2] if len(node.args) > 2 else node.kwargs.get("alpha", 1)
     if alpha != 1:
@@ -310,7 +374,7 @@ def _binary_plan(node, ep, data=False):
         if len(shape) != len(out) or shape[0] != 1:
             raise Unsupported("constant operand rank")
         channels = out[1]
-        if len(out) == 4 and (shape[2] != 1 or shape[3] != 1):
+        if len(out) == 4 and (len(shape) < 4 or shape[2] != 1 or shape[3] != 1):
             raise Unsupported("constant operand varies spatially")
         if shape[1] not in (1, channels):
             raise Unsupported("constant operand channel mismatch")
@@ -332,7 +396,8 @@ def _binary_plan(node, ep, data=False):
     if sa == out and fits(sb, out):
         return opcode, a, b, None, 0
     if sb == out and fits(sa, out):
-        return opcode, b, a, None, 1 if opcode == hx.BIN_SUB else 0
+        rev = 1 if opcode in (hx.BIN_SUB, hx.BIN_DIV, hx.BIN_POW, hx.BIN_GREATER, hx.BIN_LESS) else 0
+        return opcode, b, a, None, rev
     raise Unsupported("operands broadcast against each other")
 
 
@@ -412,11 +477,48 @@ def _norm_affine(ep, arg, target, what, data, spatial):
 
 
 def _norm_plan(node, ep, data=False):
-    """(HX_NORM mode, groups, epsilon, gamma, beta) of native_layer_norm or native_group_norm
-    over a batch-one tensor. A [1, C] LayerNorm over its channels is channel mode; a [1, C, H,
-    W] LayerNorm over (C, H, W) and a GroupNorm are group mode with one or C/groups channels per
-    group. gamma and beta are read only when `data` is set (lowering); the checks never read
-    values. Mean and inverse deviation must be unused."""
+    """(HX_NORM mode, groups, epsilon, gamma, beta, has_getitem) of native_layer_norm, native_group_norm,
+    instance_norm or batch_norm over a batch-one tensor."""
+    name = op_name(node.target)
+    if name in ("instance_norm.default", "native_instance_norm.default"):
+        x = node.args[0]
+        ishape = static_shape(x)
+        hwc = hwc_of(ishape, x.name)
+        if len(ishape) != 4:
+            raise Unsupported(f"{node.name}: instance norm requires a rank-4 tensor")
+        c = hwc[2]
+        weight = node.args[1] if len(node.args) > 1 else None
+        bias = node.args[2] if len(node.args) > 2 else None
+        eps = float(node.args[7]) if len(node.args) > 7 else (float(node.args[3]) if len(node.args) > 3 and isinstance(node.args[3], float) else 1e-5)
+        mode, groups, spatial, target = hx.NORM_GROUP, c, False, (c,)
+        gamma = _norm_affine(ep, weight, target, "normalisation weight", data, spatial)
+        beta = _norm_affine(ep, bias, target, "normalisation bias", data, spatial)
+        if data:
+            gamma = np.ones(c, np.float32) if gamma is None else gamma
+            beta = np.zeros(c, np.float32) if beta is None else beta
+        return mode, groups, eps, gamma, beta, False
+
+    if name in ("_native_batch_norm_legit.no_stats", "_native_batch_norm_legit.default"):
+        users = list(node.users)
+        if len(users) != 1 or kind_name(users[0]) != "getitem" or users[0].args[1] != 0:
+            raise Unsupported(f"{node.name}: only the normalised output is supported")
+        x = node.args[0]
+        ishape = static_shape(x)
+        hwc = hwc_of(ishape, x.name)
+        if len(ishape) != 4:
+            raise Unsupported(f"{node.name}: batch norm on batch 1 requires rank 4")
+        c = hwc[2]
+        weight = node.args[1] if len(node.args) > 1 else None
+        bias = node.args[2] if len(node.args) > 2 else None
+        eps = float(node.args[5]) if len(node.args) > 5 else 1e-5
+        mode, groups, spatial, target = hx.NORM_GROUP, c, False, (c,)
+        gamma = _norm_affine(ep, weight, target, "normalisation weight", data, spatial)
+        beta = _norm_affine(ep, bias, target, "normalisation bias", data, spatial)
+        if data:
+            gamma = np.ones(c, np.float32) if gamma is None else gamma
+            beta = np.zeros(c, np.float32) if beta is None else beta
+        return mode, groups, eps, gamma, beta, True
+
     users = list(node.users)
     if len(users) != 1 or kind_name(users[0]) != "getitem" or users[0].args[1] != 0:
         raise Unsupported(f"{node.name}: only the normalised output is supported")
@@ -426,7 +528,7 @@ def _norm_plan(node, ep, data=False):
     if static_shape(users[0]) != ishape:
         raise Unsupported(f"{node.name}: output shape differs from the input")
     c = hwc[2]
-    if op_name(node.target) == "native_layer_norm.default":
+    if name == "native_layer_norm.default":
         normalized = [int(v) for v in node.args[1]]
         weight, bias, eps = node.args[2], node.args[3], float(node.args[4])
         if len(ishape) == 2:
@@ -453,7 +555,7 @@ def _norm_plan(node, ep, data=False):
     if data:
         gamma = np.ones(c, np.float32) if gamma is None else gamma
         beta = np.zeros(c, np.float32) if beta is None else beta
-    return mode, groups, eps, gamma, beta
+    return mode, groups, eps, gamma, beta, True
 
 
 def check(kind, node, ep):
@@ -482,8 +584,9 @@ def check(kind, node, ep):
         else:
             depthwise = groups == wshape[0] == ishape[1] and wshape[1] == 1 and groups > 1
             if groups != 1 and not depthwise:
-                raise Unsupported("only dense or multiplier-one depthwise convolution")
-            if groups == 1 and wshape[1] != ishape[1]:
+                if ishape[1] % groups != 0 or wshape[0] % groups != 0 or wshape[1] != ishape[1] // groups:
+                    raise Unsupported("grouped convolution channels mismatch")
+            elif groups == 1 and wshape[1] != ishape[1]:
                 raise Unsupported("input channel mismatch")
         _require_constant(ep, w, "convolution weight")
         if len(args) > 2 and args[2] is not None:
@@ -498,6 +601,52 @@ def check(kind, node, ep):
         if len(args) > 2 and args[2] is not None:
             _require_constant(ep, args[2], "linear bias")
         hwc_of(static_shape(node), node.name)
+    elif kind == "addmm":
+        bias, x, w = args[0], args[1], args[2]
+        if len(static_shape(x)) != 2:
+            raise Unsupported("addmm input must be rank 2")
+        _require_constant(ep, w, "addmm weight")
+        if bias is not None:
+            _require_constant(ep, bias, "addmm bias")
+        hwc_of(static_shape(node), node.name)
+    elif kind == "slice":
+        x = args[0]
+        ishape = static_shape(x)
+        if len(ishape) not in (2, 4):
+            raise Unsupported("slice input must be rank 2 or 4")
+        dim = int(args[1]) if len(args) > 1 and args[1] is not None else 0
+        dim = dim + len(ishape) if dim < 0 else dim
+        if dim == 0:
+            raise Unsupported("slicing batch dimension is unsupported")
+        step = int(args[4]) if len(args) > 4 and args[4] is not None else 1
+        if step != 1:
+            raise Unsupported("slice step must be 1")
+        hwc_of(ishape, x.name)
+        hwc_of(static_shape(node), node.name)
+    elif kind == "split":
+        x = args[0]
+        ishape = static_shape(x)
+        if len(ishape) not in (2, 4):
+            raise Unsupported("split input must be rank 2 or 4")
+        split_sizes = args[1]
+        dim = int(args[2]) if len(args) > 2 and args[2] is not None else 0
+        dim = dim + len(ishape) if dim < 0 else dim
+        if dim == 0:
+            raise Unsupported("splitting batch dimension is unsupported")
+        if isinstance(split_sizes, int):
+            num_splits = (ishape[dim] + split_sizes - 1) // split_sizes
+            sizes = [min(split_sizes, ishape[dim] - i * split_sizes) for i in range(num_splits)]
+        else:
+            sizes = [int(s) for s in split_sizes]
+        if sum(sizes) != ishape[dim]:
+            raise Unsupported("split sizes must sum to dim size")
+        hwc_of(ishape, x.name)
+        for u in node.users:
+            if kind_name(u) != "getitem":
+                raise Unsupported("split user must be getitem")
+            idx = int(u.args[1])
+            if idx < 0 or idx >= len(sizes):
+                raise Unsupported("split getitem index out of bounds")
     elif kind in ("add", "binary"):
         _binary_plan(node, ep)
     elif kind == "act":
@@ -561,12 +710,19 @@ def check(kind, node, ep):
         prod = args[0]
         if not (
             isinstance(prod, torch.fx.Node)
-            and op_name(prod.target)
-            in ("max_pool2d_with_indices.default", "native_layer_norm.default",
-                "native_group_norm.default")
-            and args[1] == 0
+            and (
+                (op_name(prod.target) in (
+                    "max_pool2d_with_indices.default", "native_layer_norm.default",
+                    "native_group_norm.default", "_native_batch_norm_legit.no_stats",
+                    "_native_batch_norm_legit.default"
+                ) and args[1] == 0)
+                or (op_name(prod.target) in (
+                    "split_with_sizes_copy.default", "split_with_sizes.default",
+                    "split_copy.Tensor", "split.Tensor"
+                ))
+            )
         ):
-            raise Unsupported("only the value output of max pooling or normalisation is supported")
+            raise Unsupported("only the value output of max pooling, normalisation or split is supported")
     elif kind == "pad":
         x, pads = args[0], [int(v) for v in args[1]]
         value = args[2] if len(args) > 2 else 0
@@ -878,6 +1034,35 @@ def _emit_conv(b, ep, node):
         bias = _constant(ep, bias_node, "convolution bias").reshape(-1)
         if bias.size != co:
             raise Unsupported("bias size mismatch")
+    if groups > 1 and not (groups == w.shape[0] == ishape[1] and w.shape[1] == 1):
+        cin = ishape[1]
+        cig = cin // groups
+        cog = co // groups
+        ih, iw = ishape[2], ishape[3]
+        oh, ow = oshape[2], oshape[3]
+        acc_id, acc_c = None, 0
+        for g in range(groups):
+            piece = b.temp(f"{node.name}_gin", (1, cig, ih, iw))
+            b.emit_to(hx.SLICE, src, NONE, piece, [0, 0, g * cig])
+            w_g = w[g * cog:(g + 1) * cog]
+            b_g = bias[g * cog:(g + 1) * cog]
+            ostride_g = (cog + 31) & ~31
+            wk_g = np.pad(w_g.transpose(2, 3, 1, 0), ((0, 0),) * 3 + ((0, ostride_g - cog),))
+            packed_g, tiles_g = hx.pack_hmx_weights(wk_g)
+            p_g = [kh, kw, stride[0], stride[1], pad[0], pad[1],
+                   b.pool.emit(wk_g), b.pool.emit(_pad32(b_g)), hx.ACT_NONE,
+                   b.pool.emit(packed_g, "<f2"), tiles_g]
+            part = b.tid(node) if (g == groups - 1 and acc_id is None) else b.temp(f"{node.name}_gout", (1, cog, oh, ow))
+            b.emit_to(hx.CONV, piece, NONE, part, p_g, _dilated_z(dilation))
+            if acc_id is None:
+                acc_id, acc_c = part, cog
+                continue
+            acc_c += cog
+            comb = b.tid(node) if g == groups - 1 else b.temp(f"{node.name}_gcat", (1, acc_c, oh, ow))
+            b.emit_to(hx.CONCAT, acc_id, part, comb, [2])
+            acc_id = comb
+        b.record(node, record or "grouped_conv2d")
+        return
     if groups == 1:
         kind = hx.CONV
         wk = np.pad(w.transpose(2, 3, 1, 0), ((0, 0),) * 3 + ((0, ostride - co),))
@@ -913,6 +1098,28 @@ def _emit_linear(b, ep, node):
          b.pool.emit(packed, "<f2"), tiles]
     b.emit(hx.CONV, b.tid(x), NONE, node, p)
     b.record(node, "linear")
+
+
+def _emit_addmm(b, ep, node):
+    bias_node, x, w_node = node.args[0], node.args[1], node.args[2]
+    alpha = float(node.args[4]) if len(node.args) > 4 else float(node.kwargs.get("alpha", 1.0))
+    beta = float(node.args[3]) if len(node.args) > 3 else float(node.kwargs.get("beta", 1.0))
+    w = _constant(ep, w_node, "addmm weight") * alpha  # shape [in, out]
+    out_features = w.shape[1]
+    bias = (
+        _constant(ep, bias_node, "addmm bias").reshape(-1) * beta
+        if bias_node is not None
+        else np.zeros(out_features, np.float32)
+    )
+    ostride = (out_features + 31) & ~31
+    wk = np.pad(w[None, None], ((0, 0), (0, 0), (0, 0), (0, ostride - out_features)))
+    packed, tiles = hx.pack_hmx_weights(wk)
+    if not hx.hmx_fits(tiles, ostride):
+        raise Unsupported(f"{node.name}: addmm exceeds the HMX budget")
+    p = [1, 1, 1, 1, 0, 0, b.pool.emit(wk), b.pool.emit(_pad32(bias)), hx.ACT_NONE,
+         b.pool.emit(packed, "<f2"), tiles]
+    b.emit(hx.CONV, b.tid(x), NONE, node, p)
+    b.record(node, "addmm")
 
 
 def _emit_maxpool(b, node):
@@ -1017,6 +1224,8 @@ def lower_program(ep, destination):
             _emit_bmm(b, node)
         elif kind == "sdpa":
             _emit_sdpa(b, node)
+        elif kind == "addmm":
+            _emit_addmm(b, ep, node)
         elif kind in ("add", "binary"):
             opcode, x, y, vec, rev = _binary_plan(node, ep, data=True)
             if _plain_add(node, ep):
@@ -1027,6 +1236,28 @@ def lower_program(ep, destination):
                 b.emit(hx.BINARY, b.tid(x), NONE, node,
                        [opcode, 1, b.pool.emit(_pad32(vec)), rev])
             b.record(node, name)
+        elif kind == "slice":
+            x = node.args[0]
+            ishape = static_shape(x)
+            dim = int(node.args[1]) if len(node.args) > 1 and node.args[1] is not None else 0
+            dim = dim + len(ishape) if dim < 0 else dim
+            start = int(node.args[2]) if len(node.args) > 2 and node.args[2] is not None else 0
+            if start < 0:
+                start += ishape[dim]
+            start = max(0, min(start, ishape[dim]))
+            if len(ishape) == 4:
+                if dim == 1:
+                    p = [0, 0, start]
+                elif dim == 2:
+                    p = [start, 0, 0]
+                elif dim == 3:
+                    p = [0, start, 0]
+            else:  # rank 2
+                p = [0, 0, start]
+            b.emit(hx.SLICE, b.tid(x), NONE, node, p)
+            b.record(node, name)
+        elif kind == "split":
+            pass
         elif kind == "act":
             fn, alpha, beta = ACT_FUNCTIONS[name](node)
             b.emit(hx.ACT, b.tid(node.args[0]), NONE, node,
@@ -1053,16 +1284,47 @@ def lower_program(ep, destination):
         elif kind == "maxpool":
             _emit_maxpool(b, node)
         elif kind == "norm":
-            # Named after the getitem(0) result, as max pooling is.
-            mode, groups, eps, gamma, beta = _norm_plan(node, ep, data=True)
-            getitem = next(iter(node.users))
-            b.emit(hx.NORM, b.tid(node.args[0]), NONE, getitem,
-                   [mode, groups, hx.f32_bits(eps), b.pool.emit(_pad32(gamma)),
-                    b.pool.emit(_pad32(beta))])
-            b.alias[node.name] = getitem.name
+            mode, groups, eps, gamma, beta, has_getitem = _norm_plan(node, ep, data=True)
+            if has_getitem:
+                getitem = next(iter(node.users))
+                b.emit(hx.NORM, b.tid(node.args[0]), NONE, getitem,
+                       [mode, groups, hx.f32_bits(eps), b.pool.emit(_pad32(gamma)),
+                        b.pool.emit(_pad32(beta))])
+                b.alias[node.name] = getitem.name
+            else:
+                b.emit(hx.NORM, b.tid(node.args[0]), NONE, node,
+                       [mode, groups, hx.f32_bits(eps), b.pool.emit(_pad32(gamma)),
+                        b.pool.emit(_pad32(beta))])
             b.record(node, name)
         elif kind == "getitem":
-            pass  # the maxpool or normalisation already produced this value
+            prod = node.args[0]
+            if isinstance(prod, torch.fx.Node) and op_name(prod.target) in (
+                "split_with_sizes_copy.default", "split_with_sizes.default",
+                "split_copy.Tensor", "split.Tensor"
+            ):
+                x = prod.args[0]
+                ishape = static_shape(x)
+                split_sizes = prod.args[1]
+                dim = int(prod.args[2]) if len(prod.args) > 2 and prod.args[2] is not None else 0
+                dim = dim + len(ishape) if dim < 0 else dim
+                if isinstance(split_sizes, int):
+                    num_splits = (ishape[dim] + split_sizes - 1) // split_sizes
+                    sizes = [min(split_sizes, ishape[dim] - i * split_sizes) for i in range(num_splits)]
+                else:
+                    sizes = [int(s) for s in split_sizes]
+                idx = int(node.args[1])
+                offset = sum(sizes[:idx])
+                if len(ishape) == 4:
+                    if dim == 1:
+                        p = [0, 0, offset]
+                    elif dim == 2:
+                        p = [offset, 0, 0]
+                    elif dim == 3:
+                        p = [0, offset, 0]
+                else:
+                    p = [0, 0, offset]
+                b.emit(hx.SLICE, b.tid(x), NONE, node, p)
+                b.record(node, "split")
         elif kind == "pad":
             wl, wr, ht, hb = [int(v) for v in node.args[1]]
             b.emit(hx.PAD, b.tid(node.args[0]), NONE, node, [ht, wl, 0])

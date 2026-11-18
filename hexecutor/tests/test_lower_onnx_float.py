@@ -76,11 +76,16 @@ class Builder:
         return self.node("BatchNormalization", ins, epsilon=1e-3)
 
     def model(self, inputs, outputs, opset=17, check=True):
+        def vi(item):
+            name, shape = item[0], item[1]
+            dtype = item[2] if len(item) > 2 else TensorProto.FLOAT
+            return helper.make_tensor_value_info(name, dtype, shape)
+
         g = helper.make_graph(
             self.nodes,
             "g",
-            [helper.make_tensor_value_info(n, TensorProto.FLOAT, s) for n, s in inputs],
-            [helper.make_tensor_value_info(n, TensorProto.FLOAT, s) for n, s in outputs],
+            [vi(i) for i in inputs],
+            [vi(o) for o in outputs],
             self.init,
         )
         m = helper.make_model(g, opset_imports=[helper.make_opsetid("", opset)])
@@ -154,7 +159,8 @@ def lower_model(m, tmp, **kw):
 def run_reference(tmp, x_nchw):
     tmp = Path(tmp)
     data = x_nchw[0].transpose(1, 2, 0) if x_nchw.ndim == 4 else x_nchw[0]
-    (tmp / "in.f32").write_bytes(np.ascontiguousarray(data, np.float32).tobytes())
+    out_dt = np.int32 if np.issubdtype(x_nchw.dtype, np.integer) else np.float32
+    (tmp / "in.f32").write_bytes(np.ascontiguousarray(data, out_dt).tobytes())
     subprocess.run(
         [str(RUNNER), str(tmp / "g.hxfg"), str(tmp / "g.bin"), str(tmp / "in.f32"),
          str(tmp / "out_")],
@@ -241,6 +247,124 @@ class FloatOnnxTests(unittest.TestCase):
         manifest, ops = self.check_numeric(m, (1, 3, 4, 4))
         # Abs (inside the Add), Sqrt, Neg, Exp, Erf and the last Abs: one ACT each, none fused.
         self.assertEqual(ops.count(hx.ACT), 6, ops)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_gather_embedding_lookup_matches_onnxruntime(self):
+        b = Builder(seed=21)
+        tbl = b.const(b.rand(10, 16))
+        out = b.node("Gather", [tbl, "x"], axis=0)
+        x_val = np.array([[2, 0, 7, 3]], dtype=np.int64)
+        m = b.model([("x", [1, 4], TensorProto.INT64)], [(out, [1, 4, 16])])
+        want = onnxruntime.InferenceSession(
+            m.SerializeToString(), providers=["CPUExecutionProvider"]
+        ).run(None, {"x": x_val})[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = lower_model(m, tmp)
+            got = list(run_reference(tmp, x_val.astype(np.int32)))[0]
+            np.testing.assert_allclose(got, want.reshape(-1), atol=2e-4)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_full_size_constant_add_and_runtime_div(self):
+        b = Builder(seed=23)
+        c_full = b.const(b.rand(1, 4, 3, 3))
+        y = b.node("Add", ["x", c_full])
+        div_out = b.node("Div", [y, b.const(np.full((1, 4, 1, 1), 2.0, np.float32))])
+        m = b.model([("x", [1, 4, 3, 3])], [(div_out, [1, 4, 3, 3])])
+        self.check_numeric(m, (1, 4, 3, 3))
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_where_select_matches_onnxruntime(self):
+        b = Builder(seed=25)
+        cond = b.node("Greater", ["x", b.const(np.zeros((1, 4, 2, 2), np.float32))])
+        out = b.node("Where", [cond, "x", b.const(np.full((1, 4, 2, 2), -1.0, np.float32))])
+        m = b.model([("x", [1, 4, 2, 2])], [(out, [1, 4, 2, 2])])
+        self.check_numeric(m, (1, 4, 2, 2))
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_tile_and_expand_match_onnxruntime(self):
+        b = Builder(seed=27)
+        t_out = b.node("Tile", ["x", b.const(np.array([1, 1, 2, 2], np.int64))])
+        m = b.model([("x", [1, 4, 2, 2])], [(t_out, [1, 4, 4, 4])])
+        self.check_numeric(m, (1, 4, 2, 2))
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_resize_nearest_round_prefer_floor_matches_onnxruntime(self):
+        b = Builder(seed=29)
+        out = b.node("Resize", ["x", "", "", b.const(np.array([1, 4, 8, 8], np.int64))],
+                     mode="nearest", coordinate_transformation_mode="half_pixel",
+                     nearest_mode="round_prefer_floor")
+        m = b.model([("x", [1, 4, 4, 4])], [(out, [1, 4, 8, 8])])
+        self.check_numeric(m, (1, 4, 4, 4))
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_dense_conv_split_deep_when_k_exceeds_4032(self):
+        b = Builder(seed=31)
+        # K = 3 * 3 * 512 = 4608 > 4032: splits along input channels into slices
+        out = b.conv("x", 512, 16, k=3, pads=[1, 1, 1, 1])
+        m = b.model([("x", [1, 512, 4, 4])], [(out, [1, 16, 4, 4])])
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = lower_model(m, tmp)
+            k_list = kinds(tmp)
+            self.assertIn(hx.SLICE, k_list)
+            self.assertIn(hx.ADD, k_list)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_argmax_and_topk_channel_axis_matches_onnxruntime(self):
+        b = Builder(seed=43)
+        am_out = b.node("ArgMax", ["x"], axis=1, keepdims=1)
+        vals = b.name("topk_v")
+        idxs = b.name("topk_i")
+        b.nodes.append(helper.make_node("TopK", ["x", b.const(np.array([3], np.int64))], [vals, idxs], axis=1))
+        m = b.model([("x", [1, 8, 4, 4])],
+                    [(am_out, [1, 1, 4, 4], TensorProto.INT64),
+                     (vals, [1, 3, 4, 4]),
+                     (idxs, [1, 3, 4, 4], TensorProto.INT64)])
+        x = np.random.randn(1, 8, 4, 4).astype(np.float32)
+        want = onnxruntime.InferenceSession(m.SerializeToString(), providers=["CPUExecutionProvider"]).run(None, {"x": x})
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = lower_model(m, tmp)
+            got = list(run_reference(tmp, x))
+            np.testing.assert_allclose(got[0], want[0].flatten(), atol=1e-4)
+            np.testing.assert_allclose(got[1], want[1][0].transpose(1, 2, 0).reshape(-1), atol=1e-4)
+            np.testing.assert_allclose(got[2], want[2][0].transpose(1, 2, 0).reshape(-1), atol=1e-4)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_resize_cubic_matches_onnxruntime(self):
+        b = Builder(seed=45)
+        out = b.node("Resize", ["x", "", "", b.const(np.array([1, 4, 8, 8], np.int64))],
+                     mode="cubic", coordinate_transformation_mode="half_pixel")
+        m = b.model([("x", [1, 4, 4, 4])], [(out, [1, 4, 8, 8])])
+        self.check_numeric(m, (1, 4, 4, 4), tol=1e-3)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_elementwise_math_and_comparison_ops_match_onnxruntime(self):
+        b = Builder(seed=47)
+        pos = b.node("Add", [b.node("Abs", ["x"]), b.const(np.full((1, 4, 2, 2), 1.5, np.float32))])
+        outs = [
+            b.node("Sin", ["x"]),
+            b.node("Cos", ["x"]),
+            b.node("Log", [pos]),
+            b.node("Reciprocal", [pos]),
+            b.node("Floor", ["x"]),
+            b.node("Ceil", ["x"]),
+            b.node("Round", ["x"]),
+            b.node("Pow", [pos, b.const(np.full((1, 4, 2, 2), 2.0, np.float32))]),
+            b.node("Min", ["x", b.const(np.zeros((1, 4, 2, 2), np.float32))]),
+            b.node("Max", ["x", b.const(np.zeros((1, 4, 2, 2), np.float32))]),
+            b.node("Less", ["x", b.const(np.zeros((1, 4, 2, 2), np.float32))]),
+            b.node("Not", [b.node("Less", ["x", b.const(np.zeros((1, 4, 2, 2), np.float32))])]),
+        ]
+        m = b.model([("x", [1, 4, 2, 2])], [(o, [1, 4, 2, 2]) for o in outs[:-2]] +
+                    [(outs[-2], [1, 4, 2, 2], TensorProto.BOOL),
+                     (outs[-1], [1, 4, 2, 2], TensorProto.BOOL)])
+        x = np.random.randn(1, 4, 2, 2).astype(np.float32)
+        want = onnxruntime.InferenceSession(m.SerializeToString(), providers=["CPUExecutionProvider"]).run(None, {"x": x})
+        with tempfile.TemporaryDirectory() as tmp:
+            lower_model(m, tmp)
+            got = list(run_reference(tmp, x))
+            for i, (g, w) in enumerate(zip(got, want)):
+                w_hwc = w[0].transpose(1, 2, 0).reshape(-1)
+                np.testing.assert_allclose(g, w_hwc, atol=1e-4, err_msg=f"mismatch in op {i}")
 
     @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
     def test_softmax_over_channels_after_conv_matches_onnxruntime(self):
@@ -543,8 +667,8 @@ class FloatOnnxTests(unittest.TestCase):
 
         def spatial_const():
             b = Builder()
-            out = b.node("Add", ["x", b.const(b.rand(1, 4, 2, 2))])
-            return b.model([("x", [1, 4, 2, 2])], [(out, [1, 4, 2, 2])])
+            out = b.node("Add", ["x", b.const(b.rand(1, 4, 1, 1))])
+            return b.model([("x", [1, 1, 2, 2])], [(out, [1, 4, 2, 2])])
 
         def passthrough():
             b = Builder()
@@ -553,14 +677,14 @@ class FloatOnnxTests(unittest.TestCase):
         def nearest_round():
             b = Builder()
             out = b.node("Resize", ["x", "", "", b.const(np.array([1, 4, 8, 8], np.int64))],
-                         mode="nearest")
+                         mode="nearest", coordinate_transformation_mode="unsupported")
             return b.model([("x", [1, 4, 4, 4])], [(out, [1, 4, 8, 8])])
 
         for build, text in [
             (softmax, "channel axis"), (dilated, "between 1 and 8"), (grouped, "groups"),
             (transpose_batch, "batch axis"), (transpose_rank2, "rank-4"), (tanh_gelu, "erf"),
-            (spatial_const, "per-channel"), (passthrough, "graph input"),
-            (nearest_round, "nearest resize needs"),
+            (spatial_const, "broadcast the tensor"), (passthrough, "graph input"),
+            (nearest_round, "coordinate transformation mode unsupported"),
         ]:
             with self.subTest(text), tempfile.TemporaryDirectory() as tmp:
                 with self.assertRaisesRegex(ValueError, text):

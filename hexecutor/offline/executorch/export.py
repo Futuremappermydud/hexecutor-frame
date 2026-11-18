@@ -46,6 +46,21 @@ def export_program(model, example_inputs):
         example_inputs = (example_inputs,)
     with torch.no_grad():
         exported = torch.export.export(model, example_inputs)
+    # Fold identity repeat([1]) nodes before edge lowering so the partitioner
+    # sees through them (InstanceNorm2d decomposes to batch_norm_legit with
+    # repeat on weight/bias).
+    g = exported.graph
+    modified = False
+    for n in list(g.nodes):
+        if n.op == "call_function" and "repeat" in str(n.target):
+            sizes = n.args[1] if len(n.args) > 1 else None
+            if isinstance(sizes, (list, tuple)) and all(s == 1 for s in sizes):
+                n.replace_all_uses_with(n.args[0])
+                g.erase_node(n)
+                modified = True
+    if modified:
+        g.lint()
+        exported._graph_module = torch.fx.GraphModule(exported.graph_module, g)
     edge = to_edge_transform_and_lower(
         exported,
         partitioner=[HexecutorPartitioner()],

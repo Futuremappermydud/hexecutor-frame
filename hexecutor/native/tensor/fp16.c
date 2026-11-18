@@ -14,6 +14,14 @@ extern void hx_hmx_init(void *scale);
 extern void hx_hmx_strip(const void *a, const void *b, void *c, const HxHmxStrip *strip);
 extern void hx_hmx_finish(void *c);
 
+static inline float hx_float(uint32_t bits) {
+    union {
+        uint32_t u;
+        float f;
+    } pun;
+    pun.u = bits;
+    return pun.f;
+}
 static inline uint32_t physical_width(const HxTensor *t) { return (t->w + 1u) & ~1u; }
 static inline uint32_t tiles(const HxTensor *t) { return (t->h * physical_width(t) + 31u) / 32u; }
 static inline uint32_t plane_bytes(const HxTensor *t) { return tiles(t) * 2048u; }
@@ -91,6 +99,18 @@ static uint16_t half(float f) {
     *(HVX_Vector *)values = splat(f);
     *(HVX_Vector *)result = half_words(*(HVX_Vector *)values);
     return (uint16_t)result[0];
+}
+static void hx_cubic_weights(float t, float w[4]) {
+    const float A = -0.75f;
+    for (int i = 0; i < 4; i++) {
+        float d = fabsf(t - (float)(i - 1));
+        if (d <= 1.0f)
+            w[i] = ((A + 2.0f) * d - (A + 3.0f)) * d * d + 1.0f;
+        else if (d < 2.0f)
+            w[i] = ((A * d - 5.0f * A) * d + 8.0f * A) * d - 4.0f * A;
+        else
+            w[i] = 0.0f;
+    }
 }
 #include "fp16_depthwise_hvx.h"
 
@@ -2154,9 +2174,11 @@ void hx_fp16_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts)
                                                scalar(x[at(a, oy * physical_width(a) + ox, c)])));
                     } else if (o->kind == HX_BINARY) {
                         /* Scalar lanes, like the logistic: broadcast by clamping coordinates. */
-                        float l = scalar(x[at(a, oy * physical_width(a) + ox, c)]), u;
-                        if (o->y == HXFG_NONE) {
+                        float l = scalar(x[at(a, oy * physical_width(a) + ox, c)]), u = 0.0f;
+                        if (p[1] == 1) {
                             u = ((const float *)(g->constants + p[2]))[c];
+                        } else if (p[1] == 2) {
+                            u = ((const float *)(g->constants + p[2]))[(oy * b->w + ox) * b->stride + c];
                         } else {
                             const HxTensor *t = &g->tensors[o->y];
                             const uint16_t *yv = (const uint16_t *)tensor_data(g, o->y);
@@ -2170,7 +2192,21 @@ void hx_fp16_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts)
                             l = u;
                             u = s;
                         }
-                        v = half(p[0] == HX_BIN_ADD ? l + u : (p[0] == HX_BIN_SUB ? l - u : l * u));
+                        float res = 0.0f;
+                        switch (p[0]) {
+                        case HX_BIN_ADD: res = l + u; break;
+                        case HX_BIN_SUB: res = l - u; break;
+                        case HX_BIN_MUL: res = l * u; break;
+                        case HX_BIN_DIV: res = u == 0.0f ? 0.0f : l / u; break;
+                        case HX_BIN_MIN: res = fminf(l, u); break;
+                        case HX_BIN_MAX: res = fmaxf(l, u); break;
+                        case HX_BIN_POW: res = powf(l, u); break;
+                        case HX_BIN_EQUAL: res = (l == u) ? 1.0f : 0.0f; break;
+                        case HX_BIN_GREATER: res = (l > u) ? 1.0f : 0.0f; break;
+                        case HX_BIN_LESS: res = (l < u) ? 1.0f : 0.0f; break;
+                        default: res = 0.0f; break;
+                        }
+                        v = half(res);
                     } else if (o->kind == HX_MATMUL) {
                         /* Row oy of A against B in scalar lanes, float accumulate. transB 0 reads
                          * B element (k, c) at pixel k; transB 1 reads (c, k) at pixel c. */
@@ -2186,6 +2222,118 @@ void hx_fp16_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts)
                             acc += l * u;
                         }
                         v = half(acc * scale);
+                    } else if (o->kind == HX_GATHER) {
+                        uint32_t px = oy * b->w + ox;
+                        uint32_t a_elem = px / a->c, a_c = px % a->c;
+                        uint32_t a_py = a_elem / a->w, a_px = a_elem % a->w;
+                        uint16_t raw_val = x[at(a, a_py * physical_width(a) + a_px, a_c)];
+                        int32_t idx = (p[3] == 0) ? (int32_t)raw_val : (int32_t)lrintf(scalar(raw_val));
+                        const uint32_t vocab = p[2];
+                        if (idx < 0) idx += (int32_t)vocab;
+                        idx = idx < 0 ? 0 : (idx >= (int32_t)vocab ? (int32_t)vocab - 1 : idx);
+                        if (p[0] == 1) {
+                            float val = ((const float *)(g->constants + p[1]))[(uint32_t)idx * b->stride + c];
+                            v = half(val);
+                        } else {
+                            const HxTensor *tbl = &g->tensors[o->y];
+                            const uint16_t *ytbl = (const uint16_t *)tensor_data(g, o->y);
+                            v = ytbl[at(tbl, (uint32_t)idx, c)];
+                        }
+                    } else if (o->kind == HX_WHERE) {
+                        const HxTensor *cond_t = a;
+                        uint32_t cy = (cond_t->h == 1) ? 0 : oy, cx = (cond_t->w == 1) ? 0 : ox;
+                        float cond_v = scalar(x[at(cond_t, cy * physical_width(cond_t) + cx, cond_t->c == 1 ? 0 : c)]);
+                        float val = 0.0f;
+                        if (cond_v != 0.0f) {
+                            if (p[0] == 1) val = hx_float(p[1]);
+                            else if (p[0] == 2) val = ((const float *)(g->constants + p[1]))[c];
+                            else if (p[0] == 3) val = ((const float *)(g->constants + p[1]))[(oy * b->w + ox) * b->stride + c];
+                            else {
+                                const HxTensor *yt = &g->tensors[o->y];
+                                const uint16_t *yv = (const uint16_t *)tensor_data(g, o->y);
+                                val = scalar(yv[at(yt, (yt->h == 1 ? 0 : oy) * physical_width(yt) + (yt->w == 1 ? 0 : ox), yt->c == 1 ? 0 : c)]);
+                            }
+                        } else {
+                            if (p[2] == 1) val = hx_float(p[3]);
+                            else if (p[2] == 2) val = ((const float *)(g->constants + p[3]))[c];
+                            else if (p[2] == 3) val = ((const float *)(g->constants + p[3]))[(oy * b->w + ox) * b->stride + c];
+                            else {
+                                const HxTensor *zt = &g->tensors[o->z];
+                                const uint16_t *zv = (const uint16_t *)tensor_data(g, o->z);
+                                val = scalar(zv[at(zt, (zt->h == 1 ? 0 : oy) * physical_width(zt) + (zt->w == 1 ? 0 : ox), zt->c == 1 ? 0 : c)]);
+                            }
+                        }
+                        v = half(val);
+                    } else if (o->kind == HX_ARGMAX) {
+                        float max_val = -FLT_MAX;
+                        int32_t best_c = 0;
+                        for (uint32_t ch = 0; ch < a->c; ch++) {
+                            float fv = scalar(x[at(a, oy * physical_width(a) + ox, ch)]);
+                            if (p[0] ? (fv >= max_val) : (fv > max_val)) {
+                                max_val = fv;
+                                best_c = (int32_t)ch;
+                            }
+                        }
+                        v = (c == 0) ? half((float)best_c) : 0;
+                    } else if (o->kind == HX_TOPK) {
+                        const uint32_t K = p[0], largest = p[1], sorted = p[2];
+                        struct { float val; int32_t idx; } top[128];
+                        uint32_t nk = 0;
+                        for (uint32_t ch = 0; ch < a->c; ch++) {
+                            float fv = scalar(x[at(a, oy * physical_width(a) + ox, ch)]);
+                            int32_t idx = (int32_t)ch;
+                            if (nk < K) {
+                                top[nk].val = fv; top[nk].idx = idx; nk++;
+                                if (nk == K && sorted) {
+                                    for (uint32_t m = 0; m < K; m++)
+                                        for (uint32_t n = m + 1; n < K; n++)
+                                            if (largest ? (top[n].val > top[m].val) : (top[n].val < top[m].val)) {
+                                                float tv = top[m].val; int32_t ti = top[m].idx;
+                                                top[m].val = top[n].val; top[m].idx = top[n].idx;
+                                                top[n].val = tv; top[n].idx = ti;
+                                            }
+                                }
+                            } else {
+                                uint32_t worst = 0;
+                                for (uint32_t k = 1; k < K; k++)
+                                    if (largest ? (top[k].val < top[worst].val) : (top[k].val > top[worst].val))
+                                        worst = k;
+                                if (largest ? (fv > top[worst].val) : (fv < top[worst].val)) {
+                                    top[worst].val = fv; top[worst].idx = idx;
+                                }
+                            }
+                        }
+                        if (sorted) {
+                            for (uint32_t m = 0; m < K; m++)
+                                for (uint32_t n = m + 1; n < K; n++)
+                                    if (largest ? (top[n].val > top[m].val) : (top[n].val < top[m].val)) {
+                                        float tv = top[m].val; int32_t ti = top[m].idx;
+                                        top[m].val = top[n].val; top[m].idx = top[n].idx;
+                                        top[n].val = tv; top[n].idx = ti;
+                                    }
+                        }
+                        v = (c < K) ? half(top[c].val) : 0;
+                        if (o->z != HXFG_NONE && c < K) {
+                            uint16_t *zout = (uint16_t *)tensor_data(g, o->z);
+                            zout[at(&g->tensors[o->z], pair * 2u + q, c)] = half((float)top[c].idx);
+                        }
+                    } else if (o->kind == HX_TILE) {
+                        uint32_t sy = oy % a->h, sx = ox % a->w;
+                        v = x[at(a, sy * physical_width(a) + sx, c % a->c)];
+                    } else if (o->kind == HX_CAST) {
+                        float fv = scalar(x[at(a, oy * physical_width(a) + ox, c)]);
+                        if (p[0] == 0) {
+                            int32_t iv = (int32_t)lrintf(fv);
+                            v = (uint16_t)iv;
+                        } else if (p[0] == 1) {
+                            int32_t iv = (int32_t)x[at(a, oy * physical_width(a) + ox, c)];
+                            v = half((float)iv);
+                        } else if (p[0] == 2) {
+                            int32_t iv = (int32_t)x[at(a, oy * physical_width(a) + ox, c)];
+                            v = half(iv != 0 ? 1.0f : 0.0f);
+                        } else {
+                            v = (fv != 0.0f) ? 1 : 0;
+                        }
                     } else if (o->kind == HX_AVGPOOL) {
                         float sum = 0;
                         uint32_t taps = 0;
@@ -2204,13 +2352,81 @@ void hx_fp16_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts)
                         if (p[6])
                             taps = p[0] * p[1];
                         v = half(taps ? sum / (float)taps : 0.0f);
-                    } else if (o->kind == HX_RESIZE) {
-                        /* Nearest (asymmetric floor): copy the source pixel's halfwords. */
-                        uint32_t sy = (uint32_t)((uint64_t)oy * a->h / b->h),
-                                 sx = (uint32_t)((uint64_t)ox * a->w / b->w);
+                    } else if (o->kind == HX_RESIZE && p[2] == 1) {
+                        /* Nearest: coordinate mode in p[3], nearest mode in p[4] */
+                        const uint32_t coord_mode = p[3], near_mode = p[4];
+                        uint32_t sy, sx;
+                        if (coord_mode == 0 && near_mode == 0) {
+                            /* Asymmetric floor (backward compatible fast path) */
+                            sy = (uint32_t)((uint64_t)oy * a->h / b->h);
+                            sx = (uint32_t)((uint64_t)ox * a->w / b->w);
+                        } else {
+                            float fy = 0.0f, fx = 0.0f;
+                            if (coord_mode == 0) { /* asymmetric */
+                                fy = (float)oy * (float)a->h / (float)b->h;
+                                fx = (float)ox * (float)a->w / (float)b->w;
+                            } else if (coord_mode == 1) { /* align_corners */
+                                fy = b->h > 1 ? (float)oy * (float)(a->h - 1) / (float)(b->h - 1) : 0.0f;
+                                fx = b->w > 1 ? (float)ox * (float)(a->w - 1) / (float)(b->w - 1) : 0.0f;
+                            } else if (coord_mode == 3) { /* pytorch_half_pixel */
+                                fy = b->h > 1 ? ((float)oy + 0.5f) * (float)a->h / (float)b->h - 0.5f : 0.0f;
+                                fx = b->w > 1 ? ((float)ox + 0.5f) * (float)a->w / (float)b->w - 0.5f : 0.0f;
+                            } else { /* half_pixel (2) */
+                                fy = ((float)oy + 0.5f) * (float)a->h / (float)b->h - 0.5f;
+                                fx = ((float)ox + 0.5f) * (float)a->w / (float)b->w - 0.5f;
+                            }
+                            int32_t iy, ix;
+                            if (near_mode == 1) { /* round_prefer_floor */
+                                iy = (int32_t)ceilf(fy - 0.5f);
+                                ix = (int32_t)ceilf(fx - 0.5f);
+                            } else if (near_mode == 2) { /* round_prefer_ceil */
+                                iy = (int32_t)floorf(fy + 0.5f);
+                                ix = (int32_t)floorf(fx + 0.5f);
+                            } else if (near_mode == 3) { /* ceil */
+                                iy = (int32_t)ceilf(fy);
+                                ix = (int32_t)ceilf(fx);
+                            } else { /* floor */
+                                iy = (int32_t)floorf(fy);
+                                ix = (int32_t)floorf(fx);
+                            }
+                            sy = (uint32_t)(iy < 0 ? 0 : (iy >= (int32_t)a->h ? (int32_t)a->h - 1 : iy));
+                            sx = (uint32_t)(ix < 0 ? 0 : (ix >= (int32_t)a->w ? (int32_t)a->w - 1 : ix));
+                        }
                         sy = sy < a->h ? sy : a->h - 1u;
                         sx = sx < a->w ? sx : a->w - 1u;
                         v = x[at(a, sy * physical_width(a) + sx, c)];
+                    } else if (o->kind == HX_RESIZE && p[5] == 1) {
+                        /* Bicubic */
+                        const uint32_t coord_mode = p[3];
+                        float fy = 0.0f, fx = 0.0f;
+                        if (coord_mode == 1 && b->h > 1 && b->w > 1) {
+                            fy = (float)oy * (float)(a->h - 1) / (float)(b->h - 1);
+                            fx = (float)ox * (float)(a->w - 1) / (float)(b->w - 1);
+                        } else if (coord_mode == 0) { /* asymmetric */
+                            fy = (float)oy * (float)a->h / (float)b->h;
+                            fx = (float)ox * (float)a->w / (float)b->w;
+                        } else if (coord_mode == 3) { /* pytorch_half_pixel */
+                            fy = b->h > 1 ? ((float)oy + 0.5f) * (float)a->h / (float)b->h - 0.5f : 0.0f;
+                            fx = b->w > 1 ? ((float)ox + 0.5f) * (float)a->w / (float)b->w - 0.5f : 0.0f;
+                        } else { /* half_pixel (2) */
+                            fy = ((float)oy + 0.5f) * (float)a->h / (float)b->h - 0.5f;
+                            fx = ((float)ox + 0.5f) * (float)a->w / (float)b->w - 0.5f;
+                        }
+                        int32_t y0 = (int32_t)floorf(fy), x0 = (int32_t)floorf(fx);
+                        float wy[4], wx[4];
+                        hx_cubic_weights(fy - (float)y0, wy);
+                        hx_cubic_weights(fx - (float)x0, wx);
+                        float acc = 0.0f;
+                        for (int j = 0; j < 4; j++) {
+                            int32_t sy = y0 + j - 1;
+                            sy = sy < 0 ? 0 : (sy >= (int32_t)a->h ? (int32_t)a->h - 1 : sy);
+                            for (int k = 0; k < 4; k++) {
+                                int32_t sx = x0 + k - 1;
+                                sx = sx < 0 ? 0 : (sx >= (int32_t)a->w ? (int32_t)a->w - 1 : sx);
+                                acc += wy[j] * wx[k] * scalar(x[at(a, (uint32_t)sy * physical_width(a) + (uint32_t)sx, c)]);
+                            }
+                        }
+                        v = half(acc);
                     } else if (o->kind == HX_LOGISTIC) {
                         v = half(1.0f /
                                  (1.0f + expf(-scalar(x[at(a, oy * physical_width(a) + ox, c)]))));
