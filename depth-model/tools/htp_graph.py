@@ -4,6 +4,11 @@
 Format evidence: the installed Qualcomm HTP serialization headers and static
 inspection of libQnnHtpPrepare.so. This is a model-specific research decoder,
 not a supported general QNN converter. Fail on unrecognized structures.
+
+QAIRT 2.25 and 2.50 contexts (for example V75 graphs from
+hexecutor/offline/compile_qnn.py) put extra words before the dictionaries and use
+a different I/O preamble; pass --graph-name to read their debug-name table, or
+omit it to decode without source names.
 """
 import argparse
 from collections import Counter
@@ -60,7 +65,7 @@ def dictionary(data, pos, magic):
     return [dict(index=i, name=n.decode(), format=c) for i, (n, c) in enumerate(zip(names, codes))], r.pos
 
 
-def source_names(data, limit):
+def source_names(data, limit, graph_name='zelda_qvga_boltnn_delegate - delegate_0', io_counts=(4, 2)):
     """Locate the backend graph-info table and read its ID -> debug-name map."""
     f = FB(data)
     for t in range(0x480, limit, 4):
@@ -80,12 +85,12 @@ def source_names(data, limit):
             length = f.u32(pos)
             if not 1 <= length <= 80 or pos + 4 + length > limit:
                 continue
-            if f.string(t, 3) != 'zelda_qvga_boltnn_delegate - delegate_0':
+            if f.string(t, 3) != graph_name:
                 continue
-            if len(f.vec_tables(t, 1)) != 4 or len(f.vec_tables(t, 2)) != 2:
+            if io_counts and (len(f.vec_tables(t, 1)), len(f.vec_tables(t, 2))) != tuple(io_counts):
                 continue
             names = {f.scalar(row, 0, 'I'): f.string(row, 1) for row in f.vec_tables(t, 0)}
-            if len(names) < 100 or not all(isinstance(v, str) and v for v in names.values()):
+            if not names or not all(isinstance(v, str) and v for v in names.values()):
                 continue
             return names
         except (struct.error, IndexError, UnicodeError):
@@ -264,7 +269,24 @@ class Tensors:
         return t['id']
 
 
-def decode(path, output):
+def io_preamble(data, start, end):
+    """Position of the graph input count: the 2.19 four-input pattern, else the
+    2.25+ form where the count follows 0xf and a complemented size word."""
+    io = data.find(struct.pack('<6I', 4, 0, 0x80000001, 0, 0x3b808081, 0x80000002), start, end)
+    if io >= 0:
+        return io
+    candidates = []
+    for pos in range(start, end - 8, 4):
+        marker, size = struct.unpack_from('<2I', data, pos)
+        low, high = size & 0xffff, size >> 16
+        if marker == 0xf and low and high == (low ^ 0xffff):
+            candidates.append(pos + 8)
+    if len(candidates) != 1:
+        raise DecodeError('graph I/O preamble not found or ambiguous')
+    return candidates[0]
+
+
+def decode(path, output, graph_name=None, legacy_names=True):
     data = path.read_bytes()
     base = data.find(struct.pack('<I', MAGIC))
     if base < 0:
@@ -279,9 +301,24 @@ def decode(path, output):
             raise DecodeError('invalid HTP header record')
         tags[tag] = dict(offset=p, words=list(struct.unpack_from('<' + 'I' * (n - 1), data, p + 4)))
         p += n * 4
-    ops, p = dictionary(data, end_header, 0x6f4390bc)
-    classes, p = dictionary(data, p, 0x74438bbc)
-    names = source_names(data, base)
+    modern = struct.unpack_from('<I', data, end_header)[0] != 0x6f4390bc
+    if not modern:
+        ops, p = dictionary(data, end_header, 0x6f4390bc)
+    else:  # 2.25+: a few extra words precede the dictionary.
+        at = data.find(struct.pack('<I', 0x6f4390bc), end_header, end_header + 64)
+        if at < 0:
+            raise DecodeError('operation dictionary not found')
+        ops, p = dictionary(data, at, 0x6f4390bc)
+    at = data.find(struct.pack('<I', 0x74438bbc), p, p + 64)
+    if at < 0:
+        raise DecodeError('tensor class dictionary not found')
+    classes, p = dictionary(data, at, 0x74438bbc)
+    if graph_name is not None:
+        names = source_names(data, base, graph_name, None)
+    elif legacy_names:
+        names = source_names(data, base)
+    else:
+        names = {}
     first = data.find(struct.pack('<I', SEQ_XOR), p)
     if first < 0:
         raise DecodeError('no operation sequence')
@@ -303,16 +340,16 @@ def decode(path, output):
         raise DecodeError('missing final tensor fixup terminator')
     markers.append(sentinel - 4)
     tensors = Tensors(classes)
-    io = data.find(struct.pack('<6I', 4, 0, 0x80000001, 0, 0x3b808081, 0x80000002), p, first)
-    if io < 0:
-        raise DecodeError('observed four-input graph preamble not found')
-    r = Reader(data, io, first)
+    r = Reader(data, io_preamble(data, p, first), first)
     inputs = [tensors.tensor(r, 'input') for _ in range(r.word())]
     outputs = [tensors.tensor(r, 'output') for _ in range(r.word())]
     nodes = []
     for seq, (start, end) in enumerate(zip(markers, markers[1:])):
         r = Reader(data, start, end)
-        marker, typeword, source, site = r.words(4)
+        marker = r.word()
+        if (marker ^ SEQ_XOR) & 0x40000000:
+            r.word()
+        typeword, source, site = r.words(3)
         kind = typeword & 0xfffffff
         if kind >= len(ops):
             raise DecodeError('unknown operation type')
@@ -324,6 +361,9 @@ def decode(path, output):
             node['source_name'] = names[source]
         if not flags & 1:
             node['checkpoints'] = r.words(1 if flags & 2 else 2)
+        elif modern and flags & 2:
+            # 2.25+ also stores one checkpoint word when both low flags are set.
+            node['checkpoints'] = r.words(1)
         try:
             if fmt == 0xffffffff:
                 counts = r.word()
@@ -344,6 +384,35 @@ def decode(path, output):
                     node['framework_vector'] = r.words(length // 4)
             node['inputs'] = r.words(ni)
             node['outputs'] = [tensors.tensor(r, seq) for _ in range(no)]
+            if modern and node['type_name'] == '@BlockZap' and r.pos != end:
+                # 2.25+: a mode word, mask words ending in 0, then block addresses ending in 0.
+                node['zap_mode'] = r.word()
+                mask = []
+                while (w := r.word()) != 0:
+                    mask.append(w)
+                node['zap_mask'] = mask
+                blocks = []
+                while (w := r.word()) != 0:
+                    blocks.append(w)
+                node['zap_blocks'] = blocks
+                # Tables: a header word (code << 16 | copy << 15 | n), then n
+                # block addresses. With the copy bit set they are n (source,
+                # destination) pairs: the source block is copied to the
+                # destination, whose code region is then cleared.
+                tables, i = [], 0
+                while i < len(blocks):
+                    head = blocks[i]
+                    pairs = bool(head & 0x8000)
+                    n = (head & 0x7fff) * (2 if pairs else 1)
+                    if not n or head >> 24 or i + 1 + n > len(blocks):
+                        raise DecodeError(f'bad @BlockZap table header {head:#x}')
+                    words = blocks[i + 1:i + 1 + n]
+                    if pairs:
+                        tables.append(dict(code=(head >> 16) & 0xff, blocks=words[1::2], sources=words[0::2]))
+                    else:
+                        tables.append(dict(code=(head >> 16) & 0xff, blocks=words))
+                    i += 1 + n
+                node['zap_tables'] = tables
             if r.pos != end:
                 raise DecodeError(f'{end-r.pos} trailing bytes')
         except Exception as exc:
@@ -369,7 +438,7 @@ def decode(path, output):
                   graph_inputs=inputs, graph_outputs=outputs, source_names=names,
                   nodes=nodes, tensors=tensors.tensors)
     output.mkdir(parents=True, exist_ok=True)
-    serialized = json.dumps(result, separators=(',', ':'), allow_nan=False).encode() + b'\n'
+    serialized = json.dumps(result, separators=(',', ':'), allow_nan=not legacy_names).encode() + b'\n'
     with gzip.GzipFile(filename=str(output / 'graph.json.gz'), mode='wb', mtime=0) as out:
         out.write(serialized)
     # Keep a compact uncompressed graph for tools which do not read gzip.
@@ -395,5 +464,8 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('context', type=Path)
     ap.add_argument('output', type=Path)
+    ap.add_argument('--graph-name', help='2.25+ contexts: QNN graph name for source names')
+    ap.add_argument('--no-source-names', action='store_true',
+                    help='2.25+ contexts: decode without the debug-name table')
     args = ap.parse_args()
-    decode(args.context, args.output)
+    decode(args.context, args.output, args.graph_name, not args.no_source_names)

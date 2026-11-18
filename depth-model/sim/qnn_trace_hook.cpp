@@ -112,8 +112,21 @@ int trampoline(void *arg, void *graph, int flag) {
         };
         void *tensor = nullptr, *data = nullptr;
         std::vector<uint8_t> buf(d.bytes);
-        if (!read(&tensor, (char *)w->op + 8 * d.slot, 8) ||
-            !read(&data, (char *)tensor + 24, 8) || !read(buf.data(), data, d.bytes)) {
+        bool indirect = (d.slot & 0x80000000u) != 0;
+        uint32_t slot = d.slot & 0x7fffffffu;
+        bool ok = read(&tensor, (char *)w->op + 8 * slot, 8) &&
+                  read(&data, (char *)tensor + 24, 8);
+        if (ok && indirect) {
+            ok = d.bytes % BLOCK == 0;
+            for (size_t b = 0; ok && b < d.bytes / BLOCK; ++b) {
+                void *block = nullptr;
+                ok = read(&block, (char *)data + b * sizeof(void *), sizeof(void *)) &&
+                     read(buf.data() + b * BLOCK, block, BLOCK);
+            }
+        } else if (ok) {
+            ok = read(buf.data(), data, d.bytes);
+        }
+        if (!ok) {
             fprintf(stderr, "QD tensor dump failed: list=%u idx=%u tid=%u\n", w->list, w->idx, d.tid);
             continue;
         }
