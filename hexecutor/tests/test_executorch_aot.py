@@ -575,7 +575,9 @@ def run_reference(parsed, x):
         root = Path(root)
         (root / "g.hxfg").write_bytes(parsed.image)
         (root / "g.bin").write_bytes(parsed.constants)
-        (root / "in.f32").write_bytes(x[0].numpy().transpose(1, 2, 0).astype(np.float32).tobytes())
+        arr = x[0].numpy()
+        data = arr.transpose(1, 2, 0) if arr.ndim == 3 else arr
+        (root / "in.f32").write_bytes(data.astype(np.float32).tobytes())
         subprocess.run(
             [str(RUNNER), str(root / "g.hxfg"), str(root / "g.bin"),
              str(root / "in.f32"), str(root / "out_")],
