@@ -5,11 +5,13 @@ and the portable reference runner (build/bin/hexecutor_tensor_run); they compare
 lowered graph on the CPU reference against onnxruntime on the original model.
 """
 
+import os
 import struct
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 import numpy as np
 
 try:
@@ -26,7 +28,7 @@ except ImportError:
     onnxruntime = None
 
 ROOT = Path(__file__).resolve().parents[2]
-RUNNER = ROOT / "build/bin/hexecutor_tensor_run"
+RUNNER = Path(os.environ.get("HEXECUTOR_TENSOR_RUN", ROOT / "build/bin/hexecutor_tensor_run"))
 
 
 class Builder:
@@ -73,7 +75,7 @@ class Builder:
         ]
         return self.node("BatchNormalization", ins, epsilon=1e-3)
 
-    def model(self, inputs, outputs, opset=17):
+    def model(self, inputs, outputs, opset=17, check=True):
         g = helper.make_graph(
             self.nodes,
             "g",
@@ -83,7 +85,8 @@ class Builder:
         )
         m = helper.make_model(g, opset_imports=[helper.make_opsetid("", opset)])
         m.ir_version = 9
-        onnx.checker.check_model(m)
+        if check:  # onnx 1.23 deprecates the opset-18 GroupNormalization schema
+            onnx.checker.check_model(m)
         return m
 
 
@@ -123,6 +126,17 @@ def model_b():
     n2 = b.node("Sub", [b.const(b.rand(1, 8, 1, 1)), n1])
     n3 = b.node("Div", [n2, b.const(2.0)])
     return b.model([("x", [1, 3, 16, 16])], [(n1, [1, 8, 8, 8]), (n3, [1, 8, 8, 8])])
+
+
+def model_nearest():
+    """Nearest resize (asymmetric, floor): an integer 2x up, then a non-integer 8x8 -> 5x3."""
+    b = Builder(seed=9)
+    a = b.node("Relu", [b.conv("x", 3, 4, k=1, bias=False)])
+    up = b.node("Resize", [a, "", "", b.const(np.array([1, 4, 8, 8], np.int64))],
+                mode="nearest", coordinate_transformation_mode="asymmetric", nearest_mode="floor")
+    odd = b.node("Resize", [up, "", "", b.const(np.array([1, 4, 5, 3], np.int64))],
+                 mode="nearest", coordinate_transformation_mode="asymmetric", nearest_mode="floor")
+    return b.model([("x", [1, 3, 4, 4])], [(odd, [1, 4, 5, 3])])
 
 
 def model_wide():
@@ -195,6 +209,11 @@ class FloatOnnxTests(unittest.TestCase):
         self.assertEqual(ops.count(hx.CONCAT), 2)  # three inputs chain through one temporary
 
     @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_nearest_resize_matches_onnxruntime(self):
+        manifest, ops = self.check_numeric(model_nearest(), (1, 3, 4, 4))
+        self.assertEqual(ops.count(hx.RESIZE), 2, ops)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
     def test_asymmetric_same_pad_affine_fold_and_reversed_ops(self):
         manifest, ops = self.check_numeric(model_b(), (1, 3, 16, 16))
         # Mul and Add fold into the convolution; c - x needs negate + add; Div folds nowhere
@@ -207,6 +226,42 @@ class FloatOnnxTests(unittest.TestCase):
         manifest, ops = self.check_numeric(model_wide(), (1, 32), tol=1e-3)
         self.assertGreater(len(manifest["output_tensors"]), 1)
 
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_elementwise_activations_match_onnxruntime(self):
+        b = Builder(seed=13)
+        # Sqrt sees only positive values (|x| + 1), so every output is finite.
+        pos = b.node("Add", [b.node("Abs", ["x"]), b.const(np.ones((3, 1, 1), np.float32))])
+        outs = [
+            b.node("Sqrt", [pos]),
+            b.node("Exp", [b.node("Neg", ["x"])]),
+            b.node("Erf", ["x"]),
+            b.node("Abs", ["x"]),
+        ]
+        m = b.model([("x", [1, 3, 4, 4])], [(o, [1, 3, 4, 4]) for o in outs])
+        manifest, ops = self.check_numeric(m, (1, 3, 4, 4))
+        # Abs (inside the Add), Sqrt, Neg, Exp, Erf and the last Abs: one ACT each, none fused.
+        self.assertEqual(ops.count(hx.ACT), 6, ops)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_softmax_over_channels_after_conv_matches_onnxruntime(self):
+        b = Builder(seed=17)
+        y = b.conv("x", 3, 40)  # 40 channels: two channel blocks
+        out = b.node("Softmax", [y], axis=1)
+        manifest, ops = self.check_numeric(b.model([("x", [1, 3, 8, 8])], [(out, [1, 40, 8, 8])]),
+                                           (1, 3, 8, 8))
+        self.assertEqual(ops.count(hx.SOFTMAX), 1, ops)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_softmax_after_gemm_with_large_logits_matches_onnxruntime(self):
+        b = Builder(seed=19)
+        # Weights scaled by 3 give logits of order +-15 or more; the lowered softmax subtracts the
+        # per-pixel maximum, so it must still match onnxruntime.
+        g = b.node("Gemm", ["x", b.const(b.rand(10, 32, scale=3.0)), b.const(b.rand(10))],
+                   transB=1)
+        out = b.node("Softmax", [g])  # opset 17 default axis -1 is channel axis 1 for rank 2
+        manifest, ops = self.check_numeric(b.model([("x", [1, 32])], [(out, [1, 10])]), (1, 32))
+        self.assertEqual(ops.count(hx.SOFTMAX), 1, ops)
+
     def test_bn_fold_changes_weights_not_op_count(self):
         b = Builder()
         out = b.node("Relu", [b.bn(b.conv("x", 3, 8), 8)])
@@ -215,38 +270,271 @@ class FloatOnnxTests(unittest.TestCase):
             self.assertEqual(kinds(tmp), [hx.CONV])
             self.assertEqual(len(manifest["ops"]), 3)  # Conv, BatchNormalization and Relu are recorded
 
-    def test_fp16_blockers_are_reported(self):
+    def test_dense_convolutions_of_any_shape_are_fp16_eligible(self):
         b = Builder()
-        out = b.conv(b.conv("x", 3, 32), 32, 32)  # a dense 3x3 in the middle
+        y = b.conv("x", 3, 32, k=7, strides=[2, 2], pads=[3, 3, 3, 3])  # ResNet-style stem
+        y = b.conv(y, 32, 32)  # dense 3x3 mid-graph
+        y = b.conv(y, 32, 32, k=7, group=32, strides=[2, 2], pads=[3, 3, 3, 3])  # 7x7 depthwise
+        out = b.conv(y, 32, 64, k=1, strides=[2, 2], pads=[0, 0, 0, 0])  # strided 1x1
         with tempfile.TemporaryDirectory() as tmp:
-            plan = lower_model(b.model([("x", [1, 3, 8, 8])], [(out, [1, 32, 8, 8])]), tmp)[
+            m = b.model([("x", [1, 3, 32, 32])], [(out, [1, 64, 4, 4])])
+            manifest = lower_model(m, tmp)
+            self.assertTrue(manifest["fp16_plan"]["eligible"], manifest["fp16_plan"])
+            # The 7x7 stem cannot use the compact RGB fast path, so the input is padded instead.
+            image = (Path(tmp) / "g.hxfg").read_bytes()
+            first_tensor_stride = struct.unpack_from("<8I", image, 256)[4]
+            self.assertEqual(first_tensor_stride, 32)
+        b = Builder()
+        out = b.conv("x", 3, 32)  # one 3x3 on a 3-channel input keeps the compact layout
+        with tempfile.TemporaryDirectory() as tmp:
+            lower_model(b.model([("x", [1, 3, 8, 8])], [(out, [1, 32, 8, 8])]), tmp)
+            image = (Path(tmp) / "g.hxfg").read_bytes()
+            self.assertEqual(struct.unpack_from("<8I", image, 256)[4], 3)
+
+    def test_unpackable_depth_is_reported(self):
+        b = Builder()
+        out = b.conv("x", 512, 8, k=3, pads=[1, 1, 1, 1])  # K = 4608 > 4096
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = lower_model(b.model([("x", [1, 512, 4, 4])], [(out, [1, 8, 4, 4])]), tmp)[
                 "fp16_plan"
             ]
             self.assertFalse(plan["eligible"])
-            self.assertTrue(any("3x3 stride-1 convolution" in r for r in plan["blockers"]))
-        b = Builder()
-        out = b.node("Relu", [b.bn(b.conv("x", 3, 32), 32)])
-        with tempfile.TemporaryDirectory() as tmp:
-            m = b.model([("x", [1, 3, 8, 8])], [(out, [1, 32, 8, 8])])
-            self.assertTrue(lower_model(m, tmp)["fp16_plan"]["eligible"])
+            self.assertTrue(any("no HMX packing" in r for r in plan["blockers"]))
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_oversized_convolutions_are_split_by_output_channel(self):
+        b = Builder(seed=9)
+        c = b.conv("x", 128, 512)  # 3x3: packed weights 1.18 MB, over the HMX budget
+        h = b.node("Relu", [c])
+        out = h
+        m = b.model([("x", [1, 128, 4, 4])], [(out, [1, 512, 4, 4])])
+        manifest, ops = self.check_numeric(m, (1, 128, 4, 4), tol=1e-3)
+        self.assertGreaterEqual(ops.count(hx.CONV), 2)
+        self.assertGreaterEqual(ops.count(hx.CONCAT), 1)
+        self.assertTrue(manifest["fp16_plan"]["eligible"], manifest["fp16_plan"])
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_wide_mid_graph_gemm_is_split_with_concat(self):
+        b = Builder(seed=10)
+        wide = b.node("Gemm", ["x", b.const(b.rand(2048, 256, scale=0.05)), b.const(b.rand(2048))],
+                      transB=1)
+        out = b.node("Gemm", [b.node("Relu", [wide]), b.const(b.rand(10, 2048, scale=0.05)),
+                              b.const(b.rand(10))], transB=1)
+        manifest, ops = self.check_numeric(b.model([("x", [1, 256])], [(out, [1, 10])]), (1, 256),
+                                           tol=1e-3)
+        self.assertGreaterEqual(ops.count(hx.CONCAT), 1)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_flatten_and_reshape_across_spatial_and_channel_order_match_onnxruntime(self):
+        b = Builder(seed=23)  # conv feature map [1,4,2,2] -> Flatten (NCHW order) -> Gemm
+        feat = b.conv("x", 3, 4, pads=[0, 0, 0, 0])
+        flat = b.node("Flatten", [feat])
+        out = b.node("Gemm", [flat, b.const(b.rand(10, 16)), b.const(b.rand(10, scale=0.1))],
+                     transB=1)
+        manifest, ops = self.check_numeric(b.model([("x", [1, 3, 4, 4])], [(out, [1, 10])]),
+                                           (1, 3, 4, 4))
+        self.assertEqual(ops.count(hx.RESHAPE), 1, ops)  # straight to 1x1x16
+
+        b = Builder(seed=24)  # [1,4,2,2] -> [1,8,2,1] moves spatial extent into channels
+        r = b.node("Reshape", ["x", b.const(np.array([1, 8, 2, 1], np.int64))])
+        out = b.conv(r, 8, 6, k=1, bias=False)
+        manifest, ops = self.check_numeric(b.model([("x", [1, 4, 2, 2])], [(out, [1, 6, 2, 1])]),
+                                           (1, 4, 2, 2))
+        self.assertEqual(ops.count(hx.RESHAPE), 2, ops)  # flatten to 1x1x16, then unflatten
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_transpose_matches_onnxruntime(self):
+        b = Builder(seed=26)  # NHWC order, then a flatten (NHWC content) into a Gemm
+        t = b.node("Transpose", ["x"], perm=[0, 2, 3, 1])  # [1,4,3,5] -> [1,3,5,4]
+        out = b.node("Gemm", [b.node("Flatten", [t]), b.const(b.rand(6, 60)),
+                              b.const(b.rand(6, scale=0.1))], transB=1)
+        manifest, ops = self.check_numeric(b.model([("x", [1, 4, 3, 5])], [(out, [1, 6])]),
+                                           (1, 4, 3, 5))
+        self.assertEqual(ops.count(hx.TRANSPOSE), 1, ops)
+        self.assertEqual(ops.count(hx.RESHAPE), 1, ops)
+        for perm in ([0, 2, 3, 1], [0, 3, 2, 1], [0, 1, 3, 2], [0, 3, 1, 2], [0, 2, 1, 3],
+                     [0, 1, 2, 3]):
+            with self.subTest(perm=perm):  # each permutation followed by a 1x1 convolution
+                b = Builder(seed=27)
+                t = b.node("Transpose", ["x"], perm=perm)
+                dims = [[1, 4, 3, 5][i] for i in perm]
+                out = b.conv(t, dims[1], 6, k=1, bias=False)
+                self.check_numeric(b.model([("x", [1, 4, 3, 5])],
+                                           [(out, [1, 6, dims[2], dims[3]])]), (1, 4, 3, 5))
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_slice_matches_onnxruntime(self):
+        b = Builder(seed=17)
+        out = b.node("Slice", ["x", b.const(np.array([1, 2, 3], np.int64)),
+                               b.const(np.array([15, 8, -1], np.int64)),
+                               b.const(np.array([1, 2, 3], np.int64))])  # C, H and W offsets
+        out = b.node("Relu", [out])
+        manifest, ops = self.check_numeric(
+            b.model([("x", [1, 20, 9, 11])], [(out, [1, 14, 6, 7])]), (1, 20, 9, 11))
+        self.assertEqual(ops.count(hx.SLICE), 1)
+        b = Builder(seed=18)  # rank 2: channel slice of a flat tensor
+        out = b.node("Slice", ["x", b.const(np.array([3], np.int64)),
+                               b.const(np.array([17], np.int64)), b.const(np.array([1], np.int64))])
+        self.check_numeric(b.model([("x", [1, 20])], [(out, [1, 14])]), (1, 20))
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_split_matches_onnxruntime(self):
+        b = Builder(seed=19)  # explicit sizes as an input
+        o1, o2, o3 = b.name("split"), b.name("split"), b.name("split")
+        b.nodes.append(helper.make_node("Split", ["x", b.const(np.array([8, 4, 8], np.int64))],
+                                        [o1, o2, o3], axis=1))
+        outs = [(b.node("Relu", [o1]), [1, 8, 6, 6]), (o2, [1, 4, 6, 6]),
+                (b.conv(o3, 8, 4, k=1, bias=False), [1, 4, 6, 6])]
+        manifest, ops = self.check_numeric(b.model([("x", [1, 20, 6, 6])], outs), (1, 20, 6, 6))
+        self.assertEqual(ops.count(hx.SLICE), 3)
+        b = Builder(seed=20)  # equal split, no sizes input
+        o1, o2, o3 = (b.name("split") for _ in range(3))
+        b.nodes.append(helper.make_node("Split", ["x"], [o1, o2, o3], axis=1))
+        self.check_numeric(b.model([("x", [1, 12, 5, 5])],
+                                   [(o, [1, 4, 5, 5]) for o in (o1, o2, o3)]), (1, 12, 5, 5))
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_grouped_convolution_matches_onnxruntime(self):
+        for group, ic, co, seed in ((2, 10, 6, 21), (4, 8, 12, 22)):  # 8 -> 12 needs no padding
+            with self.subTest(group=group, ic=ic, co=co):
+                b = Builder(seed=seed)
+                out = b.node("Relu", [b.conv("x", ic, co, group=group)])
+                m = b.model([("x", [1, ic, 6, 6])], [(out, [1, co, 6, 6])])
+                manifest, ops = self.check_numeric(m, (1, ic, 6, 6))
+                self.assertEqual(ops.count(hx.SLICE), group, ops)
+                self.assertEqual(ops.count(hx.CONV), group, ops)
+                self.assertEqual(ops.count(hx.CONCAT), group - 1, ops)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_dilated_convolution_matches_onnxruntime(self):
+        # (name, build, input shape, output shape, z of each convolution or depthwise op)
+        cases = [
+            ("dense d2", lambda b: b.conv("x", 3, 8, dilations=[2, 2], pads=[2, 2, 2, 2]),
+             (1, 3, 10, 10), (1, 8, 10, 10), [0x202]),
+            ("dense d3 stride 2",
+             lambda b: b.conv("x", 3, 8, dilations=[3, 3], strides=[2, 2], pads=[3, 3, 3, 3]),
+             (1, 3, 10, 10), (1, 8, 5, 5), [0x303]),
+            ("dense d(1,2) asymmetric pads",
+             lambda b: b.conv("x", 3, 8, dilations=[1, 2], pads=[1, 2, 1, 2]),
+             (1, 3, 10, 10), (1, 8, 10, 10), [0x102]),
+            ("depthwise d2",
+             lambda b: b.conv("x", 4, 4, group=4, dilations=[2, 2], pads=[2, 2, 2, 2]),
+             (1, 4, 8, 8), (1, 4, 8, 8), [0x202]),
+            ("depthwise d3 stride 2",
+             lambda b: b.conv("x", 4, 4, group=4, dilations=[3, 3], strides=[2, 2],
+                              pads=[3, 3, 3, 3]),
+             (1, 4, 9, 9), (1, 4, 5, 5), [0x303]),
+            ("grouped d2",
+             lambda b: b.conv("x", 4, 6, group=2, dilations=[2, 2], pads=[2, 2, 2, 2]),
+             (1, 4, 8, 8), (1, 6, 8, 8), [0x202, 0x202]),
+        ]
+        for name, build, in_shape, out_shape, zs in cases:
+            with self.subTest(name):
+                b = Builder(seed=31)
+                out = build(b)
+                m = b.model([("x", list(in_shape))], [(out, list(out_shape))])
+                _, ops = self.check_numeric(m, in_shape)
+                with tempfile.TemporaryDirectory() as tmp:
+                    lower_model(m, tmp)
+                    image = (Path(tmp) / "g.hxfg").read_bytes()
+                    tensors, count = struct.unpack_from("<2I", image, 12)
+                    fields = [struct.unpack_from("<4I", image, 256 + 32 * tensors + 64 * i)
+                              for i in range(count)]  # kind, x, y, z
+                got = [z for kind, _, _, z in fields if kind in (hx.CONV, hx.DEPTHWISE)]
+                self.assertEqual(got, zs)
+                self.assertTrue(all(z == hx.NONE for kind, _, _, z in fields
+                                    if kind not in (hx.CONV, hx.DEPTHWISE)))
+
+    @staticmethod
+    def conv_transpose(b, x, ci, co, k, bias=True, **attrs):
+        w = b.const(b.rand(ci, co, k, k))  # ONNX layout [in, out/group, kh, kw]
+        ins = [x, w] + ([b.const(b.rand(co, scale=0.1))] if bias else [])
+        return b.node("ConvTranspose", ins, **attrs)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_conv_transpose_matches_onnxruntime(self):
+        cases = [  # stride 2, k3, pad 1, output_padding 1: 5x5 -> 10x10
+            dict(seed=31, ih=5, ci=4, co=6, k=3, strides=[2, 2], pads=[1, 1, 1, 1],
+                 output_padding=[1, 1], out=10),
+            # stride 2, k4, pad 1: 6x6 -> 12x12 (output is exactly 2x)
+            dict(seed=32, ih=6, ci=3, co=5, k=4, strides=[2, 2], pads=[1, 1, 1, 1], out=12),
+            # stride 1, k3, no pad: 6x6 -> 8x8, then BatchNorm and ReLU that must fold/fuse
+            dict(seed=33, ih=6, ci=3, co=4, k=3, strides=[1, 1], pads=[0, 0, 0, 0], out=8,
+                 fold=True),
+        ]
+        for case in cases:
+            with self.subTest(**{k: v for k, v in case.items() if k != "seed"}):
+                b = Builder(seed=case["seed"])
+                attrs = {k: case[k] for k in ("strides", "pads", "output_padding") if k in case}
+                out = self.conv_transpose(b, "x", case["ci"], case["co"], case["k"], **attrs)
+                if case.get("fold"):
+                    out = b.node("Relu", [b.bn(out, case["co"])])
+                else:
+                    out = b.node("Relu", [out])
+                n = case["out"]
+                m = b.model([("x", [1, case["ci"], case["ih"], case["ih"]])],
+                            [(out, [1, case["co"], n, n])])
+                manifest, ops = self.check_numeric(m, (1, case["ci"], case["ih"], case["ih"]))
+                self.assertEqual(ops.count(hx.ZEROINSERT), 1, ops)
+                self.assertEqual(ops.count(hx.CONV), 1, ops)
+                self.assertEqual(ops.count(hx.ACT), 0, ops)  # ReLU fused into the convolution
+                if case.get("fold"):
+                    self.assertEqual(ops.count(hx.BINARY), 0, ops)  # BatchNorm folded
+
+    def test_conv_transpose_rejections(self):
+        def build(**attrs):
+            b = Builder()
+            out = self.conv_transpose(b, "x", 3, 4, 3, bias=False, **attrs)
+            return b, out
+
+        def model(b, out, n):
+            return b.model([("x", [1, 3, 6, 6])], [(out, [1, 4, n, n])])
+
+        cases = []
+        b = Builder()  # group 2 needs input channels divisible by the group count
+        grouped = b.node("ConvTranspose", ["x", b.const(b.rand(4, 2, 3, 3))], group=2)
+        cases.append((b.model([("x", [1, 4, 6, 6])], [(grouped, [1, 4, 8, 8])]),
+                      "groups other than 1"))
+        b, out = build(dilations=[2, 2])
+        cases.append((model(b, out, 10), "dilation"))
+        b, out = build(auto_pad="SAME_UPPER")
+        cases.append((model(b, out, 6), "auto_pad"))
+        b, out = build(output_shape=[8, 8])  # spatial sizes only
+        cases.append((model(b, out, 8), "output_shape"))
+        b, out = build(pads=[3, 3, 3, 3])  # k-1-p = -1: the padded input would need a negative pad
+        cases.append((model(b, out, 2), "must not exceed"))
+        b = Builder()  # weights from a graph input (batch one, so the input is accepted)
+        wv = b.node("ConvTranspose", ["x", "w"])
+        cases.append((b.model([("x", [1, 1, 6, 6]), ("w", [1, 3, 4, 3])],
+                              [(wv, [1, 3, 9, 8])]), "weights must be a constant"))
+        for m, text in cases:
+            with self.subTest(text), tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaisesRegex(ValueError, text):
+                    lower_model(m, tmp)
 
     def test_rejections_name_the_node(self):
-        def softmax():
+        def softmax():  # opset 13+ default axis -1 is W for rank 4: not the channel axis
             b = Builder()
-            return b.model([("x", [1, 8, 4, 4])], [(b.node("Softmax", ["x"], axis=1), [1, 8, 4, 4])])
+            return b.model([("x", [1, 8, 4, 4])], [(b.node("Softmax", ["x"]), [1, 8, 4, 4])])
 
-        def dilated():
+        def dilated():  # dilations above 8 have no HXFG encoding
             b = Builder()
-            out = b.conv("x", 3, 8, dilations=[2, 2], pads=[2, 2, 2, 2])
-            return b.model([("x", [1, 3, 8, 8])], [(out, [1, 8, 8, 8])])
+            out = b.conv("x", 3, 8, dilations=[9, 9], pads=[9, 9, 9, 9])
+            return b.model([("x", [1, 3, 20, 20])], [(out, [1, 8, 20, 20])])
 
-        def grouped():
+        def grouped():  # 7 output channels cannot split into two groups
             b = Builder()
-            return b.model([("x", [1, 4, 8, 8])], [(b.conv("x", 4, 8, group=2), [1, 8, 8, 8])])
+            return b.model([("x", [1, 4, 8, 8])], [(b.conv("x", 4, 7, group=2), [1, 7, 8, 8])])
 
-        def flatten_spatial():
+        def transpose_batch():  # the batch axis may not move
             b = Builder()
-            return b.model([("x", [1, 4, 2, 2])], [(b.node("Flatten", ["x"]), [1, 16])])
+            out = b.node("Transpose", ["x"], perm=[1, 0, 2, 3])
+            return b.model([("x", [1, 4, 2, 2])], [(out, [4, 1, 2, 2])])
+
+        def transpose_rank2():
+            b = Builder()
+            out = b.node("Transpose", ["x"], perm=[0, 1])
+            return b.model([("x", [1, 4])], [(out, [1, 4])])
 
         def tanh_gelu():
             b = Builder()
@@ -262,14 +550,256 @@ class FloatOnnxTests(unittest.TestCase):
             b = Builder()
             return b.model([("x", [1, 4, 2, 2])], [(b.node("Identity", ["x"]), [1, 4, 2, 2])])
 
+        def nearest_round():
+            b = Builder()
+            out = b.node("Resize", ["x", "", "", b.const(np.array([1, 4, 8, 8], np.int64))],
+                         mode="nearest")
+            return b.model([("x", [1, 4, 4, 4])], [(out, [1, 4, 8, 8])])
+
         for build, text in [
-            (softmax, "Softmax"), (dilated, "dilation"), (grouped, "groups"),
-            (flatten_spatial, "mixes spatial"), (tanh_gelu, "erf"),
+            (softmax, "channel axis"), (dilated, "between 1 and 8"), (grouped, "groups"),
+            (transpose_batch, "batch axis"), (transpose_rank2, "rank-4"), (tanh_gelu, "erf"),
             (spatial_const, "per-channel"), (passthrough, "graph input"),
+            (nearest_round, "nearest resize needs"),
         ]:
             with self.subTest(text), tempfile.TemporaryDirectory() as tmp:
                 with self.assertRaisesRegex(ValueError, text):
                     lower_model(build(), tmp)
+
+    def test_reduction_rejections_name_the_node(self):
+        def batch_axis():
+            b = Builder()
+            out = b.node("ReduceSum", ["x", b.const(np.array([0], np.int64))], keepdims=1)
+            return b.model([("x", [1, 4, 2, 2])], [(out, [1, 4, 2, 2])], opset=20)
+
+        def empty_axes():  # empty axes reduce everything, which HXFG does not express
+            b = Builder()
+            out = b.node("ReduceSum", ["x", b.const(np.array([], np.int64))], keepdims=1)
+            return b.model([("x", [1, 4, 2, 2])], [(out, [1, 1, 1, 1])], opset=20)
+
+        def channel_dropped():  # [1, H, W] has no HWC form: keepdims=1 is required
+            b = Builder()
+            out = b.node("ReduceMax", ["x"], axes=[1], keepdims=0)
+            return b.model([("x", [1, 4, 2, 2])], [(out, [1, 2, 2])], opset=17)
+
+        def keepdims_layout():  # keepdims=0 over (C, H) would need a [1, W, 1] layout
+            b = Builder()
+            out = b.node("ReduceSum", ["x", b.const(np.array([1, 2], np.int64))], keepdims=0)
+            return b.model([("x", [1, 4, 2, 3])], [(out, [1, 3])], opset=20)
+
+        for build, text in [(batch_axis, "batch axis"), (empty_axes, "empty axes"),
+                            (channel_dropped, "keepdims=1"), (keepdims_layout, "keepdims layout")]:
+            with self.subTest(text), tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaisesRegex(ValueError, text):
+                    lower_model(build(), tmp)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_channel_reductions_match_onnxruntime(self):
+        b = Builder(seed=23)
+        y = b.conv("x", 3, 8)
+        mx = b.node("ReduceMax", [y], axes=[1], keepdims=1)  # attribute axes, opset 17
+        mn = b.node("ReduceMin", [y], axes=[1], keepdims=1)
+        avg = b.node("ReduceMean", [y], axes=[1], keepdims=1)  # channel mean: HX_REDUCE, not MEAN
+        m = b.model([("x", [1, 3, 8, 8])],
+                    [(mx, [1, 1, 8, 8]), (mn, [1, 1, 8, 8]), (avg, [1, 1, 8, 8])], opset=17)
+        _, ops = self.check_numeric(m, (1, 3, 8, 8))
+        self.assertEqual(ops.count(hx.REDUCE), 3, ops)
+        self.assertNotIn(hx.MEAN, ops)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_spatial_attention_pattern_matches_onnxruntime(self):
+        b = Builder(seed=29)
+        y = b.node("Relu", [b.conv("x", 3, 8)])  # [1, 8, 8, 8]
+        avg = b.node("ReduceMean", [y, b.const(np.array([1], np.int64))], keepdims=1)
+        mx = b.node("ReduceMax", [y, b.const(np.array([1], np.int64))], keepdims=1)
+        att = b.node("Sigmoid", [b.conv(b.node("Concat", [avg, mx], axis=1), 2, 1, k=7)])
+        out = b.node("Mul", [y, att])  # [1, 8, 8, 8] times a [1, 1, 8, 8] map
+        m = b.model([("x", [1, 3, 8, 8])], [(out, [1, 8, 8, 8])], opset=20)
+        _, ops = self.check_numeric(m, (1, 3, 8, 8))
+        self.assertEqual(ops.count(hx.REDUCE), 2, ops)
+        self.assertNotIn(hx.MEAN, ops)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_spatial_reductions_match_onnxruntime(self):
+        b = Builder(seed=31)
+        y = b.node("Relu", [b.conv("x", 3, 40)])  # 40 channels: two channel blocks
+        total = b.node("ReduceSum", [y, b.const(np.array([2, 3], np.int64))], keepdims=0)
+        low = b.node("ReduceMin", [y, b.const(np.array([2, 3], np.int64))], keepdims=0)
+        peak = b.node("GlobalMaxPool", [y])  # [1, 40, 1, 1]
+        m = b.model([("x", [1, 3, 8, 8])],
+                    [(total, [1, 40]), (low, [1, 40]), (peak, [1, 40, 1, 1])], opset=20)
+        _, ops = self.check_numeric(m, (1, 3, 8, 8))
+        self.assertEqual(ops.count(hx.REDUCE), 3, ops)
+        self.assertNotIn(hx.MEAN, ops)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_instance_norm_after_conv_matches_onnxruntime(self):
+        b = Builder(seed=23)
+        scale, bias = b.const(b.rng.uniform(0.5, 1.5, 8)), b.const(b.rand(8, scale=0.2))
+        n = b.node("InstanceNormalization", [b.conv("x", 3, 8), scale, bias], epsilon=1e-5)
+        out = b.node("Relu", [n])
+        m = b.model([("x", [1, 3, 8, 8])], [(out, [1, 8, 8, 8])])
+        _, ops = self.check_numeric(m, (1, 3, 8, 8))
+        self.assertEqual(ops.count(hx.NORM), 1, ops)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_group_norm_matches_onnxruntime_for_both_opsets(self):
+        # Opset 18 gives one scale and bias per group; opset 21 gives one per channel.
+        for opset, size in ((18, 2), (21, 8)):
+            with self.subTest(opset=opset):
+                b = Builder(seed=29 + opset)
+                scale = b.const(b.rng.uniform(0.5, 1.5, size))
+                bias = b.const(b.rand(size, scale=0.2))
+                n = b.node("GroupNormalization", [b.conv("x", 3, 8), scale, bias],
+                           num_groups=2, epsilon=1e-5)
+                m = b.model([("x", [1, 3, 8, 8])], [(n, [1, 8, 8, 8])], opset=opset,
+                            check=opset != 18)
+                _, ops = self.check_numeric(m, (1, 3, 8, 8))
+                self.assertEqual(ops.count(hx.NORM), 1, ops)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_layer_norm_over_channels_matches_onnxruntime(self):
+        b = Builder(seed=31)
+        h = b.node("Gemm", ["x", b.const(b.rand(12, 16)), b.const(b.rand(12, scale=0.1))],
+                   transB=1)
+        scale, bias = b.const(b.rng.uniform(0.5, 1.5, 12)), b.const(b.rand(12, scale=0.2))
+        out = b.node("LayerNormalization", [h, scale, bias], axis=-1, epsilon=1e-5)
+        m = b.model([("x", [1, 16])], [(out, [1, 12])], opset=17)
+        _, ops = self.check_numeric(m, (1, 16))
+        self.assertEqual(ops.count(hx.NORM), 1, ops)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_layer_norm_over_chw_with_spatially_constant_affine_matches_onnxruntime(self):
+        b = Builder(seed=37)
+        y = b.conv("x", 3, 4)
+        # The scale and bias have the normalised shape [C, H, W], constant over H and W here.
+        gamma = np.broadcast_to(b.rng.uniform(0.5, 1.5, (4, 1, 1)), (4, 8, 8)).astype(np.float32)
+        beta = np.broadcast_to(b.rand(4, 1, 1, scale=0.2), (4, 8, 8)).astype(np.float32)
+        out = b.node("LayerNormalization", [y, b.const(gamma), b.const(beta)], axis=1)
+        m = b.model([("x", [1, 3, 8, 8])], [(out, [1, 4, 8, 8])], opset=17)
+        _, ops = self.check_numeric(m, (1, 3, 8, 8))
+        self.assertEqual(ops.count(hx.NORM), 1, ops)
+
+    def test_normalisation_rejections_name_the_node(self):
+        def layer_norm_axis():  # rank 4 normalises over (C, H, W): axis 2 is not supported
+            b = Builder()
+            out = b.node("LayerNormalization", ["x", b.const(np.ones((4, 2, 2), np.float32))],
+                         axis=2)
+            return b.model([("x", [1, 4, 2, 2])], [(out, [1, 4, 2, 2])], opset=17)
+
+        def layer_norm_mean_used():
+            b = Builder()
+            y, mean = b.name("y"), b.name("mean")
+            scale, bias = b.const(np.ones(8, np.float32)), b.const(np.zeros(8, np.float32))
+            b.nodes.append(helper.make_node("LayerNormalization", ["x", scale, bias], [y, mean],
+                                            axis=-1))
+            return b.model([("x", [1, 8])], [(y, [1, 8]), (mean, [1, 1])], opset=17)
+
+        def layer_norm_spatial_scale():  # varies over H and W: not a per-channel vector
+            b = Builder()
+            out = b.node("LayerNormalization", ["x", b.const(b.rand(4, 2, 2))], axis=1)
+            return b.model([("x", [1, 4, 2, 2])], [(out, [1, 4, 2, 2])], opset=17)
+
+        def group_norm_divisor():
+            b = Builder()
+            out = b.node("GroupNormalization", ["x", b.const(b.rand(3)), b.const(b.rand(3))],
+                         num_groups=3)
+            return b.model([("x", [1, 8, 2, 2])], [(out, [1, 8, 2, 2])], opset=21)
+
+        def group_norm_size():  # 5 values are neither per group (2) nor per channel (8)
+            b = Builder()
+            out = b.node("GroupNormalization", ["x", b.const(b.rand(5)), b.const(b.rand(5))],
+                         num_groups=2)
+            return b.model([("x", [1, 8, 2, 2])], [(out, [1, 8, 2, 2])], opset=21)
+
+        def instance_norm_rank2():
+            b = Builder()
+            out = b.node("InstanceNormalization", ["x", b.const(b.rand(8)), b.const(b.rand(8))])
+            return b.model([("x", [1, 8])], [(out, [1, 8])])
+
+        def norm_scale_not_constant():
+            b = Builder()
+            out = b.node("InstanceNormalization", ["x", "s", b.const(b.rand(4))])
+            return b.model([("x", [1, 4, 2, 2]), ("s", [1, 4])], [(out, [1, 4, 2, 2])])
+
+        for build, text in [
+            (layer_norm_axis, "axis 1"), (layer_norm_mean_used, "Mean and InvStdDev"),
+            (layer_norm_spatial_scale, "constant over the spatial axes"),
+            (group_norm_divisor, "must divide"), (group_norm_size, "per group"),
+            (instance_norm_rank2, "rank-4"), (norm_scale_not_constant, "must be constant"),
+        ]:
+            with self.subTest(text), tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaisesRegex(ValueError, text):
+                    lower_model(build(), tmp)
+
+
+def model_hygiene():
+    """Shapes of what torch.onnx.export emits without folding: an Identity-wrapped initializer as
+    a bias, a Shape/Slice/Mul/Concat chain feeding a Resize size, a Shape/Gather/Unsqueeze/Concat
+    chain feeding a Reshape, a dead Shape node, Squeeze with constant axes through a rank-3
+    intermediate, a float32 Cast and a Gemm head (batch one, 3x8x8)."""
+    b = Builder(seed=23)
+    w = b.const(b.rand(8, 3, 3, 3))
+    bias = b.node("Identity", [b.const(b.rand(8, scale=0.1))])
+    y = b.node("Relu", [b.node("Conv", ["x", w, bias], pads=[1, 1, 1, 1], kernel_shape=[3, 3])])
+    b.node("Shape", ["x"])  # dead: nothing reads it
+    hw = b.node("Mul", [
+        b.node("Slice", [b.node("Shape", [y]), b.const(np.array([2], np.int64)),
+                         b.const(np.array([4], np.int64))]),
+        b.const(np.array([2, 2], np.int64)),
+    ])
+    sizes = b.node("Concat", [b.const(np.array([1, 8], np.int64)), hw], axis=0)
+    up = b.node("Resize", [y, "", "", sizes], mode="nearest",
+                coordinate_transformation_mode="asymmetric", nearest_mode="floor")
+    batch = b.node("Unsqueeze", [
+        b.node("Gather", [b.node("Shape", [up]), b.const(np.array(0, np.int64))]),
+        b.const(np.array([0], np.int64)),
+    ])
+    view = b.node("Concat", [batch, b.const(np.array([8, 16, 16], np.int64))], axis=0)
+    back = b.node("Reshape", [up, view])
+    g = b.node("GlobalAveragePool", [back])
+    s = b.node("Squeeze", [b.node("Squeeze", [g, b.const(np.array([3], np.int64))]),
+                           b.const(np.array([2], np.int64))])
+    c = b.node("Cast", [s], to=TensorProto.FLOAT)
+    out = b.node("Gemm", [c, b.const(b.rand(4, 8)), b.const(b.rand(4, scale=0.1))], transB=1)
+    return b.model([("x", [1, 3, 8, 8])], [(out, [1, 4])])
+
+
+@unittest.skipIf(onnx is None, "offline onnx package not installed")
+class ExportHygieneTests(unittest.TestCase):
+    """Constant folding and shape-chain resolution for exporter hygiene (hand-built, no torch)."""
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_hygiene_chains_fold_and_match_onnxruntime(self):
+        m = model_hygiene()
+        x = np.random.default_rng(29).normal(0, 1, (1, 3, 8, 8)).astype(np.float32)
+        want = onnxruntime.InferenceSession(
+            m.SerializeToString(), providers=["CPUExecutionProvider"]).run(None, {"x": x})
+        with tempfile.TemporaryDirectory() as tmp:
+            lower_model(m, tmp)
+            got = list(run_reference(tmp, x))
+            self.assertEqual(len(got), 1)
+            np.testing.assert_allclose(got[0], want[0][0], rtol=2e-4, atol=2e-4)
+            # Shape chains, the Identity bias, the Cast, the Squeezes and the dead Shape emit
+            # nothing: one convolution (ReLU fused), Resize, mean and the Gemm convolution.
+            self.assertEqual(kinds(tmp), [hx.CONV, hx.RESIZE, hx.MEAN, hx.CONV])
+
+    def test_only_float32_casts_are_lowered(self):
+        b = Builder()
+        c = b.node("Cast", ["x"], to=TensorProto.INT64)
+        m = b.model([("x", [1, 4, 2, 2])], [(b.node("Cast", [c], to=TensorProto.FLOAT),
+                                             [1, 4, 2, 2])])
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(ValueError, "float32"):
+            lower_model(m, tmp)
+
+    def test_constant_pool_over_the_runtime_limit_is_rejected(self):
+        b = Builder()
+        out = b.conv("x", 3, 8)  # 216 weights: 864 bytes of constants
+        m = b.model([("x", [1, 3, 8, 8])], [(out, [1, 8, 8, 8])])
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(lowering, "CONSTANT_POOL_LIMIT", 256):
+            with self.assertRaisesRegex(ValueError, "constant pool"):
+                lower_model(m, tmp)
 
 
 if __name__ == "__main__":

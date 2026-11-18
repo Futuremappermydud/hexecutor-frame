@@ -14,11 +14,14 @@ import numpy as np
 NONE = 0xFFFFFFFF
 # Values of the HX_* operation enum in hexecutor/native/tensor/graph.h.
 (CONV, DEPTHWISE, ADD, PRELU, MAXPOOL, PAD, RESIZE, RESHAPE, CONCAT, MEAN, LOGISTIC, ACT, BINARY,
- AVGPOOL) = range(1, 15)
-# HX_ACT functions and HX_BINARY operations (graph.h).
+ AVGPOOL, SOFTMAX, SLICE, ZEROINSERT, TRANSPOSE, REDUCE, NORM) = range(1, 21)
+# HX_ACT functions, HX_BINARY and HX_REDUCE operations (graph.h).
 (FN_RELU, FN_RELU6, FN_HARDSWISH, FN_HARDSIGMOID, FN_SILU, FN_TANH, FN_LEAKY,
- FN_GELU) = range(8)
+ FN_GELU, FN_EXP, FN_SQRT, FN_ABS, FN_NEG, FN_ERF) = range(13)
 BIN_ADD, BIN_SUB, BIN_MUL = range(3)
+# HX_NORM modes (graph.h): per pixel over channels, or per group of channels over all pixels.
+NORM_CHANNEL, NORM_GROUP = range(2)
+RED_MEAN, RED_SUM, RED_MAX, RED_MIN = range(4)
 
 
 def f32_bits(value):
@@ -69,6 +72,25 @@ def hmx_fits(tiles, out_stride):
     )
 
 
+def tensor_refs(op):
+    """Tensor-id fields (x, y, z, out) of an op. A conv/depthwise z is a raw dilation, not an id."""
+    z = NONE if op[0] in (CONV, DEPTHWISE) else op[3]
+    return [op[1], op[2], z, op[4]]
+
+
+def dilation_z(op):
+    """Encoded z for a conv/depthwise op: NONE for dilation 1, else (dh << 8) | dw (1..8 each)."""
+    z = op[3]
+    if z == NONE:
+        return NONE
+    dh, dw = (z >> 8) & 0xFF, z & 0xFF
+    if op[0] not in (CONV, DEPTHWISE) or z >> 16 or not (1 <= dh <= 8 and 1 <= dw <= 8) or (
+        dh == 1 and dw == 1
+    ):
+        raise ValueError(f"invalid z {z:#x} on op kind {op[0]}")
+    return z
+
+
 def write(ops, inputs, outputs, hwc, stride, pool, destination, manifest):
     """Allocate activations and write `<destination>.hxfg/.bin/.json`.
 
@@ -79,12 +101,12 @@ def write(ops, inputs, outputs, hwc, stride, pool, destination, manifest):
     """
     pool = pool.data if isinstance(pool, ConstantPool) else pool
     active = sorted(
-        set(inputs + outputs + [i for op in ops for i in op[1:5] if i != NONE])
+        set(inputs + outputs + [i for op in ops for i in tensor_refs(op) if i != NONE])
     )
     ids = {old: new for new, old in enumerate(active)}
     last = {i: -1 for i in active}
     for j, op in enumerate(ops):
-        for i in op[1:4]:
+        for i in tensor_refs(op)[:3]:
             if i != NONE:
                 last[i] = j
     for i in outputs:
@@ -128,7 +150,15 @@ def write(ops, inputs, outputs, hwc, stride, pool, destination, manifest):
         struct.pack("<8I", offsets[i], *hwc(i), stride(i), 0, 0, 0) for i in active
     )
     packed_ops = b"".join(
-        struct.pack("<16I", op[0], *(ids.get(i, NONE) for i in op[1:5]), *op[5:])
+        struct.pack(
+            "<16I",
+            op[0],
+            ids.get(op[1], NONE),
+            ids.get(op[2], NONE),
+            dilation_z(op) if op[0] in (CONV, DEPTHWISE) else ids.get(op[3], NONE),
+            ids.get(op[4], NONE),
+            *op[5:],
+        )
         for op in ops
     )
     io = struct.pack(

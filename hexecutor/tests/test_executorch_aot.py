@@ -10,6 +10,7 @@ runs the portable CPU reference (build/bin/hexecutor_tensor_run) only when that
 binary exists.
 """
 
+import os
 import struct
 import tempfile
 import unittest
@@ -39,7 +40,7 @@ except ImportError:
     HAVE_EXECUTORCH = False
 
 ROOT = Path(__file__).resolve().parents[2]
-RUNNER = ROOT / "build/bin/hexecutor_tensor_run"
+RUNNER = Path(os.environ.get("HEXECUTOR_TENSOR_RUN", ROOT / "build/bin/hexecutor_tensor_run"))
 
 
 class Tiny(nn.Module):
@@ -97,9 +98,20 @@ class ModernOps(nn.Module):
         return z - w                      # tensor - tensor, same shape
 
 
-class SoftmaxOnly(nn.Module):
+class CumsumOnly(nn.Module):  # cumsum is not in the HXFG operation set
     def forward(self, x):
-        return torch.softmax(x, dim=1)
+        return torch.cumsum(x, dim=1)
+
+
+class NearestUp(nn.Module):
+    """conv3x3 + ReLU, then nearest resize to a non-integer 5x7 (sizes given, no scales)."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(3, 8, 3, padding=1)
+
+    def forward(self, x):
+        return F.interpolate(F.relu(self.conv(x)), size=(5, 7), mode="nearest")
 
 
 class ConvSoftmax(nn.Module):
@@ -109,6 +121,74 @@ class ConvSoftmax(nn.Module):
 
     def forward(self, x):
         return torch.softmax(torch.relu(self.conv(x)), dim=1)
+
+
+class ConvCumsumTail(nn.Module):  # unsupported tail: stays on the CPU
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(3, 8, 3, padding=1)
+
+    def forward(self, x):
+        return torch.cumsum(torch.relu(self.conv(x)), dim=1)
+
+
+class ConvTransposeUp(nn.Module):
+    """Transposed convolution stride 2 (5x5 -> 10x10) with a fused ReLU."""
+
+    def __init__(self):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(4, 6, 3, stride=2, padding=1, output_padding=1)
+
+    def forward(self, x):
+        return F.relu(self.up(x))
+
+
+class PermuteFlatten(nn.Module):
+    """conv + ReLU, permute to NHWC, a 1x1 convolution, a flatten of its NCHW output, then a 1x1
+    convolution standing in for a linear layer (nn.Linear exports as addmm, which is not
+    delegated). A view that directly follows a permute gets a dim-order clone at the delegate
+    boundary, so the permute is consumed by a convolution inside the delegate instead."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(3, 8, 3, padding=1)
+        self.pw = nn.Conv2d(16, 8, 1)
+        self.fc = nn.Conv2d(1024, 10, 1)
+
+    def forward(self, x):
+        y = self.pw(F.relu(self.conv(x)).permute(0, 2, 3, 1))  # [1, 8, 16, 8]
+        return self.fc(y.reshape(1, 1024, 1, 1))
+
+
+class ViewMix(nn.Module):
+    """conv + ReLU, then a view that moves spatial extent into channels, then a 1x1 convolution."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(3, 8, 3, padding=1)
+        self.pw = nn.Conv2d(16, 4, 1)
+
+    def forward(self, x):
+        return self.pw(F.relu(self.conv(x)).reshape(1, 16, 8, 16))
+
+
+class PermuteOut(nn.Module):
+    """conv + ReLU, then a permute whose 4-D result is the delegate output."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(3, 8, 3, padding=1)
+
+    def forward(self, x):
+        return F.relu(self.conv(x)).permute(0, 2, 3, 1)
+
+
+def ops_of(parsed):
+    """Operation kinds of a parsed HXFG image, in order."""
+    count = struct.unpack_from("<I", parsed.image, 16)[0]
+    tensors = struct.unpack_from("<I", parsed.image, 12)[0]
+    return [struct.unpack_from("<I", parsed.image, 256 + 32 * tensors + 64 * i)[0]
+            for i in range(count)]
 
 
 def delegate_payloads(program):
@@ -168,16 +248,39 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(ops, 4)  # conv(+relu), depthwise, add, logistic
 
     def test_unsupported_operation_is_left_on_cpu(self):
-        program = export_program(SoftmaxOnly(), (torch.randn(1, 4, 8, 8),))
+        program = export_program(CumsumOnly(), (torch.randn(1, 4, 8, 8),))
         self.assertEqual(delegate_payloads(program), [])
 
+    def test_conv_softmax_is_fully_delegated(self):
+        delegates = delegate_payloads(export_program(ConvSoftmax(), (torch.randn(1, 3, 16, 16),)))
+        self.assertEqual(len(delegates), 1)
+        parsed = blob.unpack(delegates[0][1])
+        self.assertEqual([s.dims for s in parsed.outputs], [(1, 8, 16, 16)])
+        kinds = struct.unpack_from("<I", parsed.image, 16)[0]
+        ops = [struct.unpack_from("<I", parsed.image, 256 + 32 * struct.unpack_from("<I", parsed.image, 12)[0] + 64 * i)[0]
+               for i in range(kinds)]
+        self.assertEqual(ops.count(lowering.hx.SOFTMAX), 1)
+
     def test_unsupported_tail_stays_outside_delegate(self):
-        program = export_program(ConvSoftmax(), (torch.randn(1, 3, 16, 16),))
+        program = export_program(ConvCumsumTail(), (torch.randn(1, 3, 16, 16),))
         delegates = delegate_payloads(program)
         self.assertEqual(len(delegates), 1)
         parsed = blob.unpack(delegates[0][1])
-        # The softmax runs on the CPU, so the delegate returns the conv+ReLU tensor.
+        # The cumsum runs on the CPU, so the delegate returns the conv+ReLU tensor.
         self.assertEqual([s.dims for s in parsed.outputs], [(1, 8, 16, 16)])
+
+    @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
+    def test_conv_softmax_matches_torch_on_cpu_reference(self):
+        torch.manual_seed(3)
+        model = ConvSoftmax().eval()
+        x = torch.randn(1, 3, 16, 16)
+        with torch.no_grad():
+            want = model(x).numpy()
+        parsed = blob.unpack(delegate_payloads(export_program(model, (x,)))[0][1])
+        got = run_reference(parsed, x)
+        _, c, h, w = want.shape
+        got = got.reshape(h, w, c).transpose(2, 0, 1)[None]
+        np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
 
     @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
     def test_hxfg_matches_torch_on_cpu_reference(self):
@@ -221,6 +324,19 @@ class ExportTests(unittest.TestCase):
         got = got.reshape(h, w, c).transpose(2, 0, 1)[None]
         np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
 
+    @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
+    def test_nearest_resize_matches_torch_on_cpu_reference(self):
+        torch.manual_seed(2)
+        model = NearestUp().eval()
+        x = torch.randn(1, 3, 16, 16)
+        with torch.no_grad():
+            want = model(x).numpy()
+        parsed = blob.unpack(delegate_payloads(export_program(model, (x,)))[0][1])
+        got = run_reference(parsed, x)
+        _, c, h, w = want.shape
+        got = got.reshape(h, w, c).transpose(2, 0, 1)[None]
+        np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
+
     def test_unsupported_broadcasts_stay_on_cpu(self):
         class Outer(nn.Module):
             def forward(self, x):  # [1,C,H,1] * [1,C,1,W] broadcasts both operands
@@ -238,6 +354,218 @@ class ExportTests(unittest.TestCase):
         self.assertEqual([s.dims for s in parsed.outputs], [(1, 10)])
         # conv, maxpool, conv, prelu, concat, pad, resize, mean, linear, logistic
         self.assertEqual(struct.unpack_from("<I", parsed.image, 16)[0], 10)
+
+    def test_conv_transpose_is_fully_delegated(self):
+        model = ConvTransposeUp().eval()
+        delegates = delegate_payloads(export_program(model, (torch.randn(1, 4, 5, 5),)))
+        self.assertEqual(len(delegates), 1)
+        parsed = blob.unpack(delegates[0][1])
+        self.assertEqual([s.dims for s in parsed.outputs], [(1, 6, 10, 10)])
+        kinds = struct.unpack_from("<I", parsed.image, 16)[0]
+        ops = [struct.unpack_from("<I", parsed.image, 256 + 32 * struct.unpack_from("<I", parsed.image, 12)[0] + 64 * i)[0]
+               for i in range(kinds)]
+        # zero insertion, then a dense convolution; the ReLU is fused into the convolution
+        self.assertEqual(ops, [lowering.hx.ZEROINSERT, lowering.hx.CONV])
+
+    @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
+    def test_conv_transpose_matches_torch_on_cpu_reference(self):
+        torch.manual_seed(4)
+        for stride_pad, k in ((dict(stride=2, padding=1, output_padding=1), 3),
+                              (dict(stride=2, padding=1), 4)):
+            with self.subTest(k=k, **stride_pad):
+                model = nn.Sequential(nn.ConvTranspose2d(4, 6, k, **stride_pad), nn.ReLU()).eval()
+                x = torch.randn(1, 4, 5, 5)
+                with torch.no_grad():
+                    want = model(x).numpy()
+                parsed = blob.unpack(delegate_payloads(export_program(model, (x,)))[0][1])
+                got = run_reference(parsed, x)
+                _, c, h, w = want.shape
+                got = got.reshape(h, w, c).transpose(2, 0, 1)[None]
+                np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
+
+    @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
+    def test_dilated_convolution_matches_torch_on_cpu_reference(self):
+        torch.manual_seed(5)
+        cases = [
+            (nn.Conv2d(3, 6, 3, dilation=2, padding=2), (1, 3, 10, 10)),
+            (nn.Conv2d(3, 6, 3, dilation=(1, 3), stride=2, padding=(1, 3)), (1, 3, 11, 11)),
+            (nn.Conv2d(4, 4, 3, dilation=2, padding=2, groups=4), (1, 4, 8, 8)),  # depthwise
+        ]
+        for conv, shape in cases:
+            with self.subTest(conv=str(conv)):
+                model = nn.Sequential(conv, nn.ReLU()).eval()
+                x = torch.randn(*shape)
+                with torch.no_grad():
+                    want = model(x).numpy()
+                delegates = delegate_payloads(export_program(model, (x,)))
+                self.assertEqual(len(delegates), 1)
+                parsed = blob.unpack(delegates[0][1])
+                got = run_reference(parsed, x)
+                _, c, h, w = want.shape
+                got = got.reshape(h, w, c).transpose(2, 0, 1)[None]
+                np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
+
+    @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
+    def test_permute_then_flatten_matches_torch_on_cpu_reference(self):
+        torch.manual_seed(5)
+        model = PermuteFlatten().eval()
+        x = torch.randn(1, 3, 16, 16)
+        with torch.no_grad():
+            want = model(x).numpy()
+        delegates = delegate_payloads(export_program(model, (x,)))
+        self.assertEqual(len(delegates), 1)
+        parsed = blob.unpack(delegates[0][1])
+        kinds = ops_of(parsed)
+        self.assertIn(lowering.hx.TRANSPOSE, kinds)  # permute: nothing falls back to the CPU
+        self.assertIn(lowering.hx.RESHAPE, kinds)
+        got = run_reference(parsed, x)
+        np.testing.assert_allclose(got.reshape(want.shape), want, rtol=1e-3, atol=1e-3)
+
+    @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
+    def test_view_mixing_spatial_and_channel_order_matches_torch_on_cpu_reference(self):
+        torch.manual_seed(6)
+        model = ViewMix().eval()
+        x = torch.randn(1, 3, 16, 16)
+        with torch.no_grad():
+            want = model(x).numpy()
+        delegates = delegate_payloads(export_program(model, (x,)))
+        self.assertEqual(len(delegates), 1)
+        parsed = blob.unpack(delegates[0][1])
+        self.assertEqual(ops_of(parsed).count(lowering.hx.RESHAPE), 2)  # flatten, unflatten
+        got = run_reference(parsed, x)
+        _, c, h, w = want.shape
+        got = got.reshape(h, w, c).transpose(2, 0, 1)[None]
+        np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-3)
+
+    @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
+    def test_permute_output_matches_torch_on_cpu_reference(self):
+        torch.manual_seed(7)
+        model = PermuteOut().eval()
+        x = torch.randn(1, 3, 16, 16)
+        with torch.no_grad():
+            want = model(x).numpy()
+        delegates = delegate_payloads(export_program(model, (x,)))
+        self.assertEqual(len(delegates), 1)
+        parsed = blob.unpack(delegates[0][1])
+        self.assertEqual(ops_of(parsed)[-1], lowering.hx.TRANSPOSE)
+        got = run_reference(parsed, x)
+        _, c, h, w = want.shape  # the permuted output is (1, 16, 16, 8): C=16, H=16, W=8
+        got = got.reshape(h, w, c).transpose(2, 0, 1)[None]
+        np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
+
+    @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
+    def test_reductions_match_torch_on_cpu_reference(self):
+        torch.manual_seed(6)
+        for mode in ("channel_max", "channel_mean", "sum_hw", "min_hw"):
+            with self.subTest(mode=mode):
+                model = Reduction(mode).eval()
+                x = torch.randn(1, 3, 8, 8)
+                with torch.no_grad():
+                    want = model(x).numpy()
+                delegates = delegate_payloads(export_program(model, (x,)))
+                self.assertEqual(len(delegates), 1)
+                parsed = blob.unpack(delegates[0][1])
+                kinds = struct.unpack_from("<I", parsed.image, 16)[0]
+                ops = [struct.unpack_from("<I", parsed.image,
+                                          256 + 32 * struct.unpack_from("<I", parsed.image, 12)[0]
+                                          + 64 * i)[0] for i in range(kinds)]
+                self.assertEqual(ops[-1], lowering.hx.REDUCE, ops)
+                got = run_reference(parsed, x)
+                if want.ndim == 4:  # external output is compact NHWC; compare as NCHW
+                    _, c, h, w = want.shape
+                    got = got.reshape(h, w, c).transpose(2, 0, 1)[None]
+                np.testing.assert_allclose(got.reshape(want.shape), want, rtol=1e-4, atol=1e-4)
+
+    def _norm_model_matches_torch(self, model, x):
+        """Fully delegated, one HX_NORM, and the portable reference matches torch."""
+        torch.manual_seed(7)
+        with torch.no_grad():
+            want = model(x).numpy()
+        delegates = delegate_payloads(export_program(model, (x,)))
+        self.assertEqual(len(delegates), 1)
+        parsed = blob.unpack(delegates[0][1])
+        kinds = struct.unpack_from("<I", parsed.image, 16)[0]
+        ops = [struct.unpack_from("<I", parsed.image,
+                                  256 + 32 * struct.unpack_from("<I", parsed.image, 12)[0]
+                                  + 64 * i)[0] for i in range(kinds)]
+        self.assertIn(lowering.hx.NORM, ops)
+        got = run_reference(parsed, x)
+        if want.ndim == 4:  # external output is compact NHWC; compare as NCHW
+            _, c, h, w = want.shape
+            got = got.reshape(h, w, c).transpose(2, 0, 1)[None]
+        np.testing.assert_allclose(got.reshape(want.shape), want, rtol=1e-4, atol=1e-4)
+
+    @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
+    def test_layer_norm_over_chw_matches_torch_on_cpu_reference(self):
+        model = NormNet("layer_chw").eval()
+        self._norm_model_matches_torch(model, torch.randn(1, 3, 8, 8))
+
+    @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
+    def test_group_norm_matches_torch_on_cpu_reference(self):
+        # One group (LayerNorm over C, H, W), two groups, and one group per channel.
+        for groups in (1, 2, 8):
+            with self.subTest(groups=groups):
+                model = NormNet("group", groups=groups).eval()
+                self._norm_model_matches_torch(model, torch.randn(1, 3, 8, 8))
+
+    @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
+    def test_layer_norm_over_channels_matches_torch_on_cpu_reference(self):
+        model = NormNet("layer_channels").eval()
+        self._norm_model_matches_torch(model, torch.randn(1, 16, 1, 1))
+
+    def test_layer_norm_over_a_spatial_axis_stays_on_cpu(self):
+        # Normalising over W alone is not one of the HX_NORM modes; the convolution is delegated.
+        model = NormNet("layer_w").eval()
+        delegates = delegate_payloads(export_program(model, (torch.randn(1, 3, 8, 8),)))
+        if delegates:
+            parsed = blob.unpack(delegates[0][1])
+            kinds = struct.unpack_from("<I", parsed.image, 16)[0]
+            ops = [struct.unpack_from("<I", parsed.image,
+                                      256 + 32 * struct.unpack_from("<I", parsed.image, 12)[0]
+                                      + 64 * i)[0] for i in range(kinds)]
+            self.assertNotIn(lowering.hx.NORM, ops)
+
+
+class NormNet(nn.Module):
+    """Conv, then one normalisation (kind selects it), then ReLU."""
+
+    def __init__(self, kind, groups=1):
+        super().__init__()
+        self.kind = kind
+        self.conv = nn.Conv2d(3, 8 if kind == "group" else 4, 3, padding=1)
+        if kind == "layer_chw":
+            self.norm = nn.LayerNorm([4, 8, 8])
+        elif kind == "group":
+            self.norm = nn.GroupNorm(groups, 8)
+        elif kind == "layer_w":
+            self.norm = nn.LayerNorm([8])
+        else:  # a [1, 16] tensor normalised over its channels: flatten, then LayerNorm
+            self.linear = nn.Linear(16, 12)
+            self.norm = nn.LayerNorm(12)
+
+    def forward(self, x):
+        if self.kind == "layer_channels":
+            return self.norm(self.linear(x.flatten(1)))
+        return F.relu(self.norm(self.conv(x)))
+
+
+class Reduction(nn.Module):
+    """One ATen reduction after a convolution with a fused ReLU; mode selects the call."""
+
+    def __init__(self, mode):
+        super().__init__()
+        self.mode = mode
+        self.conv = nn.Conv2d(3, 16, 3, padding=1)
+
+    def forward(self, x):
+        y = F.relu(self.conv(x))
+        if self.mode == "channel_max":  # spatial-attention style channel map
+            return y.amax(dim=1, keepdim=True)
+        if self.mode == "channel_mean":
+            return y.mean(dim=1, keepdim=True)
+        if self.mode == "sum_hw":  # keepdim=False: [1, C]
+            return y.sum(dim=(2, 3))
+        return y.amin(dim=(2, 3), keepdim=True)
 
 
 def run_reference(parsed, x):
