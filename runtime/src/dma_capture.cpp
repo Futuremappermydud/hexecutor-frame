@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "dma_capture.hpp"
+#include "camera_groups.hpp"
 #include <iostream>
 #include <cstdio>
 #include <cstdlib>
@@ -51,7 +52,7 @@ bool DMACapture::autoDiscoverCameraGroups(pid_t compositorPid,
     DIR *dir = opendir(fdDir);
     if (!dir) return false;
 
-    std::vector<int> camFds;
+    std::vector<CameraBuffer> camBuffers;
     struct dirent *ent;
     while ((ent = readdir(dir)) != nullptr) {
         if (ent->d_name[0] == '.') continue;
@@ -63,18 +64,17 @@ bool DMACapture::autoDiscoverCameraGroups(pid_t compositorPid,
         target[len] = '\0';
         struct stat st;
         if (strstr(target, "dmabuf") && stat(linkPath, &st) == 0 && st.st_size == 9564160) {
-            camFds.push_back(atoi(ent->d_name));
+            camBuffers.push_back({atoi(ent->d_name), uint64_t(st.st_ino)});
         }
     }
     closedir(dir);
-    std::sort(camFds.begin(), camFds.end());
-    if (camFds.size() < 2) {
-        std::cerr << "[DMACapture] Failed to find camera dmabufs (found " << camFds.size() << ")" << std::endl;
+    if (!splitCameraGroups(camBuffers, VkYDetile::kMaxSlots, outRightFds, outLeftFds)) {
+        std::cerr << "[DMACapture] Failed to find camera dmabufs (found " << camBuffers.size() << ")" << std::endl;
         return false;
     }
-    size_t mid = camFds.size() / 2;
-    outRightFds.assign(camFds.begin(), camFds.begin() + mid);
-    outLeftFds.assign(camFds.begin() + mid, camFds.end());
+    if (camBuffers.size() > outRightFds.size() + outLeftFds.size())
+        std::cout << "[DMACapture] Ignoring " << camBuffers.size() - outRightFds.size() - outLeftFds.size()
+                  << " older camera dmabufs" << std::endl;
     std::cout << "[DMACapture] Right slots:";
     for (int fd : outRightFds) std::cout << " " << fd;
     std::cout << " | Left slots:";
@@ -129,9 +129,9 @@ bool DMACapture::initialize(pid_t compositorPid, int rightFd, int leftFd) {
     return true;
 }
 
-bool DMACapture::captureFrame(bool includeUV) {
+bool DMACapture::captureFrame(bool includeUV, bool leftOnly) {
     if (!m_isReady) return false;
-    return m_detile.copyYPlanes(includeUV);
+    return m_detile.copyYPlanes(includeUV, leftOnly);
 }
 
 const uint8_t* DMACapture::getLeftBuffer() const { return m_activeDetile ? m_activeDetile->leftY() : nullptr; }

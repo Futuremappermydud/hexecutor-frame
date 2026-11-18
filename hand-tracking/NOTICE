@@ -1,0 +1,17 @@
+MediaPipe Hands model integration
+
+MediaPipe is Copyright 2019 The MediaPipe Authors, licensed under the
+Apache License, Version 2.0 (LICENSE.mediapipe).
+
+The palm anchors, decoding, weighted suppression, crop geometry and tracking
+ROI formulas follow the MediaPipe graph/calculator contracts. Neural model
+assets are downloaded separately and are not embedded in this source tree.
+
+Sources:
+https://github.com/google-ai-edge/mediapipe/tree/master/mediapipe/modules/palm_detection
+https://github.com/google-ai-edge/mediapipe/tree/master/mediapipe/modules/hand_landmark
+https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker
+https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+
+The exported world landmarks are model-relative predictions in meters. They
+are not a substitute for calibrated stereo or a camera-to-world transform.

@@ -1,0 +1,28 @@
+Mercury stereo hand tracking, ported from Monado
+
+Monado is Copyright 2018-2026 Collabora, Ltd. and its contributors, licensed
+under the Boost Software License 1.0 (third_party/monado/LICENSE.BSL-1.0).
+Source: https://gitlab.freedesktop.org/monado/monado
+Commit: 3acbda6b7dacbe014749020e8543fded54ef076b
+Path: src/xrt/tracking/hand/mercury
+
+third_party/monado/ holds unmodified copies of Monado files, except
+mercury/hg_hand_size_opt.{hpp,cpp}, whose std::span parameters were changed to
+const std::array references for C++17 (marked in each file). compat/ provides
+the small subset of Monado's xrt_defines.h, m_api, logging, tracing and time
+interfaces those files include. src/ is a port of hg_sync.cpp, hg_model.cpp
+and hg_image_distorter.cpp without OpenCV, ONNX Runtime or debug sinks, for
+rectified pinhole cameras.
+
+tinyceres (third_party/tinyceres/) is a subset of Ceres Solver, Copyright 2015
+Google Inc., under the BSD 3-Clause license in third_party/tinyceres/LICENSE,
+as distributed in Monado's src/external/tinyceres.
+
+Eigen 3.3+ is an external header dependency (MPL-2.0) and is not included
+here; see docs/model-development/mercury-hand-tracking.md.
+
+The neural networks (grayscale_detection_160x160.onnx,
+grayscale_keypoint_jan18.onnx) come from
+https://gitlab.freedesktop.org/monado/utilities/hand-tracking-models and are
+not included. That repository carries no license file; establish the model
+license before distributing converted model artifacts.

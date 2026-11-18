@@ -18,7 +18,7 @@ public:
     void release();
 
     // RGB consumers use the default; depth-only consumers can skip chroma.
-    bool captureFrame(bool includeUV = true);
+    bool captureFrame(bool includeUV = true, bool leftOnly = false);
 
     const uint8_t* getLeftBuffer() const;
     const uint8_t* getRightBuffer() const;

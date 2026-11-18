@@ -18,13 +18,15 @@ public:
     bool initialize();
     bool importStereoGroups(const std::vector<int>& leftFds, const std::vector<int>& rightFds);
     // Luma-only reads preserve Y slot selection; UV getters return null until refreshed.
-    bool copyYPlanes(bool includeUV = true);
+    // Left-only consumers avoid copying/detiling the unused right camera.
+    // Right getters are unavailable until a subsequent full stereo capture.
+    bool copyYPlanes(bool includeUV = true, bool leftOnly = false);
     void release();
 
     const uint8_t* leftY() const { return m_leftY.empty() ? nullptr : m_leftY.data(); }
-    const uint8_t* rightY() const { return m_rightY.empty() ? nullptr : m_rightY.data(); }
+    const uint8_t* rightY() const { return !m_rightCurrent || m_rightY.empty() ? nullptr : m_rightY.data(); }
     const uint8_t* leftUV() const { return !m_uvCurrent || m_leftUV.empty() ? nullptr : m_leftUV.data(); }
-    const uint8_t* rightUV() const { return !m_uvCurrent || m_rightUV.empty() ? nullptr : m_rightUV.data(); }
+    const uint8_t* rightUV() const { return !m_rightCurrent || !m_uvCurrent || m_rightUV.empty() ? nullptr : m_rightUV.data(); }
     int uvWidth() const { return m_uvW; }
     int uvHeight() const { return m_uvH; }
     uint64_t leftHash() const { return m_leftHash; }
@@ -83,6 +85,7 @@ private:
     PFN_vkGetMemoryFdPropertiesKHR m_vkGetMemoryFdPropertiesKHR = nullptr;
     VkPhysicalDeviceMemoryProperties m_memProps{};
     bool m_uvCurrent = false;
+    bool m_rightCurrent = false;
     bool m_initialized = false;
     bool m_imported = false;
     int m_width;

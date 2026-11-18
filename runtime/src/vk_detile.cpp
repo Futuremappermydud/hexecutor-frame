@@ -286,8 +286,9 @@ bool VkYDetile::importStereoGroups(const std::vector<int>& leftFds, const std::v
     return true;
 }
 
-bool VkYDetile::copyYPlanes(bool includeUV) {
+bool VkYDetile::copyYPlanes(bool includeUV, bool leftOnly) {
     m_uvCurrent = false;
+    m_rightCurrent = false;
     if (!m_imported || !m_hostMapped) return false;
     const int total = m_nLeft + m_nRight;
     if (total <= 0) return false;
@@ -355,7 +356,7 @@ bool VkYDetile::copyYPlanes(bool includeUV) {
     for (int i = 0; i < m_nLeft; i++, idx++) {
         copyImage(m_leftSlots[i].image, idx);
     }
-    for (int i = 0; i < m_nRight; i++, idx++) {
+    for (int i = 0; !leftOnly && i < m_nRight; i++, idx++) {
         copyImage(m_rightSlots[i].image, idx);
     }
 
@@ -415,17 +416,18 @@ bool VkYDetile::copyYPlanes(bool includeUV) {
 
     int leftChanged = -1, rightChanged = -1;
     m_curLeft = pick(m_nLeft, 0, m_prevLeftHash, m_curLeft, &leftChanged);
-    m_curRight = pick(m_nRight, m_nLeft, m_prevRightHash, m_curRight, &rightChanged);
+    if (!leftOnly) m_curRight = pick(m_nRight, m_nLeft, m_prevRightHash, m_curRight, &rightChanged);
     m_leftHash = m_prevLeftHash[m_curLeft];
     m_rightHash = m_prevRightHash[m_curRight];
     std::memcpy(m_leftY.data(), m_hostMapped + m_ySize * m_curLeft, (size_t)m_ySize);
-    std::memcpy(m_rightY.data(), m_hostMapped + m_ySize * (m_nLeft + m_curRight), (size_t)m_ySize);
+    if (!leftOnly) std::memcpy(m_rightY.data(), m_hostMapped + m_ySize * (m_nLeft + m_curRight), (size_t)m_ySize);
     if (includeUV) {
         std::memcpy(m_leftUV.data(), m_uvMapped + m_uvSize * m_curLeft, (size_t)m_uvSize);
-        std::memcpy(m_rightUV.data(),
+        if (!leftOnly) std::memcpy(m_rightUV.data(),
                     m_uvMapped + m_uvSize * (m_nLeft + m_curRight), (size_t)m_uvSize);
         m_uvCurrent = true;
     }
+    m_rightCurrent = !leftOnly;
     return true;
 }
 

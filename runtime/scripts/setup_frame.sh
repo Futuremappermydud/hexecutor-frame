@@ -16,9 +16,9 @@ if [[ ${1:-} == '--qnn' ]]; then
     echo '[Setup] Checking the QNN cDSP boot state...'
     ssh frame 'fault=/home/steamos/frame-spatial-runtime/runtime/experiments/room-dataset/.npu-fault-boot-id; if [ -f "$fault" ] && [ "$(cat "$fault")" = "$(cat /proc/sys/kernel/random/boot_id)" ]; then echo "Prior cDSP cleanup failed in this boot; reboot the Frame first." >&2; exit 1; fi'
     echo '[Setup] Loading the 128 MB QNN memory lease if needed...'
-    ssh frame 'cd /home/steamos/frame-dsp/depth-model/wave1-20261101 && if [ ! -e /dev/cdsp_mem ]; then echo frame1 | sudo -S insmod frame/kmod/cdsp_mem.ko size_mb=128; fi && test "$(cat /sys/module/cdsp_mem/parameters/size_mb)" = 128 && test "$(cat /sys/module/cdsp_mem/parameters/iova)" = 2684354560'
+    ssh frame 'cd /home/steamos/frame-dsp/quest-depth/wave1-20261101 && if [ ! -e /dev/cdsp_mem ]; then echo frame1 | sudo -S insmod frame/kmod/cdsp_mem.ko size_mb=128; fi && test "$(cat /sys/module/cdsp_mem/parameters/size_mb)" = 128 && test "$(cat /sys/module/cdsp_mem/parameters/iova)" = 2684354560'
     echo '[Setup] Verifying every cDSP memory chunk before inference...'
-    ssh frame 'cd /home/steamos/frame-dsp/depth-model/wave1-20261101 && /home/steamos/frame-dsp/depth-model/.venv/bin/python frame/bench/chunk_map.py'
+    ssh frame 'cd /home/steamos/frame-dsp/quest-depth/wave1-20261101 && PY=$(python3 -c "import numpy" 2>/dev/null && echo python3 || echo /home/steamos/frame-dsp/quest-depth/.venv314/bin/python3) && $PY frame/bench/chunk_map.py'
 fi
 
 echo "[Setup] Configuration complete. Ready for deployment."

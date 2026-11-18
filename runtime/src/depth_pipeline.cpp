@@ -9,6 +9,7 @@
 #include <fstream>
 #include <limits>
 #include <string>
+#include <stdexcept>
 #include <omp.h>
 
 namespace FrameSpatial {
@@ -143,6 +144,7 @@ void DepthPipeline::initialize() {
                               rightFromLeft[2][row] * rightFromLeftTranslation[2]);
     }
     const Vec3 rectX = normalized(baselineLeft);
+    m_rectifiedBaseline = std::sqrt(dot(baselineLeft, baselineLeft));
     const Vec3 rightOpticalInLeft{
         rightFromLeft[2][0], rightFromLeft[2][1], rightFromLeft[2][2]};
     Vec3 rectZ = normalized(Vec3{rightOpticalInLeft[0], rightOpticalInLeft[1],
@@ -250,13 +252,19 @@ void DepthPipeline::initialize() {
               << RECT_WIDTH << "x" << RECT_HEIGHT << ", 64 disparities)" << std::endl;
     std::cout << "[DepthPipeline] Stereo alignment source: "
               << (loadedAlignment ? "XRService latest history" : "built-in fallback")
-              << ", baseline=" << std::sqrt(dot(baselineLeft, baselineLeft))
+              << ", baseline=" << m_rectifiedBaseline
               << " m" << std::endl;
 }
 
 std::array<float, 3> DepthPipeline::rectifiedPointInHead(int x, int y, float z) const {
     const Vec3 point{(x - RECT_CX) * z / RECT_FOCAL,
                      (y - RECT_CY) * z / RECT_FOCAL, z};
+    Vec3 head = multiply(m_headFromRectified, point);
+    for (int i = 0; i < 3; ++i) head[i] += m_leftOriginInHead[i];
+    return head;
+}
+
+std::array<float, 3> DepthPipeline::rectifiedCameraPointInHead(const Vec3& point) const {
     Vec3 head = multiply(m_headFromRectified, point);
     for (int i = 0; i < 3; ++i) head[i] += m_leftOriginInHead[i];
     return head;
@@ -373,6 +381,28 @@ std::vector<Point3D> DepthPipeline::process(const uint8_t* leftRaw,
 
     (void)hmdPose;
     return {};
+}
+
+std::vector<uint8_t> DepthPipeline::rectifyLeftRgb(const uint8_t* y, const uint8_t* uv) {
+    if (!y || !uv) throw std::invalid_argument("left RGB rectification requires Y and UV");
+    if (!m_initialized) initialize();
+    std::vector<uint8_t> rgb(size_t(RECT_WIDTH) * RECT_HEIGHT * 3);
+    #pragma omp parallel for
+    for (int i = 0; i < RECT_WIDTH * RECT_HEIGHT; ++i) {
+        const auto p = m_lutL[i];
+        if (p.x < 0 || p.y < 0 || p.x >= RAW_CAMERA_WIDTH - 1 || p.y >= RAW_CAMERA_HEIGHT - 1)
+            continue;
+        const float c = sampleBilinear(y, p.x, p.y) - 16;
+        // NV12 chroma is sampled at its native half resolution. Match the
+        // production passthrough's BT.601 limited-range conversion.
+        const size_t index = (size_t(int(p.y) / 2) * (RAW_CAMERA_WIDTH / 2) + int(p.x) / 2) * 2;
+        const float u = uv[index] - 128.f, v = uv[index + 1] - 128.f;
+        auto byte = [](float value) { return uint8_t(std::clamp(std::lround(value), 0l, 255l)); };
+        rgb[size_t(i) * 3] = byte(1.164f * c + 1.596f * v);
+        rgb[size_t(i) * 3 + 1] = byte(1.164f * c - .392f * u - .813f * v);
+        rgb[size_t(i) * 3 + 2] = byte(1.164f * c + 2.017f * u);
+    }
+    return rgb;
 }
 
 void DepthPipeline::rectify(const uint8_t* leftRaw, const uint8_t* rightRaw) {

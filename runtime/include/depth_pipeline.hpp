@@ -17,6 +17,10 @@ public:
     // Calibrated luma rectification shared by both the CPU matcher and the
     // asynchronous learned Vulkan backend.
     void rectify(const uint8_t* leftRaw, const uint8_t* rightRaw);
+
+    // RGB view of the left NV12 camera, using the same calibrated LUT as luma.
+    // Chroma is interleaved UV at half resolution. No raw DMA storage is retained.
+    std::vector<uint8_t> rectifyLeftRgb(const uint8_t* y, const uint8_t* uv);
     
     // Process stereo pair into 3D metric point cloud in world coordinates
     std::vector<Point3D> process(const uint8_t* leftRaw,
@@ -25,6 +29,8 @@ public:
 
     // Apply the same rectified basis used by the LUT, then calibrated rig extrinsics.
     std::array<float, 3> rectifiedPointInHead(int x, int y, float z) const;
+    // Metric point in the rectified left camera (x right, y down, z forward) to head.
+    std::array<float, 3> rectifiedCameraPointInHead(const std::array<float, 3>& point) const;
 
     // Inverse rig transform for visibility checks in the captured depth image.
     std::array<float, 3> headPointInRectified(const std::array<float, 3>& head) const;
@@ -32,6 +38,7 @@ public:
     // Accessors for debug / visualization
     const std::vector<uint8_t>& getRectifiedLeft() const { return m_rectL; }
     const std::vector<uint8_t>& getRectifiedRight() const { return m_rectR; }
+    float rectifiedBaseline() const { return m_rectifiedBaseline; }
     // Model-style rectified spherical images (256x320, same rectified basis):
     // column -> azimuth (u - 127.5) * k, row -> elevation (v - 159.5) * k,
     // ray ~ (tan az, sin el, cos el). Empty unless FRAME_DEPTH_SPHERICAL=1.
@@ -49,6 +56,7 @@ private:
     std::vector<Point2D> m_sphLutL, m_sphLutR;  // 9 supersamples per pixel
     std::vector<uint8_t> m_sphL, m_sphR;
     float m_sphK = 0;
+    float m_rectifiedBaseline = 0;
     std::vector<uint64_t> m_censusL;
     std::vector<uint64_t> m_censusR;
     std::vector<float> m_depthMap;

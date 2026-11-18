@@ -1,5 +1,10 @@
 CXX = g++
 CXXFLAGS = -O3 -Wall -Wextra -std=c++17 -fopenmp -MMD -MP -Iinclude -I/opt/steamvr/tools/hellovr_vulkan_linux/src/openvr/headers
+ifneq ($(OPENXR_INCLUDE),)
+CXXFLAGS += -I$(OPENXR_INCLUDE)
+else ifneq ($(wildcard ../hand-tracking/.work/openxr-sdk/include/openxr/openxr.h),)
+CXXFLAGS += -I../hand-tracking/.work/openxr-sdk/include
+endif
 LDFLAGS = -L/opt/steamvr/bin/linuxarm64 -lopenvr_api -Wl,-rpath=/opt/steamvr/bin/linuxarm64 -lpthread -lm -lvulkan
 
 MNN_PREFIX ?= $(HOME)/.local/frame-mnn
@@ -59,6 +64,48 @@ clean:
 -include $(DEP)
 
 .PHONY: all clean dirs
+
+# Standalone live camera/hand inspector. Build from runtime/; private model and
+# matching DSP paths are supplied at launch, never copied into the executable.
+HAND_NATIVE_BUILD ?= ../build
+.PHONY: hand-viewer-host hand-viewer
+hand-viewer-host:
+	cmake -S .. -B $(HAND_NATIVE_BUILD) -DCMAKE_BUILD_TYPE=Release
+	cmake --build $(HAND_NATIVE_BUILD) --parallel --target hand_tracking_host mercury_executor_networks mercury_hand_tracking hexecutor_host
+
+HAND_SPV = shaders/hand_joints.vert.spv shaders/hand_joints.frag.spv
+hand-viewer: bin/frame_hand_viewer $(HAND_SPV)
+
+NIR_ORT ?= ../hand-tracking/.work/ort/onnxruntime-linux-aarch64-1.24.1
+.PHONY: nir-hand-viewer nir-hand-viewer-host
+nir-hand-viewer: bin/frame_nir_hand_viewer $(HAND_SPV)
+nir-hand-viewer-host:
+	cmake -S .. -B $(HAND_NATIVE_BUILD) -DCMAKE_BUILD_TYPE=Release
+	cmake --build $(HAND_NATIVE_BUILD) --parallel --target hexecutor_host
+
+bin/frame_nir_hand_viewer: tools/frame_nir_hand_viewer.cpp $(wildcard ../hand-tracking/nirhands/include/nirhands/*.hpp) src/hand_viewer_xr.o ../hand-tracking/nirhands/src/pipeline.cpp ../hand-tracking/nirhands/src/skeleton.cpp ../hand-tracking/nirhands/src/geometry.cpp ../hand-tracking/nirhands/src/geometry_ops.cpp nir-hand-viewer-host | dirs
+	$(CXX) $(CXXFLAGS) -I../hand-tracking/nirhands/include -I../hexecutor/include -I$(NIR_ORT)/include \
+		tools/frame_nir_hand_viewer.cpp src/hand_viewer_xr.o ../hand-tracking/nirhands/src/*.cpp \
+		$(HAND_NATIVE_BUILD)/libhexecutor_host.a \
+		-L$(NIR_ORT)/lib -lonnxruntime -Wl,-rpath,$(abspath $(NIR_ORT))/lib \
+		-L/opt/steamvr/bin/linuxarm64 -lopenxr_loader -Wl,-rpath,/opt/steamvr/bin/linuxarm64 -lvulkan -lpthread -o $@
+
+GLSLC ?= glslc
+
+shaders/hand_joints.vert.spv: shaders/hand_joints.vert
+	@if command -v $(GLSLC) >/dev/null 2>&1; then $(GLSLC) -O $< -o $@; elif [ -f $@ ]; then echo "glslc not found; using existing $@"; else echo "Error: glslc not found and $@ missing" >&2; exit 1; fi
+
+shaders/hand_joints.frag.spv: shaders/hand_joints.frag
+	@if command -v $(GLSLC) >/dev/null 2>&1; then $(GLSLC) -O $< -o $@; elif [ -f $@ ]; then echo "glslc not found; using existing $@"; else echo "Error: glslc not found and $@ missing" >&2; exit 1; fi
+
+bin/frame_hand_viewer: tools/frame_hand_viewer.cpp src/hand_viewer_xr.o ../hand-tracking/include/hand_tracking/viewer_geometry.hpp src/dma_capture.o src/vk_detile.o src/depth_pipeline.o hand-viewer-host | dirs
+	$(CXX) $(CXXFLAGS) -I../hand-tracking/include -I../hand-tracking/mercury/include -I../hexecutor/include \
+		tools/frame_hand_viewer.cpp src/hand_viewer_xr.o src/dma_capture.o src/vk_detile.o src/depth_pipeline.o \
+		$(HAND_NATIVE_BUILD)/libhand_tracking_host.a $(HAND_NATIVE_BUILD)/libmercury_executor_networks.a \
+		$(HAND_NATIVE_BUILD)/libmercury_hand_tracking.a $(HAND_NATIVE_BUILD)/libhexecutor_host.a \
+		-L/opt/steamvr/bin/linuxarm64 -lopenxr_loader -Wl,-rpath,/opt/steamvr/bin/linuxarm64 -lvulkan -lpthread -o $@
+
+-include src/hand_viewer_xr.d
 
 OCCLUSION_TARGET = bin/libframe_openxr_occlusion.so
 OCCLUSION_SRC = src/openxr_occlusion_layer.cpp src/occlusion_renderer.cpp src/cloud_worker.cpp src/tsdf_volume.cpp src/model_depth_pipeline.cpp src/model_temporal.cpp src/persistent_depth.cpp src/vulkan_guarded_stereo_pipeline.cpp src/dma_capture.cpp src/vk_detile.cpp src/depth_pipeline.cpp src/vulkan_stereo_pipeline.cpp

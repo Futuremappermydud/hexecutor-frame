@@ -24,9 +24,11 @@ This is the maintained handbook for the spatial application, Hexecutor DSP execu
 
 | Guide | What it explains |
 | --- | --- |
+| [Generic tensor backend](hexecutor/tensor-backend.md) | Static tensor graphs, multi-model sessions, FP16 HMX and model-independent tooling |
 | [Native host API](hexecutor/api.md) | C++ tensors/programs, explicit packages, and worker lifecycle |
 | [Executor architecture](hexecutor/README.md) | Host/DSP responsibilities, loader, transport, and execution modes |
 | [Memory layout](hexecutor/memory-layout.md) | Private DDR, VTCM, L2 leases, aliasing, and workspace limits |
+| [CDSP broker (proposed)](hexecutor/broker.md) | One owner for the CDSP: scheduling depth, hands, controller and eye work |
 | [Clocks and bandwidth](hexecutor/clocks.md) | AXI and HMX clock findings, controlled measurements, and restoration |
 | [Kernels and arithmetic](hexecutor/kernels.md) | HVX/HMX, blocked layouts, exact conversion, and adapters |
 | [Scheduling and optimizations](hexecutor/scheduling.md) | Dependencies, lane scheduling, plan replay, DMA, and rejected changes |
@@ -38,7 +40,7 @@ This is the maintained handbook for the spatial application, Hexecutor DSP execu
 
 ## Models and repository policy
 
-- [Depth model](model-development/depth.md), [CPU reference](model-development/cpu-reference.md), and [hand tracking](model-development/hand-tracking.md).
+- [Depth model](model-development/depth.md), [CPU reference](model-development/cpu-reference.md), and [hand tracking](model-development/hand-tracking.md), including its [optimization checkpoint](model-development/hand-tracking-progress.md) and the [Mercury QNN run-list plan](model-development/mercury-hand-tracking.md); [controller FeatureNN](model-development/controller-featurenn.md) on the tensor backend.
 - [Training and local artifacts](model-development/training-and-artifacts.md): future model replacement, ignored assets, and history policy.
 
 The temporal-fusion report and related working notes remain in their original locations and are outside this rewrite. Both fusion handoffs are also preserved unchanged. Superseded session diaries are available in Git history and the external documentation recovery copy; they are not the primary navigation system.
