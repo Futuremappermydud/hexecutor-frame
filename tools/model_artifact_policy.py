@@ -5,7 +5,7 @@ import re
 ARTIFACT_SUFFIXES = (
     '.bin', '.blob', '.pt', '.pth', '.ptl', '.pte', '.ckpt', '.safetensors',
     '.onnx', '.onnx.data', '.tflite', '.pb', '.fb', '.npy', '.npz', '.pkl',
-    '.pickle', '.qdrx', '.nprg', '.qnn', '.raw', '.u8', '.u16', '.f16', '.f32',
+    '.pickle', '.hxfg', '.task', '.qdrx', '.nprg', '.qnn', '.raw', '.u8', '.u16', '.f16', '.f32',
     '.pool1', '.epcpu', '.ppcpu', '.ncpfx', '.mpfx', '.s2pf', '.zip', '.gz',
     '.elf', '.so', '.o', '.a', '.spv', '.pyc', '.pgm', '.asm', '.dis', '.disasm.txt',
     '.qnn.json', '.htp-strings.json', '.generated.h', '.ok',

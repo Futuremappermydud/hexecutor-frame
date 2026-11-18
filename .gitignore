@@ -18,6 +18,8 @@
 *.pkl
 *.pickle
 *.qdrx
+*.hxfg
+*.task
 *.nprg
 *.qnn
 *.raw

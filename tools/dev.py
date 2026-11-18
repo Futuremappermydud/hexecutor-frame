@@ -77,7 +77,7 @@ def main():
     elif command=='check-layout':check_layout()
     elif command=='check-model':check_model()
     elif command=='check':
-        check_layout();check_docs();run(sys.executable,'tools/test_model_artifact_policy.py');run(sys.executable,'tools/model_artifact_policy.py','--history')
+        check_layout();check_docs();run(sys.executable,'-m','unittest','discover','-s','hexecutor/tests','-p','test_qnn_inspect.py');run(sys.executable,'-m','unittest','discover','-s','hexecutor/tests','-p','test_lower_onnx.py');run(sys.executable,'tools/test_model_artifact_policy.py');run(sys.executable,'tools/model_artifact_policy.py','--history')
         run('c++','-O2','-std=c++17','-Iruntime/include','runtime/tools/test_model_depth_geometry.cpp','-o','build/test_geometry');run('build/test_geometry')
         run('c++','-O2','-std=c++17','-Iruntime/include','runtime/tools/test_model_temporal.cpp','runtime/src/model_temporal.cpp','-o','build/test_temporal');run('build/test_temporal')
     elif command=='run':

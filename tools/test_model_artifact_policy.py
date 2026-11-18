@@ -12,7 +12,7 @@ class ArtifactPolicyTests(unittest.TestCase):
 
     def test_raw_weights_and_source_encoded_dumps(self):
         for path in ('other/weights.safetensors', 'other/model.onnx.data', 'other/pool.pool1',
-                     'other/arrays.npy', 'other/qnn_runlist_primary.generated.h',
+                     'other/arrays.npy', 'other/graph.hxfg', 'other/hand_landmarker.task', 'other/qnn_runlist_primary.generated.h',
                      'other/xwb1022_actual_data.h', 'other/ch5099_padw7_input_data.h'):
             self.assertTrue(is_artifact(path))
         self.assertTrue(is_artifact('depth-model/100000'))
