@@ -1872,6 +1872,8 @@ def fp16_blockers(ops, inputs, outputs, hwc, stride):
     reasons, compact_conv = [], False
     for n, op in enumerate(ops):
         kind, x, p = op[0], op[1], op[5:]
+        if kind < 1 or kind > 26:
+            reasons.append(f"op {n}: op kind {kind} is not supported in blocked FP16 plan")
         if stride(x) == 3 and kind != hx.CONV:
             reasons.append(f"op {n}: compact RGB input feeds a non-convolution")
         if kind == hx.CONV:

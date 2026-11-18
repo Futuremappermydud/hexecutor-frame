@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <utility>
 #ifdef __linux__

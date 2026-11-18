@@ -70,6 +70,7 @@ Autoregressive decode (such as LFM3-VL-2B or LFM3-1.7B text decode) requires per
   - Overlap checking is partitioned: persistent tensors cannot alias non-persistent scratch tensors, preventing activation reuse collisions while allowing in-place state mutation for `HX_SHORTCONV` and `HX_KV_WRITE`.
   - Ops mutating persistent state cannot be reordered across the persistent hazard.
 - **Initialization and reset:** State is zero-initialized at session creation (`memset`). Host callers or the broker can issue an explicit reset via `Session::reset_state()` or `Client::reset_state()`, which sends `QDS_OP_RESET_STATE` (4) to the DSP resident entry to zero the persistent region.
+- **Blocked FP16 layout and state contract:** Operations 22–26 (`HX_RMSNORM`, `HX_ROPE`, `HX_SHORTCONV`, `HX_LINEAR_Q`, `HX_KV_WRITE`) run natively in the blocked FP16 execution plan. Persistent tensors (`HX_TENSOR_PERSISTENT`) reside exclusively in the session persistent state region (`g->state`) in plain FP32 layout rather than VTCM arena allocation. Ops converting at the boundary (`HX_SHORTCONV` and `HX_KV_WRITE`) preserve this contract, ensuring persistent state survives across `run()` invocations identically between the FP32 reference and FP16 execution paths.
 
 ### Memory map update
 

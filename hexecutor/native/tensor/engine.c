@@ -155,6 +155,11 @@ __attribute__((section(".text.resident_entry"))) void resident_entry(uint32_t ti
         }
         for (uint32_t i = 0; i < cfg->graphs; i++) {
             const HxGraphConfig *c = &cfg->graph[i];
+            /* hx_graph_open keeps a state pointer set beforehand and checks persistent tensors
+             * against it; set it first so they are bounded by state_bytes, not the arena. */
+            hx_graph_set_state(&GRAPHS[i],
+                               cfg->state_bytes ? (void *)(QDO_BASE + cfg->state) : (void *)0,
+                               cfg->state_bytes);
             init_error =
                 hx_graph_open(&GRAPHS[i], (const void *)(QDO_BASE + c->image), c->image_bytes,
                               (const void *)(QDO_BASE + c->constants), c->constant_bytes,
