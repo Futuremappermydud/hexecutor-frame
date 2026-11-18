@@ -21,7 +21,9 @@ from hexecutor.offline.frame_transport import FrameTransport
 
 FRAME=(PATHS.native)
 CHUNK=2<<20
-WINDOW=128<<20  # the probe maps the first 128 MB (QDO_BYTES)
+import os as _os
+WINDOW=int(_os.environ.get('CDSP_WINDOW_MB','128'))<<20  # the probe maps this much (QDO_BYTES)
+PROBE=_os.environ.get('CDSP_PROBE_ELF','qd_chunk_map_probe.elf')  # a QDO_SLOTS build for windows above 128 MB
 
 def chunk_map():
     """Return {iova_chunk: resolved_chunk_or_raw_word} for every mismatching chunk."""
@@ -29,7 +31,7 @@ def chunk_map():
     if size<WINDOW:raise RuntimeError(f'cdsp_mem lease is {size>>20} MB; need at least {WINDOW>>20} MB')
     if int(Path('/sys/module/cdsp_mem/parameters/iova').read_text())!=0xa0000000:raise RuntimeError('wrong CDSP IOVA')
     chunks=WINDOW//CHUNK
-    with FrameTransport((PATHS.native / 'build/qd_loader.elf'),(PATHS.native / 'build/qd_chunk_map_probe.elf'),30,raise_clock=False) as t:
+    with FrameTransport((PATHS.native / 'build/qd_loader.elf'),(PATHS.native / 'build' / PROBE),30,raise_clock=False) as t:
         fd=os.open('/dev/cdsp_mem',os.O_RDWR)
         try:mem=mmap.mmap(fd,WINDOW,flags=mmap.MAP_SHARED,prot=mmap.PROT_READ|mmap.PROT_WRITE)
         finally:os.close(fd)
@@ -41,12 +43,17 @@ def chunk_map():
             def prepare(seq):
                 t.arena[:4096]=bytes(4096);struct.pack_into('<I',t.arena,16,nonce)
                 struct.pack_into('<I',t.arena,8,seq);t.fence()
-            out=t.invoke(prepare,t.workers_done,lambda:struct.unpack_from(f'<{100+chunks}I',t.arena,2048))
+            def read():
+                head=struct.unpack_from('<8I',t.arena,2048)
+                if head[4]==2048:return head+struct.unpack_from(f'<{chunks}I',t.arena,8192)  # table at 8192
+                return struct.unpack_from(f'<{100+chunks}I',t.arena,2048)
+            out=t.invoke(prepare,t.workers_done,read)
         finally:mem.close()
     if out[0]!=0x31544d51 or out[1] or out[6]:raise RuntimeError(f'chunk-map probe failed: {out[:8]}')
     bad={}
+    base=8 if out[4]==2048 else 100
     for ch in range(chunks):
-        v=out[100+ch]^nonce
+        v=out[base+ch]^nonce
         got=v>>21 if not v&(CHUNK-1) and v>>21<chunks else f'{out[100+ch]:#x}'
         if got!=ch:bad[ch]=got
     return bad

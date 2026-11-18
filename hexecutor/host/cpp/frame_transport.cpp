@@ -803,21 +803,35 @@ void verify_chunk_map(const Artifacts &artifacts) {
         auto b = read_file(p);
         return std::string(b.begin(), b.end());
     };
-    require(std::stoul(text("/sys/module/cdsp_mem/parameters/size_mb")) == 128,
-            "requires a 128 MB memory lease");
+    /* Shipped engines map exactly 128 MiB. HEXECUTOR_CHUNK_WINDOW_MB (probe experiments only)
+     * widens the window and needs a probe built with a matching QDO_SLOTS and a cdsp_mem lease
+     * of at least that size. */
+    size_t window_mb = 128;
+    const char *window_env = std::getenv("HEXECUTOR_CHUNK_WINDOW_MB");
+    if (window_env)
+        window_mb = std::stoul(window_env);
+    require(window_mb >= 32 && window_mb % 16 == 0 && window_mb <= 1024, "bad probe window");
+    const size_t lease_mb = std::stoul(text("/sys/module/cdsp_mem/parameters/size_mb"));
+    require(window_env ? lease_mb >= window_mb : lease_mb == 128,
+            window_env ? "memory lease smaller than the probe window"
+                       : "requires a 128 MB memory lease");
     require(std::stoull(text("/sys/module/cdsp_mem/parameters/iova")) == 0xa0000000,
             "wrong CDSP IOVA");
+    const unsigned chunks = unsigned(window_mb / 2);
+    const size_t window = window_mb << 20;
     auto probe_options = artifacts;
     probe_options.timeout_seconds = 30;
     Transport probe(probe_options, artifacts.chunk_probe);
     int fd = ::open("/dev/cdsp_mem", O_RDWR | O_CLOEXEC);
     require(fd >= 0, "cannot open memory-map probe window");
-    void *p = mmap(nullptr, 128u << 20, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    void *p = mmap(nullptr, window, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     ::close(fd);
     require(p != MAP_FAILED, "cannot map probe window");
     try {
-        uint32_t nonce = std::random_device{}() & ~0x0fe00000u;
-        for (unsigned i = 0; i < 64; i++)
+        /* Keep the chunk-index bits of the nonce clear (7 bits cover 128 chunks, 8 cover 256). */
+        const uint32_t keep = window_mb > 256 ? ~0x1fe00000u : ~0x0fe00000u;
+        uint32_t nonce = std::random_device{}() & keep;
+        for (unsigned i = 0; i < chunks; i++)
             put<uint32_t>(p, size_t(i) << 21, (i << 21) ^ nonce);
         auto *arena = probe.arena();
         probe.invoke(
@@ -831,16 +845,22 @@ void verify_chunk_map(const Artifacts &artifacts) {
                 require(get<uint32_t>(arena, 2048) == 0x31544d51 && !get<uint32_t>(arena, 2052) &&
                             !get<uint32_t>(arena, 2072),
                         "chunk-map probe failed");
-                for (unsigned i = 0; i < 64; i++)
-                    require(
-                        (get<uint32_t>(arena, 2048 + (100 + i) * 4) ^ nonce) == (i << 21),
+                /* A probe that sets word 4 to 2048 keeps its table at arena + 8192; older
+                 * probes (128 MiB only) keep it at word 100 of the result block. */
+                const size_t table = get<uint32_t>(arena, 2064) == 2048 ? 8192 : 2048 + 100 * 4;
+                require(window_mb <= 128 || table == 8192, "probe too old for this window");
+                unsigned bad = 0;
+                for (unsigned i = 0; i < chunks; i++)
+                    if ((get<uint32_t>(arena, table + i * 4) ^ nonce) != (i << 21))
+                        bad++;
+                require(bad == 0,
                         "CDSP resolves private memory to a wrong chunk; reboot before inference");
             });
     } catch (...) {
-        munmap(p, 128u << 20);
+        munmap(p, window);
         throw;
     }
-    munmap(p, 128u << 20);
+    munmap(p, window);
     probe.close();
 #else
     (void)artifacts;

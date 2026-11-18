@@ -90,3 +90,4 @@ space_to_depth_cases.h
 
 # Reverse engineering notes, excerpts, and investigative probes
 /re-archive/
+build-*/
