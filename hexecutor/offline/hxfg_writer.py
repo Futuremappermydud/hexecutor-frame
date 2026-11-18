@@ -84,7 +84,7 @@ def tensor_refs(op):
     HX_MATMUL reads two tensors: x (A) and y (B, a runtime input), so y is always a live input."""
     if op[0] == MATMUL and op[2] == NONE:
         raise ValueError("HX_MATMUL needs a runtime tensor as its second operand")
-    z = NONE if op[0] in (CONV, DEPTHWISE) else op[3]
+    z = NONE if op[0] in (CONV, DEPTHWISE, MAXPOOL, AVGPOOL) else op[3]
     refs = [op[1], op[2], z, op[4]]
     if op[0] == SDPA and len(op) > 5 and op[5] != NONE:
         refs.append(op[5])
@@ -97,7 +97,7 @@ def dilation_z(op):
     if z == NONE:
         return NONE
     dh, dw = (z >> 8) & 0xFF, z & 0xFF
-    if op[0] not in (CONV, DEPTHWISE) or z >> 16 or not (1 <= dh <= 8 and 1 <= dw <= 8) or (
+    if op[0] not in (CONV, DEPTHWISE, MAXPOOL, AVGPOOL) or z >> 16 or not (1 <= dh <= 8 and 1 <= dw <= 8) or (
         dh == 1 and dw == 1
     ):
         raise ValueError(f"invalid z {z:#x} on op kind {op[0]}")
@@ -175,7 +175,7 @@ def write(ops, inputs, outputs, hwc, stride, pool, destination, manifest):
             op[0],
             ids.get(op[1], NONE),
             ids.get(op[2], NONE),
-            dilation_z(op) if op[0] in (CONV, DEPTHWISE) else ids.get(op[3], NONE),
+            dilation_z(op) if op[0] in (CONV, DEPTHWISE, MAXPOOL, AVGPOOL) else ids.get(op[3], NONE),
             ids.get(op[4], NONE),
             ids.get(op[5], NONE) if op[0] == SDPA and len(op) > 5 and op[5] != NONE else op[5],
             *op[6:],

@@ -375,7 +375,17 @@ def _binary_plan(node, ep, data=False):
             raise Unsupported("constant operand rank")
         channels = out[1]
         if len(out) == 4 and (len(shape) < 4 or shape[2] != 1 or shape[3] != 1):
-            raise Unsupported("constant operand varies spatially")
+            if not data:
+                return opcode, tensor, None, None, reversed_, 2
+            try:
+                c_arr = np.broadcast_to(np.asarray(const, dtype=np.float32), out)
+            except ValueError:
+                raise Unsupported("cannot broadcast constant to output")
+            hwc_arr = c_arr[0].transpose(1, 2, 0)
+            stride = (channels + 31) & ~31
+            if stride > channels:
+                hwc_arr = np.pad(hwc_arr, ((0, 0), (0, 0), (0, stride - channels)))
+            return opcode, tensor, None, np.ascontiguousarray(hwc_arr).reshape(-1), reversed_, 2
         if shape[1] not in (1, channels):
             raise Unsupported("constant operand channel mismatch")
         vec = (
@@ -383,7 +393,7 @@ def _binary_plan(node, ep, data=False):
             if data
             else None
         )
-        return opcode, tensor, None, vec, reversed_
+        return opcode, tensor, None, vec, reversed_, 1
     sa, sb = static_shape(a), static_shape(b)
     if len(sa) != len(sb):
         raise Unsupported("operands of different rank")
@@ -1227,11 +1237,16 @@ def lower_program(ep, destination):
         elif kind == "addmm":
             _emit_addmm(b, ep, node)
         elif kind in ("add", "binary"):
-            opcode, x, y, vec, rev = _binary_plan(node, ep, data=True)
+            plan = _binary_plan(node, ep, data=True)
+            opcode, x, y, vec, rev = plan[:5]
+            mode = plan[5] if len(plan) > 5 else 1
             if _plain_add(node, ep):
                 b.emit(hx.ADD, b.tid(x), b.tid(y), node, [0])
             elif y is not None:
                 b.emit(hx.BINARY, b.tid(x), b.tid(y), node, [opcode, 0, 0, rev])
+            elif mode == 2:
+                b.emit(hx.BINARY, b.tid(x), NONE, node,
+                       [opcode, 2, b.pool.emit(vec), rev])
             else:
                 b.emit(hx.BINARY, b.tid(x), NONE, node,
                        [opcode, 1, b.pool.emit(_pad32(vec)), rev])
