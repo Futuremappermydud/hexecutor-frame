@@ -426,9 +426,10 @@ def _binary_plan(node, ep, data=False):
 def _plain_add(node, ep):
     """Same-shape tensor + tensor, which keeps the original HX_ADD with fusable activation."""
     try:
-        opcode, x, y, vec, rev = _binary_plan(node, ep)
+        plan = _binary_plan(node, ep)
     except Unsupported:
         return False
+    opcode, x, y = plan[0], plan[1], plan[2]
     return opcode == hx.BIN_ADD and y is not None and static_shape(x) == static_shape(y)
 
 
