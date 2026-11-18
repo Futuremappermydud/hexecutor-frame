@@ -27,6 +27,190 @@ static int same(const HxTensor *a, const HxTensor *b) {
 static int constant(const HxGraph *g, uint32_t at, uint64_t n) {
     return !(at & 127u) && span(at, n, g->header->constant_bytes);
 }
+static int matmul_dims(const HxGraph *g, const HxOp *o,
+                       uint32_t *B_out, uint32_t *M_out, uint32_t *K_out,
+                       uint32_t *N_out, uint32_t *B_b_out) {
+    if (o->y == HXFG_NONE || o->y >= g->header->tensors ||
+        o->x >= g->header->tensors || o->out >= g->header->tensors)
+        return 0;
+    const HxTensor *a = &g->tensors[o->x];
+    const HxTensor *b = &g->tensors[o->y];
+    const HxTensor *out = &g->tensors[o->out];
+    const uint32_t *p = o->p;
+    uint32_t transB = p[0], transA = p[3];
+    if (transB > 1 || transA > 1)
+        return 0;
+
+    uint32_t Ba = 1, Ma = 0, Ka = 0;
+    if (a->w > 1) {
+        Ba = a->h;
+        Ma = transA ? a->c : a->w;
+        Ka = transA ? a->w : a->c;
+    } else {
+        uint32_t b_param = p[2] > 1 ? p[2] : 1;
+        if (a->h % b_param != 0)
+            return 0;
+        Ba = b_param;
+        Ma = transA ? a->c : (a->h / b_param);
+        Ka = transA ? (a->h / b_param) : a->c;
+    }
+    if (Ka > 4096 || Ma == 0 || Ka == 0)
+        return 0;
+
+    uint32_t Bb = 1, Kb = 0, Nb = 0;
+    if (b->w > 1) {
+        Bb = b->h;
+        Kb = transB ? b->c : b->w;
+        Nb = transB ? b->w : b->c;
+    } else {
+        if (Ba > 1 && b->h % Ba == 0) {
+            Bb = Ba;
+            Kb = transB ? b->c : (b->h / Ba);
+            Nb = transB ? (b->h / Ba) : b->c;
+        } else {
+            Bb = 1;
+            Kb = transB ? b->c : b->h;
+            Nb = transB ? b->h : b->c;
+        }
+    }
+    if (Kb != Ka || (Bb != Ba && Bb != 1) || Nb == 0)
+        return 0;
+
+    uint32_t Bout = 1, Mout = 0, Nout = 0;
+    if (out->w > 1) {
+        Bout = out->h;
+        Mout = out->w;
+        Nout = out->c;
+    } else {
+        if (Ba > 1) {
+            if (out->h % Ba != 0)
+                return 0;
+            Bout = Ba;
+            Mout = out->h / Ba;
+            Nout = out->c;
+        } else {
+            Bout = 1;
+            Mout = out->h;
+            Nout = out->c;
+        }
+    }
+    if (Bout != Ba || Mout != Ma || Nout != Nb)
+        return 0;
+
+    if (B_out) *B_out = Ba;
+    if (M_out) *M_out = Ma;
+    if (K_out) *K_out = Ka;
+    if (N_out) *N_out = Nb;
+    if (B_b_out) *B_b_out = Bb;
+    return 1;
+}
+
+static int sdpa_dims(const HxGraph *g, const HxOp *o,
+                     uint32_t *B_out, uint32_t *Lq_out, uint32_t *Lk_out,
+                     uint32_t *Dk_out, uint32_t *Dv_out) {
+    if (o->y == HXFG_NONE || o->z == HXFG_NONE ||
+        o->x >= g->header->tensors || o->y >= g->header->tensors ||
+        o->z >= g->header->tensors || o->out >= g->header->tensors)
+        return 0;
+    const HxTensor *q = &g->tensors[o->x];
+    const HxTensor *k = &g->tensors[o->y];
+    const HxTensor *v = &g->tensors[o->z];
+    const HxTensor *out = &g->tensors[o->out];
+    const uint32_t *p = o->p;
+
+    uint32_t Bq = 1, Lq = 0, Dq = 0;
+    if (q->w > 1) {
+        Bq = q->h;
+        Lq = q->w;
+        Dq = q->c;
+    } else {
+        uint32_t b_param = p[3] > 1 ? p[3] : 1;
+        if (q->h % b_param != 0)
+            return 0;
+        Bq = b_param;
+        Lq = q->h / b_param;
+        Dq = q->c;
+    }
+    if (Dq > 4096 || Lq == 0 || Dq == 0)
+        return 0;
+
+    uint32_t Bk = 1, Lk = 0, Dk = 0;
+    if (k->w > 1) {
+        Bk = k->h;
+        Lk = k->w;
+        Dk = k->c;
+    } else {
+        if (Bq > 1 && k->h % Bq == 0) {
+            Bk = Bq;
+            Lk = k->h / Bq;
+            Dk = k->c;
+        } else {
+            Bk = 1;
+            Lk = k->h;
+            Dk = k->c;
+        }
+    }
+    if (Dk != Dq || (Bk != Bq && Bk != 1) || Lk == 0)
+        return 0;
+
+    uint32_t Bv = 1, Lv = 0, Dv = 0;
+    if (v->w > 1) {
+        Bv = v->h;
+        Lv = v->w;
+        Dv = v->c;
+    } else {
+        if (Bq > 1 && v->h % Bq == 0) {
+            Bv = Bq;
+            Lv = v->h / Bq;
+            Dv = v->c;
+        } else {
+            Bv = 1;
+            Lv = v->h;
+            Dv = v->c;
+        }
+    }
+    if (Lv != Lk || (Bv != Bq && Bv != 1) || Dv == 0 || Dv > 4096)
+        return 0;
+
+    uint32_t Bout = 1, Lout = 0, Dout = 0;
+    if (out->w > 1) {
+        Bout = out->h;
+        Lout = out->w;
+        Dout = out->c;
+    } else {
+        if (Bq > 1) {
+            if (out->h % Bq != 0)
+                return 0;
+            Bout = Bq;
+            Lout = out->h / Bq;
+            Dout = out->c;
+        } else {
+            Bout = 1;
+            Lout = out->h;
+            Dout = out->c;
+        }
+    }
+    if (Bout != Bq || Lout != Lq || Dout != Dv)
+        return 0;
+
+    if (p[0] != HXFG_NONE) {
+        if (p[0] >= g->header->tensors)
+            return 0;
+        const HxTensor *m = &g->tensors[p[0]];
+        uint32_t mh = m->w > 1 ? m->h : (Bq > 1 && m->h % Bq == 0 ? Bq : 1);
+        uint32_t mw = m->w > 1 ? m->w : (mh > 1 ? m->h / mh : m->h);
+        uint32_t mc = m->c;
+        if ((mh != Bq && mh != 1) || (mw != Lq && mw != 1) || (mc != Lk && mc != 1))
+            return 0;
+    }
+
+    if (B_out) *B_out = Bq;
+    if (Lq_out) *Lq_out = Lq;
+    if (Lk_out) *Lk_out = Lk;
+    if (Dk_out) *Dk_out = Dq;
+    if (Dv_out) *Dv_out = Dv;
+    return 1;
+}
 static int op_valid(const HxGraph *g, const HxOp *o) {
     const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
     const uint32_t *p = o->p;
@@ -55,6 +239,15 @@ static int op_valid(const HxGraph *g, const HxOp *o) {
         break;
     case HX_NORM:
         used = 5;
+        break;
+    case HX_MATMUL:
+        used = 4;
+        break;
+    case HX_SDPA:
+        used = 5;
+        break;
+    case HX_ATTN_SOFTMAX:
+        used = 3;
         break;
     case HX_ADD:
     case HX_PRELU:
@@ -163,8 +356,26 @@ static int op_valid(const HxGraph *g, const HxOp *o) {
         return b->h == 1 && b->w == 1 && a->c == b->c;
     case HX_LOGISTIC:
         return same(a, b);
-    case HX_SOFTMAX: /* over channels per pixel: unary, no p fields (checked above) */
+    case HX_SOFTMAX:
         return same(a, b);
+    case HX_ATTN_SOFTMAX: {
+        if (!same(a, b))
+            return 0;
+        if (o->y != HXFG_NONE) {
+            if (o->y >= g->header->tensors)
+                return 0;
+            const HxTensor *yt = &g->tensors[o->y];
+            if ((yt->h != b->h && yt->h != 1) ||
+                (yt->w != b->w && yt->w != 1) ||
+                (yt->c != b->c && yt->c != 1))
+                return 0;
+        }
+        return p[0] <= 2 && p[1] <= 1;
+    }
+    case HX_MATMUL:
+        return matmul_dims(g, o, NULL, NULL, NULL, NULL, NULL);
+    case HX_SDPA:
+        return sdpa_dims(g, o, NULL, NULL, NULL, NULL, NULL);
     case HX_NORM: /* unary; p[1] = groups (GROUP only, must divide C), p[3]/p[4] gamma/beta */
         return same(a, b) && p[0] < HX_NORM_COUNT &&
                (p[0] == HX_NORM_GROUP ? p[1] >= 1 && p[1] <= b->c && b->c % p[1] == 0 : !p[1]) &&
@@ -251,8 +462,10 @@ uint32_t hx_graph_open(HxGraph *g, const void *image, uint32_t image_bytes, cons
         const HxOp *o = &g->ops[i];
         if (bad_op)
             *bad_op = i;
-        int binary = o->kind == HX_ADD || o->kind == HX_CONCAT ||
-                     (o->kind == HX_BINARY && !o->p[1]);
+        int req_y = o->kind == HX_ADD || o->kind == HX_CONCAT || o->kind == HX_MATMUL ||
+                    o->kind == HX_SDPA || (o->kind == HX_BINARY && !o->p[1]);
+        int opt_y = (o->kind == HX_ATTN_SOFTMAX);
+        int req_z = (o->kind == HX_SDPA);
         /* z is NONE, or a dilation (dh << 8) | dw on conv/depthwise only (1..8 each, not both 1). */
         const int conv_like = o->kind == HX_CONV || o->kind == HX_DEPTHWISE;
         const int dilated_z = o->z != HXFG_NONE && conv_like && (o->z >> 16) == 0 &&
@@ -260,24 +473,36 @@ uint32_t hx_graph_open(HxGraph *g, const void *image, uint32_t image_bytes, cons
                               hx_dilation_w(o) >= 1 && hx_dilation_w(o) <= 8 &&
                               (hx_dilation_h(o) > 1 || hx_dilation_w(o) > 1);
         if (o->x >= h->tensors || o->out >= h->tensors ||
-            (o->z != HXFG_NONE && !dilated_z) ||
-            (binary ? o->y >= h->tensors : o->y != HXFG_NONE))
+            (req_z ? (o->z >= h->tensors) : (o->z != HXFG_NONE && !dilated_z)) ||
+            (req_y ? (o->y >= h->tensors) : (opt_y ? (o->y != HXFG_NONE && o->y >= h->tensors) : (o->y != HXFG_NONE))))
             return HX_OPERATOR;
-        if (!live[o->x] || (binary && !live[o->y]) || produced[o->out])
+        if (o->kind == HX_SDPA && o->p[0] != HXFG_NONE) {
+            if (o->p[0] >= h->tensors || !live[o->p[0]])
+                return HX_OPERATOR;
+        }
+        if (!live[o->x] || (req_y && !live[o->y]) || (opt_y && o->y != HXFG_NONE && !live[o->y]) ||
+            (req_z && !live[o->z]) || produced[o->out])
             return HX_UNINITIALIZED;
         const HxTensor *out = &g->tensors[o->out];
         for (uint32_t j = 0; j < h->tensors; j++)
             if (live[j]) {
                 const HxTensor *t = &g->tensors[j];
                 if (overlap(out->offset, hx_tensor_bytes(out), t->offset, hx_tensor_bytes(t))) {
-                    if (j == o->x || (binary && j == o->y))
+                    if (j == o->x || (req_y && j == o->y) || (opt_y && o->y != HXFG_NONE && j == o->y) ||
+                        (req_z && j == o->z) || (o->kind == HX_SDPA && o->p[0] != HXFG_NONE && j == o->p[0]))
                         return HX_ALIAS;
                     live[j] = 0;
                 }
             }
         if (g->tensors[o->x].stride % 32u && o->kind != HX_CONV)
             return HX_SHAPE;
-        if (binary && g->tensors[o->y].stride % 32u)
+        if (req_y && g->tensors[o->y].stride % 32u)
+            return HX_SHAPE;
+        if (opt_y && o->y != HXFG_NONE && g->tensors[o->y].stride % 32u)
+            return HX_SHAPE;
+        if (req_z && g->tensors[o->z].stride % 32u)
+            return HX_SHAPE;
+        if (o->kind == HX_SDPA && o->p[0] != HXFG_NONE && g->tensors[o->p[0]].stride % 32u)
             return HX_SHAPE;
         if (out->stride % 32u || !op_valid(g, o))
             return HX_SHAPE;
@@ -602,20 +827,214 @@ void hx_execute_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t par
             }
             continue;
         }
-        if (o->kind == HX_SOFTMAX) {
-            /* Stable softmax over the real channels; padding lanes are written as zero. */
-            const float *src = x + i * a->stride;
-            float peak = -FLT_MAX, sum = 0;
-            for (uint32_t c = 0; c < b->c; c++)
-                peak = fmaxf(peak, src[c]);
-            for (uint32_t c = 0; c < b->c; c++) {
-                dst[c] = expf(src[c] - peak);
-                sum += dst[c];
+        if (o->kind == HX_MATMUL) {
+            uint32_t Ba = 1, Ma = 0, Ka = 0, Nout = 0, Bb = 1;
+            matmul_dims(g, o, &Ba, &Ma, &Ka, &Nout, &Bb);
+            const float scale = p[1] ? hx_float(p[1]) : 1.0f;
+            const uint32_t transB = p[0], transA = p[3];
+            const HxTensor *yt = &g->tensors[o->y];
+
+            uint32_t batch_idx = (b->w > 1) ? (i / b->w) : (Ba > 1 ? (i / Ma) : 0);
+            uint32_t m_idx = (b->w > 1) ? (i % b->w) : (Ba > 1 ? (i % Ma) : i);
+            uint32_t b_batch = (Bb == 1) ? 0 : batch_idx;
+
+            uint32_t a_row_base = (a->w > 1) ? (batch_idx * a->w) : (Ba > 1 ? (batch_idx * Ma) : 0);
+
+            for (uint32_t n = 0; n < b->stride; n++) {
+                if (n >= Nout) {
+                    dst[n] = 0.0f;
+                    continue;
+                }
+                float acc = 0.0f;
+                if (!transA && !transB) {
+                    const float *src_a = x + (a_row_base + m_idx) * a->stride;
+                    uint32_t b_row_base = (yt->w > 1) ? (b_batch * yt->w) : (Bb > 1 ? (b_batch * Ka) : 0);
+                    for (uint32_t k = 0; k < Ka; k++)
+                        acc += src_a[k] * y[(b_row_base + k) * yt->stride + n];
+                } else if (!transA && transB) {
+                    const float *src_a = x + (a_row_base + m_idx) * a->stride;
+                    uint32_t b_row_base = (yt->w > 1) ? (b_batch * yt->w) : (Bb > 1 ? (b_batch * Nout) : 0);
+                    const float *src_b = y + (b_row_base + n) * yt->stride;
+                    for (uint32_t k = 0; k < Ka; k++)
+                        acc += src_a[k] * src_b[k];
+                } else if (transA && !transB) {
+                    uint32_t b_row_base = (yt->w > 1) ? (b_batch * yt->w) : (Bb > 1 ? (b_batch * Ka) : 0);
+                    for (uint32_t k = 0; k < Ka; k++)
+                        acc += x[(a_row_base + k) * a->stride + m_idx] * y[(b_row_base + k) * yt->stride + n];
+                } else {
+                    uint32_t b_row_base = (yt->w > 1) ? (b_batch * yt->w) : (Bb > 1 ? (b_batch * Nout) : 0);
+                    const float *src_b = y + (b_row_base + n) * yt->stride;
+                    for (uint32_t k = 0; k < Ka; k++)
+                        acc += x[(a_row_base + k) * a->stride + m_idx] * src_b[k];
+                }
+                dst[n] = acc * scale;
             }
-            for (uint32_t c = 0; c < b->c; c++)
-                dst[c] /= sum;
-            for (uint32_t c = b->c; c < b->stride; c++)
-                dst[c] = 0.0f;
+            continue;
+        }
+        if (o->kind == HX_SDPA) {
+            uint32_t Bq = 1, Lq = 0, Lk = 0, Dk = 0, Dv = 0;
+            sdpa_dims(g, o, &Bq, &Lq, &Lk, &Dk, &Dv);
+
+            const HxTensor *q_t = a, *k_t = &g->tensors[o->y], *v_t = &g->tensors[o->z];
+            const float *qv = x;
+            const float *kv = (const float *)(g->arena + k_t->offset);
+            const float *vv = (const float *)(g->arena + v_t->offset);
+            const HxTensor *mask_t = (p[0] != HXFG_NONE) ? &g->tensors[p[0]] : NULL;
+            const float *mask_data = mask_t ? (const float *)(g->arena + mask_t->offset) : NULL;
+
+            uint32_t Bk = (k_t->w > 1) ? k_t->h : ((Bq > 1 && k_t->h % Bq == 0) ? Bq : 1);
+            uint32_t Bv = (v_t->w > 1) ? v_t->h : ((Bq > 1 && v_t->h % Bq == 0) ? Bq : 1);
+
+            float scale = p[1] ? hx_float(p[1]) : (1.0f / sqrtf((float)Dk));
+            uint32_t causal = p[2];
+
+            uint32_t b_idx = (b->w > 1) ? (i / b->w) : (Bq > 1 ? (i / Lq) : 0);
+            uint32_t q = (b->w > 1) ? (i % b->w) : (Bq > 1 ? (i % Lq) : i);
+            uint32_t k_batch = (Bk == 1) ? 0 : b_idx;
+            uint32_t v_batch = (Bv == 1) ? 0 : b_idx;
+
+            const float *q_row = qv + ((q_t->w > 1 ? b_idx * q_t->w : b_idx * Lq) + q) * q_t->stride;
+
+            const float *m_row = NULL;
+            if (mask_data) {
+                uint32_t mb = (mask_t->h == 1 ? 0 : b_idx);
+                uint32_t mq = (mask_t->w == 1 ? 0 : q);
+                m_row = mask_data + (mb * mask_t->w + mq) * mask_t->stride;
+            }
+
+            float scores[4096];
+            float peak = -FLT_MAX, sum = 0.0f;
+            for (uint32_t k = 0; k < Lk; k++) {
+                if (causal && k > q) {
+                    scores[k] = -FLT_MAX;
+                    continue;
+                }
+                const float *k_row = kv + ((k_t->w > 1 ? k_batch * k_t->w : k_batch * Lk) + k) * k_t->stride;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < Dk; d++)
+                    dot += q_row[d] * k_row[d];
+                dot *= scale;
+                if (m_row) dot += (mask_t->c == 1 ? m_row[0] : m_row[k]);
+                scores[k] = dot;
+                if (dot > peak) peak = dot;
+            }
+            if (peak == -FLT_MAX) peak = 0.0f;
+
+            for (uint32_t k = 0; k < Lk; k++) {
+                if (causal && k > q) {
+                    scores[k] = 0.0f;
+                } else {
+                    scores[k] = expf(scores[k] - peak);
+                    sum += scores[k];
+                }
+            }
+            float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+            for (uint32_t k = 0; k < Lk; k++)
+                scores[k] *= inv_sum;
+
+            for (uint32_t d = 0; d < Dv; d++) {
+                float acc = 0.0f;
+                for (uint32_t k = 0; k < Lk; k++) {
+                    if (scores[k] > 0.0f) {
+                        const float *v_row = vv + ((v_t->w > 1 ? v_batch * v_t->w : v_batch * Lk) + k) * v_t->stride;
+                        acc += scores[k] * v_row[d];
+                    }
+                }
+                dst[d] = acc;
+            }
+            for (uint32_t d = Dv; d < b->stride; d++)
+                dst[d] = 0.0f;
+            continue;
+        }
+        if (o->kind == HX_SOFTMAX || o->kind == HX_ATTN_SOFTMAX) {
+            uint32_t axis = p[0] ? p[0] : 2;
+            if (axis == 2) {
+                const float *src = x + i * a->stride;
+                const uint32_t causal = p[1];
+                const uint32_t M = b->w > 1 ? b->w : (p[2] > 0 ? p[2] : b->h);
+                const uint32_t q = M > 0 ? (i % M) : 0;
+
+                const HxTensor *mask_t = (o->y != HXFG_NONE) ? &g->tensors[o->y] : NULL;
+                const float *mask_data = mask_t ? (const float *)(g->arena + mask_t->offset) : NULL;
+                const float *m_row = NULL;
+                if (mask_data) {
+                    uint32_t my = mask_t->h == 1 ? 0 : oy;
+                    uint32_t mx = mask_t->w == 1 ? 0 : ox;
+                    m_row = mask_data + (my * mask_t->w + mx) * mask_t->stride;
+                }
+
+                float peak = -FLT_MAX, sum = 0.0f;
+                for (uint32_t c = 0; c < b->c; c++) {
+                    if (causal && c > q)
+                        continue;
+                    float v = src[c];
+                    if (m_row)
+                        v += (mask_t->c == 1 ? m_row[0] : m_row[c]);
+                    if (v > peak)
+                        peak = v;
+                }
+                if (peak == -FLT_MAX)
+                    peak = 0.0f;
+
+                for (uint32_t c = 0; c < b->c; c++) {
+                    if (causal && c > q) {
+                        dst[c] = 0.0f;
+                    } else {
+                        float v = src[c];
+                        if (m_row)
+                            v += (mask_t->c == 1 ? m_row[0] : m_row[c]);
+                        dst[c] = expf(v - peak);
+                        sum += dst[c];
+                    }
+                }
+                float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+                for (uint32_t c = 0; c < b->c; c++)
+                    dst[c] *= inv_sum;
+                for (uint32_t c = b->c; c < b->stride; c++)
+                    dst[c] = 0.0f;
+            } else if (axis == 1) {
+                if (ox == 0) {
+                    for (uint32_t c = 0; c < b->c; c++) {
+                        float peak = -FLT_MAX, sum = 0.0f;
+                        for (uint32_t w = 0; w < b->w; w++) {
+                            float v = x[(oy * a->w + w) * a->stride + c];
+                            if (v > peak) peak = v;
+                        }
+                        for (uint32_t w = 0; w < b->w; w++) {
+                            float v = expf(x[(oy * a->w + w) * a->stride + c] - peak);
+                            out[(oy * b->w + w) * b->stride + c] = v;
+                            sum += v;
+                        }
+                        float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+                        for (uint32_t w = 0; w < b->w; w++)
+                            out[(oy * b->w + w) * b->stride + c] *= inv;
+                    }
+                    for (uint32_t w = 0; w < b->w; w++)
+                        for (uint32_t c = b->c; c < b->stride; c++)
+                            out[(oy * b->w + w) * b->stride + c] = 0.0f;
+                }
+            } else {
+                if (oy == 0) {
+                    for (uint32_t c = 0; c < b->c; c++) {
+                        float peak = -FLT_MAX, sum = 0.0f;
+                        for (uint32_t h = 0; h < b->h; h++) {
+                            float v = x[(h * a->w + ox) * a->stride + c];
+                            if (v > peak) peak = v;
+                        }
+                        for (uint32_t h = 0; h < b->h; h++) {
+                            float v = expf(x[(h * a->w + ox) * a->stride + c] - peak);
+                            out[(h * b->w + ox) * b->stride + c] = v;
+                            sum += v;
+                        }
+                        float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+                        for (uint32_t h = 0; h < b->h; h++)
+                            out[(h * b->w + ox) * b->stride + c] *= inv;
+                    }
+                    for (uint32_t h = 0; h < b->h; h++)
+                        for (uint32_t c = b->c; c < b->stride; c++)
+                            out[(h * b->w + ox) * b->stride + c] = 0.0f;
+                }
+            }
             continue;
         }
         if (o->kind == HX_AVGPOOL) {

@@ -1032,11 +1032,292 @@ static void norm_scalar(const HxGraph *g, const HxOp *o, uint32_t lo, uint32_t h
             }
     }
 }
+
+/* HX_MATMUL in scalar lanes. Accumulates in float32 and converts to half. */
+static void matmul_fp16_scalar(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
+    const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out], *yt = &g->tensors[o->y];
+    const uint16_t *xv = (const uint16_t *)tensor_data(g, o->x);
+    const uint16_t *yv = (const uint16_t *)tensor_data(g, o->y);
+    uint16_t *out = (uint16_t *)tensor_data(g, o->out);
+
+    uint32_t Ba = 1, Ma = 0, Ka = 0;
+    if (a->w > 1) {
+        Ba = a->h;
+        Ma = o->p[3] ? a->c : a->w;
+        Ka = o->p[3] ? a->w : a->c;
+    } else {
+        uint32_t b_param = o->p[2] > 1 ? o->p[2] : 1;
+        Ba = b_param;
+        Ma = o->p[3] ? a->c : (a->h / b_param);
+        Ka = o->p[3] ? (a->h / b_param) : a->c;
+    }
+
+    uint32_t Bb = 1, Kb = 0, Nb = 0;
+    if (yt->w > 1) {
+        Bb = yt->h;
+        Kb = o->p[0] ? yt->c : yt->w;
+        Nb = o->p[0] ? yt->w : yt->c;
+    } else {
+        if (Ba > 1 && yt->h % Ba == 0) {
+            Bb = Ba;
+            Kb = o->p[0] ? yt->c : (yt->h / Ba);
+            Nb = o->p[0] ? (yt->h / Ba) : yt->c;
+        } else {
+            Bb = 1;
+            Kb = o->p[0] ? yt->c : yt->h;
+            Nb = o->p[0] ? yt->h : yt->c;
+        }
+    }
+
+    float scale = 1.0f;
+    if (o->p[1])
+        memcpy(&scale, &o->p[1], sizeof scale);
+
+    const uint32_t transB = o->p[0], transA = o->p[3];
+    const uint32_t pw_a = physical_width(a), pw_b = physical_width(b), pw_y = physical_width(yt);
+    const uint32_t total_rows = Ba * Ma;
+    const uint32_t r0 = total_rows * part / parts, r1 = total_rows * (part + 1u) / parts;
+
+    for (uint32_t r = r0; r < r1; r++) {
+        uint32_t batch_idx = r / Ma;
+        uint32_t m_idx = r % Ma;
+        uint32_t b_batch = (Bb == 1) ? 0 : batch_idx;
+
+        uint32_t out_y = (b->w > 1) ? batch_idx : r;
+        uint32_t out_x = (b->w > 1) ? m_idx : 0;
+        uint32_t out_px = out_y * pw_b + out_x;
+
+        for (uint32_t n = 0; n < b->stride; n++) {
+            if (n >= Nb) {
+                out[at(b, out_px, n)] = 0;
+                continue;
+            }
+            float acc = 0.0f;
+            if (!transA && !transB) {
+                uint32_t a_y = (a->w > 1) ? batch_idx : (batch_idx * Ma + m_idx);
+                uint32_t a_x = (a->w > 1) ? m_idx : 0;
+                uint32_t a_px = a_y * pw_a + a_x;
+                for (uint32_t k = 0; k < Ka; k++) {
+                    uint32_t y_y = (yt->w > 1) ? b_batch : (b_batch * Kb + k);
+                    uint32_t y_x = (yt->w > 1) ? k : 0;
+                    acc += scalar(xv[at(a, a_px, k)]) * scalar(yv[at(yt, y_y * pw_y + y_x, n)]);
+                }
+            } else if (!transA && transB) {
+                uint32_t a_y = (a->w > 1) ? batch_idx : (batch_idx * Ma + m_idx);
+                uint32_t a_x = (a->w > 1) ? m_idx : 0;
+                uint32_t a_px = a_y * pw_a + a_x;
+                uint32_t y_y = (yt->w > 1) ? b_batch : (b_batch * Nb + n);
+                uint32_t y_x = (yt->w > 1) ? n : 0;
+                uint32_t y_px = y_y * pw_y + y_x;
+                for (uint32_t k = 0; k < Ka; k++)
+                    acc += scalar(xv[at(a, a_px, k)]) * scalar(yv[at(yt, y_px, k)]);
+            } else if (transA && !transB) {
+                for (uint32_t k = 0; k < Ka; k++) {
+                    uint32_t a_y = (a->w > 1) ? batch_idx : (batch_idx * Ka + k);
+                    uint32_t a_x = (a->w > 1) ? k : 0;
+                    uint32_t y_y = (yt->w > 1) ? b_batch : (b_batch * Kb + k);
+                    uint32_t y_x = (yt->w > 1) ? k : 0;
+                    acc += scalar(xv[at(a, a_y * pw_a + a_x, m_idx)]) *
+                           scalar(yv[at(yt, y_y * pw_y + y_x, n)]);
+                }
+            } else {
+                uint32_t y_y = (yt->w > 1) ? b_batch : (b_batch * Nb + n);
+                uint32_t y_x = (yt->w > 1) ? n : 0;
+                uint32_t y_px = y_y * pw_y + y_x;
+                for (uint32_t k = 0; k < Ka; k++) {
+                    uint32_t a_y = (a->w > 1) ? batch_idx : (batch_idx * Ka + k);
+                    uint32_t a_x = (a->w > 1) ? k : 0;
+                    acc += scalar(xv[at(a, a_y * pw_a + a_x, m_idx)]) * scalar(yv[at(yt, y_px, k)]);
+                }
+            }
+            out[at(b, out_px, n)] = half(acc * scale);
+        }
+    }
+}
+
+/* HX_SOFTMAX / HX_ATTN_SOFTMAX in scalar lanes. */
+static void softmax_fp16_scalar(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
+    const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
+    const uint16_t *x = (const uint16_t *)tensor_data(g, o->x);
+    uint16_t *out = (uint16_t *)tensor_data(g, o->out);
+    const HxTensor *mask_t = (o->y != HXFG_NONE) ? &g->tensors[o->y] : NULL;
+    const uint16_t *mask_v = mask_t ? (const uint16_t *)tensor_data(g, o->y) : NULL;
+
+    const uint32_t pw_a = physical_width(a), pw_b = physical_width(b);
+    const uint32_t pw_m = mask_t ? physical_width(mask_t) : 0;
+    const uint32_t causal = o->p[1];
+    const uint32_t M = b->w > 1 ? b->w : (o->p[2] > 0 ? o->p[2] : b->h);
+
+    const uint32_t pixels = b->h * b->w;
+    const uint32_t lo = pixels * part / parts, hi = pixels * (part + 1u) / parts;
+
+    for (uint32_t i = lo; i < hi; i++) {
+        uint32_t oy = i / b->w, ox = i % b->w;
+        uint32_t px = oy * pw_b + ox;
+        uint32_t q = M > 0 ? (i % M) : 0;
+
+        uint32_t my = mask_t ? (mask_t->h == 1 ? 0 : oy) : 0;
+        uint32_t mx = mask_t ? (mask_t->w == 1 ? 0 : ox) : 0;
+        uint32_t m_px = mask_t ? (my * pw_m + mx) : 0;
+
+        float peak = -FLT_MAX, sum = 0.0f;
+        for (uint32_t c = 0; c < b->c; c++) {
+            if (causal && c > q)
+                continue;
+            float v = scalar(x[at(a, px, c)]);
+            if (mask_v)
+                v += scalar(mask_v[at(mask_t, m_px, mask_t->c == 1 ? 0 : c)]);
+            if (v > peak)
+                peak = v;
+        }
+        if (peak == -FLT_MAX)
+            peak = 0.0f;
+
+        for (uint32_t c = 0; c < b->c; c++) {
+            if (causal && c > q) {
+                out[at(b, px, c)] = 0;
+            } else {
+                float v = scalar(x[at(a, px, c)]);
+                if (mask_v)
+                    v += scalar(mask_v[at(mask_t, m_px, mask_t->c == 1 ? 0 : c)]);
+                sum += expf(v - peak);
+            }
+        }
+        float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+        for (uint32_t c = 0; c < b->c; c++) {
+            if (causal && c > q) {
+                out[at(b, px, c)] = 0;
+            } else {
+                float v = scalar(x[at(a, px, c)]);
+                if (mask_v)
+                    v += scalar(mask_v[at(mask_t, m_px, mask_t->c == 1 ? 0 : c)]);
+                out[at(b, px, c)] = half(expf(v - peak) * inv_sum);
+            }
+        }
+        for (uint32_t c = b->c; c < b->stride; c++)
+            out[at(b, px, c)] = 0;
+    }
+}
+
+/* HX_SDPA in scalar lanes. */
+static void sdpa_fp16_scalar(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
+    const HxTensor *q_t = &g->tensors[o->x], *k_t = &g->tensors[o->y], *v_t = &g->tensors[o->z], *b = &g->tensors[o->out];
+    const uint16_t *qv = (const uint16_t *)tensor_data(g, o->x);
+    const uint16_t *kv = (const uint16_t *)tensor_data(g, o->y);
+    const uint16_t *vv = (const uint16_t *)tensor_data(g, o->z);
+    uint16_t *out = (uint16_t *)tensor_data(g, o->out);
+
+    const HxTensor *mask_t = (o->p[0] != HXFG_NONE) ? &g->tensors[o->p[0]] : NULL;
+    const uint16_t *mask_v = mask_t ? (const uint16_t *)tensor_data(g, o->p[0]) : NULL;
+
+    uint32_t Bq = 1, Lq = 0, Dq = q_t->c;
+    if (q_t->w > 1) { Bq = q_t->h; Lq = q_t->w; }
+    else { uint32_t b_param = o->p[3] > 1 ? o->p[3] : 1; Bq = b_param; Lq = q_t->h / b_param; }
+
+    uint32_t Bk = 1, Lk = 0;
+    if (k_t->w > 1) { Bk = k_t->h; Lk = k_t->w; }
+    else { Bk = (Bq > 1 && k_t->h % Bq == 0) ? Bq : 1; Lk = (Bk > 1) ? (k_t->h / Bk) : k_t->h; }
+
+    uint32_t Bv = (v_t->w > 1) ? v_t->h : ((Bq > 1 && v_t->h % Bq == 0) ? Bq : 1);
+    uint32_t Dv = b->c;
+
+    float scale = 1.0f / sqrtf((float)Dq);
+    if (o->p[1])
+        memcpy(&scale, &o->p[1], sizeof scale);
+    const uint32_t causal = o->p[2];
+
+    const uint32_t pw_q = physical_width(q_t), pw_k = physical_width(k_t),
+                   pw_v = physical_width(v_t), pw_b = physical_width(b);
+    const uint32_t pw_m = mask_t ? physical_width(mask_t) : 0;
+
+    const uint32_t pixels = b->h * b->w;
+    const uint32_t lo = pixels * part / parts, hi = pixels * (part + 1u) / parts;
+
+    float scores[4096];
+    for (uint32_t i = lo; i < hi; i++) {
+        uint32_t b_idx = (b->w > 1) ? (i / b->w) : (Bq > 1 ? (i / Lq) : 0);
+        uint32_t q = (b->w > 1) ? (i % b->w) : (Bq > 1 ? (i % Lq) : i);
+        uint32_t k_batch = (Bk == 1) ? 0 : b_idx;
+        uint32_t v_batch = (Bv == 1) ? 0 : b_idx;
+
+        uint32_t q_y = (q_t->w > 1) ? b_idx : (b_idx * Lq + q);
+        uint32_t q_x = (q_t->w > 1) ? q : 0;
+        uint32_t q_px = q_y * pw_q + q_x;
+
+        uint32_t out_y = i / b->w, out_x = i % b->w;
+        uint32_t out_px = out_y * pw_b + out_x;
+
+        uint32_t mb = mask_t ? (mask_t->h == 1 ? 0 : b_idx) : 0;
+        uint32_t mq = mask_t ? (mask_t->w == 1 ? 0 : q) : 0;
+        uint32_t m_px = mask_t ? (mb * pw_m + mq) : 0;
+
+        float peak = -FLT_MAX, sum = 0.0f;
+        for (uint32_t k = 0; k < Lk; k++) {
+            if (causal && k > q) {
+                scores[k] = -FLT_MAX;
+                continue;
+            }
+            uint32_t k_y = (k_t->w > 1) ? k_batch : (k_batch * Lk + k);
+            uint32_t k_x = (k_t->w > 1) ? k : 0;
+            uint32_t k_px = k_y * pw_k + k_x;
+
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < Dq; d++)
+                dot += scalar(qv[at(q_t, q_px, d)]) * scalar(kv[at(k_t, k_px, d)]);
+            dot *= scale;
+            if (mask_v)
+                dot += scalar(mask_v[at(mask_t, m_px, mask_t->c == 1 ? 0 : k)]);
+            scores[k] = dot;
+            if (dot > peak)
+                peak = dot;
+        }
+        if (peak == -FLT_MAX)
+            peak = 0.0f;
+
+        for (uint32_t k = 0; k < Lk; k++) {
+            if (causal && k > q) {
+                scores[k] = 0.0f;
+            } else {
+                scores[k] = expf(scores[k] - peak);
+                sum += scores[k];
+            }
+        }
+        float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+        for (uint32_t k = 0; k < Lk; k++)
+            scores[k] *= inv_sum;
+
+        for (uint32_t d = 0; d < Dv; d++) {
+            float acc = 0.0f;
+            for (uint32_t k = 0; k < Lk; k++) {
+                if (scores[k] > 0.0f) {
+                    uint32_t v_y = (v_t->w > 1) ? v_batch : (v_batch * Lk + k);
+                    uint32_t v_x = (v_t->w > 1) ? k : 0;
+                    uint32_t v_px = v_y * pw_v + v_x;
+                    acc += scores[k] * scalar(vv[at(v_t, v_px, d)]);
+                }
+            }
+            out[at(b, out_px, d)] = half(acc);
+        }
+        for (uint32_t d = Dv; d < b->stride; d++)
+            out[at(b, out_px, d)] = 0;
+    }
+}
+
 void hx_fp16_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts) {
     const HxOp *o = &g->ops[index];
     const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
     const uint32_t *p = o->p;
     switch (o->kind) {
+    case HX_MATMUL:
+        matmul_fp16_scalar(g, o, part, parts);
+        return;
+    case HX_SDPA:
+        sdpa_fp16_scalar(g, o, part, parts);
+        return;
+    case HX_SOFTMAX:
+    case HX_ATTN_SOFTMAX:
+        softmax_fp16_scalar(g, o, part, parts);
+        return;
     case HX_DEPTHWISE:
         if (dw_fast(o)) {
             blocked_depthwise(g, index, part, parts);

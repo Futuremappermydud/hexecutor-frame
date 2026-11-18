@@ -7,10 +7,7 @@
 #include <stdexcept>
 #include <vector>
 namespace {
-void check(bool b) {
-    if (!b)
-        throw std::runtime_error("tensor test failed");
-}
+#define check(b) do { if (!(b)) { std::cerr << "check failed at line " << __LINE__ << std::endl; throw std::runtime_error("tensor test failed"); } } while(0)
 void near(float a, float b) { check(std::abs(a - b) < 1e-5f); }
 struct Fixture {
     std::vector<uint8_t> image, constants = std::vector<uint8_t>(4096), arena;
@@ -43,8 +40,8 @@ struct Fixture {
         inputs.push_back(op.out);
         std::memcpy(image.data() + h.io_offset, inputs.data(), inputs.size() * 4);
     }
+    uint32_t bad = 0;
     uint32_t open() {
-        uint32_t bad;
         return hx_graph_open(&graph, image.data(), image.size(), constants.data(), constants.size(),
                              arena.data(), arena.size(), &bad);
     }
@@ -72,12 +69,12 @@ struct Fixture {
     }
 };
 HxTensor shape(uint32_t h, uint32_t w, uint32_t c) { return {0, h, w, c, 0, {0, 0, 0}}; }
-HxOp op(uint32_t kind, uint32_t out = 1, uint32_t y = HXFG_NONE) {
+HxOp op(uint32_t kind, uint32_t out = 1, uint32_t y = HXFG_NONE, uint32_t z = HXFG_NONE) {
     HxOp o{};
     o.kind = kind;
     o.x = 0;
     o.y = y;
-    o.z = HXFG_NONE;
+    o.z = z;
     o.out = out;
     return o;
 }
@@ -875,6 +872,237 @@ int main() {
             conv.z = z;
             Fixture cz({shape(1, 2, 1), shape(1, 2, 1)}, conv, {0});
             check(cz.open() == HX_OPERATOR);
+        }
+    }
+    // Matrix product (HX_MATMUL): unbatched and batched multi-head forms
+    {
+        constexpr uint32_t L = 7, K = 33, N = 19;
+        std::vector<float> a(L * K), bk(K * N), bn(N * K);
+        for (uint32_t i = 0; i < L; i++)
+            for (uint32_t k = 0; k < K; k++)
+                a[i * K + k] = ((int)((i * 5 + k * 3) % 13) - 6) * 0.125f;
+        for (uint32_t k = 0; k < K; k++)
+            for (uint32_t n = 0; n < N; n++)
+                bk[k * N + n] = ((int)((k * 7 + n * 2) % 11) - 5) * 0.25f;
+        for (uint32_t n = 0; n < N; n++)
+            for (uint32_t k = 0; k < K; k++)
+                bn[n * K + k] = bk[k * N + n];
+        auto reference = [&](bool trans, float scale) {
+            std::vector<float> out(L * N);
+            for (uint32_t i = 0; i < L; i++)
+                for (uint32_t n = 0; n < N; n++) {
+                    double acc = 0;
+                    for (uint32_t k = 0; k < K; k++)
+                        acc += double(a[i * K + k]) * (trans ? bn[n * K + k] : bk[k * N + n]);
+                    out[i * N + n] = float(acc * scale);
+                }
+            return out;
+        };
+        auto bits = [](float f) {
+            uint32_t u;
+            std::memcpy(&u, &f, 4);
+            return u;
+        };
+        auto mm = [&](uint32_t trans, uint32_t scale_bits) {
+            auto o = op(HX_MATMUL, 2, 1);
+            o.p[0] = trans;
+            o.p[1] = scale_bits;
+            return o;
+        };
+        struct Case {
+            bool trans;
+            uint32_t scale_bits;
+            float scale;
+        };
+        for (Case c : {Case{false, 0, 1.0f}, Case{true, 0, 1.0f}, Case{true, bits(1.0f), 1.0f},
+                       Case{false, bits(0.5f), 0.5f}, Case{true, bits(-2.0f), -2.0f}}) {
+            Fixture fx({shape(L, 1, K), c.trans ? shape(N, 1, K) : shape(K, 1, N), shape(L, 1, N)},
+                       mm(c.trans, c.scale_bits), {0, 1});
+            fx.input(0, a);
+            fx.input(1, c.trans ? bn : bk);
+            auto got = fx.run();
+            auto want = reference(c.trans, c.scale);
+            check(got.size() == want.size());
+            for (size_t i = 0; i < want.size(); i++)
+                check(std::abs(got[i] - want[i]) < 1e-4f);
+        }
+
+        // Batched multi-head MatMul with w > 1: [H, Lq, K] x [H, Lk, K]^T -> [H, Lq, Lk]
+        {
+            constexpr uint32_t H = 3, Lq = 4, Lk = 5, D = 8;
+            std::vector<float> q(H * Lq * D), k(H * Lk * D);
+            for (size_t i = 0; i < q.size(); i++) q[i] = (float)((i % 7) - 3) * 0.25f;
+            for (size_t i = 0; i < k.size(); i++) k[i] = (float)((i % 5) - 2) * 0.5f;
+
+            auto bmm_op = op(HX_MATMUL, 2, 1);
+            bmm_op.p[0] = 1; // transB = 1
+            bmm_op.p[1] = bits(0.5f); // scale
+
+            Fixture fxb({shape(H, Lq, D), shape(H, Lk, D), shape(H, Lq, Lk)}, bmm_op, {0, 1});
+            fxb.input(0, q);
+            fxb.input(1, k);
+            auto got_b = fxb.run();
+            check(got_b.size() == H * Lq * Lk);
+
+            for (uint32_t h = 0; h < H; h++)
+                for (uint32_t qi = 0; qi < Lq; qi++)
+                    for (uint32_t ki = 0; ki < Lk; ki++) {
+                        double acc = 0;
+                        for (uint32_t d = 0; d < D; d++)
+                            acc += double(q[(h * Lq + qi) * D + d]) * double(k[(h * Lk + ki) * D + d]);
+                        float want = float(acc * 0.5f);
+                        float got = got_b[(h * Lq + qi) * Lk + ki];
+                        check(std::abs(got - want) < 1e-4f);
+                    }
+        }
+
+        // Batched multi-head MatMul with w = 1 and p[2] = H: [H*Lq, 1, K] x [H*Lk, 1, K]^T -> [H*Lq, 1, Lk]
+        {
+            constexpr uint32_t H = 2, Lq = 3, Lk = 4, D = 6;
+            std::vector<float> q(H * Lq * D), k(H * Lk * D);
+            for (size_t i = 0; i < q.size(); i++) q[i] = (float)(i + 1) * 0.1f;
+            for (size_t i = 0; i < k.size(); i++) k[i] = (float)(i % 4) * 0.2f;
+
+            auto bmm_op = op(HX_MATMUL, 2, 1);
+            bmm_op.p[0] = 1; // transB = 1
+            bmm_op.p[1] = 0; // scale 1.0f
+            bmm_op.p[2] = H; // batch count H
+
+            Fixture fxb({shape(H * Lq, 1, D), shape(H * Lk, 1, D), shape(H * Lq, 1, Lk)}, bmm_op, {0, 1});
+            fxb.input(0, q);
+            fxb.input(1, k);
+            auto got_b = fxb.run();
+            check(got_b.size() == H * Lq * Lk);
+            for (uint32_t h = 0; h < H; h++)
+                for (uint32_t qi = 0; qi < Lq; qi++)
+                    for (uint32_t ki = 0; ki < Lk; ki++) {
+                        double acc = 0;
+                        for (uint32_t d = 0; d < D; d++)
+                            acc += double(q[(h * Lq + qi) * D + d]) * double(k[(h * Lk + ki) * D + d]);
+                        float want = float(acc);
+                        float got = got_b[(h * Lq + qi) * Lk + ki];
+                        check(std::abs(got - want) < 1e-4f);
+                    }
+        }
+    }
+
+    // Softmax with causal mask and additive mask (HX_SOFTMAX and HX_ATTN_SOFTMAX)
+    {
+        constexpr uint32_t H = 2, Lq = 3, Lk = 3;
+        std::vector<float> logits(H * Lq * Lk);
+        for (size_t i = 0; i < logits.size(); i++) logits[i] = (float)(i % 5) - 2.0f;
+
+        // Causal softmax: p[1] = 1
+        auto sm = op(HX_ATTN_SOFTMAX);
+        sm.p[0] = 2; // channel/key axis
+        sm.p[1] = 1; // causal mask
+        Fixture fc({shape(H, Lq, Lk), shape(H, Lq, Lk)}, sm, {0});
+        fc.input(0, logits);
+        auto got_c = fc.run();
+        check(got_c.size() == H * Lq * Lk);
+        for (uint32_t h = 0; h < H; h++)
+            for (uint32_t q = 0; q < Lq; q++) {
+                float row_sum = 0.0f;
+                for (uint32_t k = 0; k < Lk; k++) {
+                    float v = got_c[(h * Lq + q) * Lk + k];
+                    if (k > q) {
+                        check(v == 0.0f); // future tokens masked out
+                    } else {
+                        check(v > 0.0f);
+                        row_sum += v;
+                    }
+                }
+                check(std::abs(row_sum - 1.0f) < 1e-4f);
+            }
+
+        // Additive mask with HX_ATTN_SOFTMAX
+        auto asm_op = op(HX_ATTN_SOFTMAX, 2, 1);
+        asm_op.p[0] = 2; // channel axis
+        asm_op.p[1] = 0; // non-causal
+        std::vector<float> mask(H * Lq * Lk, 0.0f);
+        // mask out last key position with large negative value
+        for (uint32_t h = 0; h < H; h++)
+            for (uint32_t q = 0; q < Lq; q++)
+                mask[(h * Lq + q) * Lk + 2] = -10000.0f;
+
+        Fixture fa({shape(H, Lq, Lk), shape(H, Lq, Lk), shape(H, Lq, Lk)}, asm_op, {0, 1});
+        fa.input(0, logits);
+        fa.input(1, mask);
+        auto got_a = fa.run();
+        for (uint32_t h = 0; h < H; h++)
+            for (uint32_t q = 0; q < Lq; q++) {
+                check(got_a[(h * Lq + q) * Lk + 2] < 1e-6f);
+                float row_sum = got_a[(h * Lq + q) * Lk + 0] + got_a[(h * Lq + q) * Lk + 1];
+                check(std::abs(row_sum - 1.0f) < 1e-4f);
+            }
+    }
+
+    // Fused Scaled Dot-Product Attention (HX_SDPA, 27)
+    {
+        constexpr uint32_t H = 2, Lq = 4, Lk = 4, D = 8;
+        std::vector<float> q(H * Lq * D), k(H * Lk * D), v(H * Lk * D);
+        for (size_t i = 0; i < q.size(); i++) q[i] = (float)((i * 3) % 7 - 3) * 0.25f;
+        for (size_t i = 0; i < k.size(); i++) k[i] = (float)((i * 5) % 9 - 4) * 0.25f;
+        for (size_t i = 0; i < v.size(); i++) v[i] = (float)((i * 7) % 11 - 5) * 0.25f;
+
+        auto bits = [](float f) {
+            uint32_t u;
+            std::memcpy(&u, &f, 4);
+            return u;
+        };
+
+        for (uint32_t causal : {0u, 1u}) {
+            auto sdpa = op(HX_SDPA, 3, 1, 2); // out=3, y=1 (K), z=2 (V)
+            sdpa.p[0] = HXFG_NONE; // no mask
+            float scale = 1.0f / std::sqrt((float)D);
+            sdpa.p[1] = bits(scale);
+            sdpa.p[2] = causal;
+
+            Fixture f({shape(H, Lq, D), shape(H, Lk, D), shape(H, Lk, D), shape(H, Lq, D)}, sdpa, {0, 1, 2});
+            f.input(0, q);
+            f.input(1, k);
+            f.input(2, v);
+            auto got = f.run();
+            check(got.size() == H * Lq * D);
+
+            // Compute reference output using composed formula:
+            for (uint32_t h = 0; h < H; h++) {
+                for (uint32_t qi = 0; qi < Lq; qi++) {
+                    std::vector<float> scores(Lk);
+                    float peak = -1e30f;
+                    for (uint32_t ki = 0; ki < Lk; ki++) {
+                        if (causal && ki > qi) {
+                            scores[ki] = -1e30f;
+                            continue;
+                        }
+                        double dot = 0;
+                        for (uint32_t d = 0; d < D; d++)
+                            dot += double(q[(h * Lq + qi) * D + d]) * double(k[(h * Lk + ki) * D + d]);
+                        scores[ki] = float(dot * scale);
+                        if (scores[ki] > peak) peak = scores[ki];
+                    }
+                    float sum = 0;
+                    for (uint32_t ki = 0; ki < Lk; ki++) {
+                        if (causal && ki > qi) {
+                            scores[ki] = 0;
+                        } else {
+                            scores[ki] = std::exp(scores[ki] - peak);
+                            sum += scores[ki];
+                        }
+                    }
+                    for (uint32_t ki = 0; ki < Lk; ki++)
+                        scores[ki] /= sum;
+
+                    for (uint32_t d = 0; d < D; d++) {
+                        double acc = 0;
+                        for (uint32_t ki = 0; ki < Lk; ki++)
+                            acc += double(scores[ki]) * double(v[(h * Lk + ki) * D + d]);
+                        float want = float(acc);
+                        float val = got[(h * Lq + qi) * D + d];
+                        check(std::abs(val - want) < 1e-4f);
+                    }
+                }
+            }
         }
     }
     std::cout

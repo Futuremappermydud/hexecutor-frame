@@ -36,12 +36,15 @@ enum {
     HX_ACT,
     HX_BINARY,
     HX_AVGPOOL,
-    HX_SOFTMAX, /* reserved 2026-11-17: softmax over channels per pixel; no p fields */
-    HX_SLICE    /* reserved: p[0..2] = h, w, channel start; output is the sub-box */,
+    HX_SOFTMAX, /* softmax over channels per pixel, or axis p[0] with optional mask y */
+    HX_SLICE,   /* reserved: p[0..2] = h, w, channel start; output is the sub-box */
     HX_ZEROINSERT, /* reserved: zero-insert upsample, p[0]=sh p[1]=sw (ConvTranspose) */
     HX_TRANSPOSE,  /* permute (h,w,c) axes, p[0..2] = source axis of each output axis */
     HX_REDUCE,     /* unary reduction over a subset of (h,w,c); see HX_RED_* below */
-    HX_NORM        /* normalisation; see HX_NORM_* below (p[0..4]) */
+    HX_NORM,       /* normalisation; see HX_NORM_* below (p[0..4]) */
+    HX_MATMUL,     /* 21: runtime matrix product (batched/multi-head, see below) */
+    HX_SDPA = 27,  /* 27: fused scaled dot-product attention (Q, K, V) */
+    HX_ATTN_SOFTMAX = 28 /* 28: attention softmax with key-axis and causal/additive mask */
 };
 /* HX_ACT p[0] functions. */
 enum {
@@ -105,7 +108,25 @@ typedef struct {
  * z is reserved; all unused fields must be zero (y/z use HXFG_NONE). Conv/depthwise only: z is
  * HXFG_NONE (dilation 1,1) or (dh << 8) | dw with 1 <= dh, dw <= 8 and at least one above 1; the
  * effective kernel extent is (k - 1) * d + 1 and tap (ky, kx) reads input row oy * sh + ky * dh -
- * pad_top, column ox * sw + kx * dw - pad_left. */
+ * pad_top, column ox * sw + kx * dw - pad_left.
+ * Matmul (HX_MATMUL, 21): Matrix product extending to batched and multi-head layouts:
+ * x = A [B, M, K], y = B [B, K, N] (or transposed), out = Out [B, M, N].
+ * p[0] transB: 0 means B is [K, N], 1 means B is [N, K] (e.g. Q.K^T).
+ * p[1] float32 bit pattern of scalar factor applied to result (0 selects 1.0f).
+ * p[2] batch count B when tensors have w = 1 (if 0 or 1, inferred or single batch).
+ * p[3] transA: 0 means A is [M, K], 1 means A is [K, M].
+ * All three tensors have K <= 4096. Accumulation is float32.
+ * Softmax (HX_SOFTMAX 15 / HX_ATTN_SOFTMAX 28):
+ * x in, out same shape. y optional additive mask tensor (or HXFG_NONE).
+ * p[0] axis: 0 H, 1 W, 2 C (default 2/channel axis, which is key axis for [B, H, Lq, Lk]).
+ * p[1] causal mask flag (1: causal, masks out k > q; 0: none).
+ * p[2] sequence length L for causal query indexing if w = 1 (0 selects default).
+ * SDPA (HX_SDPA, 27): Fused scaled dot-product attention: Out = Softmax(Q.K^T * scale + mask) * V.
+ * x = Q [B, Lq, D], y = K [B, Lk, D], z = V [B, Lk, Dv], out = Out [B, Lq, Dv].
+ * p[0] optional additive mask tensor ID (or HXFG_NONE).
+ * p[1] float32 bits of scale (0 selects 1.0 / sqrt(D)).
+ * p[2] causal mask flag (1: causal, masks out k > q; 0: none).
+ * p[3] batch/head count B when tensors have w = 1. */
 typedef struct {
     uint32_t kind, x, y, z, out, p[11];
 } HxOp;
