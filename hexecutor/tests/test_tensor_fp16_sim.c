@@ -525,6 +525,342 @@ static int check_rgb(uint32_t base, uint32_t ih, uint32_t iw, uint32_t kh, uint3
     free(constants);
     return 0;
 }
+
+static int check_indexing(uint32_t base) {
+    uint8_t *constants = (uint8_t *)aligned_alloc(128, 0x100000);
+    float *reference = (float *)aligned_alloc(128, 0x200000);
+    float *actual = (float *)aligned_alloc(128, 0x200000);
+    uint8_t *arena = (uint8_t *)base;
+    if (!constants || !reference || !actual)
+        return 1;
+    static uint32_t tables[4096];
+    static struct HxFp16Plan plan;
+    int errors = 0;
+
+    /* 1. HX_GATHER Mode 1 (embedding table in constants) */
+    {
+        memset(constants, 0, 0x100000);
+        memset(reference, 0, 0x200000);
+        memset(actual, 0, 0x200000);
+        HxHeader header = {0};
+        header.tensors = 2;
+        header.inputs = 1;
+        header.outputs = 1;
+        header.ops = 1;
+        uint32_t io[2] = {0, 1};
+        uint32_t vocab = 16, dim = 64;
+        HxTensor t[2] = {
+            {0, 4, 1, 1, 32, {0}}, /* indices [4, 1, 1] */
+            {0x40000, 4, 1, dim, dim, {0}} /* output [4, 1, 64] */
+        };
+        HxOp o = {0};
+        o.kind = HX_GATHER;
+        o.x = 0;
+        o.y = o.z = HXFG_NONE;
+        o.out = 1;
+        o.p[0] = 1; /* Mode 1: constant table */
+        o.p[1] = 0x20000; /* offset */
+        o.p[2] = vocab;
+        o.p[3] = dim;
+        o.p[4] = 0; /* axis */
+        o.p[5] = dim; /* inner */
+        o.p[6] = 1; /* outer */
+        o.p[7] = dim; /* stride */
+        float *tbl = (float *)(constants + 0x20000);
+        for (uint32_t i = 0; i < vocab * dim; i++)
+            tbl[i] = ((int)(i % 23) - 11) * 0.125f;
+        float *idx_in = reference + t[0].offset / 4;
+        idx_in[0] = 3.0f;
+        idx_in[32] = 0.0f;
+        idx_in[64] = 7.0f;
+        idx_in[96] = 2.0f;
+        HxGraph g = {&header, t, &o, io, constants, (uint8_t *)reference, NULL};
+        for (uint32_t p = 0; p < 3; p++)
+            hx_execute_op(&g, 0, p, 3);
+        g.arena = arena;
+        if (!hx_fp16_plan(&g, &plan, tables, arena + vtcm_size)) {
+            printf("FAIL plan gather mode 1\n");
+            return 1;
+        }
+        g.fp16 = &plan;
+        hx_fp16_stage(&g, NULL);
+        hx_fp16_import(&g, 0, idx_in, NULL);
+        for (uint32_t p = 0; p < 3; p++)
+            hx_fp16_op(&g, 0, p, 3);
+        hx_fp16_complete(&g, 0);
+        hx_fp16_export(&g, 1, actual, NULL);
+        const float *expected = reference + t[1].offset / 4;
+        int mismatch = 0;
+        for (uint32_t i = 0; i < t[1].h * t[1].w * t[1].stride; i++) {
+            if (fabsf(actual[i] - expected[i]) > 0.004f) {
+                printf("FAIL gather mode 1 mismatch at %u: got %f exp %f\n", (unsigned)i, actual[i], expected[i]);
+                mismatch = 1;
+                break;
+            }
+        }
+        errors += mismatch;
+    }
+
+    /* 2. HX_GATHER Mode 2 (constant indices, runtime table) */
+    {
+        memset(constants, 0, 0x100000);
+        memset(reference, 0, 0x200000);
+        memset(actual, 0, 0x200000);
+        HxHeader header = {0};
+        header.tensors = 2;
+        header.inputs = 1;
+        header.outputs = 1;
+        header.ops = 1;
+        uint32_t io[2] = {0, 1};
+        uint32_t vocab = 8, dim = 32;
+        HxTensor t[2] = {
+            {0, vocab, 1, dim, dim, {0}}, /* table in arena [8, 1, 32] */
+            {0x40000, 3, 1, dim, dim, {0}} /* output [3, 1, 32] */
+        };
+        HxOp o = {0};
+        o.kind = HX_GATHER;
+        o.x = 0;
+        o.y = o.z = HXFG_NONE;
+        o.out = 1;
+        o.p[0] = 2; /* Mode 2: constant indices */
+        o.p[2] = vocab;
+        o.p[3] = dim;
+        o.p[4] = 0; /* axis */
+        o.p[5] = dim; /* inner */
+        o.p[6] = 1; /* outer */
+        o.p[7] = dim; /* stride */
+        o.p[8] = 0x10000; /* const_idx_off */
+        o.p[9] = 3; /* const_idx_num */
+        int32_t *c_idx = (int32_t *)(constants + 0x10000);
+        c_idx[0] = 5; c_idx[1] = 1; c_idx[2] = 6;
+        float *tbl_in = reference + t[0].offset / 4;
+        for (uint32_t i = 0; i < vocab * dim; i++)
+            tbl_in[i] = ((int)(i % 17) - 8) * 0.25f;
+        HxGraph g = {&header, t, &o, io, constants, (uint8_t *)reference, NULL};
+        for (uint32_t p = 0; p < 3; p++)
+            hx_execute_op(&g, 0, p, 3);
+        g.arena = arena;
+        if (!hx_fp16_plan(&g, &plan, tables, arena + vtcm_size)) {
+            printf("FAIL plan gather mode 2\n");
+            return 1;
+        }
+        g.fp16 = &plan;
+        hx_fp16_stage(&g, NULL);
+        hx_fp16_import(&g, 0, tbl_in, NULL);
+        for (uint32_t p = 0; p < 3; p++)
+            hx_fp16_op(&g, 0, p, 3);
+        hx_fp16_complete(&g, 0);
+        hx_fp16_export(&g, 1, actual, NULL);
+        const float *expected = reference + t[1].offset / 4;
+        int mismatch = 0;
+        for (uint32_t i = 0; i < t[1].h * t[1].w * t[1].stride; i++) {
+            if (fabsf(actual[i] - expected[i]) > 0.004f) {
+                printf("FAIL gather mode 2 mismatch at %u: got %f exp %f\n", (unsigned)i, actual[i], expected[i]);
+                mismatch = 1;
+                break;
+            }
+        }
+        errors += mismatch;
+    }
+
+    /* 3. HX_GATHER_ELEMENTS */
+    {
+        memset(constants, 0, 0x100000);
+        memset(reference, 0, 0x200000);
+        memset(actual, 0, 0x200000);
+        HxHeader header = {0};
+        header.tensors = 3;
+        header.inputs = 2;
+        header.outputs = 1;
+        header.ops = 1;
+        uint32_t io[3] = {0, 1, 2};
+        HxTensor t[3] = {
+            {0, 4, 4, 32, 32, {0}}, /* data */
+            {0x20000, 4, 4, 32, 32, {0}}, /* indices */
+            {0x40000, 4, 4, 32, 32, {0}}  /* output */
+        };
+        HxOp o = {0};
+        o.kind = HX_GATHER_ELEMENTS;
+        o.x = 0;
+        o.y = 1;
+        o.z = HXFG_NONE;
+        o.out = 2;
+        o.p[0] = 1; /* axis = 1 */
+        o.p[1] = 1; /* index_dtype = 1 (float32) */
+        o.p[2] = 0; /* mode = 0 (tensors in arena) */
+        o.p[3] = 0;
+        float *data = reference + t[0].offset / 4;
+        float *idx = reference + t[1].offset / 4;
+        for (uint32_t i = 0; i < 4 * 4 * 32; i++) {
+            data[i] = ((int)(i % 19) - 9) * 0.25f;
+            idx[i] = (float)((i / 32) % 4); /* column indices 0..3 */
+        }
+        HxGraph g = {&header, t, &o, io, constants, (uint8_t *)reference, NULL};
+        for (uint32_t p = 0; p < 3; p++)
+            hx_execute_op(&g, 0, p, 3);
+        g.arena = arena;
+        if (!hx_fp16_plan(&g, &plan, tables, arena + vtcm_size)) {
+            printf("FAIL plan gather_elements\n");
+            return 1;
+        }
+        g.fp16 = &plan;
+        hx_fp16_stage(&g, NULL);
+        hx_fp16_import(&g, 0, data, NULL);
+        hx_fp16_import(&g, 1, idx, NULL);
+        for (uint32_t p = 0; p < 3; p++)
+            hx_fp16_op(&g, 0, p, 3);
+        hx_fp16_complete(&g, 0);
+        hx_fp16_export(&g, 2, actual, NULL);
+        const float *expected = reference + t[2].offset / 4;
+        int mismatch = 0;
+        for (uint32_t i = 0; i < t[2].h * t[2].w * t[2].stride; i++) {
+            if (fabsf(actual[i] - expected[i]) > 0.004f) {
+                printf("FAIL gather_elements mismatch at %u: got %f exp %f\n", (unsigned)i, actual[i], expected[i]);
+                mismatch = 1;
+                break;
+            }
+        }
+        errors += mismatch;
+    }
+
+    /* 4. HX_GATHER_ND */
+    {
+        memset(constants, 0, 0x100000);
+        memset(reference, 0, 0x200000);
+        memset(actual, 0, 0x200000);
+        HxHeader header = {0};
+        header.tensors = 3;
+        header.inputs = 2;
+        header.outputs = 1;
+        header.ops = 1;
+        uint32_t io[3] = {0, 1, 2};
+        HxTensor t[3] = {
+            {0, 4, 4, 32, 32, {0}}, /* data */
+            {0x20000, 2, 1, 2, 32, {0}}, /* indices: 2 slices, k=2 */
+            {0x40000, 2, 1, 32, 32, {0}}  /* output */
+        };
+        HxOp o = {0};
+        o.kind = HX_GATHER_ND;
+        o.x = 0;
+        o.y = 1;
+        o.z = HXFG_NONE;
+        o.out = 2;
+        o.p[0] = 0; /* batch_dims */
+        o.p[1] = 1; /* index_dtype = 1 (float32) */
+        o.p[2] = 0; /* mode = 0 (tensors in arena) */
+        o.p[3] = 0; /* const offset */
+        o.p[4] = 2; /* k */
+        o.p[5] = 32; /* slice_size */
+        float *data = reference + t[0].offset / 4;
+        float *idx = reference + t[1].offset / 4;
+        for (uint32_t i = 0; i < 4 * 4 * 32; i++)
+            data[i] = ((int)(i % 23) - 10) * 0.25f;
+        /* Slice 0: row 1, col 2 -> (1, 2) */
+        idx[0] = 1.0f; idx[1] = 2.0f;
+        /* Slice 1: row 3, col 0 -> (3, 0) */
+        idx[32] = 3.0f; idx[33] = 0.0f;
+        HxGraph g = {&header, t, &o, io, constants, (uint8_t *)reference, NULL};
+        for (uint32_t p = 0; p < 3; p++)
+            hx_execute_op(&g, 0, p, 3);
+        g.arena = arena;
+        if (!hx_fp16_plan(&g, &plan, tables, arena + vtcm_size)) {
+            printf("FAIL plan gather_nd\n");
+            return 1;
+        }
+        g.fp16 = &plan;
+        hx_fp16_stage(&g, NULL);
+        hx_fp16_import(&g, 0, data, NULL);
+        hx_fp16_import(&g, 1, idx, NULL);
+        for (uint32_t p = 0; p < 3; p++)
+            hx_fp16_op(&g, 0, p, 3);
+        hx_fp16_complete(&g, 0);
+        hx_fp16_export(&g, 2, actual, NULL);
+        const float *expected = reference + t[2].offset / 4;
+        int mismatch = 0;
+        for (uint32_t i = 0; i < t[2].h * t[2].w * t[2].stride; i++) {
+            if (fabsf(actual[i] - expected[i]) > 0.004f) {
+                printf("FAIL gather_nd mismatch at %u: got %f exp %f\n", (unsigned)i, actual[i], expected[i]);
+                mismatch = 1;
+                break;
+            }
+        }
+        errors += mismatch;
+    }
+
+    /* 5. HX_SCATTER_ND */
+    {
+        memset(constants, 0, 0x100000);
+        memset(reference, 0, 0x200000);
+        memset(actual, 0, 0x200000);
+        HxHeader header = {0};
+        header.tensors = 3;
+        header.inputs = 2;
+        header.outputs = 1;
+        header.ops = 1;
+        uint32_t io[3] = {0, 1, 2};
+        HxTensor t[3] = {
+            {0, 4, 4, 32, 32, {0}}, /* data */
+            {0x20000, 2, 1, 32, 32, {0}}, /* updates */
+            {0x40000, 4, 4, 32, 32, {0}}  /* output */
+        };
+        HxOp o = {0};
+        o.kind = HX_SCATTER_ND;
+        o.x = 0;
+        o.y = HXFG_NONE;
+        o.z = 1; /* updates is z */
+        o.out = 2;
+        o.p[0] = 0; /* mode: out distinct from x */
+        o.p[1] = 0; /* index_dtype: 0 int32 */
+        o.p[2] = 2; /* k */
+        o.p[3] = 32; /* slice_size */
+        o.p[4] = 0; /* reduction: none */
+        o.p[5] = 1; /* const_mask: bit 0 = indices in constants */
+        o.p[6] = 0x10000; /* idx_offset in constants */
+        o.p[7] = 0; /* const_upd_off */
+        o.p[8] = 2; /* num_idx */
+        int32_t *c_idx = (int32_t *)(constants + 0x10000);
+        c_idx[0] = 1; c_idx[1] = 2; /* (1, 2) */
+        c_idx[2] = 2; c_idx[3] = 3; /* (2, 3) */
+        float *data = reference + t[0].offset / 4;
+        float *updates = reference + t[1].offset / 4;
+        for (uint32_t i = 0; i < 4 * 4 * 32; i++)
+            data[i] = 1.0f;
+        for (uint32_t i = 0; i < 2 * 32; i++)
+            updates[i] = 5.0f;
+        HxGraph g = {&header, t, &o, io, constants, (uint8_t *)reference, NULL};
+        for (uint32_t p = 0; p < 3; p++)
+            hx_execute_op(&g, 0, p, 3);
+        g.arena = arena;
+        if (!hx_fp16_plan(&g, &plan, tables, arena + vtcm_size)) {
+            printf("FAIL plan scatter_nd\n");
+            return 1;
+        }
+        g.fp16 = &plan;
+        hx_fp16_stage(&g, NULL);
+        hx_fp16_import(&g, 0, data, NULL);
+        hx_fp16_import(&g, 1, updates, NULL);
+        for (uint32_t p = 0; p < 3; p++)
+            hx_fp16_op(&g, 0, p, 3);
+        hx_fp16_complete(&g, 0);
+        hx_fp16_export(&g, 2, actual, NULL);
+        const float *expected = reference + t[2].offset / 4;
+        int mismatch = 0;
+        for (uint32_t i = 0; i < t[2].h * t[2].w * t[2].stride; i++) {
+            if (fabsf(actual[i] - expected[i]) > 0.004f) {
+                printf("FAIL scatter_nd mismatch at %u: got %f exp %f\n", (unsigned)i, actual[i], expected[i]);
+                mismatch = 1;
+                break;
+            }
+        }
+        errors += mismatch;
+    }
+
+    free(actual);
+    free(reference);
+    free(constants);
+    return errors;
+}
+
 int main(void) {
     uint32_t base = __rdcfg(__vtcm_base) << 16;
     for (uint32_t i = 0; i < 0x800000; i += 4096)
@@ -718,6 +1054,7 @@ int main(void) {
     for (uint32_t trans = 0; trans <= 1; trans++)
         errors += check(base, HX_MATMUL, 8, 1, 197, 197, 1, trans, 0);
     vtcm_size = 0x800000;
+    errors += check_indexing(base);
     if (errors)
         return 1;
     puts("PASS blocked FP16 RGB entry, convolution, depthwise, elementwise, pooling, resize, transforms, "

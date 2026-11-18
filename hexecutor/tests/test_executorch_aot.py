@@ -553,6 +553,53 @@ class ExportTests(unittest.TestCase):
                                       + 64 * i)[0] for i in range(kinds)]
             self.assertNotIn(lowering.hx.NORM, ops)
 
+    @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
+    def test_embedding_matches_torch_on_cpu_reference(self):
+        torch.manual_seed(10)
+        model = EmbeddingNet().eval()
+        x = torch.tensor([[1, 3, 5, 7]], dtype=torch.int32)
+        with torch.no_grad():
+            want = model(x).numpy()
+        delegates = delegate_payloads(export_program(model, (x,)))
+        self.assertEqual(len(delegates), 1)
+        parsed = blob.unpack(delegates[0][1])
+        ops = ops_of(parsed)
+        self.assertIn(lowering.hx.GATHER, ops)
+        got = run_reference(parsed, x)
+        np.testing.assert_allclose(got.reshape(want.shape), want, rtol=1e-4, atol=1e-4)
+
+    @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
+    def test_index_select_matches_torch_on_cpu_reference(self):
+        torch.manual_seed(11)
+        model = IndexSelectNet().eval()
+        x = torch.randn(1, 3, 8, 8)
+        with torch.no_grad():
+            want = model(x).numpy()
+        delegates = delegate_payloads(export_program(model, (x,)))
+        self.assertEqual(len(delegates), 1)
+        parsed = blob.unpack(delegates[0][1])
+        ops = ops_of(parsed)
+        self.assertIn(lowering.hx.GATHER, ops)
+        got = run_reference(parsed, x)
+        _, c, h, w = want.shape
+        got = got.reshape(h, w, c).transpose(2, 0, 1)[None]
+        np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
+
+    @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
+    def test_index_tensor_matches_torch_on_cpu_reference(self):
+        torch.manual_seed(12)
+        model = IndexTensorNet().eval()
+        x = torch.tensor([[1, 3, 5]], dtype=torch.int32)
+        with torch.no_grad():
+            want = model(x).numpy()
+        delegates = delegate_payloads(export_program(model, (x,)))
+        self.assertEqual(len(delegates), 1)
+        parsed = blob.unpack(delegates[0][1])
+        ops = ops_of(parsed)
+        self.assertIn(lowering.hx.GATHER, ops)
+        got = run_reference(parsed, x)
+        np.testing.assert_allclose(got.reshape(want.shape), want, rtol=1e-4, atol=1e-4)
+
 
 class NormNet(nn.Module):
     """Conv, then one normalisation (kind selects it), then ReLU."""
@@ -610,6 +657,44 @@ class Reduction(nn.Module):
         return y.amin(dim=(2, 3), keepdim=True)
 
 
+class EmbeddingNet(nn.Module):
+    """Embedding lookup followed by activation."""
+
+    def __init__(self, num_embeddings=16, embedding_dim=8):
+        super().__init__()
+        self.emb = nn.Embedding(num_embeddings, embedding_dim)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        return self.relu(self.emb(x))
+
+
+class IndexSelectNet(nn.Module):
+    """Conv2d followed by index_select along channel axis."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(3, 8, 1)
+        self.register_buffer("idx", torch.tensor([1, 3, 5], dtype=torch.int64))
+
+    def forward(self, x):
+        y = self.conv(x)
+        return torch.index_select(y, 1, self.idx)
+
+
+class IndexTensorNet(nn.Module):
+    """aten.index lookup from constant table buffer."""
+
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("table", torch.randn(16, 8))
+        self.relu = nn.ReLU()
+
+    def forward(self, idx):
+        y = self.table[idx]
+        return self.relu(y)
+
+
 def run_reference(parsed, x):
     """Run the HXFG image on the portable CPU reference; returns the first output, flat."""
     import subprocess
@@ -619,7 +704,8 @@ def run_reference(parsed, x):
         (root / "g.bin").write_bytes(parsed.constants)
         arr = x[0].numpy()
         data = arr.transpose(1, 2, 0) if arr.ndim == 3 else arr
-        (root / "in.f32").write_bytes(data.astype(np.float32).tobytes())
+        dt = np.int32 if np.issubdtype(arr.dtype, np.integer) else np.float32
+        (root / "in.f32").write_bytes(np.ascontiguousarray(data, dtype=dt).tobytes())
         subprocess.run(
             [str(RUNNER), str(root / "g.hxfg"), str(root / "g.bin"),
              str(root / "in.f32"), str(root / "out_")],

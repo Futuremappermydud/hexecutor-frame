@@ -1481,6 +1481,120 @@ int main() {
         near(shared_f[1 * D], 0.0f);
         near(shared_f[2 * D], 0.0f);
     }
+    {
+        // HX_GATHER: constant pool embedding lookup
+        auto gop = op(HX_GATHER, 1);
+        gop.p[0] = 1; // mode 1: constant pool
+        gop.p[1] = 128; // offset (128-byte aligned)
+        gop.p[2] = 4; // vocab
+        gop.p[3] = 1; // float indices
+        gop.p[4] = 0; // axis 0
+        gop.p[5] = 2; // inner_dim
+        gop.p[7] = 32; // table stride
+        Fixture f({shape(1, 2, 1), shape(1, 2, 2)}, gop, {0});
+        // vocab 0: [10, 11], vocab 1: [20, 21], vocab 2: [30, 31], vocab 3: [40, 41]
+        f.constant(128 + 0 * 32 * 4, {10.0f, 11.0f});
+        f.constant(128 + 1 * 32 * 4, {20.0f, 21.0f});
+        f.constant(128 + 2 * 32 * 4, {30.0f, 31.0f});
+        f.constant(128 + 3 * 32 * 4, {40.0f, 41.0f});
+        f.input(0, {2.0f, 0.0f});
+        auto r = f.run();
+        near(r[0], 30.0f);
+        near(r[1], 31.0f);
+        near(r[2], 10.0f);
+        near(r[3], 11.0f);
+    }
+    {
+        // HX_GATHER_ELEMENTS: axis = 1
+        auto geop = op(HX_GATHER_ELEMENTS, 2, 1);
+        geop.p[0] = 1; // axis 1 (W)
+        geop.p[1] = 1; // float indices
+        Fixture f({shape(2, 2, 1), shape(2, 2, 1), shape(2, 2, 1)}, geop, {0, 1});
+        f.input(0, {1.0f, 2.0f,
+                    3.0f, 4.0f});
+        f.input(1, {1.0f, 0.0f,
+                    0.0f, 1.0f});
+        auto r = f.run();
+        near(r[0], 2.0f);
+        near(r[1], 1.0f);
+        near(r[2], 3.0f);
+        near(r[3], 4.0f);
+    }
+    {
+        // HX_GATHER_ND: k = 2
+        auto gnd = op(HX_GATHER_ND, 2, 1);
+        gnd.p[1] = 1; // float indices
+        gnd.p[4] = 2; // k = 2
+        Fixture f({shape(2, 2, 2), shape(2, 1, 2), shape(2, 1, 2)}, gnd, {0, 1});
+        f.input(0, {1.0f, 2.0f, 3.0f, 4.0f,
+                    5.0f, 6.0f, 7.0f, 8.0f});
+        // Index 0: coords (0, 1) -> data[0, 1] which is [3.0, 4.0]
+        // Index 1: coords (1, 0) -> data[1, 0] which is [5.0, 6.0]
+        f.input(1, {0.0f, 1.0f,
+                    1.0f, 0.0f});
+        auto r = f.run();
+        near(r[0], 3.0f);
+        near(r[1], 4.0f);
+        near(r[2], 5.0f);
+        near(r[3], 6.0f);
+    }
+    {
+        // HX_SCATTER_ND: k = 2, assignment
+        auto snd = op(HX_SCATTER_ND, 3, 1, 2);
+        snd.p[0] = 0; // distinct out
+        snd.p[1] = 1; // float indices
+        snd.p[2] = 2; // k = 2
+        snd.p[4] = 0; // assignment
+        Fixture f({shape(2, 2, 2), shape(1, 1, 2), shape(1, 1, 2), shape(2, 2, 2)}, snd, {0, 1, 2});
+        f.input(0, {1.0f, 2.0f, 3.0f, 4.0f,
+                    5.0f, 6.0f, 7.0f, 8.0f});
+        // Index coords (0, 1) -> update with [99.0, 100.0]
+        f.input(1, {0.0f, 1.0f});
+        f.input(2, {99.0f, 100.0f});
+        auto r = f.run();
+        near(r[0], 1.0f);
+        near(r[1], 2.0f);
+        near(r[2], 99.0f);
+        near(r[3], 100.0f);
+        near(r[4], 5.0f);
+        near(r[5], 6.0f);
+        near(r[6], 7.0f);
+        near(r[7], 8.0f);
+    }
+    {
+        // HX_SCATTER_ND: in-place row update on persistent tensor (KV-cache style)
+        std::vector<uint8_t> state(4 * 1 * 32 * sizeof(float), 0);
+        float *state_f = reinterpret_cast<float *>(state.data());
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++)
+                state_f[r * 32 + c] = (float)(r + 1);
+
+        auto snd_inplace = op(HX_SCATTER_ND, 0, 1, 2);
+        snd_inplace.p[0] = 1; // mode 1: in-place
+        snd_inplace.p[1] = 1; // float indices
+        snd_inplace.p[2] = 1; // k = 1 (row update)
+        snd_inplace.p[4] = 0; // assignment
+
+        std::vector<HxTensor> tensors = {shape(4, 1, 4), shape(1, 1, 1), shape(1, 1, 4)};
+        tensors[0].reserved[0] = HX_TENSOR_PERSISTENT;
+
+        Fixture f(tensors, snd_inplace, {1, 2});
+        f.tensor(0).offset = 0;
+        hx_graph_set_state(&f.graph, state.data(), state.size());
+
+        // Row 2 -> update with [7, 8, 9, 10]
+        f.input(1, {2.0f});
+        f.input(2, {7.0f, 8.0f, 9.0f, 10.0f});
+        f.run();
+
+        near(state_f[0 * 32 + 0], 1.0f);
+        near(state_f[1 * 32 + 0], 2.0f);
+        near(state_f[2 * 32 + 0], 7.0f);
+        near(state_f[2 * 32 + 1], 8.0f);
+        near(state_f[2 * 32 + 2], 9.0f);
+        near(state_f[2 * 32 + 3], 10.0f);
+        near(state_f[3 * 32 + 0], 4.0f);
+    }
     std::cout
         << "Tensor kernels, padding, layout, aliases, ranges, and bootstrap ownership passed\n";
 }

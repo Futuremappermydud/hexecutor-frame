@@ -20,6 +20,9 @@ MATMUL = 21
 RMSNORM = 22
 SDPA = 27
 ATTN_SOFTMAX = 28
+GATHER_ELEMENTS = 29
+GATHER_ND = 30
+SCATTER_ND = 31
 GATHER, WHERE, ARGMAX, TOPK, TILE, CAST = range(32, 38)
 # HX_ACT functions, HX_BINARY and HX_REDUCE operations (graph.h).
 (FN_RELU, FN_RELU6, FN_HARDSWISH, FN_HARDSIGMOID, FN_SILU, FN_TANH, FN_LEAKY,
@@ -104,7 +107,10 @@ def dilation_z(op):
     return z
 
 
-def write(ops, inputs, outputs, hwc, stride, pool, destination, manifest):
+TENSOR_DTYPE_INT32 = 2
+DTYPE_INT32 = 1
+
+def write(ops, inputs, outputs, hwc, stride, pool, destination, manifest, reserved_flags=None):
     """Allocate activations and write `<destination>.hxfg/.bin/.json`.
 
     ops: [kind, x, y, z, out, p0..p10] over front-end tensor ids.
@@ -161,13 +167,23 @@ def write(ops, inputs, outputs, hwc, stride, pool, destination, manifest):
             else:
                 merged.append((at, n))
         free[:] = merged
-        allocate(op[4])
+        if op[4] not in allocated:
+            allocate(op[4])
         if op[0] == TOPK and op[3] != NONE:
             allocate(op[3])
     if not pool:
         pool.extend(bytes(128))
     tensors = b"".join(
-        struct.pack("<8I", offsets[i], *hwc(i), stride(i), 0, 0, 0) for i in active
+        struct.pack(
+            "<8I",
+            offsets[i],
+            *hwc(i),
+            stride(i),
+            reserved_flags.get(i, 0) if reserved_flags else 0,
+            0,
+            0,
+        )
+        for i in active
     )
     packed_ops = b"".join(
         struct.pack(

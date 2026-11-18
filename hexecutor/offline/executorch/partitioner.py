@@ -31,14 +31,19 @@ class HexecutorPartitioner(Partitioner):
         selected = set(select_nodes(ep))
 
         def keep(node):
-            return node in selected and kind_name(node) in ("prelu", "linear", "act", "bmm", "sdpa")
+            return node in selected and kind_name(node) in (
+                "prelu", "linear", "act", "bmm", "sdpa", "embedding", "index_select", "index"
+            )
 
         # Non-core activations would otherwise be rewritten into clamp/mul sequences.
         kept = [torch.ops.aten.prelu.default, torch.ops.aten.linear.default,
                 torch.ops.aten.hardswish.default, torch.ops.aten.hardsigmoid.default,
                 torch.ops.aten.silu.default,
                 torch.ops.aten.bmm.default,
-                torch.ops.aten.scaled_dot_product_attention.default]
+                torch.ops.aten.scaled_dot_product_attention.default,
+                torch.ops.aten.embedding.default,
+                torch.ops.aten.index_select.default,
+                torch.ops.aten.index.Tensor]
         return (kept, keep)
 
     def partition(self, exported_program) -> PartitionResult:
