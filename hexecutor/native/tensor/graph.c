@@ -947,7 +947,7 @@ void hx_execute_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t par
             continue;
         }
         if (o->kind == HX_SOFTMAX || o->kind == HX_ATTN_SOFTMAX) {
-            uint32_t axis = p[0] ? p[0] : 2;
+            uint32_t axis = (o->kind == HX_ATTN_SOFTMAX) ? p[0] : 2;
             if (axis == 2) {
                 const float *src = x + i * a->stride;
                 const uint32_t causal = p[1];

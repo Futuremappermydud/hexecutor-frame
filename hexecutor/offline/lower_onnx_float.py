@@ -34,6 +34,20 @@ inference runs with data propagation and again on the folded graph, so computed 
 resolve. Cast to float32 is an alias. A squeezed rank-3 `[1, C, L]` intermediate is NCHW with
 H = 1. The packed constant pool is limited to 32 MiB, the tensor runtime's own limit.
 
+Transformer lowering (batch one, static shapes): a rank-3 `[1, L, K]` tensor read or written
+by MatMul, last-axis LayerNormalization or last-axis Softmax is a token matrix, HWC with h = L,
+w = 1, c = K, not NCHW with H = 1. Token status flows through elementwise operators, Concat,
+Gather, reductions and reshape-like operators. A MatMul with a constant right operand is a 1x1
+convolution over the L rows; two runtime operands lower to HX_MATMUL (p[0] = transB from the
+operand's layout, a transposed operand being a logical view). Attention is recognised from the
+exporter chain: Reshape to a `[1, L, H, dh]` view, Transpose to `[1, H, L, dh]` (per-head channel
+slices; K transposed with `[0, 2, 3, 1]` is a transposed operand), one HX_MATMUL per head, Mul or
+Div by a scalar folded into the QK product's p[1], Softmax over the last axis (HX_SOFTMAX per
+row), the value product, and a Transpose `[0, 2, 1, 3]` merged back by a channel Concat before
+the Reshape to `[1, L, D]`. A Transpose `[0, 2, 1]` of a conv-style `[1, C, L]` (patch
+embedding) is a logical reshape. Gather of a contiguous run on the sequence axis is a slice.
+Anything else on token or head tensors raises an error naming the node.
+
 The manifest's `fp16_plan` entry lists what keeps the graph out of the DSP's blocked
 FP16 plan (see `fp16_blockers`); such a graph still lowers and runs on the FP32 path.
 
@@ -41,6 +55,7 @@ Requires numpy and onnx. Nothing here is used by the native host or engine.
 """
 
 import argparse
+import collections
 import hashlib
 from pathlib import Path
 
@@ -54,8 +69,51 @@ except ImportError:  # run as a script from hexecutor/offline
     import hxfg_writer as hx
 
 NONE = hx.NONE
+MATMUL = hx.MATMUL
+RMSNORM = hx.RMSNORM
+SDPA = hx.SDPA
+ATTN_SOFTMAX = hx.ATTN_SOFTMAX
 # hx_graph_open (hexecutor/native/tensor/graph.c) rejects constant pools above 32 MiB.
 CONSTANT_POOL_LIMIT = 0x4000000
+# hx_graph_open rejects more operations than this (HXFG_MAX_OPS).
+OPERATION_LIMIT = 1024
+
+# One matrix of a runtime tensor: `rows` x `cols` physical elements of tensor `id` (h = rows,
+# c = cols). `trans` reads it transposed (logical [cols, rows]); `op` produced it, or None.
+Mat = collections.namedtuple("Mat", "id rows cols trans op")
+ELEMENTWISE = frozenset({
+    "Add", "Sub", "Mul", "Div", "Relu", "Clip", "LeakyRelu", "PRelu", "Sigmoid", "Tanh",
+    "HardSigmoid", "HardSwish", "Gelu", "Exp", "Sqrt", "Abs", "Neg", "Erf", "Identity",
+    "Dropout", "Cast", "Silu",
+})
+REDUCES = frozenset({"ReduceMean", "ReduceSum", "ReduceMax", "ReduceMin"})
+# Operators that pass token status from one of their inputs to their outputs.
+TOKEN_LINKED = ELEMENTWISE | REDUCES | frozenset({
+    "Concat", "Gather", "Reshape", "Squeeze", "Unsqueeze", "Flatten", "LayerNormalization",
+    "RMSNormalization", "RMSNorm", "Softmax", "Split", "Slice",
+})
+TOKEN_OPS = TOKEN_LINKED | frozenset({"MatMul", "Transpose", "Einsum", "ScaledDotProductAttention", "sdpa"})
+HEAD_OPS = frozenset({"MatMul", "Mul", "Div", "Softmax", "Transpose", "Identity", "Einsum", "ScaledDotProductAttention", "sdpa"})
+SPLIT_OPS = frozenset({"Transpose", "Reshape", "Identity"})
+
+
+def is_causal_mask(const):
+    arr = np.asarray(const, dtype=np.float32)
+    if arr.ndim < 2:
+        return False
+    h, w = arr.shape[-2], arr.shape[-1]
+    if h != w or h < 2:
+        return False
+    for i in range(h):
+        for j in range(w):
+            val = arr[..., i, j]
+            if j <= i:
+                if not np.allclose(val, 0.0, atol=1e-3):
+                    return False
+            else:
+                if not np.all(val <= -100.0):
+                    return False
+    return True
 
 
 def _pad32(values):
@@ -66,7 +124,7 @@ def _pad32(values):
 class Op:
     """One HXFG operation under construction. Layers keep unpacked weights until the end."""
 
-    def __init__(self, kind, x, y, out, p=(), node=None):
+    def __init__(self, kind, x, y, out, p=(), node=None, z=NONE):
         self.kind, self.x, self.y, self.out = kind, x, y, out
         self.p = (list(p) + [0] * 11)[:11]
         self.node = node
@@ -75,10 +133,13 @@ class Op:
         self.foldable = False  # a following affine node may be folded in
         self.fused = False  # an activation has been fused
         self.dilation = (1, 1)  # conv/depthwise only; encoded as the HXFG z field
+        self._z = z
 
     @property
     def z(self):
-        """HXFG z: NONE for dilation (1, 1), else (dh << 8) | dw."""
+        """HXFG z: tensor id for ops like SDPA, else NONE or (dh << 8) | dw for conv."""
+        if self._z != NONE:
+            return self._z
         dh, dw = self.dilation
         return NONE if (dh, dw) == (1, 1) else (dh << 8) | dw
 
@@ -131,6 +192,11 @@ class Lowerer:
             self.users[name] = self.users.get(name, 0) + 1
         self.output_parts = None
         self.synthetic = 0
+        # Transformer layout state (see the docstring): token tensors, rank-4 head splits of a
+        # token tensor (canonical name -> (H, dh)), per-head matrices and transposed token views.
+        self.token, self.split_of, self.heads, self.ttrans, self.multihead = set(), {}, {}, {}, set()
+        self.head_view, self.causal_masked = set(), set()
+        self._classify_tokens()
 
     # ------------------------------------------------------------ helpers
     @staticmethod
@@ -208,6 +274,96 @@ class Lowerer:
             return
         for name, dims in inferred.items():
             self.dims.setdefault(name, dims)
+        # Forward shape propagation for ops unhandled or broken by ONNX shape inference
+        changed = True
+        while changed:
+            changed = False
+            for n in self.nodes:
+                op = n.op_type
+                inputs = n.input
+                out = n.output[0] if n.output else None
+                if not out or out in self.dims:
+                    continue
+                in0 = inputs[0] if inputs else None
+                s0 = self.dims.get(in0)
+                if s0 is None:
+                    continue
+                attrs = self.attrs(n)
+                if op in ("RMSNormalization", "RMSNorm", "LayerNormalization", "Relu", "Sigmoid",
+                          "Tanh", "Gelu", "Identity", "Dropout", "Cast", "Softmax"):
+                    self.dims[out] = list(s0)
+                    changed = True
+                elif op in ("Add", "Sub", "Mul", "Div"):
+                    self.dims[out] = list(s0)
+                    changed = True
+                elif op == "MatMul":
+                    w = self.const(inputs[1]) if len(inputs) > 1 else None
+                    if w is not None and len(s0) in (2, 3):
+                        self.dims[out] = list(s0[:-1]) + [int(w.shape[-1])]
+                        changed = True
+                    elif len(inputs) > 1 and inputs[1] in self.dims:
+                        s1 = self.dims[inputs[1]]
+                        self.dims[out] = list(s0[:-1]) + [s1[-1]]
+                        changed = True
+                elif op == "Transpose":
+                    perm = [int(v) for v in attrs.get("perm", [])]
+                    if len(perm) == len(s0):
+                        self.dims[out] = [s0[p] for p in perm]
+                        changed = True
+                elif op == "Split":
+                    sizes = self.const(inputs[1]) if len(inputs) > 1 and inputs[1] else attrs.get("split")
+                    if sizes is not None:
+                        axis = int(attrs.get("axis", 0)) % len(s0)
+                        for out_i, sz in zip(n.output, sizes):
+                            sh = list(s0)
+                            sh[axis] = int(sz)
+                            self.dims[out_i] = sh
+                        changed = True
+                elif op == "Reshape":
+                    sh = self.const(inputs[1]) if len(inputs) > 1 else None
+                    if sh is not None:
+                        sh = [int(v) for v in sh]
+                        tot = int(np.prod(s0))
+                        if -1 in sh:
+                            idx = sh.index(-1)
+                            known = int(np.prod([v for v in sh if v != -1]))
+                            sh[idx] = tot // known if known else 1
+                        self.dims[out] = sh
+                        changed = True
+                elif op == "Conv":
+                    w = self.const(inputs[1]) if len(inputs) > 1 else None
+                    if w is not None and len(s0) == 4:
+                        co = int(w.shape[0])
+                        kh, kw = int(w.shape[2]), int(w.shape[3])
+                        strides = attrs.get("strides", [1, 1])
+                        pads = attrs.get("pads", [0, 0, 0, 0])
+                        dil = attrs.get("dilations", [1, 1])
+                        ho = (s0[2] + pads[0] + pads[2] - dil[0] * (kh - 1) - 1) // strides[0] + 1
+                        wo = (s0[3] + pads[1] + pads[3] - dil[1] * (kw - 1) - 1) // strides[1] + 1
+                        self.dims[out] = [s0[0], co, ho, wo]
+                        changed = True
+                elif op == "Einsum":
+                    eq = attrs.get("equation", "")
+                    if isinstance(eq, bytes):
+                        eq = eq.decode("utf-8")
+                    eq = "".join(eq.split())
+                    if "->" in eq and len(inputs) == 2 and in0 in self.dims and inputs[1] in self.dims:
+                        s1 = self.dims[inputs[1]]
+                        lhs, rhs = eq.split("->")
+                        in_eqs = lhs.split(",")
+                        dim_map = {}
+                        for sym, d in zip(in_eqs[0], s0):
+                            dim_map[sym] = d
+                        for sym, d in zip(in_eqs[1], s1):
+                            dim_map[sym] = d
+                        if all(sym in dim_map for sym in rhs):
+                            self.dims[out] = [dim_map[sym] for sym in rhs]
+                            changed = True
+                elif op in ("ScaledDotProductAttention", "sdpa"):
+                    if len(inputs) >= 3 and in0 in self.dims and inputs[2] in self.dims:
+                        dv = self.dims[inputs[2]]
+                        self.dims[out] = list(s0[:-1]) + [dv[-1]]
+                        changed = True
 
     def _evaluate(self, node, feeds, outs):
         """Run one node with onnx.reference on its constant inputs."""
@@ -235,20 +391,44 @@ class Lowerer:
     def const(self, name):
         return self.init.get(name)
 
+    def _is_multihead(self, name):
+        return self.canon(name) in self.multihead
+
+    def _is_head_view(self, name):
+        return self.canon(name) in self.head_view
+
     def hwc(self, name):
+        name = self.canon(name)
         s = self.dims.get(name)
         if s is None:
             raise ValueError(f"no static float32 shape for {name}")
+        if name in self.heads:
+            raise ValueError(f"{name} is a per-head attention tensor with no HWC form")
+        if (self._is_multihead(name) or self._is_head_view(name)) and len(s) == 4 and s[0] == 1:
+            return [s[1], s[2], s[3]]
+        if len(s) == 3 and s[0] == 1 and self._is_token(name):
+            return [s[1], 1, s[2]]
+        if len(s) == 4 and s[0] == 1 and name in self.split_of:  # heads merged into channels
+            return [s[1], 1, s[2] * s[3]]
+        if name in self.ttrans:  # logical transpose: only ever a MatMul operand
+            return [s[1], 1, s[2]]
+        # Higher-rank tensor (e.g. rank-5 [1, 1, H, L, D] or rank-6 [1, 1, 1, 2, 2, 1024]):
+        if len(s) in (5, 6) and s[0] == 1:
+            if all(d == 1 for d in s[:-3]):
+                return list(s[-3:])
+            return [int(np.prod(s[1:-2])), int(s[-2]), int(s[-1])]
         if len(s) == 4 and s[0] == 1:
             return [s[2], s[3], s[1]]
         if len(s) == 3 and s[0] == 1:  # squeezed intermediate: NCHW with H = 1
             return [1, s[2], s[1]]
         if len(s) == 2 and s[0] == 1:
             return [1, 1, s[1]]
-        raise ValueError(f"unsupported shape {s} for {name} (batch-one rank 2, 3 or 4 only)")
+        raise ValueError(f"unsupported shape {s} for {name} (batch-one rank 2..6 only)")
 
     def tid(self, name):
         name = self.canon(name)
+        if name in self.heads or name in self.ttrans:
+            raise ValueError(f"internal: {name} has no single tensor id")
         if name not in self.ids:
             self.ids[name] = len(self.ids)
             if name in self.dims:
@@ -267,6 +447,220 @@ class Lowerer:
         self.ops.append(op)
         self.producer[op.out] = op
         return op
+
+    def _is_token(self, name):
+        """True for a token tensor [1, L, K] (or a merged head tensor) with the token HWC form."""
+        c = self.canon(name)
+        if c in self.ttrans or c in self.heads:
+            return False
+        return c in self.token or (c in self.split_of and len(self.dims.get(c) or ()) == 4)
+
+    def _producer(self, name):
+        return self.producer.get(self.tid(name))
+
+    def _mats(self, name):
+        """The matrices of a runtime operand: one for a token tensor or transposed view, one per
+        head for a per-head tensor. None when the operand is not a matrix."""
+        c = self.canon(name)
+        if c in self.heads:
+            return self.heads[c]
+        if c in self.ttrans:
+            base = self.canon(self.ttrans[c])
+            rows, _, cols = self.hwc(base)
+            return [Mat(self.tid(base), rows, cols, True, self._producer(base))]
+        if self._is_token(c):
+            rows, _, cols = self.hwc(c)
+            return [Mat(self.tid(c), rows, cols, False, self._producer(c))]
+        return None
+
+    def _emit_matmul(self, node, a, b, out_id):
+        """One HX_MATMUL: out = a . b, with b read as [N, K] when it is a transposed matrix."""
+        if a.trans:
+            self.fail(node, "a transposed left operand is unsupported")
+        trans_b = 1 if b.trans else 0
+        inner, cols = (b.cols, b.rows) if trans_b else (b.rows, b.cols)
+        if inner != a.cols:
+            self.fail(node, f"inner dimensions disagree ({a.cols} and {inner})")
+        op = self.add(Op(MATMUL, a.id, b.id, out_id, [trans_b, 0], node))
+        return Mat(out_id, a.rows, cols, False, op)
+
+    def _emit_batched_matmul(self, node, a_name, b_name, out_name, transB=0, transA=0, scale=0.0):
+        da = self.dims.get(a_name)
+        db = self.dims.get(b_name)
+        if da is None or db is None:
+            self.fail(node, "runtime operands require static dimensions")
+
+        scale_bits = 0 if scale == 0.0 else (scale if isinstance(scale, int) else hx.f32_bits(scale))
+
+        if len(da) == 4 and len(db) == 4:
+            H = da[1]
+            if db[1] != H:
+                self.fail(node, f"head counts disagree ({H} vs {db[1]})")
+            Ka = da[2] if transA else da[3]
+            Kb = db[3] if transB else db[2]
+            if Ka != Kb:
+                self.fail(node, f"inner dimensions disagree ({Ka} vs {Kb})")
+
+            self.multihead.add(self.canon(a_name))
+            self.multihead.add(self.canon(b_name))
+            self.multihead.add(self.canon(out_name))
+            op = self.add(Op(MATMUL, self.tid(a_name), self.tid(b_name), self.tid(out_name),
+                             [transB, scale_bits, H, transA], node))
+            return op
+
+        if len(da) == 3 and len(db) == 3:
+            Ka = da[1] if transA else da[2]
+            Kb = db[2] if transB else db[1]
+            if Ka != Kb:
+                self.fail(node, f"inner dimensions disagree ({Ka} vs {Kb})")
+            self.token.add(self.canon(a_name))
+            self.token.add(self.canon(b_name))
+            self.token.add(self.canon(out_name))
+            op = self.add(Op(MATMUL, self.tid(a_name), self.tid(b_name), self.tid(out_name),
+                             [transB, scale_bits, 1, transA], node))
+            return op
+
+        self.fail(node, f"unsupported batched MatMul operands shapes {da} and {db}")
+
+    def _runtime_matmul(self, node):
+        """MatMul of two runtime operands: batched multi-head, token tensors or per-head attention."""
+        a_name, b_name, out = node.input[0], node.input[1], node.output[0]
+        da = self.dims.get(a_name)
+        db = self.dims.get(b_name)
+        if da is not None and db is not None and len(da) == 4 and len(db) == 4 and self.canon(a_name) not in self.heads:
+            Ka = da[3]
+            if db[2] == Ka:
+                transB = 0
+            elif db[3] == Ka:
+                transB = 1
+            else:
+                self.fail(node, f"inner dimensions disagree ({Ka} vs {db[2]},{db[3]})")
+            return self._emit_batched_matmul(node, a_name, b_name, out, transB=transB)
+
+        if da is not None and db is not None and len(da) == 3 and len(db) == 3 and self.canon(a_name) not in self.heads and self.canon(b_name) not in self.heads:
+            transA_val = 1 if self.canon(a_name) in self.ttrans else 0
+            transB_val = 1 if self.canon(b_name) in self.ttrans else 0
+            real_a = self.ttrans[self.canon(a_name)] if transA_val else a_name
+            real_b = self.ttrans[self.canon(b_name)] if transB_val else b_name
+            Ka = da[1] if transA_val else da[2]
+            Kb = db[2] if transB_val else db[1]
+            if Ka == Kb:
+                return self._emit_batched_matmul(node, real_a, real_b, out, transB=transB_val, transA=transA_val)
+
+        A, B = self._mats(a_name), self._mats(b_name)
+        if A is None or B is None:
+            self.fail(node, "runtime operands must be token tensors [1, L, K] or per-head "
+                            "attention tensors")
+        heads = self.canon(a_name) in self.heads
+        if (self.canon(b_name) in self.heads) != heads or len(A) != len(B):
+            self.fail(node, "operands must both be per-head tensors of one head count, or both "
+                            "token tensors")
+        if heads:
+            shape = self.dims[out]
+            if len(shape) != 4 or shape[1] != len(A):
+                self.fail(node, f"output shape {shape} disagrees with the head count")
+            new = []
+            for a, b in zip(A, B):
+                cols = b.rows if b.trans else b.cols
+                if [shape[2], shape[3]] != [a.rows, cols]:
+                    self.fail(node, "output shape disagrees with the per-head product")
+                t = self.temp(out, [a.rows, 1, cols])
+                new.append(self._emit_matmul(node, a, b, t))
+            self.heads[out] = new
+            return
+        if out not in self.token or len(A) != 1:
+            self.fail(node, "the product of two token tensors must be a token tensor")
+        cols = B[0].rows if B[0].trans else B[0].cols
+        if self.hwc(out) != [A[0].rows, 1, cols]:
+            self.fail(node, "output shape disagrees with the product")
+        self._emit_matmul(node, A[0], B[0], self.tid(out))
+
+    def _fold_scale(self, name, out, factor):
+        """Fold a scalar multiplier into the HX_MATMUL that produced `name` (p[1]), when that
+        product has no other user and no scale yet. The output then aliases the product."""
+        if factor == 0.0 or self.canon(name) in self.ttrans or not self.sole_user(name):
+            return False
+        mats = self._mats(name)
+        if mats is not None and all(m.op is not None and m.op.kind == MATMUL and not m.op.p[1] for m in mats):
+            bits = 0 if factor == 1.0 else hx.f32_bits(factor)
+            for m in mats:
+                m.op.p[1] = bits
+            self.alias[out] = self.canon(name)
+            return True
+        c = self.canon(name)
+        prod = self.producer.get(self.ids.get(c, -1))
+        if prod is not None and prod.kind == MATMUL and not prod.p[1]:
+            bits = 0 if factor == 1.0 else hx.f32_bits(factor)
+            prod.p[1] = bits
+            self.alias[out] = c
+            if self._is_multihead(name):
+                self.multihead.add(out)
+            return True
+        return False
+
+    def _scale(self, node, name, out, factor):
+        """out = name * factor for a scalar factor on a token or per-head tensor: folded into
+        the producing product when possible, else one multiply per matrix."""
+        if self._fold_scale(name, out, factor):
+            return
+        c = self.canon(name)
+        if c in self.heads:
+            new = []
+            for m in self.heads[c]:
+                vec = np.full(m.cols, factor, np.float32)
+                t = self.temp(out, [m.rows, 1, m.cols])
+                op = self.add(Op(hx.BINARY, m.id, NONE, t,
+                                 [hx.BIN_MUL, 1, self.pool.emit(_pad32(vec)), 0], node))
+                new.append(Mat(t, m.rows, m.cols, m.trans, op))
+            self.heads[out] = new
+            return
+        vec = np.full(self.hwc(out)[2], factor, np.float32)
+        self._affine(node, name, out, vec, np.zeros_like(vec))
+
+    def _check_operands(self, node):
+        """Fail closed when a token or per-head tensor reaches an operator that cannot take it."""
+        for name in node.input:
+            if not name or name in self.init:
+                continue
+            c = self.canon(name)
+            rank = len(self.dims.get(name) or ())
+            if c in self.ttrans:
+                ok, kind = node.op_type == "MatMul", "transposed token"
+            elif c in self.heads:
+                ok, kind = node.op_type in HEAD_OPS, "per-head attention"
+            elif rank == 4 and c in self.split_of:
+                ok, kind = node.op_type in SPLIT_OPS, "[1, L, H, dh] head view"
+            elif rank == 3 and self._is_token(name):
+                ok, kind = node.op_type in TOKEN_OPS, "token [1, L, K]"
+            else:
+                continue
+            if not ok:
+                self.fail(node, f"{name} is a {kind} tensor, which this operator does not accept")
+
+    def _classify_tokens(self):
+        """Mark the rank-3 tensors in token layout. Seeds: every operand and result of a MatMul,
+        the input of a last-axis LayerNormalization or Softmax, and the input of a reduction.
+        Token status then flows through TOKEN_LINKED operators until nothing changes."""
+        def r3(name):
+            return bool(name) and name not in self.init and len(self.dims.get(name) or ()) == 3
+
+        changed = True
+        while changed:
+            changed = False
+            for node in self.nodes:
+                names = [n for n in list(node.input) + list(node.output) if r3(n)]
+                if not names:
+                    continue
+                op = node.op_type
+                last_axis = (op in ("LayerNormalization", "RMSNormalization", "RMSNorm", "Softmax", "Split") and r3(node.input[0])
+                             and int(self.attrs(node).get("axis", -1)) % 3 == 2)
+                seed = op == "MatMul" or last_axis or (op in REDUCES and r3(node.input[0]))
+                link = op in TOKEN_LINKED and any(n in self.token for n in names)
+                if seed or link:
+                    for n in names:
+                        if n not in self.token:
+                            self.token.add(n)
+                            changed = True
 
     def sole_user(self, name):
         return self.users.get(name, 0) == 1 and name not in self.outputs
@@ -319,17 +713,24 @@ class Lowerer:
 
     # ------------------------------------------------------------ constants
     def channel_vector(self, node, value, out_name):
-        """Per-channel float32 vector from a constant broadcast against `out_name`, else None."""
+        """Per-channel float32 vector from a constant broadcast against `out_name`, else None.
+        For a token tensor [1, L, K] the channels are the last axis and the constant must not vary
+        over the sequence."""
         shape = self.dims[out_name]
-        c = shape[1]
+        token = self._is_token(out_name)
+        c = shape[2] if token else shape[1]
         v = np.asarray(value, dtype=np.float32)
         padded = (1,) * (len(shape) - v.ndim) + tuple(v.shape)
         if len(padded) != len(shape) or padded[0] != 1:
             return None
-        if len(shape) == 4 and (padded[2] != 1 or padded[3] != 1):
-            return None
-        if padded[1] not in (1, c):
-            return None
+        if token:
+            if padded[1] != 1 or padded[2] not in (1, c):
+                return None
+        else:
+            if len(shape) == 4 and (padded[2] != 1 or padded[3] != 1):
+                return None
+            if padded[1] not in (1, c):
+                return None
         return np.broadcast_to(v.reshape(-1), (c,)).astype(np.float32).copy()
 
     # ------------------------------------------------------------ main driver
@@ -343,6 +744,7 @@ class Lowerer:
             handler = getattr(self, "op_" + node.op_type, None)
             if handler is None:
                 self.fail(node, "unsupported operator")
+            self._check_operands(node)
             if id(node) in silu["mul"]:
                 self._emit_act(node, silu["mul"][id(node)], hx.FN_SILU)
             else:
@@ -495,10 +897,18 @@ class Lowerer:
         self.add(layer)
 
     def _linear(self, node, x, w, bias, out):
-        """Gemm/MatMul as a 1x1 convolution on a [1, 1, K] tensor; wide outputs are split."""
-        if self.hwc(x)[:2] != [1, 1]:
-            self.fail(node, "input must be a flat [1, K] tensor")
+        """Gemm/MatMul as a 1x1 convolution: on a [1, 1, K] tensor, or on a token tensor [1, L, K]
+        as a convolution over its L rows (w = 1). Wide outputs are split."""
+        if self.canon(x) in self.ttrans:
+            self.fail(node, "a transposed token tensor is only a MatMul operand")
         n, k = w.shape
+        token = self._is_token(x)
+        if token:
+            rows, width, ic = self.hwc(x)
+            if width != 1 or ic != k:
+                self.fail(node, f"input {[rows, width, ic]} does not match a {k}-input weight")
+        elif self.hwc(x)[:2] != [1, 1]:
+            self.fail(node, "input must be a flat [1, K] tensor")
         tiles = (k + 31) // 32
         chunk = max(
             (c for c in range(32, min((n + 31) & ~31, hx.MAX_CHANNELS) + 1, 32)
@@ -508,6 +918,9 @@ class Lowerer:
         if not chunk:
             self.fail(node, "input is too deep for the HMX budget")
         w4 = w.reshape(n, k, 1, 1)
+        if token:  # one layer; _split_wide splits an oversized output into channel chunks
+            self._new_layer(node, hx.CONV, x, out, w4, bias, [1, 1, 1, 1, 0, 0])
+            return
         if chunk >= n:
             self._new_layer(node, hx.CONV, x, out, w4, bias, [1, 1, 1, 1, 0, 0])
             return
@@ -545,11 +958,101 @@ class Lowerer:
         self._linear(node, node.input[0], w.astype(np.float32), bias, node.output[0])
 
     def op_MatMul(self, node):
+        if self.const(node.input[0]) is not None:
+            self.fail(node, "constant left operands are unsupported")
         b = self.const(node.input[1])
-        if b is None or b.ndim != 2:
+        if b is None:
+            return self._runtime_matmul(node)
+        if b.ndim != 2:
             self.fail(node, "right operand must be a constant matrix")
         self._linear(node, node.input[0], b.T.astype(np.float32),
                      np.zeros(b.shape[1], np.float32), node.output[0])
+
+    def op_Einsum(self, node):
+        eq = self.attrs(node).get("equation", "")
+        if isinstance(eq, bytes):
+            eq = eq.decode("utf-8")
+        eq = "".join(eq.split())
+        if "->" not in eq or len(node.input) != 2:
+            self.fail(node, f"only 2-operand Einsum with explicit '->' is supported; got '{eq}'")
+        lhs, rhs = eq.split("->")
+        in_eqs = lhs.split(",")
+        if len(in_eqs) != 2:
+            self.fail(node, f"only 2-operand Einsum is supported; got '{eq}'")
+
+        a_name, b_name, out_name = node.input[0], node.input[1], node.output[0]
+        eq_a, eq_b, eq_out = in_eqs[0], in_eqs[1], rhs
+
+        contracted = [c for c in eq_a if c in eq_b and c not in eq_out]
+        if len(contracted) != 1:
+            self.fail(node, f"unsupported Einsum pattern '{eq}': expected exactly 1 contraction axis")
+        c_idx = contracted[0]
+
+        idx_a = eq_a.index(c_idx)
+        if idx_a == len(eq_a) - 1:
+            transA = 0
+            m_char = eq_a[-2] if len(eq_a) >= 2 else None
+        elif idx_a == len(eq_a) - 2:
+            transA = 1
+            m_char = eq_a[-1]
+        else:
+            self.fail(node, f"unsupported Einsum contraction axis position in operand A: '{eq}'")
+
+        idx_b = eq_b.index(c_idx)
+        if idx_b == len(eq_b) - 2:
+            transB = 0
+            n_char = eq_b[-1]
+        elif idx_b == len(eq_b) - 1:
+            transB = 1
+            n_char = eq_b[-2] if len(eq_b) >= 2 else None
+        else:
+            self.fail(node, f"unsupported Einsum contraction axis position in operand B: '{eq}'")
+
+        batch_a = [c for c in eq_a if c != c_idx and c != m_char]
+        batch_b = [c for c in eq_b if c != c_idx and c != n_char]
+        batch_out = [c for c in eq_out if c != m_char and c != n_char]
+        if batch_a != batch_b or batch_a != batch_out:
+            self.fail(node, f"Einsum batch axes mismatch: '{eq}'")
+
+        return self._emit_batched_matmul(node, a_name, b_name, out_name, transB=transB, transA=transA)
+
+    def op_ScaledDotProductAttention(self, node):
+        q, k, v = node.input[0], node.input[1], node.input[2]
+        mask = node.input[3] if len(node.input) > 3 and node.input[3] else None
+        scale_in = node.input[4] if len(node.input) > 4 and node.input[4] else None
+        scale = float(self.attrs(node).get("scale", 0.0))
+        if scale_in:
+            c = self.const(scale_in)
+            if c is not None:
+                scale = float(c)
+        is_causal = int(self.attrs(node).get("is_causal", 0))
+
+        scale_bits = 0 if scale == 0.0 else hx.f32_bits(scale)
+        mask_id = self.tid(mask) if mask else hx.NONE
+        out = node.output[0]
+
+        dq = self.dims.get(q)
+        if dq is None:
+            self.fail(node, "SDPA query operand requires static dimensions")
+        if len(dq) == 4:
+            H = dq[1]
+            self.multihead.add(self.canon(q))
+            self.multihead.add(self.canon(k))
+            self.multihead.add(self.canon(v))
+            self.multihead.add(self.canon(out))
+            self.add(Op(SDPA, self.tid(q), self.tid(k), self.tid(out),
+                        [mask_id, scale_bits, is_causal, H, 0], node, z=self.tid(v)))
+        elif len(dq) == 3:
+            self.token.add(self.canon(q))
+            self.token.add(self.canon(k))
+            self.token.add(self.canon(v))
+            self.token.add(self.canon(out))
+            self.add(Op(SDPA, self.tid(q), self.tid(k), self.tid(out),
+                        [mask_id, scale_bits, is_causal, 1, 0], node, z=self.tid(v)))
+        else:
+            self.fail(node, f"unsupported SDPA query shape {dq}")
+
+    op_sdpa = op_ScaledDotProductAttention
 
     # ------------------------------------------------------------ affine / BN
     def _affine(self, node, x_name, out_name, scale, shift):
@@ -607,6 +1110,17 @@ class Lowerer:
             self.fail(node, "both operands are constants")
         if ca is not None or cb is not None:
             const, tensor, rev = (ca, b_name, 1) if ca is not None else (cb, a_name, 0)
+            if self._is_token(tensor) or self._is_multihead(tensor) or self.canon(tensor) in self.heads:
+                if opcode == hx.BIN_MUL and np.asarray(const).size == 1:
+                    return self._scale(node, tensor, out,
+                                       float(np.asarray(const, np.float64).reshape(())))
+                if self.canon(tensor) in self.heads:
+                    self.fail(node, "per-head attention tensors take only a scalar multiplier")
+            if self._is_multihead(tensor) and opcode == hx.BIN_ADD and is_causal_mask(const):
+                self.causal_masked.add(self.canon(out))
+                self.alias[out] = self.canon(tensor)
+                self.multihead.add(self.canon(out))
+                return
             if self.dims[tensor] != self.dims[out]:
                 self.fail(node, "a constant operand would broadcast the tensor")
             vec = self.channel_vector(node, const, out)
@@ -627,6 +1141,8 @@ class Lowerer:
             self.add(Op(hx.BINARY, neg, NONE, self.tid(out),
                         [hx.BIN_ADD, 1, self.pool.emit(_pad32(vec)), 0], node))
             return None
+        if self.canon(a_name) in self.heads or self.canon(b_name) in self.heads:
+            self.fail(node, "elementwise operations on per-head attention tensors are unsupported")
         sa, sb, so = self.dims[a_name], self.dims[b_name], self.dims[out]
         if len(sa) != len(sb):
             self.fail(node, "operands of different rank")
@@ -662,10 +1178,23 @@ class Lowerer:
         d = self.const(node.input[1])
         if d is None or self.const(node.input[0]) is not None:
             self.fail(node, "only division of a tensor by a constant is supported")
-        vec = self.channel_vector(node, 1.0 / np.asarray(d, dtype=np.float64), node.output[0])
+        source = node.input[0]
+        if np.asarray(d).size == 1 and (self._is_token(source) or self.canon(source) in self.heads):
+            return self._scale(node, source, node.output[0],
+                               1.0 / float(np.asarray(d, np.float64).reshape(())))
+        vec =self.channel_vector(node, 1.0 / np.asarray(d, dtype=np.float64), node.output[0])
         if vec is None or self.dims[node.input[0]] != self.dims[node.output[0]]:
             self.fail(node, "the divisor must be a per-channel vector")
         self._affine(node, node.input[0], node.output[0], vec, np.zeros_like(vec))
+
+    def op_Pow(self, node):
+        exp = self.const(node.input[1])
+        if exp is not None and np.allclose(exp, 2.0):
+            x = node.input[0]
+            out = node.output[0]
+            self.add(Op(hx.BINARY, self.tid(x), self.tid(x), self.tid(out), [hx.BIN_MUL, 0, 0, 0], node))
+            return
+        self.fail(node, f"only Pow with exponent 2 is supported, got {exp}")
 
     # ------------------------------------------------------------ activations
     @staticmethod
@@ -733,6 +1262,9 @@ class Lowerer:
         self._emit_act(node, node.input[0], hx.FN_HARDSIGMOID, a.get("alpha", 0.2),
                        a.get("beta", 0.5))
 
+    def op_Silu(self, node):
+        self._emit_act(node, node.input[0], hx.FN_SILU)
+
     def op_Gelu(self, node):
         approx = self.attrs(node).get("approximate", "none")
         approx = approx.decode() if isinstance(approx, bytes) else approx
@@ -760,20 +1292,81 @@ class Lowerer:
                     node))
 
     def op_Softmax(self, node):
-        dims = self.dims.get(node.input[0])
-        if dims is None or len(dims) not in (2, 4):
-            self.fail(node, "only batch-one rank 2 or 4 float32 inputs are supported")
+        x, out = node.input[0], node.output[0]
+        if self.const(x) is not None:
+            self.fail(node, "constant inputs are unsupported")
+        dims = self.dims.get(x)
+        if dims is None:
+            self.fail(node, "only static float32 inputs are supported")
         rank = len(dims)
-        # Opset 13+ defaults to axis -1, which is W for rank 4: that case is rejected below.
         axis = int(self.attrs(node).get("axis", -1))
         axis = axis + rank if axis < 0 else axis
-        if axis != 1:
-            self.fail(node, f"only softmax over the channel axis (axis 1) is supported; "
-                            f"got axis {axis} for rank {rank} (set axis=1 explicitly)")
-        if self.const(node.input[0]) is not None:
-            self.fail(node, "constant inputs are unsupported")
-        self.add(Op(hx.SOFTMAX, self.tid(node.input[0]), NONE, self.tid(node.output[0]), [],
-                    node))
+
+        if self.canon(x) in self.heads:  # per-head [L, L] scores: a row softmax per head
+            if axis != rank - 1:
+                self.fail(node, "per-head Softmax must be over the last axis (-1)")
+            new = []
+            for m in self.heads[self.canon(x)]:
+                if m.trans:
+                    self.fail(node, "a transposed per-head tensor cannot be the softmax input")
+                t = self.temp(out, [m.rows, 1, m.cols])
+                op = self.add(Op(hx.SOFTMAX, m.id, NONE, t, [], node))
+                new.append(Mat(t, m.rows, m.cols, False, op))
+            self.heads[out] = new
+            return
+
+        causal = 1 if (x in self.causal_masked or self.canon(x) in self.causal_masked) else 0
+        if self._is_multihead(x) or (rank == 4 and dims[0] == 1 and self.canon(x) in self.multihead):
+            axis_map = {1: 0, 2: 1, 3: 2}
+            if axis not in axis_map:
+                self.fail(node, f"unsupported softmax axis {axis} for multihead shape {dims}")
+            hwc_axis = axis_map[axis]
+            self.multihead.add(self.canon(out))
+            self.add(Op(ATTN_SOFTMAX, self.tid(x), NONE, self.tid(out), [hwc_axis, causal, 0], node))
+            return
+
+        if self._is_token(x):  # HX_SOFTMAX is per pixel over channels: per row of [L, K]
+            axis_map = {1: 0, 2: 2}
+            if axis not in axis_map:
+                self.fail(node, f"unsupported softmax axis {axis} for token shape {dims}")
+            hwc_axis = axis_map[axis]
+            self.token.add(self.canon(out))
+            if hwc_axis == 2:
+                self.add(Op(hx.SOFTMAX, self.tid(x), NONE, self.tid(out), [], node))
+            else:
+                self.add(Op(ATTN_SOFTMAX, self.tid(x), NONE, self.tid(out), [hwc_axis, 0, 0], node))
+            return
+
+        if rank == 4 and dims[0] == 1:
+            if axis != 1:
+                self.fail(node, f"only softmax over the channel axis (axis 1) is supported; "
+                                f"got axis {axis} for rank {rank} (set axis=1 explicitly)")
+            self.add(Op(hx.SOFTMAX, self.tid(node.input[0]), NONE, self.tid(node.output[0]), [],
+                        node))
+            return
+
+        if rank == 2 and dims[0] == 1:
+            if axis != 1:
+                self.fail(node, f"unsupported softmax axis {axis} for rank 2 shape {dims}")
+            self.add(Op(hx.SOFTMAX, self.tid(node.input[0]), NONE, self.tid(node.output[0]), [],
+                        node))
+            return
+
+        if rank in (5, 6) and dims[0] == 1:
+            if axis == rank - 1:
+                self.add(Op(hx.SOFTMAX, self.tid(node.input[0]), NONE, self.tid(node.output[0]), [],
+                            node))
+            elif axis == rank - 2:
+                self.add(Op(ATTN_SOFTMAX, self.tid(node.input[0]), NONE, self.tid(node.output[0]),
+                            [1, 0, 0], node))
+            elif axis == rank - 3:
+                self.add(Op(ATTN_SOFTMAX, self.tid(node.input[0]), NONE, self.tid(node.output[0]),
+                            [0, 0, 0], node))
+            else:
+                self.fail(node, f"unsupported softmax axis {axis} for rank {rank}")
+            return
+
+        self.fail(node, f"unsupported input shape {dims} or axis {axis}")
 
     # ------------------------------------------------------------ normalisation
     def _norm(self, node, x, out, mode, groups, eps, gamma, beta):
@@ -840,6 +1433,19 @@ class Lowerer:
         be constant per channel (spatially constant for rank 4). Mean and InvStdDev are unused."""
         if any(self.users.get(name, 0) for name in node.output[1:]):
             self.fail(node, "the Mean and InvStdDev outputs are unsupported")
+        if self._is_token(node.input[0]):  # [1, L, K] normalised over K: per row, channel mode
+            if int(self.attrs(node).get("axis", -1)) % 3 != 2:
+                self.fail(node, "token LayerNormalization must normalise the last axis")
+            c = self.dims[node.input[0]][2]
+            eps = float(self.attrs(node).get("epsilon", 1e-5))
+            scale = self._optional_constant(node, 1, "scale")
+            bias = self._optional_constant(node, 2, "bias")
+            gamma = (np.ones(c, np.float32) if scale is None
+                     else self._norm_vector(node, scale, c, "scale"))
+            beta = (np.zeros(c, np.float32) if bias is None
+                    else self._norm_vector(node, bias, c, "bias"))
+            self._norm(node, node.input[0], node.output[0], hx.NORM_CHANNEL, 0, eps, gamma, beta)
+            return
         dims = self.dims.get(node.input[0])
         if dims is None or len(dims) not in (2, 4):
             self.fail(node, "only batch-one rank-2 or rank-4 float32 inputs are supported")
@@ -866,6 +1472,34 @@ class Lowerer:
         beta = (np.zeros(c, np.float32) if bias is None
                 else self._spatial_vector(node, bias, c, h, w, "bias"))
         self._norm(node, node.input[0], node.output[0], hx.NORM_GROUP, 1, eps, gamma, beta)
+
+    def op_RMSNormalization(self, node):
+        """RMSNorm over the last axis of a token tensor or [1, C] (HX_RMSNORM).
+        Scale (gamma) must be constant. Optional bias (beta) defaults to None."""
+        x = node.input[0]
+        out = node.output[0]
+        if out not in self.dims and x in self.dims:
+            self.dims[out] = list(self.dims[x])
+        dims = self.dims.get(x)
+        if dims is None:
+            self.fail(node, "unknown shape")
+        c = dims[-1] if self._is_token(x) else (dims[1] if len(dims) == 2 else dims[1])
+        eps = float(self.attrs(node).get("epsilon", 1e-5))
+        scale = self.const(node.input[1])
+        if scale is None:
+            self.fail(node, "RMSNormalization scale must be constant")
+        gamma = self._norm_vector(node, scale, c, "scale")
+        beta = None
+        if len(node.input) > 2 and node.input[2]:
+            b_val = self.const(node.input[2])
+            if b_val is not None:
+                beta = self._norm_vector(node, b_val, c, "bias")
+        gamma_off = self.pool.emit(_pad32(gamma))
+        beta_off = self.pool.emit(_pad32(beta)) if beta is not None else NONE
+        p = [hx.f32_bits(eps), gamma_off, beta_off] + [0] * 8
+        self.add(Op(hx.RMSNORM, self.tid(x), NONE, self.tid(out), p, node))
+
+    op_RMSNorm = op_RMSNormalization
 
     def op_GroupNormalization(self, node):
         """GroupNormalization over a [1, C, H, W] input. Scale and bias have one value per group
@@ -953,14 +1587,18 @@ class Lowerer:
         representable as the output's HWC shape."""
         x, out = node.input[0], node.output[0]
         dims = self.dims.get(x)
-        if dims is None or len(dims) not in (2, 4):
+        token = self._is_token(x)
+        if dims is None or (len(dims) not in (2, 4) and not token):
             self.fail(node, "only static rank-2 or rank-4 float32 inputs are supported")
         if self.const(x) is not None:
             self.fail(node, "constant inputs are unsupported")
         if not axes:
             self.fail(node, "empty axes (reduce everything) are unsupported")
         rank = len(dims)
-        bits = {1: 4, 2: 1, 3: 2} if rank == 4 else {1: 4}  # ONNX C, H, W -> HWC c, h, w
+        if token:  # [1, L, K]: the sequence is h (bit 1), the channels are c (bit 4)
+            bits = {1: 1, 2: 4}
+        else:
+            bits = {1: 4, 2: 1, 3: 2} if rank == 4 else {1: 4}  # ONNX C, H, W -> HWC c, h, w
         mask = 0
         for v in axes:
             v = int(v) + rank if int(v) < 0 else int(v)
@@ -1007,10 +1645,45 @@ class Lowerer:
         an alias; any other change is a row-major (NCHW) reshape, lowered as an NCHW flatten to
         1x1xN (HX_RESHAPE flag 1) and an NCHW unflatten (flag 2), each skipped when already 1x1."""
         x, out = node.input[0], node.output[0]
+        dims_out = self.dims.get(out) or []
+        has_legacy_split = any(n.op_type == "Transpose" and [int(v) for v in self.attrs(n).get("perm", [])] == [0, 2, 3, 1] for n in self.nodes)
+        if self._is_token(x) and len(dims_out) == 4:  # [1, L, K] -> [1, L, H, dh]: a head view
+            rows, _, width = self.hwc(x)
+            if dims_out[:2] != [1, rows] or dims_out[2] * dims_out[3] != width:
+                self.fail(node, "a token tensor may only be reshaped to [1, L, H, dh] with "
+                                "H * dh = K")
+            split, cx = (dims_out[2], dims_out[3]), self.canon(x)
+            if has_legacy_split:
+                if self.split_of.get(cx, split) != split:
+                    self.fail(node, "the same tensor is split into two different head layouts")
+                self.split_of[cx] = split
+                self.alias[out] = cx
+                return
+            else:
+                self.head_view.add(self.canon(out))
+                self.add(Op(hx.RESHAPE, self.tid(x), NONE, self.tid(out), [0], node))
+                return
+        if self._is_head_view(x) and len(dims_out) == 3:
+            self.token.add(self.canon(out))
+            self.add(Op(hx.RESHAPE, self.tid(x), NONE, self.tid(out), [0], node))
+            return
         src, dst = self.hwc(x), self.hwc(out)
         if src == dst:
             self.alias[out] = self.canon(x)
             return
+        if self._is_token(x) and self._is_token(out):
+            if src[0] * src[1] * src[2] != dst[0] * dst[1] * dst[2]:
+                self.fail(node, "the input and output element counts differ")
+            self.add(Op(hx.RESHAPE, self.tid(x), NONE, self.tid(out), [0], node))
+            return
+        if (self._is_token(x) or self._is_token(out)) and not (self._is_token(x) and self._is_token(out)):
+            if src[0] * src[1] == dst[0] * dst[1] and src[2] == dst[2]:
+                self.alias[out] = self.canon(x)
+                return
+            if src[0] * src[1] * src[2] == dst[0] * dst[1] * dst[2]:
+                self.add(Op(hx.RESHAPE, self.tid(x), NONE, self.tid(out), [0], node))
+                return
+            self.fail(node, "a token tensor reshape requires matching elements")
         n = src[0] * src[1] * src[2]
         if n != dst[0] * dst[1] * dst[2]:
             self.fail(node, "the input and output element counts differ")
@@ -1037,6 +1710,112 @@ class Lowerer:
         self._alias_shape(node)
 
     def op_Transpose(self, node):
+        if not self._transpose_view(node):
+            self._transpose_nchw(node)
+
+    def _transpose_view(self, node):
+        """Transposes of token and per-head tensors. Returns False for an NCHW transpose of a
+        rank-4 or rank-3 tensor that is not in token layout (the caller handles it)."""
+        x, out = node.input[0], node.output[0]
+        cx = self.canon(x)
+        dims_x = self.dims.get(x)
+        perm = [int(v) for v in self.attrs(node).get("perm", [])]
+        if cx in self.ttrans:
+            self.fail(node, "a transposed token tensor cannot be transposed again")
+        if cx in self.heads:
+            self._heads_transpose(node, cx, perm)
+            return True
+        has_legacy_split = any(n.op_type == "Transpose" and [int(v) for v in self.attrs(n).get("perm", [])] == [0, 2, 3, 1] for n in self.nodes)
+        if dims_x is not None and len(dims_x) == 4 and cx in self.split_of:
+            if has_legacy_split:
+                self._split_transpose(node, cx, perm)
+                return True
+        if dims_x is not None and len(dims_x) == 4 and dims_x[0] == 1:
+            if perm == [0, 2, 1, 3]:
+                if self._is_head_view(x) or cx in self.split_of:
+                    self.multihead.add(self.canon(out))
+                    self.add(Op(hx.TRANSPOSE, self.tid(x), NONE, self.tid(out), [1, 0, 2], node))
+                    return True
+                elif self._is_multihead(x):
+                    self.head_view.add(self.canon(out))
+                    self.add(Op(hx.TRANSPOSE, self.tid(x), NONE, self.tid(out), [1, 0, 2], node))
+                    return True
+            elif perm == [0, 1, 3, 2] and self._is_multihead(x):
+                self.multihead.add(self.canon(out))
+                self.add(Op(hx.TRANSPOSE, self.tid(x), NONE, self.tid(out), [0, 2, 1], node))
+                return True
+        if dims_x is not None and len(dims_x) in (5, 6) and dims_x[0] == 1:
+            if out not in self.dims and len(perm) == len(dims_x):
+                self.dims[out] = [dims_x[p] for p in perm]
+            src, dst = self.hwc(x), self.hwc(out)
+            if src == dst or (src[0] * src[1] == dst[0] * dst[1] and src[2] == dst[2]):
+                self.alias[out] = cx
+                return True
+        if dims_x is not None and len(dims_x) == 3:
+            if perm == [1, 0, 2]:
+                self.fail(node, "sequence-first [L, 1, K] tensors are unsupported (torch's "
+                                "nn.MultiheadAttention works this way); export a batch-first block")
+            if perm != [0, 2, 1]:
+                self.fail(node, "rank-3 transposes must be [0, 2, 1]")
+            if out in self.outputs:
+                self.fail(node, "a transposed view cannot be a graph output")
+            if self._is_token(x):  # K^T of a token tensor: a logical view, used by MatMul only
+                self.ttrans[out] = cx
+                return True
+            if not self._is_token(out):
+                self.fail(node, "a rank-3 transpose is supported only into token layout")
+            # [1, C, L] (NCHW with H = 1) and [1, L, C] share one HWC order: a logical reshape.
+            self.add(Op(hx.RESHAPE, self.tid(x), NONE, self.tid(out), [0], node))
+            return True
+        return False
+
+    def _split_transpose(self, node, cx, perm):
+        """[1, L, H, dh] head view -> per-head matrices: [0, 2, 1, 3] gives [L, dh] heads, and
+        [0, 2, 3, 1] gives the transposed heads [dh, L] (a logical view of the same slices)."""
+        heads, dh = self.split_of[cx]
+        rows = self.hwc(cx)[0]
+        out = node.output[0]
+        if perm == [0, 2, 1, 3]:
+            trans, expect = False, [1, heads, rows, dh]
+        elif perm == [0, 2, 3, 1]:
+            trans, expect = True, [1, heads, dh, rows]
+        else:
+            self.fail(node, "a head view transposes as [0, 2, 1, 3] or [0, 2, 3, 1]")
+        if list(self.dims[out]) != expect:
+            self.fail(node, "output shape disagrees with the head split")
+        base = self.tid(cx)
+        mats = []
+        for h in range(heads):
+            piece = self.temp(out, [rows, 1, dh])
+            op = self.add(Op(hx.SLICE, base, NONE, piece, [0, 0, h * dh], node))
+            mats.append(Mat(piece, rows, dh, trans, op))
+        self.heads[out] = mats
+
+    def _heads_transpose(self, node, cx, perm):
+        """Per-head matrices: [0, 1, 3, 2] flips each matrix (K^T); [0, 2, 1, 3] merges the heads
+        back into channels, one token block per head, as a [1, L, H, dh] head view."""
+        mats, out = self.heads[cx], node.output[0]
+        if perm == [0, 1, 3, 2]:
+            self.heads[out] = [m._replace(trans=not m.trans) for m in mats]
+            return
+        if perm != [0, 2, 1, 3] or any(m.trans for m in mats):
+            self.fail(node, "per-head tensors transpose as [0, 1, 3, 2] or, for untransposed "
+                            "heads, [0, 2, 1, 3]")
+        heads, rows, dh = len(mats), mats[0].rows, mats[0].cols
+        if list(self.dims[out]) != [1, rows, heads, dh]:
+            self.fail(node, "output shape disagrees with the merged heads")
+        self.split_of[out] = (heads, dh)
+        if heads == 1:
+            self.ids[out] = mats[0].id
+            return
+        acc, width = mats[0].id, dh
+        for i, m in enumerate(mats[1:], 1):
+            width += dh
+            merged = self.tid(out) if i == heads - 1 else self.temp(out, [rows, 1, width])
+            self.add(Op(hx.CONCAT, acc, m.id, merged, [2], node))
+            acc = merged
+
+    def _transpose_nchw(self, node):
         """Rank-4 batch-one transposes whose perm keeps the batch axis first. ONNX axes are
         (1=C, 2=H, 3=W); HWC axes are (H=0, W=1, C=2). Output h, w and c are output ONNX axes
         2, 3 and 1, so they read source axes perm[2], perm[3] and perm[1]."""
@@ -1056,11 +1835,17 @@ class Lowerer:
         self.add(Op(hx.TRANSPOSE, self.tid(node.input[0]), NONE, self.tid(node.output[0]), p, node))
 
     def op_Concat(self, node):
-        rank = len(self.dims[node.output[0]])
-        axis = int(self.attrs(node)["axis"]) % rank
-        if rank == 4 and axis == 0 or rank not in (2, 4):
-            self.fail(node, "unsupported axis or rank")
-        hwc_axis = 2 if rank == 2 else {1: 2, 2: 0, 3: 1}[axis]
+        if self._is_token(node.output[0]):  # sequence (1) joins rows, channels (2) join c
+            axis = int(self.attrs(node)["axis"]) % 3
+            if axis not in (1, 2):
+                self.fail(node, "token Concat must join the sequence (1) or channel (2) axis")
+            hwc_axis = 0 if axis == 1 else 2
+        else:
+            rank = len(self.dims[node.output[0]])
+            axis = int(self.attrs(node)["axis"]) % rank
+            if rank == 4 and axis == 0 or rank not in (2, 4):
+                self.fail(node, "unsupported axis or rank")
+            hwc_axis = 2 if rank == 2 else {1: 2, 2: 0, 3: 1}[axis]
         names = [n for n in node.input]
         if any(self.const(n) is not None for n in names):
             self.fail(node, "constant inputs are unsupported")
@@ -1074,6 +1859,30 @@ class Lowerer:
             self.add(Op(hx.CONCAT, acc_id, self.tid(n), out, [hwc_axis], node))
             acc_id, acc_shape = out, merged
 
+    def op_Gather(self, node):
+        """Gather along the sequence axis of a token tensor [1, L, K] with constant indices that
+        form a contiguous run: a scalar index gives [1, K], a run of m gives [1, m, K] (HX_SLICE)."""
+        data, index, out = node.input[0], node.input[1], node.output[0]
+        if not self._is_token(data) or len(self.dims[data]) != 3:
+            self.fail(node, "only Gather over the sequence axis of a token tensor [1, L, K] is "
+                            "supported")
+        if int(self.attrs(node).get("axis", 0)) % 3 != 1:
+            self.fail(node, "only the sequence axis (1) is supported")
+        value = self.const(index)
+        if value is None:
+            self.fail(node, "indices must be constant")
+        idx = np.asarray(value).astype(np.int64)
+        if idx.ndim > 1:
+            self.fail(node, "indices must be a scalar or a vector")
+        rows, _, width = self.hwc(data)
+        idx = idx.reshape(-1)
+        idx = np.where(idx < 0, idx + rows, idx)
+        if idx.size == 0 or idx.min() < 0 or idx.max() >= rows or np.any(np.diff(idx) != 1):
+            self.fail(node, "indices must be a contiguous run of sequence positions")
+        if self.hwc(out) != [idx.size, 1, width]:
+            self.fail(node, "output shape disagrees with the indices")
+        self.add(Op(hx.SLICE, self.tid(data), NONE, self.tid(out), [int(idx[0]), 0, 0], node))
+
     def op_Slice(self, node):
         """Slice with constant starts/ends (opset 10+) and unit steps. Channel and spatial
         axes become SLICE offsets; any other axis must be taken whole."""
@@ -1081,8 +1890,8 @@ class Lowerer:
             self.fail(node, "starts and ends must be inputs (opset 10 or later)")
         data = node.input[0]
         dims = self.dims.get(data)
-        if dims is None or len(dims) not in (2, 4):
-            self.fail(node, "only static rank-2 or rank-4 tensors are supported")
+        if dims is None or len(dims) not in (2, 3, 4):
+            self.fail(node, "only static rank-2, rank-3 or rank-4 tensors are supported")
         rank = len(dims)
 
         def const_input(i, default):
@@ -1100,7 +1909,13 @@ class Lowerer:
         steps = const_input(4, [1] * len(starts))
         if len(axes) != len(starts) or len(steps) != len(starts) or any(s != 1 for s in steps):
             self.fail(node, "only unit steps are supported")
-        hwc_axis = {1: 2, 2: 0, 3: 1} if rank == 4 else {1: 2}  # ONNX axis -> HWC index
+        if rank == 4:
+            hwc_axis = {1: 2, 2: 0, 3: 1}
+        elif rank == 3:
+            hwc_axis = {1: 0, 2: 2} if self._is_token(data) else {1: 2}
+        else:
+            hwc_axis = {1: 2}
+
         sizes = list(self.hwc(data))
         offsets, out_shape, seen = [0, 0, 0], list(sizes), set()
         for axis, start, end in zip(axes, starts, ends):
@@ -1130,10 +1945,12 @@ class Lowerer:
         a = self.attrs(node)
         data = node.input[0]
         dims = self.dims.get(data)
-        if dims is None or len(dims) not in (2, 4):
-            self.fail(node, "only static rank-2 or rank-4 tensors are supported")
-        if int(a.get("axis", 0)) % len(dims) != 1:
-            self.fail(node, "only splits along the channel axis (1) are supported")
+        if dims is None or len(dims) not in (2, 3, 4):
+            self.fail(node, "only static rank-2, rank-3 or rank-4 tensors are supported")
+        is_token = self._is_token(data) or (len(dims) == 3 and int(a.get("axis", 0)) % 3 == 2)
+        exp_axis = 2 if is_token else 1
+        if int(a.get("axis", 0)) % len(dims) != exp_axis:
+            self.fail(node, f"only splits along the channel axis ({exp_axis}) are supported")
         ih, iw, ic = self.hwc(data)
         if len(node.input) > 1 and node.input[1]:
             sizes = self.const(node.input[1])
@@ -1319,6 +2136,9 @@ class Lowerer:
             return 3 if i in compact else (self.shapes[i][2] + 31) & ~31
 
         ops = [[o.kind, o.x, o.y, o.z, o.out] + o.p for o in self.ops]
+        if len(ops) > OPERATION_LIMIT:
+            raise ValueError(f"{len(ops)} operations exceed the runtime limit of {OPERATION_LIMIT}; "
+                             "fewer heads or a shorter sequence")
         blockers = fp16_blockers(ops, input_ids, out_ids, hwc, stride)
         if len(self.pool.data) > CONSTANT_POOL_LIMIT:
             raise ValueError(

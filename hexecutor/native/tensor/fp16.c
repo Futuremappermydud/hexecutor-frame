@@ -1147,6 +1147,63 @@ static void softmax_fp16_scalar(const HxGraph *g, const HxOp *o, uint32_t part, 
     const uint32_t pw_m = mask_t ? physical_width(mask_t) : 0;
     const uint32_t causal = o->p[1];
     const uint32_t M = b->w > 1 ? b->w : (o->p[2] > 0 ? o->p[2] : b->h);
+    const uint32_t axis = (o->kind == HX_ATTN_SOFTMAX) ? o->p[0] : 2;
+
+    if (axis == 1) {
+        if (part == 0) {
+            for (uint32_t oy = 0; oy < b->h; oy++) {
+                for (uint32_t c = 0; c < b->c; c++) {
+                    float peak = -FLT_MAX, sum = 0.0f;
+                    for (uint32_t ox = 0; ox < b->w; ox++) {
+                        float v = scalar(x[at(a, oy * pw_a + ox, c)]);
+                        if (v > peak) peak = v;
+                    }
+                    for (uint32_t ox = 0; ox < b->w; ox++) {
+                        float v = expf(scalar(x[at(a, oy * pw_a + ox, c)]) - peak);
+                        sum += v;
+                    }
+                    float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+                    for (uint32_t ox = 0; ox < b->w; ox++) {
+                        float v = expf(scalar(x[at(a, oy * pw_a + ox, c)]) - peak);
+                        out[at(b, oy * pw_b + ox, c)] = half(v * inv);
+                    }
+                }
+                for (uint32_t ox = 0; ox < b->w; ox++) {
+                    for (uint32_t c = b->c; c < b->stride; c++)
+                        out[at(b, oy * pw_b + ox, c)] = 0;
+                }
+            }
+        }
+        return;
+    } else if (axis == 0) {
+        if (part == 0) {
+            for (uint32_t ox = 0; ox < b->w; ox++) {
+                for (uint32_t c = 0; c < b->c; c++) {
+                    float peak = -FLT_MAX, sum = 0.0f;
+                    for (uint32_t oy = 0; oy < b->h; oy++) {
+                        float v = scalar(x[at(a, oy * pw_a + ox, c)]);
+                        if (v > peak) peak = v;
+                    }
+                    for (uint32_t oy = 0; oy < b->h; oy++) {
+                        float v = expf(scalar(x[at(a, oy * pw_a + ox, c)]) - peak);
+                        sum += v;
+                    }
+                    float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+                    for (uint32_t oy = 0; oy < b->h; oy++) {
+                        float v = expf(scalar(x[at(a, oy * pw_a + ox, c)]) - peak);
+                        out[at(b, oy * pw_b + ox, c)] = half(v * inv);
+                    }
+                }
+            }
+            for (uint32_t oy = 0; oy < b->h; oy++) {
+                for (uint32_t ox = 0; ox < b->w; ox++) {
+                    for (uint32_t c = b->c; c < b->stride; c++)
+                        out[at(b, oy * pw_b + ox, c)] = 0;
+                }
+            }
+        }
+        return;
+    }
 
     const uint32_t pixels = b->h * b->w;
     const uint32_t lo = pixels * part / parts, hi = pixels * (part + 1u) / parts;

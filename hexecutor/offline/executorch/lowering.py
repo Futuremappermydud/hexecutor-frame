@@ -64,6 +64,8 @@ KINDS = {
     "native_group_norm.default": "norm",
     "sub.Tensor": "binary",
     "mul.Tensor": "binary",
+    "bmm.default": "bmm",
+    "scaled_dot_product_attention.default": "sdpa",
     "hardswish.default": "act",
     "hardsigmoid.default": "act",
     "silu.default": "act",
@@ -128,15 +130,24 @@ def static_shape(node):
     return tuple(int(d) for d in val.shape)
 
 
-def hwc_of(shape, name="tensor"):
-    """HXFG [H, W, C] for a batch-one rank-4 or rank-2 PyTorch shape."""
+def hwc_of(shape, name="tensor", multihead=False):
+    """HXFG [H, W, C] for a batch-one rank-4 or rank-2 PyTorch shape, or multi-head [B, H, L, D] / rank-3 [B, L, C]."""
     shape = tuple(shape)
-    if len(shape) == 4 and shape[0] == 1:
+    if multihead:
+        if len(shape) == 4:
+            h, w, c = shape[0] * shape[1], shape[2], shape[3]
+        elif len(shape) == 3:
+            h, w, c = shape[0], shape[1], shape[2]
+        else:
+            raise Unsupported(f"{name}: multihead shape {shape} must be rank 3 or 4")
+    elif len(shape) == 4 and shape[0] == 1:
         h, w, c = shape[2], shape[3], shape[1]
+    elif len(shape) == 3 and shape[0] == 1:
+        h, w, c = shape[1], 1, shape[2]
     elif len(shape) == 2 and shape[0] == 1:
         h, w, c = 1, 1, shape[1]
     else:
-        raise Unsupported(f"{name}: shape {shape} is not batch-one rank 2 or 4")
+        raise Unsupported(f"{name}: shape {shape} is not batch-one rank 2, 3 or 4")
     if min(h, w, c) < 1 or c > MAX_CHANNELS:
         raise Unsupported(f"{name}: unsupported size {shape}")
     return [h, w, c]
@@ -644,6 +655,35 @@ def check(kind, node, ep):
         if act_code(node) is None:
             raise Unsupported("only ReLU and ReLU6 can be fused")
         hwc_of(static_shape(node), node.name)
+    elif kind == "bmm":
+        a, b_arg = args[0], args[1]
+        shape_a = static_shape(a)
+        shape_b = static_shape(b_arg)
+        if len(shape_a) not in (3, 4) or len(shape_b) not in (3, 4):
+            raise Unsupported("bmm operands must be rank 3 or 4")
+        if shape_a[-1] != shape_b[-2]:
+            raise Unsupported(f"bmm inner dimensions disagree: {shape_a[-1]} vs {shape_b[-2]}")
+        if shape_a[0] != shape_b[0]:
+            raise Unsupported(f"bmm batch dimensions disagree: {shape_a[0]} vs {shape_b[0]}")
+        hwc_of(shape_a, a.name, multihead=True)
+        hwc_of(shape_b, b_arg.name, multihead=True)
+        hwc_of(static_shape(node), node.name, multihead=True)
+    elif kind == "sdpa":
+        q, k, v = args[0], args[1], args[2]
+        shape_q, shape_k, shape_v = static_shape(q), static_shape(k), static_shape(v)
+        if len(shape_q) != 4 or len(shape_k) != 4 or len(shape_v) != 4:
+            raise Unsupported("sdpa operands must be rank 4 [B, H, L, D]")
+        if shape_q[:2] != shape_k[:2] or shape_q[:2] != shape_v[:2]:
+            raise Unsupported("sdpa batch/head dimensions disagree")
+        if shape_q[3] != shape_k[3] or shape_k[2] != shape_v[2]:
+            raise Unsupported("sdpa dimension mismatch")
+        dropout_p = args[4] if len(args) > 4 and args[4] is not None else 0.0
+        if float(dropout_p) != 0.0:
+            raise Unsupported("sdpa dropout is unsupported at inference")
+        hwc_of(shape_q, q.name, multihead=True)
+        hwc_of(shape_k, k.name, multihead=True)
+        hwc_of(shape_v, v.name, multihead=True)
+        hwc_of(static_shape(node), node.name, multihead=True)
     else:  # pragma: no cover - table and checks are kept in step
         raise Unsupported(kind)
 
@@ -703,9 +743,11 @@ class _Builder:
         self.ops, self.op_of_out = [], {}
         self.pool = hx.ConstantPool()
         self.source_ops = []
+        self.multihead = set()
+        self.multihead_names = set()
 
     def canon(self, node):
-        name = node.name
+        name = node.name if hasattr(node, "name") else str(node)
         while name in self.alias:
             name = self.alias[name]
         return name
@@ -715,6 +757,8 @@ class _Builder:
         if name not in self.ids:
             self.ids[name] = len(self.ids)
             self.shape[self.ids[name]] = static_shape(node)
+            if name in self.multihead_names:
+                self.multihead.add(self.ids[name])
         return self.ids[name]
 
     def temp(self, name, shape):
@@ -883,6 +927,44 @@ def _emit_maxpool(b, node):
     b.record(node, "max_pool2d")
 
 
+def _emit_bmm(b, node):
+    a = node.args[0]
+    b_arg = node.args[1]
+    shape_a = static_shape(a)
+    B = shape_a[0] if len(shape_a) == 3 else shape_a[0] * shape_a[1]
+    tid_a = b.tid(a)
+    tid_b = b.tid(b_arg)
+    tid_out = b.tid(node)
+    b.multihead.add(tid_a)
+    b.multihead.add(tid_b)
+    b.multihead.add(tid_out)
+    b.emit(hx.MATMUL, tid_a, tid_b, node, [0, 0, B, 0])
+    b.record(node, "bmm")
+
+
+def _emit_sdpa(b, node):
+    q, k, v = node.args[0], node.args[1], node.args[2]
+    mask = node.args[3] if len(node.args) > 3 and node.args[3] is not None else None
+    is_causal = bool(node.args[5]) if len(node.args) > 5 and node.args[5] is not None else False
+    scale = node.args[6] if len(node.args) > 6 and node.args[6] is not None else None
+    scale_bits = hx.f32_bits(scale) if scale is not None else 0
+    shape_q = static_shape(q)
+    B = shape_q[0] * shape_q[1]
+    tid_q = b.tid(q)
+    tid_k = b.tid(k)
+    tid_v = b.tid(v)
+    tid_out = b.tid(node)
+    tid_mask = b.tid(mask) if mask is not None else NONE
+    b.multihead.add(tid_q)
+    b.multihead.add(tid_k)
+    b.multihead.add(tid_v)
+    b.multihead.add(tid_out)
+    if mask is not None:
+        b.multihead.add(tid_mask)
+    b.emit_to(hx.SDPA, tid_q, tid_k, tid_out, [tid_mask, scale_bits, 1 if is_causal else 0, B], z=tid_v)
+    b.record(node, "scaled_dot_product_attention")
+
+
 def lower_program(ep, destination):
     """Lower a delegated edge-dialect partition.
 
@@ -891,13 +973,21 @@ def lower_program(ep, destination):
     Returns (summary dict, HXFG image bytes, constant pool bytes).
     """
     b = _Builder(ep)
+    for node in ep.graph.nodes:
+        if node.op == "call_function":
+            k = kind_name(node)
+            if k in ("bmm", "sdpa"):
+                for a in node.all_input_nodes:
+                    b.multihead_names.add(b.canon(a))
+                b.multihead_names.add(b.canon(node))
+
     graph_inputs = [
         n for n in ep.graph.nodes if n.op == "placeholder" and not _is_constant(ep, n)
     ]
     if not graph_inputs:
         raise Unsupported("partition has no runtime inputs")
     for n in graph_inputs:
-        hwc_of(static_shape(n), n.name)
+        hwc_of(static_shape(n), n.name, multihead=(b.canon(n) in b.multihead_names))
     compact = {
         n.name
         for n in graph_inputs
@@ -923,6 +1013,10 @@ def lower_program(ep, destination):
             _emit_conv(b, ep, node)
         elif kind == "linear":
             _emit_linear(b, ep, node)
+        elif kind == "bmm":
+            _emit_bmm(b, node)
+        elif kind == "sdpa":
+            _emit_sdpa(b, node)
         elif kind in ("add", "binary"):
             opcode, x, y, vec, rev = _binary_plan(node, ep, data=True)
             if _plain_add(node, ep):
@@ -1041,7 +1135,7 @@ def lower_program(ep, destination):
     compact_ids = {b.ids[n.name] for n in graph_inputs if n.name in compact}
 
     def hwc(i):
-        return hwc_of(b.shape[i], names.get(i, f"tensor {i}"))
+        return hwc_of(b.shape[i], names.get(i, f"tensor {i}"), multihead=(i in b.multihead))
 
     def stride(i):
         return 3 if i in compact_ids else (hwc(i)[2] + 31) & ~31

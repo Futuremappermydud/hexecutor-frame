@@ -40,3 +40,34 @@ Use `hexecutor/build-scripts/build_tensor.sh` with explicit `HEXECUTOR_SDK_ROOT`
 `make check` exercises portable format, arithmetic, ownership, tracker and existing worker behavior. `hexecutor/build-scripts/test_tensor_sim.sh` requires the SDK and checks actual HMX/HVX instructions, including K>1,024, FP16 conversion boundaries and RGB channel/padding tails, and (added 2026-11-17; passing on the Hexagon simulator the same day) im2col dense convolutions of several kernels, strides and paddings, including a case with a small workspace that forces several pack batches, scalar-lane depthwise shapes, and the standalone activation, broadcasting binary and average-pool operations. The [hand-tracking guide](../model-development/hand-tracking.md) describes reproducible model/device comparisons.
 
 Offline QNN inspection lives under `hexecutor/offline/`: `compile_qnn.py` records an explicit target configuration and hashes; `inspect_qnn.py` parses literal schematic data with bounded scalar arithmetic. It ignores executable expansion loops and never executes a compiler dump. Generated contexts/schematics stay ignored. A compiled topology or host simulator duration is not a measured device benchmark.
+
+## Batched MatMul, attention and higher-rank layouts
+
+Added 2026-11-18: batched runtime matrix multiplication (`HX_MATMUL`, kind 21), fused scaled dot-product attention (`HX_SDPA`, kind 27), and attention softmax with arbitrary-axis and optional causal/additive mask support (`HX_ATTN_SOFTMAX`, kind 28).
+
+- `HX_MATMUL` (kind 21): Extends runtime matrix multiplication to batched and multi-head layouts (`[B, M, K]` $\times$ `[B, K, N]` or transposed). Op parameters:
+  - `p[0]`: `transB` (0: un-transposed, 1: transposed operand $B$, e.g. $Q \cdot K^T$)
+  - `p[1]`: float32 bit pattern of scalar factor applied to result (0 selects 1.0f)
+  - `p[2]`: batch count $B$ when tensors have $w = 1$ (if 0 or 1, inferred from tensor height $h$)
+  - `p[3]`: `transA` (0: un-transposed, 1: transposed operand $A$)
+  Inner dimension $K \le 4096$. Broadcast across the batch/head dimension ($B_b = 1$ to $B_a$) is supported. Accumulation is float32.
+
+- `HX_ATTN_SOFTMAX` (kind 28): Attention softmax supporting arbitrary axis reduction and masking:
+  - `x`: input tensor, `out`: output tensor (same shape)
+  - `y`: optional additive mask tensor ID (or `HXFG_NONE`), supporting arbitrary broadcasting on $h, w, c$
+  - `p[0]`: axis (0: $H$, 1: $W$, 2: $C$ / channels, which is the key axis for multi-head scores `[H, Lq, Lk]`)
+  - `p[1]`: causal mask flag (1: causal masking, sets $k > q$ to 0.0f; 0: none)
+  - `p[2]`: query sequence length $L$ for causal query indexing if $w = 1$ (0 selects default)
+  Standard unparameterized channel-axis softmax remains `HX_SOFTMAX` (kind 15).
+
+- `HX_SDPA` (kind 27): Fused scaled dot-product attention ($Out = \text{Softmax}(Q \cdot K^T \cdot \text{scale} + \text{mask}) \cdot V$):
+  - `x`: $Q$ (`[B, Lq, D]`), `y`: $K$ (`[B, Lk, D]`), `z`: $V$ (`[B, Lk, Dv]`), `out`: Output (`[B, Lq, Dv]`)
+  - `p[0]`: optional additive mask tensor ID (or `HXFG_NONE`)
+  - `p[1]`: float32 bits of scale (0 selects $1 / \sqrt{D}$)
+  - `p[2]`: causal mask flag (1: causal masking; 0: none)
+  - `p[3]`: batch/head count $B$ when tensors have $w = 1$
+  - `p[4]`: reserved (0)
+
+- Higher-rank views & Pixel Unshuffle: Rank-5/6 tensors with leading unit dimensions or collapsed spatial dimensions (e.g. `[1, 1, H, L, D]`, `[1, 1, 1, 2, 2, 1024]`) map into the generic 3D HWC representation without requiring an interpreter or hybrid fallback. Rank-6 pixel unshuffle reshapes and transposes (`conv.merge_unshuffle`) alias cleanly as zero-copy views when physical memory and channel strides match.
+
+- FP16/HVX path behavior: `HX_MATMUL`, `HX_ATTN_SOFTMAX`, and `HX_SDPA` run in scalar lanes on the FP16 path (in `fp16.c`), maintaining bit-accurate arithmetic with float32 accumulation and half-precision storage. They are correct across all shapes and tested on host, portable reference, and simulator.

@@ -15,6 +15,10 @@ NONE = 0xFFFFFFFF
 # Values of the HX_* operation enum in hexecutor/native/tensor/graph.h.
 (CONV, DEPTHWISE, ADD, PRELU, MAXPOOL, PAD, RESIZE, RESHAPE, CONCAT, MEAN, LOGISTIC, ACT, BINARY,
  AVGPOOL, SOFTMAX, SLICE, ZEROINSERT, TRANSPOSE, REDUCE, NORM) = range(1, 21)
+MATMUL = 21
+RMSNORM = 22
+SDPA = 27
+ATTN_SOFTMAX = 28
 # HX_ACT functions, HX_BINARY and HX_REDUCE operations (graph.h).
 (FN_RELU, FN_RELU6, FN_HARDSWISH, FN_HARDSIGMOID, FN_SILU, FN_TANH, FN_LEAKY,
  FN_GELU, FN_EXP, FN_SQRT, FN_ABS, FN_NEG, FN_ERF) = range(13)
@@ -75,7 +79,10 @@ def hmx_fits(tiles, out_stride):
 def tensor_refs(op):
     """Tensor-id fields (x, y, z, out) of an op. A conv/depthwise z is a raw dilation, not an id."""
     z = NONE if op[0] in (CONV, DEPTHWISE) else op[3]
-    return [op[1], op[2], z, op[4]]
+    refs = [op[1], op[2], z, op[4]]
+    if op[0] == SDPA and len(op) > 5 and op[5] != NONE:
+        refs.append(op[5])
+    return refs
 
 
 def dilation_z(op):
@@ -106,7 +113,12 @@ def write(ops, inputs, outputs, hwc, stride, pool, destination, manifest):
     ids = {old: new for new, old in enumerate(active)}
     last = {i: -1 for i in active}
     for j, op in enumerate(ops):
-        for i in tensor_refs(op)[:3]:
+        inputs_of_op = [op[1], op[2]]
+        if op[0] not in (CONV, DEPTHWISE) and op[3] != NONE:
+            inputs_of_op.append(op[3])
+        if op[0] == SDPA and len(op) > 5 and op[5] != NONE:
+            inputs_of_op.append(op[5])
+        for i in inputs_of_op:
             if i != NONE:
                 last[i] = j
     for i in outputs:
@@ -157,7 +169,8 @@ def write(ops, inputs, outputs, hwc, stride, pool, destination, manifest):
             ids.get(op[2], NONE),
             dilation_z(op) if op[0] in (CONV, DEPTHWISE) else ids.get(op[3], NONE),
             ids.get(op[4], NONE),
-            *op[5:],
+            ids.get(op[5], NONE) if op[0] == SDPA and len(op) > 5 and op[5] != NONE else op[5],
+            *op[6:],
         )
         for op in ops
     )

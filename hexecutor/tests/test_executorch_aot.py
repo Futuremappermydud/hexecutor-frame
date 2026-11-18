@@ -269,6 +269,34 @@ class ExportTests(unittest.TestCase):
         # The cumsum runs on the CPU, so the delegate returns the conv+ReLU tensor.
         self.assertEqual([s.dims for s in parsed.outputs], [(1, 8, 16, 16)])
 
+    def test_bmm_is_fully_delegated(self):
+        a = torch.randn(2, 4, 8)
+        b_arg = torch.randn(2, 8, 6)
+        c = torch.randn(2, 6, 5)
+        delegates = delegate_payloads(export_program(BmmModel().eval(), (a, b_arg, c)))
+        self.assertEqual(len(delegates), 1)
+        parsed = blob.unpack(delegates[0][1])
+        self.assertEqual([s.dims for s in parsed.outputs], [(2, 4, 5)])
+        kinds = struct.unpack_from("<I", parsed.image, 16)[0]
+        tensors = struct.unpack_from("<I", parsed.image, 12)[0]
+        ops = [struct.unpack_from("<I", parsed.image, 256 + 32 * tensors + 64 * i)[0]
+               for i in range(kinds)]
+        self.assertEqual(ops.count(lowering.hx.MATMUL), 2)
+
+    def test_sdpa_is_fully_delegated(self):
+        q = torch.randn(1, 2, 4, 8)
+        k = torch.randn(1, 2, 4, 8)
+        v = torch.randn(1, 2, 4, 8)
+        delegates = delegate_payloads(export_program(SdpaModel(is_causal=True).eval(), (q, k, v)))
+        self.assertEqual(len(delegates), 1)
+        parsed = blob.unpack(delegates[0][1])
+        self.assertEqual([s.dims for s in parsed.outputs], [(1, 2, 4, 8)])
+        kinds = struct.unpack_from("<I", parsed.image, 16)[0]
+        tensors = struct.unpack_from("<I", parsed.image, 12)[0]
+        ops = [struct.unpack_from("<I", parsed.image, 256 + 32 * tensors + 64 * i)[0]
+               for i in range(kinds)]
+        self.assertEqual(ops.count(lowering.hx.SDPA), 1)
+
     @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
     def test_conv_softmax_matches_torch_on_cpu_reference(self):
         torch.manual_seed(3)
@@ -547,6 +575,20 @@ class NormNet(nn.Module):
         if self.kind == "layer_channels":
             return self.norm(self.linear(x.flatten(1)))
         return F.relu(self.norm(self.conv(x)))
+
+
+class BmmModel(nn.Module):
+    def forward(self, a, b, c):
+        return torch.bmm(torch.bmm(a, b), c)
+
+
+class SdpaModel(nn.Module):
+    def __init__(self, is_causal=False):
+        super().__init__()
+        self.is_causal = is_causal
+
+    def forward(self, q, k, v):
+        return F.scaled_dot_product_attention(q, k, v, is_causal=self.is_causal) + q
 
 
 class Reduction(nn.Module):
