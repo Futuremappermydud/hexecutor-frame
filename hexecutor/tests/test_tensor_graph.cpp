@@ -1118,15 +1118,33 @@ int main() {
         auto r5 = fc5.run_i32();
         check(r5 == std::vector<int32_t>({1, 0}));
     }
-    // z is only a dilation on conv/depthwise, and must encode 1..8 per axis with one above 1.
+    // z is only a dilation on conv/depthwise/pool, and must encode 1..8 per axis with one above 1.
     {
+        auto non_conv = op(HX_PAD);
+        non_conv.z = (2u << 8) | 1u;
+        Fixture pz({shape(2, 1, 1), shape(3, 1, 1)}, non_conv, {0});
+        check(pz.open() == HX_OPERATOR);
         auto pool = op(HX_MAXPOOL);
         pool.p[0] = 2;
         pool.p[1] = 1;
         pool.p[2] = pool.p[3] = 1;
         pool.z = (2u << 8) | 1u;
-        Fixture pz({shape(2, 1, 1), shape(1, 1, 1)}, pool, {0});
-        check(pz.open() == HX_OPERATOR);
+        Fixture mp({shape(3, 1, 1), shape(1, 1, 1)}, pool, {0});
+        check(mp.open() == HX_OK);
+        mp.input(0, {10.0f, 50.0f, 30.0f});
+        auto mpr = mp.run();
+        check(mpr.size() == 1 && mpr[0] == 30.0f); // 50.0f skipped by dilation 2
+
+        auto apool = op(HX_AVGPOOL);
+        apool.p[0] = 2;
+        apool.p[1] = 1;
+        apool.p[2] = apool.p[3] = 1;
+        apool.z = (2u << 8) | 1u;
+        Fixture ap({shape(3, 1, 1), shape(1, 1, 1)}, apool, {0});
+        check(ap.open() == HX_OK);
+        ap.input(0, {10.0f, 50.0f, 30.0f});
+        auto apr = ap.run();
+        check(apr.size() == 1 && apr[0] == 20.0f); // (10 + 30) / 2
         auto conv = op(HX_CONV);
         uint32_t cp[] = {1, 1, 1, 1, 0, 0, 0, 128, 0};
         std::memcpy(conv.p, cp, sizeof cp);

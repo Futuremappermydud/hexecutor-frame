@@ -435,13 +435,13 @@ class FloatOnnxTests(unittest.TestCase):
 
     def test_unpackable_depth_is_reported(self):
         b = Builder()
-        out = b.conv("x", 512, 8, k=3, pads=[1, 1, 1, 1])  # K = 4608 > 4096
+        out = b.conv("x", 512, 8, k=3, pads=[1, 1, 1, 1])  # K = 4608 > 4032, split deep
         with tempfile.TemporaryDirectory() as tmp:
             plan = lower_model(b.model([("x", [1, 512, 4, 4])], [(out, [1, 8, 4, 4])]), tmp)[
                 "fp16_plan"
             ]
-            self.assertFalse(plan["eligible"])
-            self.assertTrue(any("no HMX packing" in r for r in plan["blockers"]))
+            self.assertTrue(plan["eligible"])
+            self.assertEqual(plan["blockers"], [])
 
     @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
     def test_oversized_convolutions_are_split_by_output_channel(self):
@@ -603,11 +603,14 @@ class FloatOnnxTests(unittest.TestCase):
             # stride 1, k3, no pad: 6x6 -> 8x8, then BatchNorm and ReLU that must fold/fuse
             dict(seed=33, ih=6, ci=3, co=4, k=3, strides=[1, 1], pads=[0, 0, 0, 0], out=8,
                  fold=True),
+            # dilated ConvTranspose: 4x4 -> 8x8 with dilation 2
+            dict(seed=35, ih=4, ci=3, co=4, k=3, strides=[1, 1], pads=[0, 0, 0, 0],
+                 dilations=[2, 2], out=8),
         ]
         for case in cases:
             with self.subTest(**{k: v for k, v in case.items() if k != "seed"}):
                 b = Builder(seed=case["seed"])
-                attrs = {k: case[k] for k in ("strides", "pads", "output_padding") if k in case}
+                attrs = {k: case[k] for k in ("strides", "pads", "output_padding", "dilations") if k in case}
                 out = self.conv_transpose(b, "x", case["ci"], case["co"], case["k"], **attrs)
                 if case.get("fold"):
                     out = b.node("Relu", [b.bn(out, case["co"])])
@@ -637,8 +640,8 @@ class FloatOnnxTests(unittest.TestCase):
         grouped = b.node("ConvTranspose", ["x", b.const(b.rand(4, 2, 3, 3))], group=2)
         cases.append((b.model([("x", [1, 4, 6, 6])], [(grouped, [1, 4, 8, 8])]),
                       "groups other than 1"))
-        b, out = build(dilations=[2, 2])
-        cases.append((model(b, out, 10), "dilation"))
+        b, out = build(dilations=[9, 9])
+        cases.append((model(b, out, 24), "between 1 and 8"))
         b, out = build(auto_pad="SAME_UPPER")
         cases.append((model(b, out, 6), "auto_pad"))
         b, out = build(output_shape=[8, 8])  # spatial sizes only
@@ -1525,6 +1528,118 @@ class TransformerLoweringTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
                 self.assertRaisesRegex(ValueError, "contiguous run"):
             lower_model(model_gather_run_with_gap(), tmp)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_resize_all_coordinate_and_nearest_modes_match_onnxruntime(self):
+        coord_modes = ["asymmetric", "half_pixel", "pytorch_half_pixel", "align_corners"]
+        near_modes = ["floor", "ceil", "round_prefer_floor", "round_prefer_ceil"]
+
+        for cm in coord_modes:
+            for nm in near_modes:
+                with self.subTest(mode="nearest", coord=cm, nearest=nm):
+                    b = Builder(seed=20)
+                    out = b.node("Resize", ["x", "", "", b.const(np.array([1, 4, 7, 5], np.int64))],
+                                 mode="nearest", coordinate_transformation_mode=cm, nearest_mode=nm)
+                    m = b.model([("x", [1, 4, 4, 4])], [(out, [1, 4, 7, 5])])
+                    x = np.random.uniform(-2.0, 2.0, (1, 4, 4, 4)).astype(np.float32)
+                    want = onnxruntime.InferenceSession(m.SerializeToString(),
+                                                        providers=["CPUExecutionProvider"]).run(None, {"x": x})
+                    with tempfile.TemporaryDirectory() as tmp:
+                        lower_model(m, tmp)
+                        got = list(run_reference(tmp, x))
+                        np.testing.assert_allclose(got[0], want[0][0].transpose(1, 2, 0).reshape(-1), atol=1e-4)
+
+        for cm in coord_modes:
+            with self.subTest(mode="linear", coord=cm):
+                b = Builder(seed=21)
+                out = b.node("Resize", ["x", "", "", b.const(np.array([1, 4, 8, 8], np.int64))],
+                             mode="linear", coordinate_transformation_mode=cm)
+                m = b.model([("x", [1, 4, 4, 4])], [(out, [1, 4, 8, 8])])
+                x = np.random.uniform(-2.0, 2.0, (1, 4, 4, 4)).astype(np.float32)
+                want = onnxruntime.InferenceSession(m.SerializeToString(),
+                                                    providers=["CPUExecutionProvider"]).run(None, {"x": x})
+                with tempfile.TemporaryDirectory() as tmp:
+                    lower_model(m, tmp)
+                    got = list(run_reference(tmp, x))
+                    np.testing.assert_allclose(got[0], want[0][0].transpose(1, 2, 0).reshape(-1), atol=1e-3)
+
+        for cm in ["half_pixel", "align_corners", "asymmetric"]:
+            with self.subTest(mode="cubic", coord=cm):
+                b = Builder(seed=22)
+                out = b.node("Resize", ["x", "", "", b.const(np.array([1, 4, 8, 8], np.int64))],
+                             mode="cubic", coordinate_transformation_mode=cm)
+                m = b.model([("x", [1, 4, 4, 4])], [(out, [1, 4, 8, 8])])
+                x = np.random.uniform(-2.0, 2.0, (1, 4, 4, 4)).astype(np.float32)
+                want = onnxruntime.InferenceSession(m.SerializeToString(),
+                                                    providers=["CPUExecutionProvider"]).run(None, {"x": x})
+                with tempfile.TemporaryDirectory() as tmp:
+                    lower_model(m, tmp)
+                    got = list(run_reference(tmp, x))
+                    np.testing.assert_allclose(got[0], want[0][0].transpose(1, 2, 0).reshape(-1), atol=1e-3)
+
+        # Scales input
+        b = Builder(seed=23)
+        scales = b.const(np.array([1.0, 1.0, 2.0, 2.0], np.float32))
+        out = b.node("Resize", ["x", "", scales], mode="linear", coordinate_transformation_mode="align_corners")
+        m = b.model([("x", [1, 4, 4, 4])], [(out, [1, 4, 8, 8])])
+        x = np.random.uniform(-2.0, 2.0, (1, 4, 4, 4)).astype(np.float32)
+        want = onnxruntime.InferenceSession(m.SerializeToString(),
+                                            providers=["CPUExecutionProvider"]).run(None, {"x": x})
+        with tempfile.TemporaryDirectory() as tmp:
+            lower_model(m, tmp)
+            got = list(run_reference(tmp, x))
+            np.testing.assert_allclose(got[0], want[0][0].transpose(1, 2, 0).reshape(-1), atol=1e-3)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_dilated_maxpool_matches_onnxruntime(self):
+        b = Builder(seed=24)
+        mp = b.node("MaxPool", ["x"], kernel_shape=[3, 3], strides=[1, 1], pads=[2, 2, 2, 2], dilations=[2, 2])
+        m = b.model([("x", [1, 4, 8, 8])], [(mp, [1, 4, 8, 8])])
+        x = np.random.randn(1, 4, 8, 8).astype(np.float32)
+        want = onnxruntime.InferenceSession(m.SerializeToString(),
+                                            providers=["CPUExecutionProvider"]).run(None, {"x": x})
+        with tempfile.TemporaryDirectory() as tmp:
+            lower_model(m, tmp)
+            got = list(run_reference(tmp, x))
+            np.testing.assert_allclose(got[0], want[0][0].transpose(1, 2, 0).reshape(-1), atol=1e-4)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_dense_conv_split_deep_fp16_path_matches_onnxruntime(self):
+        b = Builder(seed=31)
+        conv = b.conv("x", 512, 16, k=3, pads=[1, 1, 1, 1])
+        out = b.node("Relu", [conv])
+        m = b.model([("x", [1, 512, 4, 4])], [(out, [1, 16, 4, 4])])
+        x = np.random.randn(1, 512, 4, 4).astype(np.float32)
+        want = onnxruntime.InferenceSession(m.SerializeToString(),
+                                            providers=["CPUExecutionProvider"]).run(None, {"x": x})
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = lower_model(m, tmp)
+            self.assertTrue(manifest["fp16_plan"]["eligible"])
+            self.assertEqual(manifest["fp16_plan"]["blockers"], [])
+            k_list = kinds(tmp)
+            self.assertIn(hx.SLICE, k_list)
+            self.assertIn(hx.ADD, k_list)
+            got = list(run_reference(tmp, x))
+            want_hwc = want[0][0].transpose(1, 2, 0).reshape(-1)
+            np.testing.assert_allclose(got[0], want_hwc, atol=1e-4)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_full_size_constant_add_sub_mul_div_matches_onnxruntime(self):
+        for op_name, rev in [("Add", False), ("Sub", False), ("Sub", True),
+                             ("Mul", False), ("Div", False), ("Div", True)]:
+            with self.subTest(op=op_name, rev=rev):
+                b = Builder(seed=10)
+                c_full = b.const(np.random.uniform(0.5, 2.0, (1, 4, 3, 3)).astype(np.float32))
+                inputs = [c_full, "x"] if rev else ["x", c_full]
+                out = b.node(op_name, inputs)
+                m = b.model([("x", [1, 4, 3, 3])], [(out, [1, 4, 3, 3])])
+                x = np.random.uniform(1.0, 3.0, (1, 4, 3, 3)).astype(np.float32)
+                want = onnxruntime.InferenceSession(m.SerializeToString(),
+                                                    providers=["CPUExecutionProvider"]).run(None, {"x": x})
+                with tempfile.TemporaryDirectory() as tmp:
+                    lower_model(m, tmp)
+                    got = list(run_reference(tmp, x))
+                    np.testing.assert_allclose(got[0], want[0][0].transpose(1, 2, 0).reshape(-1), atol=1e-4)
 
 
 @unittest.skipUnless(onnx and onnxruntime and RUNNER.exists(), "needs onnx, onnxruntime, and runner")

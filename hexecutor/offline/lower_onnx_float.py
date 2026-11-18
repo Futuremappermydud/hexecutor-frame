@@ -333,6 +333,21 @@ class Lowerer:
                 elif op in ("Add", "Sub", "Mul", "Div"):
                     self.dims[out] = list(s0)
                     changed = True
+                elif op == "Resize":
+                    sizes = self.const(inputs[3]) if len(inputs) > 3 and inputs[3] else None
+                    scales = self.const(inputs[2]) if len(inputs) > 2 and inputs[2] else (
+                        self.const(inputs[1]) if len(inputs) > 1 and inputs[1] and not attrs.get("roi") else None
+                    )
+                    if scales is None and "scales" in attrs:
+                        scales = attrs["scales"]
+                    if sizes is None and "sizes" in attrs:
+                        sizes = attrs["sizes"]
+                    if sizes is not None:
+                        self.dims[out] = [int(v) for v in sizes]
+                        changed = True
+                    elif scales is not None and s0 is not None:
+                        self.dims[out] = [int(np.floor(s0[i] * float(scales[i]))) for i in range(len(s0))]
+                        changed = True
                 elif op == "MatMul":
                     w = self.const(inputs[1]) if len(inputs) > 1 else None
                     if w is not None and len(s0) in (2, 3):
@@ -1109,8 +1124,6 @@ class Lowerer:
             self.fail(node, "weights must be a constant 4-D tensor")
         if a.get("group", 1) != 1:
             self.fail(node, "groups other than 1 are unsupported")
-        if list(a.get("dilations", [1, 1])) != [1, 1]:
-            self.fail(node, "dilation is unsupported")
         if "output_shape" in a:
             self.fail(node, "output_shape is unsupported")
         mode = a.get("auto_pad", b"NOTSET")
@@ -1132,16 +1145,20 @@ class Lowerer:
         s = list(a.get("strides", [1, 1]))
         if min(s) < 1 or max(s) > 8:
             self.fail(node, "stride must be between 1 and 8")
+        dil = self.dilation(node, a)
+        dh, dw = dil
+        ke_h = (kh - 1) * dh + 1
+        ke_w = (kw - 1) * dw + 1
         pt, pl, pb, pr = (list(a.get("pads", [0, 0, 0, 0])) + [0, 0, 0, 0])[:4]
         op_h, op_w = (list(a.get("output_padding", [0, 0])) + [0, 0])[:2]
-        # Leading and trailing zeros of the zero-inserted input (pads larger than k-1 are
+        # Leading and trailing zeros of the zero-inserted input (pads larger than ke-1 are
         # rejected: the padded input would need a negative leading border).
-        zt, zl, zb, zr = kh - 1 - pt, kw - 1 - pl, kh - 1 - pb, kw - 1 - pr
+        zt, zl, zb, zr = ke_h - 1 - pt, ke_w - 1 - pl, ke_h - 1 - pb, ke_w - 1 - pr
         if min(zt, zl, zb, zr) < 0:
-            self.fail(node, "pads must not exceed the kernel size minus one")
+            self.fail(node, "pads must not exceed the effective kernel size minus one")
         oh, ow, _ = self.hwc(node.output[0])
-        if (oh, ow) != ((ih - 1) * s[0] + kh - pt - pb + op_h,
-                        (iw - 1) * s[1] + kw - pl - pr + op_w):
+        if (oh, ow) != ((ih - 1) * s[0] + ke_h - pt - pb + op_h,
+                        (iw - 1) * s[1] + ke_w - pl - pr + op_w):
             self.fail(node, "output size disagrees with the transposed geometry")
         zh = zt + (ih - 1) * s[0] + 1 + zb + op_h
         zw = zl + (iw - 1) * s[1] + 1 + zr + op_w
@@ -1151,6 +1168,8 @@ class Lowerer:
         dense = np.ascontiguousarray(
             np.asarray(w, np.float32).transpose(1, 0, 2, 3)[:, :, ::-1, ::-1])
         layer = Op(hx.CONV, zid, NONE, self.tid(node.output[0]), [kh, kw, 1, 1, 0, 0], node)
+        if dil != (1, 1):
+            layer.dilation = dil
         layer.weights = dense
         layer.bias = np.asarray(bias, np.float32).reshape(-1)
         layer.foldable = True
@@ -1950,11 +1969,15 @@ class Lowerer:
         if len(node.output) > 1 and any(node.output[1:]):
             self.fail(node, "pool indices are unsupported")
         k = list(a["kernel_shape"])
-        s, pt, pl = self.spatial(node, a, node.input[0], node.output[0], k)
+        dil = self.dilation(node, a)
+        s, pt, pl = self.spatial(node, a, node.input[0], node.output[0], k, dilated=True)
         p = [k[0], k[1], s[0], s[1], pt, pl]
         if kind == hx.AVGPOOL:
             p.append(int(a.get("count_include_pad", 0)))
-        self.add(Op(kind, self.tid(node.input[0]), NONE, self.tid(node.output[0]), p, node))
+        op = Op(kind, self.tid(node.input[0]), NONE, self.tid(node.output[0]), p, node)
+        if dil != (1, 1):
+            op.dilation = dil
+        self.add(op)
 
     def op_MaxPool(self, node):
         self._pool(node, hx.MAXPOOL)
@@ -2402,6 +2425,23 @@ class Lowerer:
         if a.get("antialias", 0):
             self.fail(node, "antialias is unsupported")
         coord = text("coordinate_transformation_mode", "half_pixel")
+        out_name = node.output[0]
+        if out_name not in self.dims:
+            sizes = self.const(node.input[3]) if len(node.input) > 3 and node.input[3] else None
+            scales = self.const(node.input[2]) if len(node.input) > 2 and node.input[2] else (
+                self.const(node.input[1]) if len(node.input) > 1 and node.input[1] and not a.get("roi") else None
+            )
+            if sizes is None and "sizes" in a:
+                sizes = a["sizes"]
+            if scales is None and "scales" in a:
+                scales = a["scales"]
+            in_shape = self.dims[node.input[0]]
+            if sizes is not None:
+                self.dims[out_name] = [int(v) for v in sizes]
+            elif scales is not None:
+                self.dims[out_name] = [int(np.floor(in_shape[i] * float(scales[i]))) for i in range(len(in_shape))]
+            else:
+                self.fail(node, "output shape or scales/sizes must be specified")
         ih, iw, ic = self.hwc(node.input[0])
         oh, ow, oc = self.hwc(node.output[0])
         if ic != oc:
@@ -2430,12 +2470,9 @@ class Lowerer:
         elif mode == "cubic":
             flags = [0, 0, 0, coord_code, 0, 1]
         else:  # linear
-            if coord == "align_corners":
-                flags = [1, 0, 0, 0, 0, 0]
-            elif coord in ("half_pixel", "pytorch_half_pixel"):
-                flags = [0, 1, 0, 0, 0, 0]
-            else:
-                flags = [0, 0, 0, 0, 0, 0]
+            flags = [1 if coord == "align_corners" else 0,
+                     1 if coord in ("half_pixel", "pytorch_half_pixel") else 0,
+                     0, coord_code, 0, 0]
         self.add(Op(hx.RESIZE, self.tid(node.input[0]), NONE, self.tid(node.output[0]), flags,
                     node))
 
@@ -2921,17 +2958,19 @@ class Lowerer:
             w_slice = op.weights[:, lo:hi, :, :]
             b_slice = op.bias if lo == 0 else np.zeros_like(op.bias)
             part_out = self.temp("deep_conv", [oh, ow, co])
-            conv_piece = Op(hx.CONV, part_in, NONE, part_out, op.p, op.node)
+            p_slice = list(op.p)
+            p_slice[8] = 0
+            conv_piece = Op(hx.CONV, part_in, NONE, part_out, p_slice, op.node)
             conv_piece.dilation = op.dilation
             conv_piece.weights = w_slice
             conv_piece.bias = b_slice
-            conv_piece.no_hmx = True
             out.append(conv_piece)
             if acc_id is None:
                 acc_id = part_out
                 continue
             sum_out = op.out if last else self.temp("deep_sum", [oh, ow, co])
-            add_op = Op(hx.ADD, acc_id, part_out, sum_out, [0], op.node)
+            add_act = op.p[8] if last else 0
+            add_op = Op(hx.ADD, acc_id, part_out, sum_out, [add_act], op.node)
             out.append(add_op)
             acc_id = sum_out
         return out

@@ -797,7 +797,8 @@ static void maxpool(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t par
     const uint32_t *p = o->p, apw = physical_width(a), obw = physical_width(b);
     const uint16_t *x = (const uint16_t *)tensor_data(g, o->x);
     uint16_t *out = (uint16_t *)tensor_data(g, o->out);
-    if (p[0] == 2 && p[1] == 2 && p[2] == 2 && p[3] == 2 && !p[4] && !p[5] && a->h == b->h * 2u &&
+    const uint32_t dil_h = hx_dilation_h(o), dil_w = hx_dilation_w(o);
+    if (dil_h == 1 && dil_w == 1 && p[0] == 2 && p[1] == 2 && p[2] == 2 && p[3] == 2 && !p[4] && !p[5] && a->h == b->h * 2u &&
         a->w == b->w * 2u && !(b->w & 1u)) {
         /* Each output pair spans two input pairs on two rows. */
         const uint32_t irow = apw / 2u, iplane = plane_bytes(a) / 128u, oplane = plane_bytes(b) / 128u,
@@ -825,8 +826,8 @@ static void maxpool(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t par
                     for (uint32_t kx = 0; kx < p[1]; kx++) {
                         int32_t pos[2];
                         for (uint32_t q = 0; q < 2; q++) {
-                            int32_t iy = (int32_t)(y * p[2] + ky) - (int32_t)p[4],
-                                    ix = (int32_t)((ox + q) * p[3] + kx) - (int32_t)p[5];
+                            int32_t iy = (int32_t)(y * p[2] + ky * dil_h) - (int32_t)p[4],
+                                    ix = (int32_t)((ox + q) * p[3] + kx * dil_w) - (int32_t)p[5];
                             pos[q] = ox + q >= b->w || iy < 0 || ix < 0 || iy >= (int32_t)a->h ||
                                              ix >= (int32_t)a->w
                                          ? -1
@@ -866,8 +867,7 @@ static void resize(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t part
     const uint32_t *p = o->p, apw = physical_width(a), obw = physical_width(b);
     const uint16_t *x = (const uint16_t *)tensor_data(g, o->x);
     uint16_t *out = (uint16_t *)tensor_data(g, o->out);
-    const float sy = p[0] && b->h > 1 ? (float)(a->h - 1) / (b->h - 1) : (float)a->h / b->h;
-    const float sx = p[0] && b->w > 1 ? (float)(a->w - 1) / (b->w - 1) : (float)a->w / b->w;
+    const uint32_t coord_mode = p[3];
     for (uint32_t y = b->h * part / parts; y < b->h * (part + 1u) / parts; y++)
         for (uint32_t ox = 0; ox < obw; ox += 2) {
             int valid[2];
@@ -877,9 +877,23 @@ static void resize(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t part
                 valid[q] = ox + q < b->w;
                 if (!valid[q])
                     continue;
-                float fy = fmaxf(0, ((float)y + (p[1] ? .5f : 0)) * sy - (p[1] ? .5f : 0));
-                float fx = fmaxf(0, ((float)(ox + q) + (p[1] ? .5f : 0)) * sx - (p[1] ? .5f : 0));
-                uint32_t y0 = fy, x0 = fx, y1 = y0 + 1 < a->h ? y0 + 1 : y0,
+                float fy, fx;
+                if (coord_mode == 1 || (coord_mode == 0 && p[0])) { /* align_corners */
+                    fy = b->h > 1 ? (float)y * (float)(a->h - 1) / (float)(b->h - 1) : 0.0f;
+                    fx = b->w > 1 ? (float)(ox + q) * (float)(a->w - 1) / (float)(b->w - 1) : 0.0f;
+                } else if (coord_mode == 3) { /* pytorch_half_pixel */
+                    fy = b->h > 1 ? ((float)y + 0.5f) * (float)a->h / (float)b->h - 0.5f : 0.0f;
+                    fx = b->w > 1 ? ((float)(ox + q) + 0.5f) * (float)a->w / (float)b->w - 0.5f : 0.0f;
+                } else if (coord_mode == 2 || (coord_mode == 0 && p[1])) { /* half_pixel */
+                    fy = ((float)y + 0.5f) * (float)a->h / (float)b->h - 0.5f;
+                    fx = ((float)(ox + q) + 0.5f) * (float)a->w / (float)b->w - 0.5f;
+                } else { /* asymmetric */
+                    fy = (float)y * (float)a->h / (float)b->h;
+                    fx = (float)(ox + q) * (float)a->w / (float)b->w;
+                }
+                fy = fmaxf(0.0f, fy);
+                fx = fmaxf(0.0f, fx);
+                uint32_t y0 = (uint32_t)fy, x0 = (uint32_t)fx, y1 = y0 + 1 < a->h ? y0 + 1 : y0,
                          x1 = x0 + 1 < a->w ? x0 + 1 : x0;
                 pos[q][0] = y0 * apw + x0;
                 pos[q][1] = y0 * apw + x1;
@@ -2430,7 +2444,7 @@ void hx_fp16_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts)
         mean(g, o, part, parts);
         return;
     case HX_RESIZE:
-        if (!p[2]) {
+        if (!p[2] && !p[5]) {
             resize(g, o, part, parts);
             return;
         }
@@ -2773,11 +2787,11 @@ void hx_fp16_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts)
                         float sum = 0;
                         uint32_t taps = 0;
                         for (uint32_t ky = 0; ky < p[0]; ky++) {
-                            int32_t iy = (int32_t)(oy * p[2] + ky) - (int32_t)p[4];
+                            int32_t iy = (int32_t)(oy * p[2] + ky * hx_dilation_h(o)) - (int32_t)p[4];
                             if (iy < 0 || iy >= (int32_t)a->h)
                                 continue;
                             for (uint32_t kx = 0; kx < p[1]; kx++) {
-                                int32_t ix = (int32_t)(ox * p[3] + kx) - (int32_t)p[5];
+                                int32_t ix = (int32_t)(ox * p[3] + kx * hx_dilation_w(o)) - (int32_t)p[5];
                                 if (ix < 0 || ix >= (int32_t)a->w)
                                     continue;
                                 sum += scalar(x[at(a, (uint32_t)iy * physical_width(a) + (uint32_t)ix, c)]);

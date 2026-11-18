@@ -369,7 +369,7 @@ static int op_valid(const HxGraph *g, const HxOp *o) {
             return p[2] == 0 && p[4] == 0;
         if (p[2] == 1)
             return !p[0] && !p[1];
-        return !p[3] && !p[4] && p[0] <= 1 && p[1] <= 1 && !(p[0] && p[1]);
+        return p[4] == 0 && p[0] <= 1 && p[1] <= 1 && !(p[0] && p[1]);
     case HX_RESHAPE: /* p[0]: 0 HWC copy, 1 NCHW flatten to 1x1xN, 2 NCHW unflatten from 1x1xN */
         if (p[0] == 0)
             return hx_tensor_elements(a) == hx_tensor_elements(b);
@@ -746,8 +746,9 @@ uint32_t hx_graph_open(HxGraph *g, const void *image, uint32_t image_bytes, cons
         int has_z = req_z || (o->kind == HX_SHORTCONV && o->z != HXFG_NONE);
         const int produces_z = (o->kind == HX_TOPK && o->z != HXFG_NONE);
         const int has_mask = o->kind == HX_SDPA && o->p[0] != HXFG_NONE;
-        /* z is NONE, or a dilation (dh << 8) | dw on conv/depthwise only (1..8 each, not both 1). */
-        const int conv_like = o->kind == HX_CONV || o->kind == HX_DEPTHWISE;
+        /* z is NONE, or a dilation (dh << 8) | dw on conv/depthwise/pool only (1..8 each, not both 1). */
+        const int conv_like = o->kind == HX_CONV || o->kind == HX_DEPTHWISE ||
+                              o->kind == HX_MAXPOOL || o->kind == HX_AVGPOOL;
         const int dilated_z = o->z != HXFG_NONE && conv_like && (o->z >> 16) == 0 &&
                               hx_dilation_h(o) >= 1 && hx_dilation_h(o) <= 8 &&
                               hx_dilation_w(o) >= 1 && hx_dilation_w(o) <= 8 &&
@@ -2202,11 +2203,11 @@ void hx_execute_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t par
                 uint32_t taps = 0;
                 if (c < b->c)
                     for (uint32_t ky = 0; ky < p[0]; ky++) {
-                        int32_t iy = (int32_t)(oy * p[2] + ky) - (int32_t)p[4];
+                        int32_t iy = (int32_t)(oy * p[2] + ky * dil_h) - (int32_t)p[4];
                         if (iy < 0 || iy >= (int32_t)a->h)
                             continue;
                         for (uint32_t kx = 0; kx < p[1]; kx++) {
-                            int32_t ix = (int32_t)(ox * p[3] + kx) - (int32_t)p[5];
+                            int32_t ix = (int32_t)(ox * p[3] + kx * dil_w) - (int32_t)p[5];
                             if (ix < 0 || ix >= (int32_t)a->w)
                                 continue;
                             sum += x[((uint32_t)iy * a->w + (uint32_t)ix) * a->stride + c];
@@ -2395,12 +2396,23 @@ void hx_execute_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t par
                 dst[c] = acc;
             }
         } else if (o->kind == HX_RESIZE) {
-            float sy = p[0] && b->h > 1 ? (float)(a->h - 1) / (float)(b->h - 1)
-                                        : (float)a->h / (float)b->h;
-            float sx = p[0] && b->w > 1 ? (float)(a->w - 1) / (float)(b->w - 1)
-                                        : (float)a->w / (float)b->w;
-            float fy = fmaxf(0, ((float)oy + (p[1] ? 0.5f : 0)) * sy - (p[1] ? 0.5f : 0));
-            float fx = fmaxf(0, ((float)ox + (p[1] ? 0.5f : 0)) * sx - (p[1] ? 0.5f : 0));
+            const uint32_t coord_mode = p[3];
+            float fy, fx;
+            if (coord_mode == 1 || (coord_mode == 0 && p[0])) { /* align_corners */
+                fy = b->h > 1 ? (float)oy * (float)(a->h - 1) / (float)(b->h - 1) : 0.0f;
+                fx = b->w > 1 ? (float)ox * (float)(a->w - 1) / (float)(b->w - 1) : 0.0f;
+            } else if (coord_mode == 3) { /* pytorch_half_pixel */
+                fy = b->h > 1 ? ((float)oy + 0.5f) * (float)a->h / (float)b->h - 0.5f : 0.0f;
+                fx = b->w > 1 ? ((float)ox + 0.5f) * (float)a->w / (float)b->w - 0.5f : 0.0f;
+            } else if (coord_mode == 2 || (coord_mode == 0 && p[1])) { /* half_pixel */
+                fy = ((float)oy + 0.5f) * (float)a->h / (float)b->h - 0.5f;
+                fx = ((float)ox + 0.5f) * (float)a->w / (float)b->w - 0.5f;
+            } else { /* asymmetric */
+                fy = (float)oy * (float)a->h / (float)b->h;
+                fx = (float)ox * (float)a->w / (float)b->w;
+            }
+            fy = fmaxf(0.0f, fy);
+            fx = fmaxf(0.0f, fx);
             uint32_t y0 = (uint32_t)fy, x0 = (uint32_t)fx, y1 = y0 + 1 < a->h ? y0 + 1 : y0,
                      x1 = x0 + 1 < a->w ? x0 + 1 : x0;
             float dy = fy - (float)y0, dx = fx - (float)x0;

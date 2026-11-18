@@ -43,11 +43,11 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
     o.kind = kind;
     o.x = 0;
     o.y = o.z = HXFG_NONE;
-    if (kind == HX_CONV || kind == HX_DEPTHWISE)
+    if (kind == HX_CONV || kind == HX_DEPTHWISE || kind == HX_MAXPOOL || kind == HX_AVGPOOL)
         o.z = dilation_z;
     o.out = 2;
     if (kind == HX_ADD || kind == HX_CONCAT || kind == HX_MATMUL ||
-        (kind == HX_BINARY && step != 4))
+        (kind == HX_BINARY && step < 4))
         o.y = 1;
     if (kind == HX_CONV || kind == HX_DEPTHWISE || kind == HX_MAXPOOL || kind == HX_AVGPOOL) {
         o.p[0] = o.p[1] = kh;
@@ -118,10 +118,16 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
     } else if (kind == HX_RESIZE) {
         t[2].h = h * 2;
         t[2].w = w * 2;
-        if (axis)
-            o.p[2] = 1; /* nearest; axis 0 is bilinear, half-pixel centres */
-        else
-            o.p[1] = 1;
+        if (axis == 1)
+            o.p[2] = 1; /* nearest */
+        else if (axis == 2) {
+            o.p[0] = 1; /* bilinear align_corners */
+            o.p[3] = 1;
+        } else if (axis == 3) {
+            o.p[5] = 1; /* bicubic */
+            o.p[3] = 2;
+        } else
+            o.p[1] = 1; /* bilinear half-pixel */
     } else if (kind == HX_ZEROINSERT) {
         /* Stride step, pad 1 on top and left, one trailing row/column: output (h-1)*step + 3. */
         o.p[0] = o.p[1] = step;
@@ -177,6 +183,12 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
             o.p[1] = 1;
             o.p[2] = 0x70000;
             for (uint32_t c = 0; c < 64; c++)
+                ((float *)(constants + 0x70000))[c] = ((int)(c % 5) - 2) * .5f;
+        }
+        if (step == 5) {
+            o.p[1] = 2;
+            o.p[2] = 0x70000;
+            for (uint32_t c = 0; c < h * w * t[2].stride; c++)
                 ((float *)(constants + 0x70000))[c] = ((int)(c % 5) - 2) * .5f;
         }
     } else if (kind == HX_MATMUL) {
@@ -887,6 +899,8 @@ int main(void) {
         errors += check(base, HX_PAD, 7, 9, ci, ci, 1, 1, 0);
         errors += check(base, HX_RESIZE, 7, 9, ci, ci, 1, 1, 0);
         errors += check(base, HX_RESIZE, 7, 9, ci, ci, 1, 1, 1);
+        errors += check(base, HX_RESIZE, 7, 9, ci, ci, 1, 1, 2);
+        errors += check(base, HX_RESIZE, 7, 9, ci, ci, 1, 1, 3);
         errors += check(base, HX_MEAN, 7, 9, ci, ci, 1, 1, 0);
         for (uint32_t axis = 0; axis < 3; axis++)
             errors += check(base, HX_CONCAT, 7, 9, ci, ci, 1, 1, axis);
@@ -973,14 +987,17 @@ int main(void) {
     for (uint32_t fn = 0; fn < HX_ACT_COUNT; fn++)
         errors += check(base, HX_ACT, 7, 9, 40, 40, 1, 1, fn);
     for (uint32_t opcode = 0; opcode < HX_BIN_COUNT; opcode++)
-        for (uint32_t mode = 0; mode <= 4; mode++)
+        for (uint32_t mode = 0; mode <= 5; mode++)
             for (uint32_t reversed = 0; reversed <= 1; reversed++)
                 errors += check(base, HX_BINARY, 7, 9, 40, 40, reversed, mode, opcode);
     for (uint32_t include = 0; include <= 1; include++) {
         errors += check(base, HX_AVGPOOL, 7, 9, 40, 40, 3, 1, include);
         errors += check(base, HX_AVGPOOL, 8, 8, 33, 33, 2, 2, include);
     }
-    /* Dilated convolution (im2col, incl. a strided one) and depthwise (scalar lanes). */
+    /* Dilated convolution, depthwise, and pooling. */
+    dilation_z = (2u << 8) | 2u;
+    errors += check(base, HX_MAXPOOL, 9, 11, 40, 40, 3, 1, 0);
+    errors += check(base, HX_AVGPOOL, 9, 11, 40, 40, 3, 1, 0);
     dilation_z = (2u << 8) | 2u;
     errors += check(base, HX_CONV, 9, 11, 40, 40, 3, 1, 0);
     errors += check(base, HX_CONV, 10, 12, 33, 33, 3, 2, 0);
