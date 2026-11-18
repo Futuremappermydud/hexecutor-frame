@@ -56,9 +56,18 @@ enum {
     HX_ARGMAX = 34, /* argmax over channel axis; p[0] select_last, p[1] dtype */
     HX_TOPK = 35,   /* top-k over channel axis; p[0] k, p[1] largest, p[2] sorted; z indices */
     HX_TILE = 36,   /* expand/tile repeating input over output */
-    HX_CAST = 37    /* element type conversion (float32, int32, bool) */
+    HX_CAST = 37,   /* element type conversion (float32, int32, bool) */
+    HX_ARGMIN = 38  /* argmin over channel axis; p[0] select_last, p[1] dtype */
 };
 #define HX_TENSOR_PERSISTENT 1u
+
+/* Tensor element types (HxTensor.dtype). */
+enum {
+    HX_DTYPE_FLOAT32 = 0,
+    HX_DTYPE_INT32 = 1,
+    HX_DTYPE_BOOL = 2,
+    HX_DTYPE_COUNT = 3
+};
 
 /* HX_ACT p[0] functions. */
 enum {
@@ -98,8 +107,14 @@ enum {
     HX_BIN_EQUAL,
     HX_BIN_GREATER,
     HX_BIN_LESS,
+    HX_BIN_GE,
+    HX_BIN_LE,
+    HX_BIN_AND,
+    HX_BIN_OR,
     HX_BIN_COUNT
 };
+#define HX_BIN_GREATER_EQUAL HX_BIN_GE
+#define HX_BIN_LESS_EQUAL HX_BIN_LE
 /* HX_NORM p[0] modes: CHANNEL normalises each pixel over its real channels (p[1] = 0); GROUP
  * splits the channels into p[1] equal groups, each normalised over all pixels. */
 enum { HX_NORM_CHANNEL = 0, HX_NORM_GROUP, HX_NORM_COUNT };
@@ -121,9 +136,25 @@ typedef struct {
     uint8_t constant_sha256[32];
     uint32_t reserved[44];
 } HxHeader;
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wgnu-anonymous-struct"
+#pragma clang diagnostic ignored "-Wnested-anon-types"
+#endif
 typedef struct {
-    uint32_t offset, h, w, c, stride, reserved[3];
+    uint32_t offset, h, w, c, stride;
+    union {
+        uint32_t reserved[3];
+        struct {
+            uint32_t flags;    /* bit 0: HX_TENSOR_PERSISTENT */
+            uint32_t state_id; /* name hash or state id */
+            uint32_t dtype;    /* HX_DTYPE_* (0: float32, 1: int32, 2: bool) */
+        };
+    };
 } HxTensor;
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
 /* Conv/depthwise p: kh,kw,sh,sw,pad_top,pad_left,weights,bias,activation.
  * p[9]/p[10] optionally declare prepacked fp16 HMX weights and K tile count.
  * Activation: 0 none, 1 ReLU, 2 ReLU[-1,1], 3 ReLU6.
@@ -145,14 +176,15 @@ typedef struct {
  * Avg pool p: pool fields as max pool, p[6] count_include_pad.
  * Gather (HX_GATHER, 32): x indices, y table tensor (mode 0) or NONE with constant table offset in p[1]
  * (mode 1), out. p[0] mode, p[1] constant offset, p[2] vocab_size, p[3] index_dtype (0 int32, 1 float32).
- * Where (HX_WHERE, 33): x condition, y X, z Y, out. p[0] X mode (0 tensor y, 1 scalar float bits in p[1],
+ * Where (HX_WHERE, 33): x condition, y X, z Y, out. p[0] X mode (0 tensor y, 1 scalar bits in p[1],
  * 2 per-channel const in p[1], 3 full-size const in p[1]), p[2] Y mode (0 tensor z, 1 scalar bits in p[3],
- * 2 per-channel const in p[3], 3 full-size const in p[3]).
- * ArgMax (HX_ARGMAX, 34): x in, out [h, w, 1]. p[0] select_last, p[1] output_dtype (0 float32, 1 int32).
+ * 2 per-channel const in p[3], 3 full-size const in p[3]). Integer/bool and float supported.
+ * ArgMax/ArgMin (HX_ARGMAX 34 / HX_ARGMIN 38): x in, out [h, w, 1]. p[0] select_last, p[1] output_dtype (0 float32, 1 int32).
  * TopK (HX_TOPK, 35): x in, out values [h, w, K], z optional indices [h, w, K] or NONE. p[0] K,
  * p[1] largest (1 largest, 0 smallest), p[2] sorted (1 sorted, 0 unsorted), p[3] index_dtype (0 float, 1 int).
  * Tile (HX_TILE, 36): x in, out. Tiles/expands x into out where out's h, w, c are integer multiples of x's.
- * Cast (HX_CAST, 37): x in, out. p[0] mode: 0 float->int32, 1 int32->float, 2 bool/int->float, 3 float->bool.
+ * Cast (HX_CAST, 37): x in, out. p[0] mode: 0 float->int32, 1 int32->float, 2 bool/int->float, 3 float->bool,
+ * 4 int32->bool, 5 bool->int32, 6 identity (int32->int32, float->float).
  * z is reserved; all unused fields must be zero (y/z use HXFG_NONE). Conv/depthwise only: z is
  * HXFG_NONE (dilation 1,1) or (dh << 8) | dw with 1 <= dh, dw <= 8 and at least one above 1; the
  * effective kernel extent is (k - 1) * d + 1 and tap (ky, kx) reads input row oy * sh + ky * dh -

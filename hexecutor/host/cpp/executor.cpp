@@ -59,7 +59,8 @@ void Program::validate() const {
                 "invalid tensor backend I/O count");
         for (const auto *group : {&inputs, &outputs})
             for (const auto &spec : *group)
-                require(spec.type == ScalarType::f32, "tensor backend requires float32 I/O");
+                require(spec.type == ScalarType::f32 || spec.type == ScalarType::i32,
+                        "tensor backend requires float32 or int32 I/O");
     }
     for (const auto *group : {&inputs, &outputs}) {
         std::vector<std::string> names;
@@ -184,8 +185,11 @@ Program load_tensor_program(const std::filesystem::path &image,
         const auto &t = graph.tensors[graph.io[i]];
         bool input = i < graph.header->inputs;
         auto &group = input ? p.inputs : p.outputs;
+        ScalarType st = ScalarType::f32;
+        if (t.dtype == HX_DTYPE_INT32 || t.dtype == HX_DTYPE_BOOL)
+            st = ScalarType::i32;
         group.push_back({std::string(input ? "input" : "output") + std::to_string(group.size()),
-                         ScalarType::f32,
+                         st,
                          {1, t.h, t.w, t.c}});
     }
     p.validate();

@@ -20,12 +20,20 @@ MATMUL = 21
 RMSNORM = 22
 SDPA = 27
 ATTN_SOFTMAX = 28
-GATHER, WHERE, ARGMAX, TOPK, TILE, CAST = range(32, 38)
+GATHER, WHERE, ARGMAX, TOPK, TILE, CAST, ARGMIN = range(32, 39)
 # HX_ACT functions, HX_BINARY and HX_REDUCE operations (graph.h).
 (FN_RELU, FN_RELU6, FN_HARDSWISH, FN_HARDSIGMOID, FN_SILU, FN_TANH, FN_LEAKY,
  FN_GELU, FN_EXP, FN_SQRT, FN_ABS, FN_NEG, FN_ERF,
  FN_LOG, FN_RECIPROCAL, FN_FLOOR, FN_CEIL, FN_SIN, FN_COS, FN_NOT, FN_SIGN, FN_ROUND) = range(22)
-BIN_ADD, BIN_SUB, BIN_MUL, BIN_DIV, BIN_MIN, BIN_MAX, BIN_POW, BIN_EQUAL, BIN_GREATER, BIN_LESS = range(10)
+(BIN_ADD, BIN_SUB, BIN_MUL, BIN_DIV, BIN_MIN, BIN_MAX, BIN_POW,
+ BIN_EQUAL, BIN_GREATER, BIN_LESS, BIN_GE, BIN_LE, BIN_AND, BIN_OR) = range(14)
+BIN_GREATER_EQUAL = BIN_GE
+BIN_LESS_EQUAL = BIN_LE
+
+# HX_DTYPE enum
+DTYPE_FLOAT32 = 0
+DTYPE_INT32 = 1
+DTYPE_BOOL = 2
 # HX_NORM modes (graph.h): per pixel over channels, or per group of channels over all pixels.
 NORM_CHANNEL, NORM_GROUP = range(2)
 RED_MEAN, RED_SUM, RED_MAX, RED_MIN = range(4)
@@ -50,9 +58,12 @@ class ConstantPool:
     def __init__(self):
         self.data = bytearray()
 
-    def emit(self, array, dtype="<f4"):
+    def emit(self, array, dtype=None):
         at = aligned(len(self.data))
         self.data.extend(bytes(at - len(self.data)))
+        if dtype is None:
+            arr = np.asarray(array)
+            dtype = "<i4" if arr.dtype.kind in ("i", "u") and arr.dtype.itemsize == 4 else "<f4"
         self.data.extend(np.asarray(array, dtype=dtype).tobytes())
         return at
 
@@ -104,14 +115,17 @@ def dilation_z(op):
     return z
 
 
-def write(ops, inputs, outputs, hwc, stride, pool, destination, manifest):
+def write(ops, inputs, outputs, hwc, stride, pool, destination, manifest, dtypes=None):
     """Allocate activations and write `<destination>.hxfg/.bin/.json`.
 
     ops: [kind, x, y, z, out, p0..p10] over front-end tensor ids.
     hwc(i)/stride(i): static NHWC shape (batch one) and channel stride.
     pool: ConstantPool or bytearray. manifest: dict with "source",
     "source_sha256" and "ops"; arena/constant/IO fields are added here.
+    dtypes: dict or callable mapping tensor id -> dtype enum (0: float32, 1: int32, 2: bool).
     """
+    dtype_fn = dtypes if callable(dtypes) else (dtypes.get if isinstance(dtypes, dict) else (lambda i: 0))
+    get_dtype = lambda i: dtype_fn(i) or 0
     pool = pool.data if isinstance(pool, ConstantPool) else pool
     active = sorted(
         set(inputs + outputs + [i for op in ops for i in tensor_refs(op) if i != NONE])
@@ -167,7 +181,7 @@ def write(ops, inputs, outputs, hwc, stride, pool, destination, manifest):
     if not pool:
         pool.extend(bytes(128))
     tensors = b"".join(
-        struct.pack("<8I", offsets[i], *hwc(i), stride(i), 0, 0, 0) for i in active
+        struct.pack("<8I", offsets[i], *hwc(i), stride(i), 0, 0, get_dtype(i)) for i in active
     )
     packed_ops = b"".join(
         struct.pack(
@@ -216,8 +230,9 @@ def write(ops, inputs, outputs, hwc, stride, pool, destination, manifest):
         "arena_bytes": peak,
         "constant_bytes": len(pool),
         "ops": manifest["ops"],
-        "inputs": [{"id": ids[i], "shape": manifest["shapes"][i]} for i in inputs],
-        "outputs": [{"id": ids[i], "shape": manifest["shapes"][i]} for i in outputs],
+        "inputs": [{"id": ids[i], "shape": manifest["shapes"][i], "dtype": get_dtype(i)} for i in inputs],
+        "outputs": [{"id": ids[i], "shape": manifest["shapes"][i], "dtype": get_dtype(i)} for i in outputs],
+        "tensor_dtypes": {str(ids[i]): get_dtype(i) for i in active},
     }
     full.update(manifest.get("extra", {}))
     destination.with_suffix(".json").write_text(json.dumps(full, indent=2) + "\n")

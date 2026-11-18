@@ -85,6 +85,10 @@ KINDS = {
     "eq.Tensor": "binary",
     "gt.Tensor": "binary",
     "lt.Tensor": "binary",
+    "ge.Tensor": "binary",
+    "le.Tensor": "binary",
+    "bitwise_and.Tensor": "binary",
+    "bitwise_or.Tensor": "binary",
     "hardswish.default": "act",
     "hardsigmoid.default": "act",
     "silu.default": "act",
@@ -352,6 +356,8 @@ def _binary_plan(node, ep, data=False):
         "div.Tensor": hx.BIN_DIV, "minimum.default": hx.BIN_MIN, "maximum.default": hx.BIN_MAX,
         "pow.Tensor_Tensor": hx.BIN_POW, "pow.Tensor_Scalar": hx.BIN_POW,
         "eq.Tensor": hx.BIN_EQUAL, "gt.Tensor": hx.BIN_GREATER, "lt.Tensor": hx.BIN_LESS,
+        "ge.Tensor": hx.BIN_GE, "le.Tensor": hx.BIN_LE,
+        "bitwise_and.Tensor": hx.BIN_AND, "bitwise_or.Tensor": hx.BIN_OR,
     }[name]
     a, b = node.args[0], node.args[1]
     alpha = node.args[2] if len(node.args) > 2 else node.kwargs.get("alpha", 1)
@@ -396,7 +402,7 @@ def _binary_plan(node, ep, data=False):
     if sa == out and fits(sb, out):
         return opcode, a, b, None, 0
     if sb == out and fits(sa, out):
-        rev = 1 if opcode in (hx.BIN_SUB, hx.BIN_DIV, hx.BIN_POW, hx.BIN_GREATER, hx.BIN_LESS) else 0
+        rev = 1 if opcode in (hx.BIN_SUB, hx.BIN_DIV, hx.BIN_POW, hx.BIN_GREATER, hx.BIN_LESS, hx.BIN_GE, hx.BIN_LE) else 0
         return opcode, b, a, None, rev
     raise Unsupported("operands broadcast against each other")
 

@@ -167,7 +167,7 @@ static int supported(const HxGraph *g) {
             return 0;
     for (uint32_t i = 0; i < g->header->ops; i++) {
         const HxOp *o = &g->ops[i];
-        if (o->kind < 1 || o->kind > 26)
+        if (o->kind < 1 || o->kind > 38 || (o->kind >= 29 && o->kind <= 31))
             return 0;
         const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
         if (a->stride == 3 && o->kind != HX_CONV)
@@ -2201,6 +2201,10 @@ void hx_fp16_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts)
                         case HX_BIN_EQUAL: res = (l == u) ? 1.0f : 0.0f; break;
                         case HX_BIN_GREATER: res = (l > u) ? 1.0f : 0.0f; break;
                         case HX_BIN_LESS: res = (l < u) ? 1.0f : 0.0f; break;
+                        case HX_BIN_GE: res = (l >= u) ? 1.0f : 0.0f; break;
+                        case HX_BIN_LE: res = (l <= u) ? 1.0f : 0.0f; break;
+                        case HX_BIN_AND: res = (l != 0.0f && u != 0.0f) ? 1.0f : 0.0f; break;
+                        case HX_BIN_OR: res = (l != 0.0f || u != 0.0f) ? 1.0f : 0.0f; break;
                         default: res = 0.0f; break;
                         }
                         v = half(res);
@@ -2261,17 +2265,23 @@ void hx_fp16_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts)
                             }
                         }
                         v = half(val);
-                    } else if (o->kind == HX_ARGMAX) {
-                        float max_val = -FLT_MAX;
+                    } else if (o->kind == HX_ARGMAX || o->kind == HX_ARGMIN) {
+                        const int is_min = (o->kind == HX_ARGMIN);
+                        float best_val = is_min ? FLT_MAX : -FLT_MAX;
                         int32_t best_c = 0;
                         for (uint32_t ch = 0; ch < a->c; ch++) {
                             float fv = scalar(x[at(a, oy * physical_width(a) + ox, ch)]);
-                            if (p[0] ? (fv >= max_val) : (fv > max_val)) {
-                                max_val = fv;
+                            int better;
+                            if (is_min)
+                                better = p[0] ? (fv <= best_val) : (fv < best_val);
+                            else
+                                better = p[0] ? (fv >= best_val) : (fv > best_val);
+                            if (better) {
+                                best_val = fv;
                                 best_c = (int32_t)ch;
                             }
                         }
-                        v = (c == 0) ? half((float)best_c) : 0;
+                        v = (c == 0) ? (p[1] == 1 ? (uint16_t)best_c : half((float)best_c)) : 0;
                     } else if (o->kind == HX_TOPK) {
                         const uint32_t K = p[0], largest = p[1], sorted = p[2];
                         struct { float val; int32_t idx; } top[128];
@@ -2320,7 +2330,7 @@ void hx_fp16_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts)
                     } else if (o->kind == HX_CAST) {
                         float fv = scalar(x[at(a, oy * physical_width(a) + ox, c)]);
                         if (p[0] == 0) {
-                            int32_t iv = (int32_t)lrintf(fv);
+                            int32_t iv = (int32_t)fv;
                             v = (uint16_t)iv;
                         } else if (p[0] == 1) {
                             int32_t iv = (int32_t)x[at(a, oy * physical_width(a) + ox, c)];
@@ -2328,8 +2338,16 @@ void hx_fp16_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts)
                         } else if (p[0] == 2) {
                             int32_t iv = (int32_t)x[at(a, oy * physical_width(a) + ox, c)];
                             v = half(iv != 0 ? 1.0f : 0.0f);
-                        } else {
+                        } else if (p[0] == 3) {
                             v = (fv != 0.0f) ? 1 : 0;
+                        } else if (p[0] == 4) {
+                            int32_t iv = (int32_t)x[at(a, oy * physical_width(a) + ox, c)];
+                            v = (iv != 0) ? 1 : 0;
+                        } else if (p[0] == 5) {
+                            int32_t iv = (int32_t)x[at(a, oy * physical_width(a) + ox, c)];
+                            v = (iv != 0) ? 1 : 0;
+                        } else {
+                            v = x[at(a, oy * physical_width(a) + ox, c)];
                         }
                     } else if (o->kind == HX_AVGPOOL) {
                         float sum = 0;

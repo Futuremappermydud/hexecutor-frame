@@ -116,8 +116,21 @@ def is_causal_mask(const):
     return True
 
 
+def _narrow_int64(arr, name=""):
+    if isinstance(arr, np.ndarray) and arr.dtype == np.int64:
+        if np.any(arr < -2147483648) or np.any(arr > 2147483647):
+            raise ValueError(f"int64 constant {name} out of int32 range: [{arr.min()}, {arr.max()}]")
+        return arr.astype(np.int32)
+    return arr
+
+
 def _pad32(values):
-    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    arr = np.asarray(values)
+    if arr.dtype.kind in ("i", "u", "b"):
+        arr = arr.astype(np.int32).reshape(-1)
+        pad = ((arr.size + 31) & ~31) - arr.size
+        return np.pad(arr, (0, pad))
+    values = arr.astype(np.float32).reshape(-1)
     return np.pad(values, (0, ((values.size + 31) & ~31) - values.size))
 
 
@@ -179,15 +192,16 @@ class Lowerer:
         self.model = model
         self.graph = model.graph
         inferred = _infer_shapes(model)
-        self.init = {i.name: numpy_helper.to_array(i) for i in self.graph.initializer}
+        self.init = {i.name: _narrow_int64(numpy_helper.to_array(i), i.name) for i in self.graph.initializer}
         self.nodes = []
         for node in self.graph.node:  # Constant nodes become initializers
             if node.op_type == "Constant":
-                self.init[node.output[0]] = self._constant_value(node)
+                self.init[node.output[0]] = _narrow_int64(self._constant_value(node), node.output[0])
             else:
                 self.nodes.append(node)
         self.dims = _static_dims(inferred)
         self.types = _elem_types(inferred)
+        self.dtypes = {}
         self._fold_constants()
         self._refresh_dims()
         self.compact_input = compact_input
@@ -258,7 +272,7 @@ class Lowerer:
                     kept.append(node)
                     continue
                 for name, value in zip(outs, values):
-                    self.init[name] = np.asarray(value)
+                    self.init[name] = _narrow_int64(np.asarray(value), name)
                 continue
             kept.append(node)
         # Dead nodes (outputs unread after folding, e.g. Shape chains that fed a folded
@@ -277,7 +291,12 @@ class Lowerer:
         """Folding turns computed sizes (Resize from a Shape chain, Upsample scales) into
         constants that shape inference can read: infer again on the folded graph and add the
         dimensions that were unknown before."""
-        inits = [numpy_helper.from_array(np.asarray(v), k) for k, v in self.init.items()]
+        inits = [
+            numpy_helper.from_array(
+                v.astype(np.int64) if hasattr(v, "dtype") and v.dtype == np.int32 else np.asarray(v), k
+            )
+            for k, v in self.init.items()
+        ]
         graph = onnx.helper.make_graph(self.nodes, "folded", list(self.graph.input),
                                        list(self.graph.output), inits)
         model = onnx.helper.make_model(graph, opset_imports=self.model.opset_import)
@@ -290,6 +309,8 @@ class Lowerer:
             return
         for name, dims in inferred.items():
             self.dims.setdefault(name, dims)
+        for name, elem_type in inferred_types.items():
+            self.types.setdefault(name, elem_type)
         # Forward shape propagation for ops unhandled or broken by ONNX shape inference
         changed = True
         while changed:
@@ -405,7 +426,10 @@ class Lowerer:
         return name
 
     def const(self, name):
-        return self.init.get(name)
+        val = self.init.get(name)
+        if val is not None and isinstance(val, np.ndarray) and val.dtype == np.int64:
+            return _narrow_int64(val, name)
+        return val
 
     def _is_multihead(self, name):
         return self.canon(name) in self.multihead
@@ -441,23 +465,67 @@ class Lowerer:
             return [1, 1, s[1]]
         raise ValueError(f"unsupported shape {s} for {name} (batch-one rank 2..6 only)")
 
+    def set_dtype(self, name_or_tid, dtype):
+        if isinstance(name_or_tid, str):
+            canon = self.canon(name_or_tid)
+            if canon in self.heads or canon in self.ttrans:
+                return
+            tid = self.tid(name_or_tid)
+        else:
+            tid = name_or_tid
+        self.dtypes[tid] = dtype
+
+    def get_dtype(self, name_or_tid):
+        if isinstance(name_or_tid, str):
+            canon = self.canon(name_or_tid)
+            if canon in self.heads or canon in self.ttrans:
+                return hx.DTYPE_FLOAT32
+            if canon in self.ids:
+                return self.dtypes.get(self.ids[canon], hx.DTYPE_FLOAT32)
+            elem_type = self.types.get(canon, self.types.get(name_or_tid))
+            if elem_type in (onnx.TensorProto.INT32, onnx.TensorProto.INT64):
+                return hx.DTYPE_INT32
+            elif elem_type == onnx.TensorProto.BOOL:
+                return hx.DTYPE_BOOL
+            return hx.DTYPE_FLOAT32
+        return self.dtypes.get(name_or_tid, hx.DTYPE_FLOAT32)
+
     def tid(self, name):
         name = self.canon(name)
         if name in self.heads or name in self.ttrans:
             raise ValueError(f"internal: {name} has no single tensor id")
         if name not in self.ids:
-            self.ids[name] = len(self.ids)
+            tid = len(self.ids)
+            self.ids[name] = tid
             if name in self.dims:
-                self.shapes[self.ids[name]] = self.hwc(name)
+                self.shapes[tid] = self.hwc(name)
+            elem_type = self.types.get(name)
+            if elem_type in (onnx.TensorProto.INT32, onnx.TensorProto.INT64):
+                self.dtypes.setdefault(tid, hx.DTYPE_INT32)
+            elif elem_type == onnx.TensorProto.BOOL:
+                self.dtypes.setdefault(tid, hx.DTYPE_BOOL)
+            else:
+                self.dtypes.setdefault(tid, hx.DTYPE_FLOAT32)
         return self.ids[name]
 
-    def temp(self, like, shape):
+    def temp(self, like, shape, dtype=None):
         """A new internal tensor with an explicit HWC shape."""
         self.synthetic += 1
         name = f"{like}#t{self.synthetic}"
-        self.ids[name] = len(self.ids)
-        self.shapes[self.ids[name]] = list(shape)
-        return self.ids[name]
+        tid = len(self.ids)
+        self.ids[name] = tid
+        self.shapes[tid] = list(shape)
+        if dtype is not None:
+            self.dtypes[tid] = dtype
+        elif isinstance(like, int):
+            self.dtypes[tid] = self.dtypes.get(like, hx.DTYPE_FLOAT32)
+        elif isinstance(like, str):
+            canon = self.canon(like)
+            if canon in self.ids:
+                self.dtypes[tid] = self.dtypes.get(self.ids[canon], hx.DTYPE_FLOAT32)
+            else:
+                self.dtypes[tid] = hx.DTYPE_FLOAT32
+        return tid
 
     def add(self, op):
         self.ops.append(op)
@@ -1126,44 +1194,65 @@ class Lowerer:
         ca, cb = self.const(a_name), self.const(b_name)
         if ca is not None and cb is not None:
             self.fail(node, "both operands are constants")
+        is_comparison = opcode in (
+            hx.BIN_EQUAL, hx.BIN_GREATER, hx.BIN_LESS, hx.BIN_GE, hx.BIN_LE, hx.BIN_AND, hx.BIN_OR
+        )
         if ca is not None or cb is not None:
             const, tensor, rev = (ca, b_name, 1) if ca is not None else (cb, a_name, 0)
-            if self._is_token(tensor) or self._is_multihead(tensor) or self.canon(tensor) in self.heads:
-                if opcode == hx.BIN_MUL and np.asarray(const).size == 1:
-                    return self._scale(node, tensor, out,
-                                       float(np.asarray(const, np.float64).reshape(())))
-                if self.canon(tensor) in self.heads:
-                    self.fail(node, "per-head attention tensors take only a scalar multiplier")
-            if self._is_multihead(tensor) and opcode == hx.BIN_ADD and is_causal_mask(const):
-                self.causal_masked.add(self.canon(out))
-                self.alias[out] = self.canon(tensor)
-                self.multihead.add(self.canon(out))
-                return
+            const_dtype = np.asarray(const).dtype
+            tensor_dtype = self.get_dtype(tensor)
+            is_int = (tensor_dtype == hx.DTYPE_INT32) or (const_dtype in (np.int32, np.int64))
+            is_bool = (tensor_dtype == hx.DTYPE_BOOL) or (const_dtype == np.bool_)
+            if is_comparison:
+                self.set_dtype(out, hx.DTYPE_BOOL)
+            elif is_int:
+                self.set_dtype(out, hx.DTYPE_INT32)
+            elif is_bool:
+                self.set_dtype(out, hx.DTYPE_BOOL)
+            else:
+                self.set_dtype(out, hx.DTYPE_FLOAT32)
+
+            if not is_int and not is_bool and not is_comparison:
+                if self._is_token(tensor) or self._is_multihead(tensor) or self.canon(tensor) in self.heads:
+                    if opcode == hx.BIN_MUL and np.asarray(const).size == 1:
+                        return self._scale(node, tensor, out,
+                                           float(np.asarray(const, np.float64).reshape(())))
+                    if self.canon(tensor) in self.heads:
+                        self.fail(node, "per-head attention tensors take only a scalar multiplier")
+                if self._is_multihead(tensor) and opcode == hx.BIN_ADD and is_causal_mask(const):
+                    self.causal_masked.add(self.canon(out))
+                    self.alias[out] = self.canon(tensor)
+                    self.multihead.add(self.canon(out))
+                    return
             if self.dims[tensor] != self.dims[out]:
                 self.fail(node, "a constant operand would broadcast the tensor")
             vec = self.channel_vector(node, const, out)
             if vec is not None:
-                if opcode == hx.BIN_MUL and not rev:
-                    return self._affine(node, tensor, out, vec, np.zeros_like(vec))
-                if opcode == hx.BIN_ADD:
-                    return self._affine(node, tensor, out, np.ones_like(vec), vec)
-                if opcode == hx.BIN_SUB and not rev:
-                    return self._affine(node, tensor, out, np.ones_like(vec), -vec)
-                if opcode == hx.BIN_MUL:  # c * x
-                    return self._affine(node, tensor, out, vec, np.zeros_like(vec))
-                if opcode == hx.BIN_SUB and rev:
-                    # c - x: negate, then add c
-                    neg = self.temp(out, self.hwc(out))
-                    self.add(Op(hx.BINARY, self.tid(tensor), NONE, neg,
-                                [hx.BIN_MUL, 1, self.pool.emit(_pad32(-np.ones_like(vec))), 0], node))
-                    self.add(Op(hx.BINARY, neg, NONE, self.tid(out),
-                                [hx.BIN_ADD, 1, self.pool.emit(_pad32(vec)), 0], node))
-                    return None
+                if not is_int and not is_bool and not is_comparison:
+                    if opcode == hx.BIN_MUL and not rev:
+                        return self._affine(node, tensor, out, vec, np.zeros_like(vec))
+                    if opcode == hx.BIN_ADD:
+                        return self._affine(node, tensor, out, np.ones_like(vec), vec)
+                    if opcode == hx.BIN_SUB and not rev:
+                        return self._affine(node, tensor, out, np.ones_like(vec), -vec)
+                    if opcode == hx.BIN_MUL:  # c * x
+                        return self._affine(node, tensor, out, vec, np.zeros_like(vec))
+                    if opcode == hx.BIN_SUB and rev:
+                        # c - x: negate, then add c
+                        neg = self.temp(out, self.hwc(out))
+                        self.add(Op(hx.BINARY, self.tid(tensor), NONE, neg,
+                                    [hx.BIN_MUL, 1, self.pool.emit(_pad32(-np.ones_like(vec))), 0], node))
+                        self.add(Op(hx.BINARY, neg, NONE, self.tid(out),
+                                    [hx.BIN_ADD, 1, self.pool.emit(_pad32(vec)), 0], node))
+                        return None
                 return self.add(Op(hx.BINARY, self.tid(tensor), NONE, self.tid(out),
                                    [opcode, 1, self.pool.emit(_pad32(vec)), rev], node))
             # Full-size constant operand (mode 2)
+            c_dtype = np.int32 if (is_int or (is_comparison and const_dtype in (np.int32, np.int64))) else (
+                np.bool_ if is_bool else np.float32
+            )
             try:
-                c_arr = np.broadcast_to(np.asarray(const, dtype=np.float32), self.dims[out])
+                c_arr = np.broadcast_to(np.asarray(const, dtype=c_dtype), self.dims[out])
             except ValueError:
                 self.fail(node, f"cannot broadcast constant of shape {const.shape} to {self.dims[out]}")
             h, w, c = self.hwc(out)
@@ -1191,13 +1280,30 @@ class Lowerer:
                 s in (1, o) for s, o in zip(small, big)
             )
 
+        non_commutative = (
+            hx.BIN_SUB, hx.BIN_DIV, hx.BIN_POW,
+            hx.BIN_GREATER, hx.BIN_LESS, hx.BIN_GE, hx.BIN_LE
+        )
         if sa == so and fits(sb, so):
             x, y, rev = a_name, b_name, 0
         elif sb == so and fits(sa, so):
-            x, y, rev = b_name, a_name, int(opcode == hx.BIN_SUB)
+            x, y, rev = b_name, a_name, int(opcode in non_commutative)
         else:
             self.fail(node, "operands broadcast against each other")
-        if opcode == hx.BIN_ADD and self.dims[x] == self.dims[y]:
+
+        da, db = self.get_dtype(a_name), self.get_dtype(b_name)
+        is_int = (da == hx.DTYPE_INT32 or db == hx.DTYPE_INT32)
+        is_bool = (da == hx.DTYPE_BOOL or db == hx.DTYPE_BOOL)
+        if is_comparison:
+            self.set_dtype(out, hx.DTYPE_BOOL)
+        elif is_int:
+            self.set_dtype(out, hx.DTYPE_INT32)
+        elif is_bool:
+            self.set_dtype(out, hx.DTYPE_BOOL)
+        else:
+            self.set_dtype(out, hx.DTYPE_FLOAT32)
+
+        if opcode == hx.BIN_ADD and self.dims[x] == self.dims[y] and not is_int:
             self.add(Op(hx.ADD, self.tid(x), self.tid(y), self.tid(out), [0], node))
             self.producer[self.tid(out)].foldable = False
         else:
@@ -1241,6 +1347,22 @@ class Lowerer:
 
     def op_Less(self, node):
         self._binary(node, hx.BIN_LESS)
+
+    def op_GreaterOrEqual(self, node):
+        self._binary(node, hx.BIN_GE)
+
+    def op_LessOrEqual(self, node):
+        self._binary(node, hx.BIN_LE)
+
+    def op_And(self, node):
+        self._binary(node, hx.BIN_AND)
+
+    def op_Or(self, node):
+        self._binary(node, hx.BIN_OR)
+
+    def op_Not(self, node):
+        self.set_dtype(node.output[0], hx.DTYPE_BOOL)
+        self._emit_act(node, node.input[0], hx.FN_NOT)
 
     def op_Min(self, node):
         self._binary(node, hx.BIN_MIN)
@@ -1787,13 +1909,6 @@ class Lowerer:
     op_Identity = op_Dropout = op_Flatten = _alias_shape
     op_Reshape = op_Squeeze = op_Unsqueeze = _alias_shape
 
-    def op_Cast(self, node):
-        """Exporters cast float32 to float32 (for example `x.float()`): an alias. Other target
-        types are not float32 tensors and cannot be lowered."""
-        if self.dims.get(node.output[0]) is None:
-            self.fail(node, "only casts to float32 are lowered")
-        self._alias_shape(node)
-
     def op_Transpose(self, node):
         if not self._transpose_view(node):
             self._transpose_nchw(node)
@@ -2132,9 +2247,12 @@ class Lowerer:
         c = self.const(name)
         if c is None:
             return 0, 0, self.tid(name)
-        arr = np.asarray(c, dtype=np.float32)
+        out_dtype = self.get_dtype(out)
+        is_int_or_bool = out_dtype in (hx.DTYPE_INT32, hx.DTYPE_BOOL)
+        arr = np.asarray(c, dtype=np.int32 if is_int_or_bool else np.float32)
         if arr.size == 1:
-            return 1, hx.f32_bits(float(arr.reshape(-1)[0])), NONE
+            val_bits = int(arr.reshape(-1)[0]) & 0xFFFFFFFF if is_int_or_bool else hx.f32_bits(float(arr.reshape(-1)[0]))
+            return 1, val_bits, NONE
         vec = self.channel_vector(None, arr, out)
         if vec is not None:
             return 2, self.pool.emit(_pad32(vec)), NONE
@@ -2154,6 +2272,24 @@ class Lowerer:
     def op_Where(self, node):
         cond, x, y = node.input
         out = node.output[0]
+        out_elem = self.types.get(out)
+        if out_elem in (onnx.TensorProto.INT32, onnx.TensorProto.INT64):
+            out_dtype = hx.DTYPE_INT32
+        elif out_elem == onnx.TensorProto.BOOL:
+            out_dtype = hx.DTYPE_BOOL
+        elif out_elem == onnx.TensorProto.FLOAT:
+            out_dtype = hx.DTYPE_FLOAT32
+        else:
+            x_dt = self.get_dtype(x) if self.const(x) is None else (
+                hx.DTYPE_INT32 if np.asarray(self.const(x)).dtype in (np.int32, np.int64)
+                else (hx.DTYPE_BOOL if np.asarray(self.const(x)).dtype == np.bool_ else hx.DTYPE_FLOAT32)
+            )
+            y_dt = self.get_dtype(y) if self.const(y) is None else (
+                hx.DTYPE_INT32 if np.asarray(self.const(y)).dtype in (np.int32, np.int64)
+                else (hx.DTYPE_BOOL if np.asarray(self.const(y)).dtype == np.bool_ else hx.DTYPE_FLOAT32)
+            )
+            out_dtype = x_dt if x_dt != hx.DTYPE_FLOAT32 else y_dt
+        self.set_dtype(out, out_dtype)
         x_mode, x_val, y_tid = self._where_operand(x, out)
         y_mode, y_val, z_tid = self._where_operand(y, out)
         op = Op(hx.WHERE, self.tid(cond), y_tid, self.tid(out),
@@ -2210,7 +2346,18 @@ class Lowerer:
         h, w, c = self.hwc(x)
         self.shapes[self.tid(out)] = [h, w, 1]
         select_last = int(a.get("select_last_index", 0))
-        self.add(Op(hx.ARGMAX, self.tid(x), NONE, self.tid(out), [select_last, 0], node))
+        self.set_dtype(out, hx.DTYPE_INT32)
+        self.add(Op(hx.ARGMAX, self.tid(x), NONE, self.tid(out), [select_last, 1], node))
+
+    def op_ArgMin(self, node):
+        a = self.attrs(node)
+        x = node.input[0]
+        out = node.output[0]
+        h, w, c = self.hwc(x)
+        self.shapes[self.tid(out)] = [h, w, 1]
+        select_last = int(a.get("select_last_index", 0))
+        self.set_dtype(out, hx.DTYPE_INT32)
+        self.add(Op(hx.ARGMIN, self.tid(x), NONE, self.tid(out), [select_last, 1], node))
 
     def op_TopK(self, node):
         a = self.attrs(node)
@@ -2226,11 +2373,19 @@ class Lowerer:
         self.shapes[self.tid(values_out)] = [h, w, k]
         indices_out = node.output[1] if len(node.output) > 1 and node.output[1] else None
         z_id = NONE
+        idx_dtype = 0
         if indices_out:
             z_id = self.tid(indices_out)
             self.shapes[z_id] = [h, w, k]
+            idx_elem = self.types.get(indices_out)
+            if idx_elem in (onnx.TensorProto.INT32, onnx.TensorProto.INT64):
+                self.set_dtype(indices_out, hx.DTYPE_INT32)
+                idx_dtype = 1
+            else:
+                self.set_dtype(indices_out, hx.DTYPE_FLOAT32)
+                idx_dtype = 0
         op = Op(hx.TOPK, self.tid(x), NONE, self.tid(values_out),
-                [k, largest, sorted_flag, 0], node)
+                [k, largest, sorted_flag, idx_dtype], node)
         op.z_id = z_id
         self.add(op)
 
@@ -2263,24 +2418,45 @@ class Lowerer:
         a = self.attrs(node)
         to_type = int(a.get("to", onnx.TensorProto.FLOAT))
         from_type = self.types.get(node.input[0], onnx.TensorProto.FLOAT)
+        valid_types = (onnx.TensorProto.FLOAT, onnx.TensorProto.INT32, onnx.TensorProto.INT64, onnx.TensorProto.BOOL)
+        if to_type not in valid_types or from_type not in valid_types:
+            self.fail(node, f"only casts between float32, int32 and bool are lowered (got {from_type} -> {to_type})")
+        if to_type == onnx.TensorProto.INT64:
+            to_type = onnx.TensorProto.INT32
+        if from_type == onnx.TensorProto.INT64:
+            from_type = onnx.TensorProto.INT32
         if to_type == from_type:
             self.alias[node.output[0]] = self.canon(node.input[0])
+            self.set_dtype(node.output[0], self.get_dtype(node.input[0]))
             return
-        out_dims = self.dims.get(node.output[0])
-        if to_type in (onnx.TensorProto.INT32, onnx.TensorProto.INT64):
-            if out_dims is not None and len(out_dims) > 2:
-                self.fail(node, "only casts to float32 or 1D/2D index tensors are lowered")
+        out_name = node.output[0]
+        inp_name = node.input[0]
+        if from_type == onnx.TensorProto.FLOAT and to_type == onnx.TensorProto.INT32:
             mode = 0  # float -> int
-        elif to_type == onnx.TensorProto.FLOAT and from_type in (onnx.TensorProto.INT32, onnx.TensorProto.INT64):
+            out_dtype = hx.DTYPE_INT32
+        elif from_type == onnx.TensorProto.INT32 and to_type == onnx.TensorProto.FLOAT:
             mode = 1  # int -> float
-        elif to_type == onnx.TensorProto.FLOAT and from_type == onnx.TensorProto.BOOL:
+            out_dtype = hx.DTYPE_FLOAT32
+        elif from_type == onnx.TensorProto.BOOL and to_type == onnx.TensorProto.FLOAT:
             mode = 2  # bool -> float
-        elif to_type == onnx.TensorProto.BOOL and from_type == onnx.TensorProto.FLOAT:
+            out_dtype = hx.DTYPE_FLOAT32
+        elif from_type == onnx.TensorProto.FLOAT and to_type == onnx.TensorProto.BOOL:
             mode = 3  # float -> bool
+            out_dtype = hx.DTYPE_BOOL
+        elif from_type == onnx.TensorProto.INT32 and to_type == onnx.TensorProto.BOOL:
+            mode = 4  # int32 -> bool
+            out_dtype = hx.DTYPE_BOOL
+        elif from_type == onnx.TensorProto.BOOL and to_type == onnx.TensorProto.INT32:
+            mode = 5  # bool -> int32
+            out_dtype = hx.DTYPE_INT32
         else:
-            self.alias[node.output[0]] = self.canon(node.input[0])
-            return
-        self.add(Op(hx.CAST, self.tid(node.input[0]), NONE, self.tid(node.output[0]), [mode], node))
+            mode = 6  # identity / bitcast
+            out_dtype = (
+                hx.DTYPE_INT32 if to_type == onnx.TensorProto.INT32
+                else (hx.DTYPE_BOOL if to_type == onnx.TensorProto.BOOL else hx.DTYPE_FLOAT32)
+            )
+        self.set_dtype(out_name, out_dtype)
+        self.add(Op(hx.CAST, self.tid(inp_name), NONE, self.tid(out_name), [mode], node))
 
     # ------------------------------------------------------------ finishing
     def _split_deep(self, op):
@@ -2456,6 +2632,7 @@ class Lowerer:
                     "fp16_plan": {"eligible": not blockers, "blockers": blockers},
                 },
             },
+            dtypes=self.dtypes,
         )
 
 

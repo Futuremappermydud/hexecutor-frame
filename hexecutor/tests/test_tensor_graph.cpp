@@ -53,10 +53,18 @@ struct Fixture {
     void constant(size_t off, std::initializer_list<float> v) {
         std::memcpy(constants.data() + off, v.begin(), v.size() * 4);
     }
+    void constant_i32(size_t off, std::initializer_list<int32_t> v) {
+        std::memcpy(constants.data() + off, v.begin(), v.size() * 4);
+    }
     void input(size_t i, const std::vector<float> &v) {
         check(open() == 0);
         check(v.size() == hx_tensor_elements(&tensor(i)));
         hx_pack(reinterpret_cast<float *>(arena.data() + tensor(i).offset), v.data(), &tensor(i));
+    }
+    void input_i32(size_t i, const std::vector<int32_t> &v) {
+        check(open() == 0);
+        check(v.size() == hx_tensor_elements(&tensor(i)));
+        hx_pack(reinterpret_cast<float *>(arena.data() + tensor(i).offset), reinterpret_cast<const float *>(v.data()), &tensor(i));
     }
     std::vector<float> run() {
         check(open() == 0);
@@ -67,8 +75,19 @@ struct Fixture {
         hx_unpack(out.data(), reinterpret_cast<float *>(arena.data() + t.offset), &t);
         return out;
     }
+    std::vector<int32_t> run_i32() {
+        check(open() == 0);
+        for (uint32_t part = 0; part < 3; part++)
+            hx_execute_op(&graph, 0, part, 3);
+        auto &t = tensor(op().out);
+        std::vector<int32_t> out(hx_tensor_elements(&t));
+        hx_unpack(reinterpret_cast<float *>(out.data()), reinterpret_cast<const float *>(arena.data() + t.offset), &t);
+        return out;
+    }
 };
 HxTensor shape(uint32_t h, uint32_t w, uint32_t c) { return {0, h, w, c, 0, {0, 0, 0}}; }
+inline HxTensor shape_i32(uint32_t h, uint32_t w, uint32_t c) { return {0, h, w, c, 0, {0, 0, HX_DTYPE_INT32}}; }
+inline HxTensor shape_bool(uint32_t h, uint32_t w, uint32_t c) { return {0, h, w, c, 0, {0, 0, HX_DTYPE_BOOL}}; }
 HxOp op(uint32_t kind, uint32_t out = 1, uint32_t y = HXFG_NONE, uint32_t z = HXFG_NONE) {
     HxOp o{};
     o.kind = kind;
@@ -963,6 +982,138 @@ int main() {
         frc.input(0, {10, 20});
         r = frc.run();
         check(r.size() == 4);
+    }
+    {  // ArgMin: channel argmin (float input, int32 output)
+        auto amin = op(HX_ARGMIN);
+        amin.p[0] = 0;
+        amin.p[1] = 1; // output int32
+        Fixture fa({shape(1, 2, 4), shape_i32(1, 2, 1)}, amin, {0});
+        fa.input(0, {10.f, 5.f, 20.f, 30.f, 7.f, 3.f, 4.f, 2.f});
+        auto r_i = fa.run_i32();
+        check(r_i == std::vector<int32_t>({1, 3}));
+    }
+    {  // ArgMax: channel argmax (int32 input, int32 output)
+        auto amax = op(HX_ARGMAX);
+        amax.p[0] = 0;
+        amax.p[1] = 1; // output int32
+        Fixture fa({shape_i32(1, 2, 4), shape_i32(1, 2, 1)}, amax, {0});
+        fa.input_i32(0, {100, 500, 200, 300, -70, -30, -40, -20});
+        auto r_i = fa.run_i32();
+        check(r_i == std::vector<int32_t>({1, 3}));
+    }
+    {  // Integer binary arithmetic: Add, Sub, Mul, Min, Max
+        for (auto bkind : {HX_BIN_ADD, HX_BIN_SUB, HX_BIN_MUL, HX_BIN_MIN, HX_BIN_MAX}) {
+            auto bop = op(HX_BINARY, 2, 1);
+            bop.p[0] = bkind;
+            Fixture fb({shape_i32(1, 2, 2), shape_i32(1, 2, 2), shape_i32(1, 2, 2)}, bop, {0, 1});
+            fb.input_i32(0, {10, -20, 30, -40});
+            fb.input_i32(1, {5, 2, -15, 8});
+            auto r_i = fb.run_i32();
+            if (bkind == HX_BIN_ADD) check(r_i == std::vector<int32_t>({15, -18, 15, -32}));
+            if (bkind == HX_BIN_SUB) check(r_i == std::vector<int32_t>({5, -22, 45, -48}));
+            if (bkind == HX_BIN_MUL) check(r_i == std::vector<int32_t>({50, -40, -450, -320}));
+            if (bkind == HX_BIN_MIN) check(r_i == std::vector<int32_t>({5, -20, -15, -40}));
+            if (bkind == HX_BIN_MAX) check(r_i == std::vector<int32_t>({10, 2, 30, 8}));
+        }
+    }
+    {  // Comparison ops on int32 and float32: Equal, Greater, Less, GE, LE
+        for (auto bkind : {HX_BIN_EQUAL, HX_BIN_GREATER, HX_BIN_LESS, HX_BIN_GE, HX_BIN_LE}) {
+            auto bop = op(HX_BINARY, 2, 1);
+            bop.p[0] = bkind;
+            Fixture fb({shape_i32(1, 2, 2), shape_i32(1, 2, 2), shape_bool(1, 2, 2)}, bop, {0, 1});
+            fb.input_i32(0, {10, 20, 30, 40});
+            fb.input_i32(1, {10, 15, 35, 40});
+            auto r_i = fb.run_i32();
+            if (bkind == HX_BIN_EQUAL) check(r_i == std::vector<int32_t>({1, 0, 0, 1}));
+            if (bkind == HX_BIN_GREATER) check(r_i == std::vector<int32_t>({0, 1, 0, 0}));
+            if (bkind == HX_BIN_LESS) check(r_i == std::vector<int32_t>({0, 0, 1, 0}));
+            if (bkind == HX_BIN_GE) check(r_i == std::vector<int32_t>({1, 1, 0, 1}));
+            if (bkind == HX_BIN_LE) check(r_i == std::vector<int32_t>({1, 0, 1, 1}));
+        }
+    }
+    {  // Logical ops: Not, And, Or
+        auto nop = op(HX_ACT);
+        nop.p[0] = HX_ACT_NOT;
+        Fixture fn({shape_bool(1, 1, 4), shape_bool(1, 1, 4)}, nop, {0});
+        fn.input_i32(0, {1, 0, 1, 0});
+        auto r_i = fn.run_i32();
+        check(r_i == std::vector<int32_t>({0, 1, 0, 1}));
+
+        for (auto bkind : {HX_BIN_AND, HX_BIN_OR}) {
+            auto bop = op(HX_BINARY, 2, 1);
+            bop.p[0] = bkind;
+            Fixture fb({shape_bool(1, 1, 4), shape_bool(1, 1, 4), shape_bool(1, 1, 4)}, bop, {0, 1});
+            fb.input_i32(0, {1, 1, 0, 0});
+            fb.input_i32(1, {1, 0, 1, 0});
+            auto r_b = fb.run_i32();
+            if (bkind == HX_BIN_AND) check(r_b == std::vector<int32_t>({1, 0, 0, 0}));
+            if (bkind == HX_BIN_OR) check(r_b == std::vector<int32_t>({1, 1, 1, 0}));
+        }
+    }
+    {  // Where with integer tensors and constants
+        auto wop = op(HX_WHERE, 3, 1, 2);
+        wop.p[0] = 0; // y tensor
+        wop.p[2] = 0; // z tensor
+        Fixture fw({shape_bool(1, 1, 4), shape_i32(1, 1, 4), shape_i32(1, 1, 4), shape_i32(1, 1, 4)}, wop, {0, 1, 2});
+        fw.input_i32(0, {1, 0, 1, 0});
+        fw.input_i32(1, {100, 200, 300, 400});
+        fw.input_i32(2, {-10, -20, -30, -40});
+        auto r_i = fw.run_i32();
+        check(r_i == std::vector<int32_t>({100, -20, 300, -40}));
+
+        // Where with scalar constant
+        auto wop2 = op(HX_WHERE, 2, HXFG_NONE, 1);
+        wop2.p[0] = 1; // scalar constant
+        wop2.p[1] = 999;
+        wop2.p[2] = 0; // tensor
+        Fixture fw2({shape_bool(1, 1, 4), shape_i32(1, 1, 4), shape_i32(1, 1, 4)}, wop2, {0, 1});
+        fw2.input_i32(0, {1, 0, 0, 1});
+        fw2.input_i32(1, {5, 6, 7, 8});
+        r_i = fw2.run_i32();
+        check(r_i == std::vector<int32_t>({999, 6, 7, 999}));
+    }
+    {  // Cast: all modes (0..5)
+        // Mode 0: float -> int32
+        auto c0 = op(HX_CAST); c0.p[0] = 0;
+        Fixture fc0({shape(1, 1, 2), shape_i32(1, 1, 2)}, c0, {0});
+        fc0.input(0, {4.2f, -3.8f});
+        auto r0 = fc0.run_i32();
+        check(r0 == std::vector<int32_t>({4, -3}));
+
+        // Mode 1: int32 -> float
+        auto c1 = op(HX_CAST); c1.p[0] = 1;
+        Fixture fc1({shape_i32(1, 1, 2), shape(1, 1, 2)}, c1, {0});
+        fc1.input_i32(0, {42, -17});
+        auto r1 = fc1.run();
+        check(r1 == std::vector<float>({42.0f, -17.0f}));
+
+        // Mode 2: bool -> float
+        auto c2 = op(HX_CAST); c2.p[0] = 2;
+        Fixture fc2({shape_bool(1, 1, 2), shape(1, 1, 2)}, c2, {0});
+        fc2.input_i32(0, {1, 0});
+        auto r2 = fc2.run();
+        check(r2 == std::vector<float>({1.0f, 0.0f}));
+
+        // Mode 3: float -> bool
+        auto c3 = op(HX_CAST); c3.p[0] = 3;
+        Fixture fc3({shape(1, 1, 3), shape_bool(1, 1, 3)}, c3, {0});
+        fc3.input(0, {0.0f, 3.5f, -0.0f});
+        auto r3 = fc3.run_i32();
+        check(r3 == std::vector<int32_t>({0, 1, 0}));
+
+        // Mode 4: int32 -> bool
+        auto c4 = op(HX_CAST); c4.p[0] = 4;
+        Fixture fc4({shape_i32(1, 1, 3), shape_bool(1, 1, 3)}, c4, {0});
+        fc4.input_i32(0, {0, 15, -7});
+        auto r4 = fc4.run_i32();
+        check(r4 == std::vector<int32_t>({0, 1, 1}));
+
+        // Mode 5: bool -> int32
+        auto c5 = op(HX_CAST); c5.p[0] = 5;
+        Fixture fc5({shape_bool(1, 1, 2), shape_i32(1, 1, 2)}, c5, {0});
+        fc5.input_i32(0, {1, 0});
+        auto r5 = fc5.run_i32();
+        check(r5 == std::vector<int32_t>({1, 0}));
     }
     // z is only a dilation on conv/depthwise, and must encode 1..8 per axis with one above 1.
     {

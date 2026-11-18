@@ -5,6 +5,7 @@ and the portable reference runner (build/bin/hexecutor_tensor_run); they compare
 lowered graph on the CPU reference against onnxruntime on the original model.
 """
 
+import json
 import os
 import struct
 import subprocess
@@ -159,16 +160,24 @@ def lower_model(m, tmp, **kw):
 def run_reference(tmp, x_nchw):
     tmp = Path(tmp)
     data = x_nchw[0].transpose(1, 2, 0) if x_nchw.ndim == 4 else x_nchw[0]
-    out_dt = np.int32 if np.issubdtype(x_nchw.dtype, np.integer) else np.float32
+    out_dt = np.int32 if np.issubdtype(x_nchw.dtype, np.integer) or x_nchw.dtype == bool else np.float32
     (tmp / "in.f32").write_bytes(np.ascontiguousarray(data, out_dt).tobytes())
     subprocess.run(
         [str(RUNNER), str(tmp / "g.hxfg"), str(tmp / "g.bin"), str(tmp / "in.f32"),
          str(tmp / "out_")],
         check=True, capture_output=True,
     )
+    manifest = json.loads((tmp / "g.json").read_text()) if (tmp / "g.json").exists() else {}
+    outputs = manifest.get("outputs", [])
     i = 0
     while (tmp / f"out_{i}.f32").exists():
-        yield np.fromfile(tmp / f"out_{i}.f32", np.float32)
+        dt_code = outputs[i].get("dtype", 0) if i < len(outputs) else 0
+        if dt_code == 1:
+            yield np.fromfile(tmp / f"out_{i}.f32", np.int32)
+        elif dt_code == 2:
+            yield np.fromfile(tmp / f"out_{i}.f32", np.int32).astype(bool)
+        else:
+            yield np.fromfile(tmp / f"out_{i}.f32", np.float32)
         i += 1
 
 
@@ -910,10 +919,10 @@ class ExportHygieneTests(unittest.TestCase):
 
     def test_only_float32_casts_are_lowered(self):
         b = Builder()
-        c = b.node("Cast", ["x"], to=TensorProto.INT64)
+        c = b.node("Cast", ["x"], to=TensorProto.STRING)
         m = b.model([("x", [1, 4, 2, 2])], [(b.node("Cast", [c], to=TensorProto.FLOAT),
-                                             [1, 4, 2, 2])])
-        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(ValueError, "float32"):
+                                             [1, 4, 2, 2])], check=False)
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(ValueError, "casts between float32"):
             lower_model(m, tmp)
 
     def test_constant_pool_over_the_runtime_limit_is_rejected(self):
@@ -1334,6 +1343,191 @@ class TransformerLoweringTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
                 self.assertRaisesRegex(ValueError, "contiguous run"):
             lower_model(model_gather_run_with_gap(), tmp)
+
+
+@unittest.skipUnless(onnx and onnxruntime and RUNNER.exists(), "needs onnx, onnxruntime, and runner")
+class IntegerTensorTests(unittest.TestCase):
+    def test_integer_arithmetic_matches_onnxruntime(self):
+        b = Builder(seed=101)
+        outs = [
+            b.node("Add", ["x", "y"]),
+            b.node("Sub", ["x", "y"]),
+            b.node("Mul", ["x", "y"]),
+            b.node("Min", ["x", "y"]),
+            b.node("Max", ["x", "y"]),
+            b.node("Add", ["x", b.const(np.full((1, 4, 4, 8), 10, np.int32))]),
+            b.node("Mul", ["x", b.const(np.full((1, 4, 4, 8), -2, np.int32))]),
+        ]
+        m = b.model(
+            [("x", [1, 4, 4, 8], TensorProto.INT32), ("y", [1, 4, 4, 8], TensorProto.INT32)],
+            [(o, [1, 4, 4, 8], TensorProto.INT32) for o in outs]
+        )
+        rng = np.random.RandomState(101)
+        x = rng.randint(-100, 100, size=(1, 4, 4, 8)).astype(np.int32)
+        y = rng.randint(-50, 50, size=(1, 4, 4, 8)).astype(np.int32)
+        want = onnxruntime.InferenceSession(m.SerializeToString(), providers=["CPUExecutionProvider"]).run(
+            None, {"x": x, "y": y}
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            lower_model(m, tmp)
+            # pack both inputs
+            data_x = x[0]
+            data_y = y[0]
+            p = Path(tmp)
+            (p / "in.f32").write_bytes(np.ascontiguousarray(data_x).tobytes() + np.ascontiguousarray(data_y).tobytes())
+            # runner takes: IMAGE CONSTANTS IN1 IN2 OUT_PREFIX
+            (p / "in_x.i32").write_bytes(np.ascontiguousarray(data_x).tobytes())
+            (p / "in_y.i32").write_bytes(np.ascontiguousarray(data_y).tobytes())
+            subprocess.run(
+                [str(RUNNER), str(p / "g.hxfg"), str(p / "g.bin"), str(p / "in_x.i32"), str(p / "in_y.i32"), str(p / "out_")],
+                check=True, capture_output=True,
+            )
+            for i, w in enumerate(want):
+                out_file = p / f"out_{i}.f32"
+                got = np.fromfile(out_file, dtype=np.int32)
+                np.testing.assert_array_equal(got, w[0].flatten(), err_msg=f"mismatch in int op {i}")
+
+    def test_comparisons_and_logical_matches_onnxruntime(self):
+        b = Builder(seed=102)
+        eq = b.node("Equal", ["x", "y"])
+        gt = b.node("Greater", ["x", "y"])
+        lt = b.node("Less", ["x", "y"])
+        ge = b.node("GreaterOrEqual", ["x", "y"])
+        le = b.node("LessOrEqual", ["x", "y"])
+        and_op = b.node("And", [gt, lt])
+        or_op = b.node("Or", [ge, le])
+        not_op = b.node("Not", [eq])
+        outs = [eq, gt, lt, ge, le, and_op, or_op, not_op]
+        m = b.model(
+            [("x", [1, 2, 2, 4], TensorProto.INT32), ("y", [1, 2, 2, 4], TensorProto.INT32)],
+            [(o, [1, 2, 2, 4], TensorProto.BOOL) for o in outs]
+        )
+        rng = np.random.RandomState(102)
+        x = rng.randint(-10, 10, size=(1, 2, 2, 4)).astype(np.int32)
+        y = rng.randint(-10, 10, size=(1, 2, 2, 4)).astype(np.int32)
+        want = onnxruntime.InferenceSession(m.SerializeToString(), providers=["CPUExecutionProvider"]).run(
+            None, {"x": x, "y": y}
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            lower_model(m, tmp)
+            p = Path(tmp)
+            (p / "in_x.i32").write_bytes(np.ascontiguousarray(x[0]).tobytes())
+            (p / "in_y.i32").write_bytes(np.ascontiguousarray(y[0]).tobytes())
+            subprocess.run(
+                [str(RUNNER), str(p / "g.hxfg"), str(p / "g.bin"), str(p / "in_x.i32"), str(p / "in_y.i32"), str(p / "out_")],
+                check=True, capture_output=True,
+            )
+            for i, w in enumerate(want):
+                out_file = p / f"out_{i}.f32"
+                got = np.fromfile(out_file, dtype=np.int32).astype(bool)
+                np.testing.assert_array_equal(got, w[0].flatten(), err_msg=f"mismatch in comp/logical op {i}")
+
+    def test_where_with_integer_and_bool_matches_onnxruntime(self):
+        b = Builder(seed=103)
+        cond = b.node("Greater", ["x", b.const(np.zeros((1, 2, 2, 4), np.int32))])
+        w1 = b.node("Where", [cond, "x", "y"])
+        w2 = b.node("Where", [cond, b.const(np.full((1, 2, 2, 4), 99, np.int32)), "y"])
+        m = b.model(
+            [("x", [1, 2, 2, 4], TensorProto.INT32), ("y", [1, 2, 2, 4], TensorProto.INT32)],
+            [(w1, [1, 2, 2, 4], TensorProto.INT32), (w2, [1, 2, 2, 4], TensorProto.INT32)]
+        )
+        rng = np.random.RandomState(103)
+        x = rng.randint(-5, 5, size=(1, 2, 2, 4)).astype(np.int32)
+        y = rng.randint(10, 20, size=(1, 2, 2, 4)).astype(np.int32)
+        want = onnxruntime.InferenceSession(m.SerializeToString(), providers=["CPUExecutionProvider"]).run(
+            None, {"x": x, "y": y}
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            lower_model(m, tmp)
+            p = Path(tmp)
+            (p / "in_x.i32").write_bytes(np.ascontiguousarray(x[0]).tobytes())
+            (p / "in_y.i32").write_bytes(np.ascontiguousarray(y[0]).tobytes())
+            subprocess.run(
+                [str(RUNNER), str(p / "g.hxfg"), str(p / "g.bin"), str(p / "in_x.i32"), str(p / "in_y.i32"), str(p / "out_")],
+                check=True, capture_output=True,
+            )
+            for i, w in enumerate(want):
+                got = np.fromfile(p / f"out_{i}.f32", dtype=np.int32)
+                np.testing.assert_array_equal(got, w[0].flatten(), err_msg=f"mismatch in where op {i}")
+
+    def test_argmin_and_argmax_matches_onnxruntime(self):
+        b = Builder(seed=104)
+        am_float = b.node("ArgMax", ["xf"], axis=1, keepdims=1)
+        an_float = b.node("ArgMin", ["xf"], axis=1, keepdims=1)
+        am_int = b.node("ArgMax", ["xi"], axis=1, keepdims=1)
+        an_int = b.node("ArgMin", ["xi"], axis=1, keepdims=1)
+        m = b.model(
+            [("xf", [1, 8, 2, 2], TensorProto.FLOAT), ("xi", [1, 8, 2, 2], TensorProto.INT32)],
+            [(am_float, [1, 1, 2, 2], TensorProto.INT64),
+             (an_float, [1, 1, 2, 2], TensorProto.INT64),
+             (am_int, [1, 1, 2, 2], TensorProto.INT64),
+             (an_int, [1, 1, 2, 2], TensorProto.INT64)]
+        )
+        rng = np.random.RandomState(104)
+        xf = rng.randn(1, 8, 2, 2).astype(np.float32)
+        xi = rng.randint(-50, 50, size=(1, 8, 2, 2)).astype(np.int32)
+        want = onnxruntime.InferenceSession(m.SerializeToString(), providers=["CPUExecutionProvider"]).run(
+            None, {"xf": xf, "xi": xi}
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            lower_model(m, tmp)
+            p = Path(tmp)
+            (p / "in_xf.f32").write_bytes(np.ascontiguousarray(xf[0].transpose(1, 2, 0)).tobytes())
+            (p / "in_xi.i32").write_bytes(np.ascontiguousarray(xi[0].transpose(1, 2, 0)).tobytes())
+            subprocess.run(
+                [str(RUNNER), str(p / "g.hxfg"), str(p / "g.bin"), str(p / "in_xf.f32"), str(p / "in_xi.i32"), str(p / "out_")],
+                check=True, capture_output=True,
+            )
+            for i, w in enumerate(want):
+                got = np.fromfile(p / f"out_{i}.f32", dtype=np.int32)
+                np.testing.assert_array_equal(got, w.flatten(), err_msg=f"mismatch in argmax/argmin {i}")
+
+    def test_cast_roundtrips_and_types_matches_onnxruntime(self):
+        b = Builder(seed=105)
+        # float -> int32
+        c_f2i = b.node("Cast", ["x"], to=TensorProto.INT32)
+        # int32 -> float
+        c_i2f = b.node("Cast", [c_f2i], to=TensorProto.FLOAT)
+        # float -> bool
+        c_f2b = b.node("Cast", ["x"], to=TensorProto.BOOL)
+        # bool -> float
+        c_b2f = b.node("Cast", [c_f2b], to=TensorProto.FLOAT)
+        # int32 -> bool
+        c_i2b = b.node("Cast", [c_f2i], to=TensorProto.BOOL)
+        # bool -> int32
+        c_b2i = b.node("Cast", [c_i2b], to=TensorProto.INT32)
+
+        m = b.model(
+            [("x", [1, 4, 1, 2], TensorProto.FLOAT)],
+            [(c_f2i, [1, 4, 1, 2], TensorProto.INT32),
+             (c_i2f, [1, 4, 1, 2], TensorProto.FLOAT),
+             (c_f2b, [1, 4, 1, 2], TensorProto.BOOL),
+             (c_b2f, [1, 4, 1, 2], TensorProto.FLOAT),
+             (c_i2b, [1, 4, 1, 2], TensorProto.BOOL),
+             (c_b2i, [1, 4, 1, 2], TensorProto.INT32)]
+        )
+        x = np.array([[[[3.2, -4.7]], [[0.0, 1.0]], [[2.1, 0.0]], [[-0.5, 9.9]]]], dtype=np.float32)
+        want = onnxruntime.InferenceSession(m.SerializeToString(), providers=["CPUExecutionProvider"]).run(
+            None, {"x": x}
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            lower_model(m, tmp)
+            got = list(run_reference(tmp, x))
+            for i, (g, w) in enumerate(zip(got, want)):
+                np.testing.assert_allclose(g, w[0].transpose(1, 2, 0).reshape(-1), atol=1e-4, err_msg=f"mismatch in cast op {i}")
+
+    def test_int64_narrowing_and_range_check(self):
+        b = Builder(seed=106)
+        # Normal int64 constant narrows to int32
+        c_ok = b.const(np.array([1, 2, 3], dtype=np.int64))
+        self.assertIsNotNone(c_ok)
+        # Out of range int64 constant raises ValueError
+        b2 = Builder()
+        b2.const(np.array([2**31 + 5], dtype=np.int64))
+        m = b2.model([("x", [1, 1, 1, 1])], [(b2.node("Add", ["x", b2.const(np.array([2**31 + 5], dtype=np.int64))]), [1, 1, 1, 1])], check=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "out of int32 range"):
+                lower_model(m, tmp)
 
 
 if __name__ == "__main__":

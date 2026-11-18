@@ -146,6 +146,12 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
         t[2].c = kh & 4u ? 1 : ci;
         t[2].stride = (t[2].c + 31) & ~31u;
     }
+    else if (kind == HX_ARGMAX || kind == HX_ARGMIN) {
+        o.p[0] = step;
+        o.p[1] = axis;
+        t[2].c = 1;
+        t[2].stride = 32;
+    }
     else if (kind == HX_ACT) {
         o.p[0] = axis;
         if (axis == HX_ACT_LEAKY)
@@ -592,6 +598,10 @@ int main(void) {
     for (uint32_t mask = 1; mask < 8; mask++)
         for (uint32_t red = 0; red < HX_RED_COUNT; red++)
             errors += check(base, HX_REDUCE, 7, 9, 40, 40, mask, 1, red);
+    for (uint32_t last = 0; last <= 1; last++) {
+        errors += check(base, HX_ARGMAX, 7, 9, 40, 1, 1, last, 0);
+        errors += check(base, HX_ARGMIN, 7, 9, 40, 1, 1, last, 0);
+    }
     /* Softmax over channels per pixel: odd width (pad column), one and two channel blocks. */
     errors += check(base, HX_SOFTMAX, 7, 9, 40, 40, 1, 1, 0);
     errors += check(base, HX_SOFTMAX, 7, 9, 3, 3, 1, 1, 0);
