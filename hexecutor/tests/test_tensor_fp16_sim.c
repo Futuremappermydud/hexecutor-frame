@@ -209,10 +209,17 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
             for (uint32_t c = 0; c < t[n].stride; c++)
                 v[i * t[n].stride + c] =
                     c < t[n].c ? ((int)((i * 7 + c * 3 + n) % 23) - 11) * .25f : 0;
-        /* HX_ACT_SQRT takes |x|: signed inputs are NaN, which check() cannot compare. */
-        if (kind == HX_ACT && axis == HX_ACT_SQRT)
+        /* HX_ACT_SQRT and HX_ACT_LOG take positive inputs; HX_ACT_RECIPROCAL avoids zero. */
+        if (kind == HX_ACT && (axis == HX_ACT_SQRT || axis == HX_ACT_LOG))
             for (uint32_t j = 0; j < t[n].h * t[n].w * t[n].stride; j++)
-                v[j] = fabsf(v[j]);
+                v[j] = fabsf(v[j]) + 0.25f;
+        if (kind == HX_ACT && axis == HX_ACT_RECIPROCAL)
+            for (uint32_t j = 0; j < t[n].h * t[n].w * t[n].stride; j++)
+                if (v[j] == 0.0f)
+                    v[j] = 0.25f;
+        if (kind == HX_BINARY && axis == HX_BIN_POW)
+            for (uint32_t j = 0; j < t[n].h * t[n].w * t[n].stride; j++)
+                v[j] = fabsf(v[j]) * 0.25f + 0.5f;
         hx_fp16_import(&g, n, v, NULL);
         hx_fp16_export(&g, n, actual, NULL);
         if (memcmp(actual, v, t[n].h * t[n].w * t[n].stride * 4)) {
@@ -248,7 +255,8 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
     for (uint32_t i = 0; i < t[2].h * t[2].w; i++)
         for (uint32_t c = 0; c < t[2].c; c++) {
             float a = actual[i * stride + c], b = expected[i * stride + c];
-            if (fabsf(a - b) > .004f) {
+            float tol = (kind == HX_BINARY && axis == HX_BIN_POW) ? .02f : .004f;
+            if (fabsf(a - b) > tol) {
                 printf("FAIL blocked kind%u shape%ux%ux%u to%u k%u s%u axis%u pixel%u c%u got%f "
                        "expected%f\n",
                        (unsigned)kind, (unsigned)h, (unsigned)w, (unsigned)ci, (unsigned)co,

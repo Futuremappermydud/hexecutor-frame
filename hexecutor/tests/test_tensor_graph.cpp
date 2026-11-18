@@ -858,6 +858,115 @@ int main() {
         near(r[2], 42.5f);
         near(r[3], 839);
     }
+    // New common general-model ops: Gather, Where, ArgMax, TopK, Tile, Cast, Binary full-size const, Resize.
+    {  // Gather with constant table: 4 vocab, 2 embedding dim (each row padded to 32 floats = 128 bytes)
+        auto gop = op(HX_GATHER);
+        gop.p[0] = 1; // mode 1: constant table
+        gop.p[1] = 0; // constant offset 0
+        gop.p[2] = 4; // vocab_size 4
+        gop.p[3] = 1; // index_dtype float32
+        Fixture fg({shape(1, 4, 1), shape(1, 4, 2)}, gop, {0});
+        fg.constant(0, {10, 11});
+        fg.constant(128, {20, 21});
+        fg.constant(256, {30, 31});
+        fg.constant(384, {40, 41});
+        fg.input(0, {2, 0, 3, 1});
+        r = fg.run();
+        check(r == std::vector<float>({30, 31, 10, 11, 40, 41, 20, 21}));
+    }
+    {  // Where: condition selects between X and Y tensors
+        auto wop = op(HX_WHERE, 3, 1);
+        wop.z = 2;
+        wop.p[0] = 0; // tensor X
+        wop.p[2] = 0; // tensor Y
+        Fixture fw({shape(1, 4, 1), shape(1, 4, 1), shape(1, 4, 1), shape(1, 4, 1)}, wop, {0, 1, 2});
+        fw.input(0, {1, 0, 1, 0});
+        fw.input(1, {10, 20, 30, 40});
+        fw.input(2, {-1, -2, -3, -4});
+        r = fw.run();
+        check(r == std::vector<float>({10, -2, 30, -4}));
+    }
+    {  // ArgMax: channel argmax
+        auto aop = op(HX_ARGMAX);
+        aop.p[0] = 0;
+        aop.p[1] = 0; // output float32
+        Fixture fa({shape(1, 2, 4), shape(1, 2, 1)}, aop, {0});
+        fa.input(0, {1, 5, 2, 0, 7, 3, 4, 2});
+        r = fa.run();
+        check(r == std::vector<float>({1, 0}));
+    }
+    {  // TopK: top 2 elements along channel axis
+        auto topk = op(HX_TOPK);
+        topk.p[0] = 2; // K = 2
+        topk.p[1] = 1; // largest
+        topk.p[2] = 1; // sorted
+        topk.p[3] = 0; // index_dtype float
+        Fixture ft({shape(1, 1, 5), shape(1, 1, 2)}, topk, {0});
+        ft.input(0, {3, 10, 1, 8, 5});
+        r = ft.run();
+        check(r == std::vector<float>({10, 8}));
+    }
+    {  // Tile: replicate input across H and W
+        auto top = op(HX_TILE);
+        Fixture fti({shape(1, 2, 2), shape(2, 4, 2)}, top, {0});
+        fti.input(0, {1, 2, 3, 4});
+        r = fti.run();
+        check(r.size() == 16);
+        check(r == std::vector<float>({1, 2, 3, 4, 1, 2, 3, 4,
+                                       1, 2, 3, 4, 1, 2, 3, 4}));
+    }
+    {  // Cast: float <-> int roundtrip
+        auto cop = op(HX_CAST);
+        cop.p[0] = 0; // float to int32 bit pattern
+        Fixture fc({shape(1, 2, 1), shape(1, 2, 1)}, cop, {0});
+        fc.input(0, {3.0f, -5.0f});
+        r = fc.run();
+        int32_t v0, v1;
+        std::memcpy(&v0, &r[0], 4);
+        std::memcpy(&v1, &r[1], 4);
+        check(v0 == 3 && v1 == -5);
+    }
+    {  // Binary mode 2: full-size constant tensor add and runtime div
+        auto bop = op(HX_BINARY);
+        bop.p[0] = HX_BIN_ADD;
+        bop.p[1] = 2; // full-size constant
+        bop.p[2] = 0; // constant offset 0
+        Fixture fb2({shape(1, 2, 2), shape(1, 2, 2)}, bop, {0});
+        // Row 0 at 0: {10, 20}, padded to stride 32 = 128 bytes
+        fb2.constant(0, {10, 20});
+        // Row 1 at 128: {30, 40}
+        fb2.constant(128, {30, 40});
+        fb2.input(0, {1, 2, 3, 4});
+        r = fb2.run();
+        check(r == std::vector<float>({11, 22, 33, 44}));
+
+        // Runtime div
+        auto dop = op(HX_BINARY, 2, 1);
+        dop.p[0] = HX_BIN_DIV;
+        Fixture fd({shape(1, 2, 2), shape(1, 2, 2), shape(1, 2, 2)}, dop, {0, 1});
+        fd.input(0, {10, 20, 30, 40});
+        fd.input(1, {2, 4, 5, 8});
+        r = fd.run();
+        check(r == std::vector<float>({5, 5, 6, 5}));
+    }
+    {  // Resize: nearest round_prefer_floor and bicubic
+        auto rn = op(HX_RESIZE);
+        rn.p[2] = 1; // nearest
+        rn.p[3] = 0; // asymmetric
+        rn.p[4] = 1; // round_prefer_floor
+        Fixture frn({shape(1, 2, 1), shape(1, 4, 1)}, rn, {0});
+        frn.input(0, {10, 20});
+        r = frn.run();
+        check(r == std::vector<float>({10, 10, 20, 20}));
+
+        auto rc = op(HX_RESIZE);
+        rc.p[5] = 1; // bicubic
+        rc.p[3] = 0; // asymmetric
+        Fixture frc({shape(1, 2, 1), shape(1, 4, 1)}, rc, {0});
+        frc.input(0, {10, 20});
+        r = frc.run();
+        check(r.size() == 4);
+    }
     // z is only a dilation on conv/depthwise, and must encode 1..8 per axis with one above 1.
     {
         auto pool = op(HX_MAXPOOL);

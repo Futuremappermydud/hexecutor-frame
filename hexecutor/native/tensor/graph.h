@@ -41,7 +41,14 @@ enum {
     HX_ZEROINSERT, /* reserved: zero-insert upsample, p[0]=sh p[1]=sw (ConvTranspose) */
     HX_TRANSPOSE,  /* permute (h,w,c) axes, p[0..2] = source axis of each output axis */
     HX_REDUCE,     /* unary reduction over a subset of (h,w,c); see HX_RED_* below */
-    HX_NORM        /* normalisation; see HX_NORM_* below (p[0..4]) */
+    HX_NORM,       /* normalisation; see HX_NORM_* below (p[0..4]) */
+    /* Kinds 21-31 reserved for coordinator merges (kinds 22-26 uncommitted LLM ops). */
+    HX_GATHER = 32, /* token/embedding table lookup; x indices, y table or p[1] const, out */
+    HX_WHERE = 33,  /* select x ? y : z; x condition, y/z tensors or scalars */
+    HX_ARGMAX = 34, /* argmax over channel axis; p[0] select_last, p[1] dtype */
+    HX_TOPK = 35,   /* top-k over channel axis; p[0] k, p[1] largest, p[2] sorted; z indices */
+    HX_TILE = 36,   /* expand/tile repeating input over output */
+    HX_CAST = 37    /* element type conversion (float32, int32, bool) */
 };
 /* HX_ACT p[0] functions. */
 enum {
@@ -58,10 +65,31 @@ enum {
     HX_ACT_ABS,
     HX_ACT_NEG,
     HX_ACT_ERF, /* standalone erf(x), same polynomial as GELU */
+    HX_ACT_LOG,
+    HX_ACT_RECIPROCAL,
+    HX_ACT_FLOOR,
+    HX_ACT_CEIL,
+    HX_ACT_SIN,
+    HX_ACT_COS,
+    HX_ACT_NOT,
+    HX_ACT_SIGN,
+    HX_ACT_ROUND,
     HX_ACT_COUNT
 };
 /* HX_BINARY p[0] operations. */
-enum { HX_BIN_ADD = 0, HX_BIN_SUB, HX_BIN_MUL, HX_BIN_COUNT };
+enum {
+    HX_BIN_ADD = 0,
+    HX_BIN_SUB,
+    HX_BIN_MUL,
+    HX_BIN_DIV,
+    HX_BIN_MIN,
+    HX_BIN_MAX,
+    HX_BIN_POW,
+    HX_BIN_EQUAL,
+    HX_BIN_GREATER,
+    HX_BIN_LESS,
+    HX_BIN_COUNT
+};
 /* HX_NORM p[0] modes: CHANNEL normalises each pixel over its real channels (p[1] = 0); GROUP
  * splits the channels into p[1] equal groups, each normalised over all pixels. */
 enum { HX_NORM_CHANNEL = 0, HX_NORM_GROUP, HX_NORM_COUNT };
@@ -94,14 +122,27 @@ typedef struct {
  * Pool p: kh,kw,sh,sw,pad_top,pad_left. Pad p: top,left,channels_before.
  * Reshape p[0]: 0 HWC-order copy (equal elements); 1 NCHW flatten, source HxWxC to 1x1xN;
  * 2 NCHW unflatten, source 1x1xN to HxWxC (n = c*H*W + h*W + w). Transpose p[0..2]: source axis
- * of each output axis. Resize p: align_corners,half_pixel_centers; p[2] 1 is nearest (source index floor(out*in/out)
- * per axis, clamped; then p[0] and p[1] are zero). Concat p[0]: axis in HWC (0..2).
+ * of each output axis. Resize p: p[0] align_corners, p[1] half_pixel_centers; p[2] nearest (0 bilinear,
+ * 1 nearest); p[3] coordinate_transformation_mode (0 asymmetric, 1 align_corners, 2 half_pixel,
+ * 3 pytorch_half_pixel); p[4] nearest_mode (0 floor, 1 round_prefer_floor, 2 round_prefer_ceil, 3 ceil);
+ * p[5] cubic (1 bicubic Catmull-Rom). Concat p[0]: axis in HWC (0..2).
  * Act (kind HX_ACT): p[0] function, p[1]/p[2] float32 bit patterns alpha/beta (leaky uses alpha,
  * hardsigmoid alpha and beta; others zero). Same shape in and out.
- * Binary (HX_BINARY): p[0] operation, p[1] mode (0: y is a tensor, 1: y is NONE and p[2] is a
- * constant per-channel float vector of stride floats), p[3] reversed (computes y op x; with the
- * constant, c op x). Each of y's h, w, c is the output's or 1 (NumPy broadcast); x and the output
- * have the same shape. Avg pool p: pool fields as max pool, p[6] count_include_pad.
+ * Binary (HX_BINARY): p[0] operation, p[1] mode (0: y is a tensor; 1: y is NONE and p[2] is a
+ * constant per-channel float vector of stride floats; 2: y is NONE and p[2] is a full-size constant
+ * tensor of shape [b->h, b->w, b->stride]), p[3] reversed (computes y op x; with the constant, c op x).
+ * Each of y's h, w, c is the output's or 1 (NumPy broadcast); x and the output have the same shape.
+ * Avg pool p: pool fields as max pool, p[6] count_include_pad.
+ * Gather (HX_GATHER, 32): x indices, y table tensor (mode 0) or NONE with constant table offset in p[1]
+ * (mode 1), out. p[0] mode, p[1] constant offset, p[2] vocab_size, p[3] index_dtype (0 int32, 1 float32).
+ * Where (HX_WHERE, 33): x condition, y X, z Y, out. p[0] X mode (0 tensor y, 1 scalar float bits in p[1],
+ * 2 per-channel const in p[1], 3 full-size const in p[1]), p[2] Y mode (0 tensor z, 1 scalar bits in p[3],
+ * 2 per-channel const in p[3], 3 full-size const in p[3]).
+ * ArgMax (HX_ARGMAX, 34): x in, out [h, w, 1]. p[0] select_last, p[1] output_dtype (0 float32, 1 int32).
+ * TopK (HX_TOPK, 35): x in, out values [h, w, K], z optional indices [h, w, K] or NONE. p[0] K,
+ * p[1] largest (1 largest, 0 smallest), p[2] sorted (1 sorted, 0 unsorted), p[3] index_dtype (0 float, 1 int).
+ * Tile (HX_TILE, 36): x in, out. Tiles/expands x into out where out's h, w, c are integer multiples of x's.
+ * Cast (HX_CAST, 37): x in, out. p[0] mode: 0 float->int32, 1 int32->float, 2 bool/int->float, 3 float->bool.
  * z is reserved; all unused fields must be zero (y/z use HXFG_NONE). Conv/depthwise only: z is
  * HXFG_NONE (dilation 1,1) or (dh << 8) | dw with 1 <= dh, dw <= 8 and at least one above 1; the
  * effective kernel extent is (k - 1) * d + 1 and tap (ky, kx) reads input row oy * sh + ky * dh -
