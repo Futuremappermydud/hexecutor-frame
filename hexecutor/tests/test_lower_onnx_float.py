@@ -785,6 +785,37 @@ class FloatOnnxTests(unittest.TestCase):
         self.assertEqual(ops.count(hx.NORM), 1, ops)
 
     @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_instance_norm_rank3_matches_onnxruntime(self):
+        c, length = 8, 16
+        b = Builder(seed=46)
+        scale = b.const(b.rng.uniform(0.5, 1.5, c))
+        bias = b.const(b.rand(c, scale=0.2))
+        n = b.node("InstanceNormalization", ["x", scale, bias], epsilon=1e-5)
+        m = b.model([("x", [1, c, length])], [(n, [1, c, length])], opset=17)
+        x = np.random.default_rng(11).normal(0, 1, (1, c, length)).astype(np.float32)
+        want = onnxruntime.InferenceSession(m.SerializeToString(), providers=["CPUExecutionProvider"]).run(None, {"x": x})
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = lower_model(m, tmp)
+            data = x[0].transpose(1, 0)
+            (Path(tmp) / "in.f32").write_bytes(np.ascontiguousarray(data, np.float32).tobytes())
+            subprocess.run([str(RUNNER), str(Path(tmp) / "g.hxfg"), str(Path(tmp) / "g.bin"),
+                            str(Path(tmp) / "in.f32"), str(Path(tmp) / "out_")], check=True)
+            got = np.fromfile(Path(tmp) / "out_0.f32", np.float32).reshape(length, c)
+            got_ncl = got.transpose(1, 0)[None]
+            np.testing.assert_allclose(got_ncl, want[0], rtol=1e-4, atol=1e-4)
+            ops = kinds(tmp)
+            self.assertEqual(ops.count(hx.NORM), 1, ops)
+
+    def test_instance_norm_optional_scale_bias_lowering(self):
+        b = Builder(seed=23)
+        n = b.node("InstanceNormalization", [b.conv("x", 3, 8)], epsilon=1e-5)
+        m = b.model([("x", [1, 3, 8, 8])], [(n, [1, 8, 8, 8])], check=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            lower_model(m, tmp)
+            ops = kinds(tmp)
+            self.assertIn(hx.NORM, ops)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
     def test_group_norm_matches_onnxruntime_for_both_opsets(self):
         # Opset 18 gives one scale and bias per group; opset 21 gives one per channel.
         for opset, size in ((18, 2), (21, 8)):
@@ -1109,6 +1140,55 @@ def model_rms_normalization():
     return b.model([("x", [1, length, dim])], [(out, [1, length, dim])], check=False)
 
 
+def model_simplified_layer_normalization():
+    length, dim = 4, 8
+    b = Builder(seed=41)
+    tok = linear_token(b, "x", dim, dim)
+    gamma = b.const(1.0 + b.rand(dim, scale=0.1))
+    out = b.node("SimplifiedLayerNormalization", [tok, gamma], epsilon=1e-5)
+    return b.model([("x", [1, length, dim])], [(out, [1, length, dim])], check=False), length, dim
+
+
+def model_decomposed_rmsnorm(with_weight=True):
+    length, dim = 4, 8
+    b = Builder(seed=44)
+    tok = linear_token(b, "x", dim, dim)
+    sq = b.node("Pow", [tok, b.const(np.array(2.0, np.float32))])
+    mean = b.node("ReduceMean", [sq], axes=[-1], keepdims=1)
+    var = b.node("Add", [mean, b.const(np.array(1e-5, np.float32))])
+    rstd = b.node("Sqrt", [var])
+    normed = b.node("Div", [tok, rstd])
+    if with_weight:
+        gamma = b.const(1.0 + b.rand(dim, scale=0.1))
+        out = b.node("Mul", [normed, gamma])
+    else:
+        out = normed
+    return b.model([("x", [1, length, dim])], [(out, [1, length, dim])], opset=17), length, dim
+
+
+def model_token_layer_norm():
+    length, dim = 4, 8
+    b = Builder(seed=45)
+    tok = linear_token(b, "x", dim, dim)
+    gamma = b.const(1.0 + b.rand(dim, scale=0.1))
+    beta = b.const(b.rand(dim, scale=0.1))
+    out = b.node("LayerNormalization", [tok, gamma, beta], axis=-1, epsilon=1e-5)
+    return b.model([("x", [1, length, dim])], [(out, [1, length, dim])], opset=17), length, dim
+
+
+def model_instance_norm_rank3(with_affine=True):
+    c, length = 8, 16
+    b = Builder(seed=46)
+    if with_affine:
+        scale = b.const(b.rng.uniform(0.5, 1.5, c))
+        bias = b.const(b.rand(c, scale=0.2))
+        inputs = ["x", scale, bias]
+    else:
+        inputs = ["x"]
+    n = b.node("InstanceNormalization", inputs, epsilon=1e-5)
+    return b.model([("x", [1, c, length])], [(n, [1, c, length])], opset=17), c, length
+
+
 
 def model_token_slice():
     length, dim = 4, 8
@@ -1341,6 +1421,26 @@ class TransformerLoweringTests(unittest.TestCase):
             lower_model(m, tmp)
             ops = [op[0] for op in ops_of(tmp)]
         self.assertIn(hx.RMSNORM, ops)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_simplified_layer_normalization_matches_onnxruntime(self):
+        m, length, dim = model_simplified_layer_normalization()
+        _, ops = self.numeric(m, (1, length, dim))
+        self.assertIn(hx.RMSNORM, ops)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_decomposed_rmsnorm_matches_onnxruntime(self):
+        for with_weight in (True, False):
+            with self.subTest(with_weight=with_weight):
+                m, length, dim = model_decomposed_rmsnorm(with_weight=with_weight)
+                _, ops = self.numeric(m, (1, length, dim))
+                self.assertIn(hx.RMSNORM, ops)
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_token_layer_norm_matches_onnxruntime(self):
+        m, length, dim = model_token_layer_norm()
+        _, ops = self.numeric(m, (1, length, dim))
+        self.assertIn(hx.NORM, ops)
 
     def test_token_slice_matches_onnxruntime(self):
         m, length, dim = model_token_slice()

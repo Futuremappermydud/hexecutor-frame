@@ -541,6 +541,53 @@ class ExportTests(unittest.TestCase):
         model = NormNet("layer_channels").eval()
         self._norm_model_matches_torch(model, torch.randn(1, 16, 1, 1))
 
+    @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
+    def test_instance_norm_matches_torch_on_cpu_reference(self):
+        for kind in ("instance_affine", "instance_noaffine"):
+            with self.subTest(kind=kind):
+                model = NormNet(kind).eval()
+                self._norm_model_matches_torch(model, torch.randn(1, 3, 8, 8))
+
+    @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
+    def test_rms_norm_matches_torch_on_cpu_reference(self):
+        for with_weight in (True, False):
+            with self.subTest(with_weight=with_weight):
+                class RMSNormNet(nn.Module):
+                    def __init__(self, with_w):
+                        super().__init__()
+                        self.norm1 = nn.RMSNorm(16, elementwise_affine=with_w)
+                        self.norm2 = nn.RMSNorm(16, elementwise_affine=with_w)
+                    def forward(self, x):
+                        return self.norm2(self.norm1(x))
+                model = RMSNormNet(with_weight).eval()
+                x = torch.randn(1, 8, 16)
+                pte = export_program(model, (x,))
+                delegates = delegate_payloads(pte)
+                self.assertTrue(len(delegates) > 0)
+                parsed = blob.unpack(delegates[0][1])
+                got = run_reference(parsed, x)
+                want = model(x).detach().numpy().flatten()
+                np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
+
+    @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
+    def test_token_layer_norm_matches_torch_on_cpu_reference(self):
+        class TokenLNNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.norm1 = nn.LayerNorm(16)
+                self.norm2 = nn.LayerNorm(16)
+            def forward(self, x):
+                return self.norm2(self.norm1(x))
+        model = TokenLNNet().eval()
+        x = torch.randn(1, 8, 16)
+        pte = export_program(model, (x,))
+        delegates = delegate_payloads(pte)
+        self.assertTrue(len(delegates) > 0)
+        parsed = blob.unpack(delegates[0][1])
+        got = run_reference(parsed, x)
+        want = model(x).detach().numpy().flatten()
+        np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
+
     def test_layer_norm_over_a_spatial_axis_stays_on_cpu(self):
         # Normalising over W alone is not one of the HX_NORM modes; the convolution is delegated.
         model = NormNet("layer_w").eval()
@@ -614,6 +661,10 @@ class NormNet(nn.Module):
             self.norm = nn.GroupNorm(groups, 8)
         elif kind == "layer_w":
             self.norm = nn.LayerNorm([8])
+        elif kind == "instance_affine":
+            self.norm = nn.InstanceNorm2d(4, affine=True)
+        elif kind == "instance_noaffine":
+            self.norm = nn.InstanceNorm2d(4, affine=False)
         else:  # a [1, 16] tensor normalised over its channels: flatten, then LayerNorm
             self.linear = nn.Linear(16, 12)
             self.norm = nn.LayerNorm(12)

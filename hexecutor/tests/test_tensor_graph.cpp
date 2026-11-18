@@ -56,6 +56,9 @@ struct Fixture {
     void constant_i32(size_t off, std::initializer_list<int32_t> v) {
         std::memcpy(constants.data() + off, v.begin(), v.size() * 4);
     }
+    void constant(size_t off, const std::vector<float> &v) {
+        std::memcpy(constants.data() + off, v.data(), v.size() * 4);
+    }
     void input(size_t i, const std::vector<float> &v) {
         check(open() == 0);
         check(v.size() == hx_tensor_elements(&tensor(i)));
@@ -1414,6 +1417,76 @@ int main() {
         float inv = (float)(1.0 / std::sqrt(ssq / double(D) + double(eps)));
         for (uint32_t i = 0; i < D; i++)
             check(std::abs(out[i] - (in[i] * inv * 1.5f)) < 1e-5f);
+    }
+    // RMSNorm without weight (p[1] = HXFG_NONE) and rank-3 token layout (H=L, W=1, C=D)
+    {
+        constexpr uint32_t L = 4, D = 32;
+        auto rms = op(HX_RMSNORM);
+        rms.p[0] = 0;         // default eps 1e-5
+        rms.p[1] = HXFG_NONE; // no weight
+        rms.p[2] = HXFG_NONE; // no beta
+        Fixture f({shape(L, 1, D), shape(L, 1, D)}, rms, {0});
+        std::vector<float> in(L * D);
+        for (uint32_t i = 0; i < L * D; i++) in[i] = (float)(i + 1) * 0.05f;
+        f.input(0, in);
+        auto out = f.run();
+        check(out.size() == L * D);
+        float eps = 1e-5f;
+        for (uint32_t t = 0; t < L; t++) {
+            double ssq = 0;
+            for (uint32_t i = 0; i < D; i++) {
+                float v = in[t * D + i];
+                ssq += double(v) * double(v);
+            }
+            float inv = (float)(1.0 / std::sqrt(ssq / double(D) + double(eps)));
+            for (uint32_t i = 0; i < D; i++) {
+                float expected = in[t * D + i] * inv;
+                check(std::abs(out[t * D + i] - expected) < 1e-5f);
+            }
+        }
+    }
+    // LayerNorm over last axis for rank-3 tokens (H=L, W=1, C=D)
+    {
+        constexpr uint32_t L = 4, D = 32;
+        auto ln = op(HX_NORM);
+        ln.p[0] = HX_NORM_CHANNEL;
+        ln.p[1] = 0;
+        float eps = 1e-5f;
+        uint32_t eps_u;
+        std::memcpy(&eps_u, &eps, 4);
+        ln.p[2] = eps_u;
+        ln.p[3] = 0;       // gamma offset
+        ln.p[4] = D * 4;   // beta offset
+        Fixture f({shape(L, 1, D), shape(L, 1, D)}, ln, {0});
+        std::vector<float> gamma(D, 1.2f), beta(D, 0.3f);
+        std::vector<float> consts(2 * D);
+        for (uint32_t i = 0; i < D; i++) {
+            consts[i] = gamma[i];
+            consts[D + i] = beta[i];
+        }
+        f.constant(0, consts);
+        std::vector<float> in(L * D);
+        for (uint32_t i = 0; i < L * D; i++) in[i] = (float)(i + 1) * 0.05f;
+        f.input(0, in);
+        auto out = f.run();
+        check(out.size() == L * D);
+        for (uint32_t t = 0; t < L; t++) {
+            double sum = 0, sum_sq = 0;
+            for (uint32_t i = 0; i < D; i++) {
+                sum += in[t * D + i];
+            }
+            double mean = sum / double(D);
+            for (uint32_t i = 0; i < D; i++) {
+                double diff = in[t * D + i] - mean;
+                sum_sq += diff * diff;
+            }
+            double var = sum_sq / double(D);
+            float inv = (float)(1.0 / std::sqrt(var + double(eps)));
+            for (uint32_t i = 0; i < D; i++) {
+                float expected = (float)((in[t * D + i] - mean) * inv * gamma[i] + beta[i]);
+                check(std::abs(out[t * D + i] - expected) < 1e-5f);
+            }
+        }
     }
     // RoPE (HX_ROPE, 23)
     {

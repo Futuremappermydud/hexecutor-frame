@@ -90,7 +90,7 @@ REDUCES = frozenset({"ReduceMean", "ReduceSum", "ReduceMax", "ReduceMin"})
 # Operators that pass token status from one of their inputs to their outputs.
 TOKEN_LINKED = ELEMENTWISE | REDUCES | frozenset({
     "Concat", "Gather", "GatherElements", "GatherND", "ScatterND", "Reshape", "Squeeze", "Unsqueeze", "Flatten", "LayerNormalization",
-    "RMSNormalization", "RMSNorm", "Softmax", "Split", "Slice",
+    "RMSNormalization", "RMSNorm", "SimplifiedLayerNormalization", "Softmax", "Split", "Slice",
 })
 TOKEN_OPS = TOKEN_LINKED | frozenset({"MatMul", "Transpose", "Einsum", "ScaledDotProductAttention", "sdpa"})
 HEAD_OPS = frozenset({"MatMul", "Mul", "Div", "Softmax", "Transpose", "Identity", "Einsum", "ScaledDotProductAttention", "sdpa"})
@@ -326,7 +326,7 @@ class Lowerer:
                 if s0 is None:
                     continue
                 attrs = self.attrs(n)
-                if op in ("RMSNormalization", "RMSNorm", "LayerNormalization", "Relu", "Sigmoid",
+                if op in ("RMSNormalization", "RMSNorm", "SimplifiedLayerNormalization", "LayerNormalization", "InstanceNormalization", "Relu", "Sigmoid",
                           "Tanh", "Gelu", "Identity", "Dropout", "Cast", "Softmax"):
                     self.dims[out] = list(s0)
                     changed = True
@@ -738,7 +738,7 @@ class Lowerer:
                 if not names:
                     continue
                 op = node.op_type
-                last_axis = (op in ("LayerNormalization", "RMSNormalization", "RMSNorm", "Softmax", "Split") and r3(node.input[0])
+                last_axis = (op in ("LayerNormalization", "RMSNormalization", "RMSNorm", "SimplifiedLayerNormalization", "Softmax", "Split") and r3(node.input[0])
                              and int(self.attrs(node).get("axis", -1)) % 3 == 2)
                 seed = op == "MatMul" or last_axis or (op in REDUCES and r3(node.input[0])) or (op == "Gather" and r3(node.output[0]))
                 link = op in TOKEN_LINKED and any(n in self.token for n in names)
@@ -747,6 +747,11 @@ class Lowerer:
                         if n not in self.token:
                             self.token.add(n)
                             changed = True
+        for m in self._find_rmsnorm_decomposed()["fused"].values():
+            if r3(m["x"]):
+                self.token.add(self.canon(m["x"]))
+            if r3(m["out"]):
+                self.token.add(self.canon(m["out"]))
 
     def sole_user(self, name):
         return self.users.get(name, 0) == 1 and name not in self.outputs
@@ -824,20 +829,189 @@ class Lowerer:
         for name in self.inputs:
             self.tid(name)
         silu = self._find_silu()
+        rmsnorms = self._find_rmsnorm_decomposed()
         for node in self.nodes:
-            if id(node) in silu["skip"]:
+            if id(node) in silu["skip"] or id(node) in rmsnorms["skip"]:
                 continue
             handler = getattr(self, "op_" + node.op_type, None)
-            if handler is None:
+            if handler is None and id(node) not in rmsnorms["fused"]:
                 self.fail(node, "unsupported operator")
             self._check_operands(node)
             if id(node) in silu["mul"]:
                 self._emit_act(node, silu["mul"][id(node)], hx.FN_SILU)
+            elif id(node) in rmsnorms["fused"]:
+                self._emit_rmsnorm_fused(node, rmsnorms["fused"][id(node)])
             else:
                 handler(node)
             self.source_ops.append({"onnx_op": node.op_type, "output": node.output[0]})
         self._finish_layers()
         return self._write
+
+    def _find_rmsnorm_decomposed(self):
+        by_output = {n.output[0]: n for n in self.nodes if n.output}
+        skip = set()
+        fused = {}
+
+        def get_const(name):
+            return self.const(name)
+
+        def is_last_axis_reduce(n, rank):
+            axes = self.attrs(n).get("axes")
+            if axes is None and len(n.input) > 1:
+                axes_c = get_const(n.input[1])
+                if axes_c is not None:
+                    axes = [int(a) for a in axes_c.reshape(-1)]
+            if axes is None:
+                axes = [-1]
+            return any(int(a) % rank == (rank - 1) for a in axes)
+
+        for n in self.nodes:
+            # Form 1: Div(x, Sqrt(Add(ReduceMean(Pow(x, 2)), eps)))
+            if n.op_type == "Div" and len(n.input) == 2:
+                x, denom = n.input[0], n.input[1]
+                sqrt_node = by_output.get(denom)
+                if (sqrt_node is not None and sqrt_node.op_type == "Sqrt"
+                        and self.users.get(denom, 0) == 1 and denom not in self.outputs):
+                    add_node = by_output.get(sqrt_node.input[0])
+                    if (add_node is not None and add_node.op_type == "Add" and len(add_node.input) == 2
+                            and self.users.get(sqrt_node.input[0], 0) == 1 and sqrt_node.input[0] not in self.outputs):
+                        mean_in, eps_in = None, None
+                        for a, b in ((add_node.input[0], add_node.input[1]), (add_node.input[1], add_node.input[0])):
+                            c_val = get_const(b)
+                            if c_val is not None and c_val.size == 1:
+                                mean_in, eps_in = a, float(c_val.reshape(-1)[0])
+                                break
+                        if mean_in is not None:
+                            mean_node = by_output.get(mean_in)
+                            rank = len(self.dims.get(x) or ())
+                            if (mean_node is not None and mean_node.op_type == "ReduceMean"
+                                    and rank in (2, 3) and is_last_axis_reduce(mean_node, rank)
+                                    and self.users.get(mean_in, 0) == 1 and mean_in not in self.outputs):
+                                pow_node = by_output.get(mean_node.input[0])
+                                is_pow2 = False
+                                if (pow_node is not None and self.users.get(mean_node.input[0], 0) == 1
+                                        and mean_node.input[0] not in self.outputs):
+                                    if pow_node.op_type == "Pow" and len(pow_node.input) == 2:
+                                        p_in, exp_in = pow_node.input[0], get_const(pow_node.input[1])
+                                        if p_in == x and exp_in is not None and np.allclose(exp_in, 2.0):
+                                            is_pow2 = True
+                                    elif pow_node.op_type == "Mul" and len(pow_node.input) == 2:
+                                        if pow_node.input[0] == x and pow_node.input[1] == x:
+                                            is_pow2 = True
+                                if is_pow2:
+                                    div_out = n.output[0]
+                                    weight = None
+                                    final_out = div_out
+                                    final_node = n
+                                    if self.users.get(div_out, 0) == 1 and div_out not in self.outputs:
+                                        consumer = [user_node for user_node in self.nodes if div_out in user_node.input]
+                                        if len(consumer) == 1 and consumer[0].op_type == "Mul" and len(consumer[0].input) == 2:
+                                            mul_node = consumer[0]
+                                            w_name = mul_node.input[1] if mul_node.input[0] == div_out else mul_node.input[0]
+                                            w_val = get_const(w_name)
+                                            if w_val is not None:
+                                                weight = w_val
+                                                final_out = mul_node.output[0]
+                                                final_node = mul_node
+                                                skip.add(id(n))
+                                    skip.add(id(pow_node))
+                                    skip.add(id(mean_node))
+                                    skip.add(id(add_node))
+                                    skip.add(id(sqrt_node))
+                                    fused[id(final_node)] = {
+                                        "x": x,
+                                        "out": final_out,
+                                        "eps": eps_in,
+                                        "weight": weight,
+                                        "node": final_node,
+                                    }
+
+            # Form 2: Mul(x, Rsqrt(Add(ReduceMean(Pow(x, 2)), eps)))
+            if n.op_type == "Mul" and len(n.input) == 2 and id(n) not in fused and id(n) not in skip:
+                for x_cand, rsqrt_in in ((n.input[0], n.input[1]), (n.input[1], n.input[0])):
+                    rsqrt_node = by_output.get(rsqrt_in)
+                    if (rsqrt_node is not None and rsqrt_node.op_type in ("Rsqrt",)
+                            and self.users.get(rsqrt_in, 0) == 1 and rsqrt_in not in self.outputs):
+                        add_node = by_output.get(rsqrt_node.input[0])
+                        if (add_node is not None and add_node.op_type == "Add" and len(add_node.input) == 2
+                                and self.users.get(rsqrt_node.input[0], 0) == 1 and rsqrt_node.input[0] not in self.outputs):
+                            mean_in, eps_in = None, None
+                            for a, b in ((add_node.input[0], add_node.input[1]), (add_node.input[1], add_node.input[0])):
+                                c_val = get_const(b)
+                                if c_val is not None and c_val.size == 1:
+                                    mean_in, eps_in = a, float(c_val.reshape(-1)[0])
+                                    break
+                            if mean_in is not None:
+                                mean_node = by_output.get(mean_in)
+                                rank = len(self.dims.get(x_cand) or ())
+                                if (mean_node is not None and mean_node.op_type == "ReduceMean"
+                                        and rank in (2, 3) and is_last_axis_reduce(mean_node, rank)
+                                        and self.users.get(mean_in, 0) == 1 and mean_in not in self.outputs):
+                                    pow_node = by_output.get(mean_node.input[0])
+                                    is_pow2 = False
+                                    if (pow_node is not None and self.users.get(mean_node.input[0], 0) == 1
+                                            and mean_node.input[0] not in self.outputs):
+                                        if pow_node.op_type == "Pow" and len(pow_node.input) == 2:
+                                            p_in, exp_in = pow_node.input[0], get_const(pow_node.input[1])
+                                            if p_in == x_cand and exp_in is not None and np.allclose(exp_in, 2.0):
+                                                is_pow2 = True
+                                        elif pow_node.op_type == "Mul" and len(pow_node.input) == 2:
+                                            if pow_node.input[0] == x_cand and pow_node.input[1] == x_cand:
+                                                is_pow2 = True
+                                    if is_pow2:
+                                        mul_x_out = n.output[0]
+                                        weight = None
+                                        final_out = mul_x_out
+                                        final_node = n
+                                        if self.users.get(mul_x_out, 0) == 1 and mul_x_out not in self.outputs:
+                                            consumer = [user_node for user_node in self.nodes if mul_x_out in user_node.input]
+                                            if len(consumer) == 1 and consumer[0].op_type == "Mul" and len(consumer[0].input) == 2:
+                                                w_mul = consumer[0]
+                                                w_name = w_mul.input[1] if w_mul.input[0] == mul_x_out else w_mul.input[0]
+                                                w_val = get_const(w_name)
+                                                if w_val is not None:
+                                                    weight = w_val
+                                                    final_out = w_mul.output[0]
+                                                    final_node = w_mul
+                                                    skip.add(id(n))
+                                        skip.add(id(pow_node))
+                                        skip.add(id(mean_node))
+                                        skip.add(id(add_node))
+                                        skip.add(id(rsqrt_node))
+                                        fused[id(final_node)] = {
+                                            "x": x_cand,
+                                            "out": final_out,
+                                            "eps": eps_in,
+                                            "weight": weight,
+                                            "node": final_node,
+                                        }
+                                        break
+        return {"skip": skip, "fused": fused}
+
+    def _emit_rmsnorm_fused(self, node, m):
+        x, out = m["x"], m["out"]
+        if out not in self.dims and x in self.dims:
+            self.dims[out] = list(self.dims[x])
+        dims = self.dims.get(x)
+        if dims is None:
+            self.fail(node, "unknown shape for fused RMSNorm")
+        if len(dims) == 3 and dims[0] == 1:
+            self.token.add(self.canon(x))
+            self.token.add(self.canon(out))
+            c = dims[2]
+        elif len(dims) == 2 and dims[0] == 1:
+            c = dims[1]
+        elif len(dims) == 2:
+            self.token.add(self.canon(x))
+            self.token.add(self.canon(out))
+            c = dims[1]
+        else:
+            c = dims[-1]
+        eps = m["eps"]
+        weight = m["weight"]
+        gamma_off = self.pool.emit(_pad32(self._norm_vector(node, weight, c, "scale"))) if weight is not None else NONE
+        p = [hx.f32_bits(eps), gamma_off, NONE] + [0] * 8
+        self.add(Op(hx.RMSNORM, self.tid(x), NONE, self.tid(out), p, node))
 
     def _find_silu(self):
         by_output = {n.output[0]: n for n in self.nodes}
@@ -1619,20 +1793,18 @@ class Lowerer:
         return value
 
     def op_InstanceNormalization(self, node):
-        """Instance normalisation: per channel over the spatial axes of a [1, C, H, W] input,
+        """Instance normalisation: per channel over the spatial axes of a [1, C, H, W] or [1, C, L] input,
         which is HX_NORM with one group per channel."""
         dims = self.dims.get(node.input[0])
-        if dims is None or len(dims) != 4:
-            self.fail(node, "only batch-one rank-4 float32 inputs are supported")
+        if dims is None or len(dims) not in (3, 4):
+            self.fail(node, "only batch-one rank-3 or rank-4 float32 inputs are supported")
         c = dims[1]
         scale = self._optional_constant(node, 1, "scale")
         bias = self._optional_constant(node, 2, "bias")
-        if scale is None or bias is None:
-            self.fail(node, "scale and bias are required and must be constant")
         eps = float(self.attrs(node).get("epsilon", 1e-5))
-        self._norm(node, node.input[0], node.output[0], hx.NORM_GROUP, c, eps,
-                   self._norm_vector(node, scale, c, "scale"),
-                   self._norm_vector(node, bias, c, "bias"))
+        gamma = np.ones(c, np.float32) if scale is None else self._norm_vector(node, scale, c, "scale")
+        beta = np.zeros(c, np.float32) if bias is None else self._norm_vector(node, bias, c, "bias")
+        self._norm(node, node.input[0], node.output[0], hx.NORM_GROUP, c, eps, gamma, beta)
 
     def op_LayerNormalization(self, node):
         """LayerNorm over the channel axis of a [1, C] tensor (HX_NORM, channel mode), or over
@@ -1654,8 +1826,23 @@ class Lowerer:
             self._norm(node, node.input[0], node.output[0], hx.NORM_CHANNEL, 0, eps, gamma, beta)
             return
         dims = self.dims.get(node.input[0])
-        if dims is None or len(dims) not in (2, 4):
-            self.fail(node, "only batch-one rank-2 or rank-4 float32 inputs are supported")
+        if dims is None or len(dims) not in (2, 3, 4):
+            self.fail(node, "only batch-one rank-2, rank-3 token, or rank-4 float32 inputs are supported")
+        if len(dims) == 3:
+            if dims[0] != 1 or int(self.attrs(node).get("axis", -1)) % 3 != 2:
+                self.fail(node, "token LayerNormalization must normalise the last axis")
+            self.token.add(self.canon(node.input[0]))
+            self.token.add(self.canon(node.output[0]))
+            c = dims[2]
+            eps = float(self.attrs(node).get("epsilon", 1e-5))
+            scale = self._optional_constant(node, 1, "scale")
+            bias = self._optional_constant(node, 2, "bias")
+            gamma = (np.ones(c, np.float32) if scale is None
+                     else self._norm_vector(node, scale, c, "scale"))
+            beta = (np.zeros(c, np.float32) if bias is None
+                    else self._norm_vector(node, bias, c, "bias"))
+            self._norm(node, node.input[0], node.output[0], hx.NORM_CHANNEL, 0, eps, gamma, beta)
+            return
         axis = int(self.attrs(node).get("axis", -1)) % len(dims)
         eps = float(self.attrs(node).get("epsilon", 1e-5))
         scale = self._optional_constant(node, 1, "scale")
@@ -1682,7 +1869,7 @@ class Lowerer:
 
     def op_RMSNormalization(self, node):
         """RMSNorm over the last axis of a token tensor or [1, C] (HX_RMSNORM).
-        Scale (gamma) must be constant. Optional bias (beta) defaults to None."""
+        Scale (gamma) must be constant (or optional None). Optional bias (beta) defaults to None."""
         x = node.input[0]
         out = node.output[0]
         if out not in self.dims and x in self.dims:
@@ -1690,23 +1877,32 @@ class Lowerer:
         dims = self.dims.get(x)
         if dims is None:
             self.fail(node, "unknown shape")
-        c = dims[-1] if self._is_token(x) else (dims[1] if len(dims) == 2 else dims[1])
+        if len(dims) == 3 and dims[0] == 1:
+            self.token.add(self.canon(x))
+            self.token.add(self.canon(out))
+            c = dims[2]
+        elif len(dims) == 2 and dims[0] == 1:
+            c = dims[1]
+        elif len(dims) == 2:
+            self.token.add(self.canon(x))
+            self.token.add(self.canon(out))
+            c = dims[1]
+        else:
+            c = dims[-1]
         eps = float(self.attrs(node).get("epsilon", 1e-5))
-        scale = self.const(node.input[1])
-        if scale is None:
-            self.fail(node, "RMSNormalization scale must be constant")
-        gamma = self._norm_vector(node, scale, c, "scale")
+        scale = self._optional_constant(node, 1, "scale")
+        gamma_off = self.pool.emit(_pad32(self._norm_vector(node, scale, c, "scale"))) if scale is not None else NONE
         beta = None
         if len(node.input) > 2 and node.input[2]:
-            b_val = self.const(node.input[2])
+            b_val = self._optional_constant(node, 2, "bias")
             if b_val is not None:
                 beta = self._norm_vector(node, b_val, c, "bias")
-        gamma_off = self.pool.emit(_pad32(gamma))
         beta_off = self.pool.emit(_pad32(beta)) if beta is not None else NONE
         p = [hx.f32_bits(eps), gamma_off, beta_off] + [0] * 8
         self.add(Op(hx.RMSNORM, self.tid(x), NONE, self.tid(out), p, node))
 
     op_RMSNorm = op_RMSNormalization
+    op_SimplifiedLayerNormalization = op_RMSNormalization
 
     def op_GroupNormalization(self, node):
         """GroupNormalization over a [1, C, H, W] input. Scale and bias have one value per group

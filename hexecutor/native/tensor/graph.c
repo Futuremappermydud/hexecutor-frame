@@ -446,7 +446,7 @@ static int op_valid(const HxGraph *g, const HxOp *o) {
                (c->c == b->c || c->c == 1);
     }
     case HX_RMSNORM:
-        return same(a, b) && constant(g, p[1], b->stride * 4u) &&
+        return same(a, b) && (p[1] == HXFG_NONE || constant(g, p[1], b->stride * 4u)) &&
                (p[2] == HXFG_NONE || constant(g, p[2], b->stride * 4u));
     case HX_ROPE: {
         if (!same(a, b) || !p[0] || (p[0] & 1u) || !p[1] || p[0] * p[1] > a->c)
@@ -1005,8 +1005,9 @@ static void hx_rmsnorm_op(const HxGraph *g, const HxOp *o, const float *x, float
                           uint32_t lo, uint32_t hi) {
     const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
     const uint32_t *p = o->p, c = b->c;
-    const double eps = (double)hx_float(p[0]);
-    const float *gamma = (const float *)(g->constants + p[1]);
+    const float eps_f = p[0] ? hx_float(p[0]) : 1e-5f;
+    const double eps = (double)eps_f;
+    const float *gamma = p[1] != HXFG_NONE ? (const float *)(g->constants + p[1]) : NULL;
     const float *beta = p[2] != HXFG_NONE ? (const float *)(g->constants + p[2]) : NULL;
     for (uint32_t i = lo; i < hi; i++) {
         const float *src = x + i * a->stride;
@@ -1015,8 +1016,14 @@ static void hx_rmsnorm_op(const HxGraph *g, const HxOp *o, const float *x, float
         for (uint32_t k = 0; k < c; k++)
             sum_sq += (double)src[k] * (double)src[k];
         const double inv = 1.0 / sqrt(sum_sq / (double)c + eps);
-        for (uint32_t k = 0; k < c; k++)
-            dst[k] = (float)((double)src[k] * inv * (double)gamma[k] + (beta ? (double)beta[k] : 0.0));
+        for (uint32_t k = 0; k < c; k++) {
+            double v = (double)src[k] * inv;
+            if (gamma)
+                v *= (double)gamma[k];
+            if (beta)
+                v += (double)beta[k];
+            dst[k] = (float)v;
+        }
         for (uint32_t k = c; k < b->stride; k++)
             dst[k] = 0.0f;
     }

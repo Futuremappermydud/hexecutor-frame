@@ -205,10 +205,10 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
         }
     }
     else if (kind == HX_RMSNORM) {
-        /* axis 1 adds a beta vector. Gamma at 0x90000, beta at 0x98000, epsilon 1e-5. */
+        /* axis 0: gamma only; axis 1: gamma + beta; axis 2: no gamma, no beta. Gamma at 0x90000, beta at 0x98000, epsilon 1e-5. */
         o.p[0] = 0x3727c5acu;
-        o.p[1] = 0x90000;
-        o.p[2] = axis ? 0x98000 : HXFG_NONE;
+        o.p[1] = axis == 2 ? HXFG_NONE : 0x90000;
+        o.p[2] = axis == 1 ? 0x98000 : HXFG_NONE;
         for (uint32_t c = 0; c < ci; c++) {
             ((float *)(constants + 0x90000))[c] = .5f + .25f * (float)(c % 3);
             ((float *)(constants + 0x98000))[c] = .125f * (float)((int)(c % 5) - 2);
@@ -1010,6 +1010,8 @@ int main(void) {
     }
     errors += check(base, HX_RMSNORM, 4, 1, 33, 33, 1, 1, 1);
     errors += check(base, HX_RMSNORM, 3, 2, 40, 40, 1, 1, 0);
+    errors += check(base, HX_RMSNORM, 3, 1, 64, 64, 1, 1, 2);
+    errors += check(base, HX_RMSNORM, 4, 1, 33, 33, 1, 1, 2);
     errors += check(base, HX_ROPE, 3, 1, 128, 128, 1, 64, 5 << 1);
     {
         const int e = check(base, HX_ROPE, 1, 1, 2048, 2048, 1, 64, 17 << 1);

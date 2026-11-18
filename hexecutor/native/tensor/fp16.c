@@ -1222,8 +1222,9 @@ static inline HVX_Vector vhsumf(HVX_Vector v) {
 static void rmsnorm_fp16(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
     const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
     const uint32_t *p = o->p, c = b->c, stride = b->stride;
-    const double eps = (double)hx_float(p[0]);
-    const float *gamma = (const float *)(g->constants + p[1]);
+    const float eps_f = p[0] ? hx_float(p[0]) : 1e-5f;
+    const double eps = (double)eps_f;
+    const float *gamma = p[1] != HXFG_NONE ? (const float *)(g->constants + p[1]) : NULL;
     const float *beta = p[2] != HXFG_NONE ? (const float *)(g->constants + p[2]) : NULL;
 
     const uint32_t obw = physical_width(b), opairs = b->h * obw / 2u;
@@ -1248,8 +1249,11 @@ static void rmsnorm_fp16(const HxGraph *g, const HxOp *o, uint32_t part, uint32_
             for (uint32_t b_idx = 0; b_idx < blocks; b_idx++) {
                 HVX_Vector h = load(x, a, px, b_idx * 32u);
                 HVX_Vector xv = float_words(h);
-                HVX_Vector gv = *(const HVX_UVector *)(gamma + b_idx * 32u);
-                HVX_Vector res = vmulf(vmulf(xv, inv_v), gv);
+                HVX_Vector res = vmulf(xv, inv_v);
+                if (gamma) {
+                    HVX_Vector gv = *(const HVX_UVector *)(gamma + b_idx * 32u);
+                    res = vmulf(res, gv);
+                }
                 if (beta) {
                     HVX_Vector bv = *(const HVX_UVector *)(beta + b_idx * 32u);
                     res = vaddf(res, bv);
@@ -1278,7 +1282,11 @@ static void rmsnorm_fp16(const HxGraph *g, const HxOp *o, uint32_t part, uint32_
             }
             const float inv = (float)(1.0 / sqrt(sum_sq / (double)c + eps));
             for (uint32_t ch = 0; ch < c; ch++) {
-                float val = scalar(x[at(a, px, ch)]) * inv * gamma[ch] + (beta ? beta[ch] : 0.0f);
+                float val = scalar(x[at(a, px, ch)]) * inv;
+                if (gamma)
+                    val *= gamma[ch];
+                if (beta)
+                    val += beta[ch];
                 out[at(b, px, ch)] = half(val);
             }
             for (uint32_t ch = c; ch < stride; ch++) {
