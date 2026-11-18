@@ -397,12 +397,6 @@ static int op_valid(const HxGraph *g, const HxOp *o) {
         return p[0] < HX_RED_COUNT && p[1] && p[1] < 8u &&
                b->h == ((p[1] & 1u) ? 1u : a->h) && b->w == ((p[1] & 2u) ? 1u : a->w) &&
                b->c == ((p[1] & 4u) ? 1u : a->c);
-    case HX_MATMUL: { /* y is B: [K,N] (transB 0) or [N,K] (transB 1); all tensors have w = 1 */
-        const HxTensor *bm = &g->tensors[o->y];
-        if (p[0] > 1 || a->w != 1 || b->w != 1 || bm->w != 1 || a->c > 4096 || a->h != b->h)
-            return 0;
-        return p[0] ? bm->c == a->c && bm->h == b->c : bm->h == a->c && bm->c == b->c;
-    }
     case HX_ACT:
         return same(a, b) && p[0] < HX_ACT_COUNT &&
                ((p[0] == HX_ACT_LEAKY && !p[2]) || (p[0] == HX_ACT_HARDSIGMOID) ||

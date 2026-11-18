@@ -133,7 +133,7 @@ typedef struct {
  * p[0] optional additive mask tensor ID (or HXFG_NONE).
  * p[1] float32 bits of scale (0 selects 1.0 / sqrt(D)).
  * p[2] causal mask flag (1: causal, masks out k > q; 0: none).
- * p[3] batch/head count B when tensors have w = 1. */
+ * p[3] batch/head count B when tensors have w = 1.
  * RMSNorm (HX_RMSNORM, 22): x in, out same shape. p[0] eps float bits, p[1] gamma constant offset,
  * p[2] optional beta constant offset or HXFG_NONE.
  * RoPE (HX_ROPE, 23): x in, out same shape. p[0] head_dim, p[1] num_heads, p[2] pos or table offset,
