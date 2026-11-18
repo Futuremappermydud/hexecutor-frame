@@ -17,7 +17,8 @@ struct HxFp16Plan {
     uint32_t peak, workspace_bytes;
     uint32_t image_rows, image_row_words, image_top; /* compact input geometry */
 };
-enum { HX_JOB_COPY = 1, HX_JOB_IMAGE_HALF, HX_JOB_RGB_PACK, HX_JOB_ACTIVATE, HX_JOB_EXPORT };
+enum { HX_JOB_COPY = 1, HX_JOB_IMAGE_HALF, HX_JOB_RGB_PACK, HX_JOB_ACTIVATE, HX_JOB_EXPORT,
+       HX_JOB_IM2COL };
 typedef struct {
     uint32_t kind;
     const HxGraph *g;

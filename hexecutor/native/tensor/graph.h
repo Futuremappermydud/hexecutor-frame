@@ -16,6 +16,10 @@ extern "C" {
 #define HXFG_CONFIG_MAGIC 0x53465848u
 #define HXFG_RESULT_MAGIC 0x52465848u
 #define HXFG_NONE 0xffffffffu
+/* Immutable constants live at relative private DDR [32 MiB, 96 MiB): the VTCM backup starts at
+ * 96 MiB and nothing of ours is mapped between 64 and 96 MiB. One graph's pool may use all 64. */
+#define HXFG_MAX_CONSTANT_BYTES 0x4000000u
+#define HXFG_CONSTANT_REGION_END 0x6000000u
 
 enum {
     HX_CONV = 1,
@@ -31,7 +35,13 @@ enum {
     HX_LOGISTIC,
     HX_ACT,
     HX_BINARY,
-    HX_AVGPOOL
+    HX_AVGPOOL,
+    HX_SOFTMAX, /* reserved 2026-11-17: softmax over channels per pixel; no p fields */
+    HX_SLICE    /* reserved: p[0..2] = h, w, channel start; output is the sub-box */,
+    HX_ZEROINSERT, /* reserved: zero-insert upsample, p[0]=sh p[1]=sw (ConvTranspose) */
+    HX_TRANSPOSE,  /* permute (h,w,c) axes, p[0..2] = source axis of each output axis */
+    HX_REDUCE,     /* unary reduction over a subset of (h,w,c); see HX_RED_* below */
+    HX_NORM        /* normalisation; see HX_NORM_* below (p[0..4]) */
 };
 /* HX_ACT p[0] functions. */
 enum {
@@ -43,10 +53,20 @@ enum {
     HX_ACT_TANH,
     HX_ACT_LEAKY, /* x < 0 ? alpha*x : x */
     HX_ACT_GELU,  /* exact erf form */
+    HX_ACT_EXP,
+    HX_ACT_SQRT,
+    HX_ACT_ABS,
+    HX_ACT_NEG,
+    HX_ACT_ERF, /* standalone erf(x), same polynomial as GELU */
     HX_ACT_COUNT
 };
 /* HX_BINARY p[0] operations. */
 enum { HX_BIN_ADD = 0, HX_BIN_SUB, HX_BIN_MUL, HX_BIN_COUNT };
+/* HX_NORM p[0] modes: CHANNEL normalises each pixel over its real channels (p[1] = 0); GROUP
+ * splits the channels into p[1] equal groups, each normalised over all pixels. */
+enum { HX_NORM_CHANNEL = 0, HX_NORM_GROUP, HX_NORM_COUNT };
+/* HX_REDUCE p[0] operations; p[1] is a non-zero HWC bitmask (bit0 h, bit1 w, bit2 c). */
+enum { HX_RED_MEAN = 0, HX_RED_SUM, HX_RED_MAX, HX_RED_MIN, HX_RED_COUNT };
 enum {
     HX_OK = 0,
     HX_HEADER,
@@ -72,17 +92,30 @@ typedef struct {
  * Convolution weights [kh,kw,input C,output stride]; depthwise [kh,kw,stride].
  * Add/concat use y. PReLU p[0] is the padded channel slope constant offset.
  * Pool p: kh,kw,sh,sw,pad_top,pad_left. Pad p: top,left,channels_before.
- * Resize p: align_corners,half_pixel_centers. Concat p[0]: axis in HWC (0..2).
+ * Reshape p[0]: 0 HWC-order copy (equal elements); 1 NCHW flatten, source HxWxC to 1x1xN;
+ * 2 NCHW unflatten, source 1x1xN to HxWxC (n = c*H*W + h*W + w). Transpose p[0..2]: source axis
+ * of each output axis. Resize p: align_corners,half_pixel_centers; p[2] 1 is nearest (source index floor(out*in/out)
+ * per axis, clamped; then p[0] and p[1] are zero). Concat p[0]: axis in HWC (0..2).
  * Act (kind HX_ACT): p[0] function, p[1]/p[2] float32 bit patterns alpha/beta (leaky uses alpha,
  * hardsigmoid alpha and beta; others zero). Same shape in and out.
  * Binary (HX_BINARY): p[0] operation, p[1] mode (0: y is a tensor, 1: y is NONE and p[2] is a
  * constant per-channel float vector of stride floats), p[3] reversed (computes y op x; with the
  * constant, c op x). Each of y's h, w, c is the output's or 1 (NumPy broadcast); x and the output
  * have the same shape. Avg pool p: pool fields as max pool, p[6] count_include_pad.
- * z is reserved; all unused fields must be zero (y/z use HXFG_NONE). */
+ * z is reserved; all unused fields must be zero (y/z use HXFG_NONE). Conv/depthwise only: z is
+ * HXFG_NONE (dilation 1,1) or (dh << 8) | dw with 1 <= dh, dw <= 8 and at least one above 1; the
+ * effective kernel extent is (k - 1) * d + 1 and tap (ky, kx) reads input row oy * sh + ky * dh -
+ * pad_top, column ox * sw + kx * dw - pad_left. */
 typedef struct {
     uint32_t kind, x, y, z, out, p[11];
 } HxOp;
+/* Dilation of a conv/depthwise op: 1 unless z encodes (dh << 8) | dw. Other kinds use 1. */
+static inline uint32_t hx_dilation_h(const HxOp *o) {
+    return o->z == HXFG_NONE ? 1u : (o->z >> 8) & 0xffu;
+}
+static inline uint32_t hx_dilation_w(const HxOp *o) {
+    return o->z == HXFG_NONE ? 1u : o->z & 0xffu;
+}
 typedef struct {
     uint32_t image, image_bytes, constants, constant_bytes, arena, arena_bytes;
 } HxGraphConfig;

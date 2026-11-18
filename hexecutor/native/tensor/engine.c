@@ -262,7 +262,9 @@ __attribute__((section(".text.resident_entry"))) void resident_entry(uint32_t ti
                     } else
                         dispatch(graph, op, seq);
                     hx_fp16_complete(g, op);
-                } else if (!(SERVICE[6] & 1u) && o->kind == HX_CONV && o->p[10]) {
+                } else if (!(SERVICE[6] & 1u) && o->kind == HX_CONV && o->p[10] &&
+                           o->z == HXFG_NONE) {
+                    /* hx_hmx_conv gathers undilated windows; dilated convs take hx_execute_op. */
                     hx_hmx_conv(g, op, workspace);
                     hmx_ops++;
                 } else {

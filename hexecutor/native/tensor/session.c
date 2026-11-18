@@ -12,7 +12,7 @@ int hx_session_config_valid(const HxSessionConfig *c) {
         if ((g->image | g->constants | g->arena) & 127u || g->image < 0x100000u ||
             g->image_bytes < 256 || !span(g->image, g->image_bytes, 0x1000000u) ||
             g->constants < 0x2000000u || !g->constant_bytes ||
-            !span(g->constants, g->constant_bytes, 0x4000000u) || g->arena < 0x1000000u ||
+            !span(g->constants, g->constant_bytes, HXFG_CONSTANT_REGION_END) || g->arena < 0x1000000u ||
             !g->arena_bytes || !span(g->arena, g->arena_bytes, 0x2000000u))
             return 0;
         for (uint32_t j = 0; j < i; j++) {

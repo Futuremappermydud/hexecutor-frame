@@ -8,6 +8,11 @@
 #include <hexagon_standalone.h>
 /* Window offsets select the depthwise loop's column parity. */
 static uint32_t pad_shift;
+/* VTCM bytes the plan may use; a small value leaves a small workspace, so a packed
+ * convolution needs several batches. */
+static uint32_t vtcm_size = 0x800000;
+/* z of the next convolution/depthwise check(): HXFG_NONE or (dh << 8) | dw. */
+static uint32_t dilation_z = HXFG_NONE;
 static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t ci, uint32_t co,
                  uint32_t kh, uint32_t step, uint32_t axis) {
     uint8_t *constants = aligned_alloc(128, 0x100000);
@@ -29,23 +34,28 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
     o.kind = kind;
     o.x = 0;
     o.y = o.z = HXFG_NONE;
+    if (kind == HX_CONV || kind == HX_DEPTHWISE)
+        o.z = dilation_z;
     o.out = 2;
-    if (kind == HX_ADD || kind == HX_CONCAT)
+    if (kind == HX_ADD || kind == HX_CONCAT || (kind == HX_BINARY && step != 4))
         o.y = 1;
-    if (kind == HX_CONV || kind == HX_DEPTHWISE || kind == HX_MAXPOOL) {
+    if (kind == HX_CONV || kind == HX_DEPTHWISE || kind == HX_MAXPOOL || kind == HX_AVGPOOL) {
         o.p[0] = o.p[1] = kh;
         o.p[2] = o.p[3] = step;
-        o.p[4] = o.p[5] = kh / 2 - (kind == HX_DEPTHWISE ? pad_shift : 0);
+        o.p[4] = o.p[5] = kh / 2 - ((kind == HX_DEPTHWISE || kind == HX_CONV) ? pad_shift : 0);
         o.p[6] = 0;
         o.p[7] = 0x50000;
         o.p[8] = 3;
         t[2].h = (h + step - 1) / step;
         t[2].w = (w + step - 1) / step;
-        if (kind == HX_MAXPOOL)
+        if (kind == HX_MAXPOOL || kind == HX_AVGPOOL) {
             o.p[6] = o.p[7] = o.p[8] = 0;
+            if (kind == HX_AVGPOOL)
+                o.p[6] = axis; /* count_include_pad */
+        }
         if (kind == HX_CONV) {
             o.p[9] = 0x60000;
-            o.p[10] = (ci + 31) / 32;
+            o.p[10] = (kh * kh * ci + 31) / 32;
         }
     } else if (kind == HX_PAD) {
         o.p[0] = 1;
@@ -56,8 +66,35 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
         t[2].c = ci + 7;
         t[2].stride = (t[2].c + 31) & ~31u;
     } else if (kind == HX_RESHAPE) {
-        t[2].h = 1;
-        t[2].w = h * w * ci / co;
+        /* axis is the p[0] flag: 0 HWC copy, 1 NCHW flatten to 1x1xN, 2 NCHW unflatten from 1x1xN
+         * (the source is then 1x1x(h*w*ci) and the output h x w x ci). */
+        o.p[0] = axis;
+        if (axis == 1) {
+            t[2].h = t[2].w = 1;
+            t[2].c = h * w * ci;
+        } else if (axis == 2) {
+            t[0].h = t[0].w = 1;
+            t[0].c = h * w * ci;
+            t[0].stride = (t[0].c + 31) & ~31u;
+            t[2].h = h;
+            t[2].w = w;
+            t[2].c = ci;
+        } else {
+            t[2].h = 1;
+            t[2].w = h * w * ci / co;
+        }
+        t[2].stride = (t[2].c + 31) & ~31u;
+    } else if (kind == HX_TRANSPOSE) {
+        /* axis selects one of the six permutations of (h, w, c); co is ignored. */
+        static const uint32_t perms[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2},
+                                             {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
+        const uint32_t ad[3] = {h, w, ci};
+        for (uint32_t k = 0; k < 3; k++)
+            o.p[k] = perms[axis][k];
+        t[2].h = ad[o.p[0]];
+        t[2].w = ad[o.p[1]];
+        t[2].c = ad[o.p[2]];
+        t[2].stride = (t[2].c + 31) & ~31u;
     } else if (kind == HX_CONCAT) {
         o.p[0] = axis;
         if (axis == 0)
@@ -71,9 +108,74 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
     } else if (kind == HX_RESIZE) {
         t[2].h = h * 2;
         t[2].w = w * 2;
-        o.p[1] = 1;
+        if (axis)
+            o.p[2] = 1; /* nearest; axis 0 is bilinear, half-pixel centres */
+        else
+            o.p[1] = 1;
+    } else if (kind == HX_ZEROINSERT) {
+        /* Stride step, pad 1 on top and left, one trailing row/column: output (h-1)*step + 3. */
+        o.p[0] = o.p[1] = step;
+        o.p[2] = o.p[3] = 1;
+        t[2].h = (h - 1) * step + 3;
+        t[2].w = (w - 1) * step + 3;
+    } else if (kind == HX_SLICE) {
+        /* Sub-box starting at (1, 2, 5): the output keeps co channels (co + 5 <= ci). */
+        o.p[0] = 1;
+        o.p[1] = 2;
+        o.p[2] = 5;
+        t[2].h = h - 1;
+        t[2].w = w - 2;
     } else if (kind == HX_MEAN)
         t[2].h = t[2].w = 1;
+    else if (kind == HX_REDUCE) {
+        /* kh: HWC bitmask of reduced axes, axis: HX_RED_* operation; co is ignored. */
+        o.p[0] = axis;
+        o.p[1] = kh;
+        t[2].h = kh & 1u ? 1 : h;
+        t[2].w = kh & 2u ? 1 : w;
+        t[2].c = kh & 4u ? 1 : ci;
+        t[2].stride = (t[2].c + 31) & ~31u;
+    }
+    else if (kind == HX_ACT) {
+        o.p[0] = axis;
+        if (axis == HX_ACT_LEAKY)
+            o.p[1] = 0x3dcccccdu; /* 0.1f */
+        if (axis == HX_ACT_HARDSIGMOID) {
+            o.p[1] = 0x3e2aaaabu; /* 1/6 */
+            o.p[2] = 0x3f000000u; /* 0.5 */
+        }
+    } else if (kind == HX_BINARY) {
+        /* axis: operation. step: 0 same-shape y, 1 y is 1x1xC, 2 y is Hx1xC, 3 y is 1x1x1,
+         * 4 per-channel constant. kh: reversed. */
+        o.p[0] = axis;
+        o.p[3] = kh;
+        if (step == 1 || step == 3)
+            t[1].h = t[1].w = 1;
+        if (step == 2)
+            t[1].w = 1;
+        if (step == 3) {
+            t[1].c = 1;
+            t[1].stride = 32;
+        }
+        if (step == 4) {
+            o.p[1] = 1;
+            o.p[2] = 0x70000;
+            for (uint32_t c = 0; c < 64; c++)
+                ((float *)(constants + 0x70000))[c] = ((int)(c % 5) - 2) * .5f;
+        }
+    } else if (kind == HX_NORM) {
+        /* axis: mode (HX_NORM_CHANNEL or HX_NORM_GROUP). step: group count (GROUP only).
+         * Epsilon 1e-5; gamma and beta are per-channel vectors at 0x90000 and 0x98000. */
+        o.p[0] = axis;
+        o.p[1] = axis == HX_NORM_GROUP ? step : 0;
+        o.p[2] = 0x3727c5acu; /* 1e-5f */
+        o.p[3] = 0x90000;
+        o.p[4] = 0x98000;
+        for (uint32_t c = 0; c < ci; c++) {
+            ((float *)(constants + 0x90000))[c] = .5f + .25f * (float)(c % 3);
+            ((float *)(constants + 0x98000))[c] = .125f * (float)((int)(c % 5) - 2);
+        }
+    }
     uint32_t stride = t[2].stride;
     float *wf = (float *)constants;
     for (uint32_t k = 0; k < kh * kh * (kind == HX_CONV ? ci : 1); k++)
@@ -87,7 +189,7 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
     if (kind == HX_CONV) {
         uint16_t *wp = (uint16_t *)(constants + o.p[9]);
         uint32_t kb = o.p[10];
-        for (uint32_t k = 0; k < ci; k++)
+        for (uint32_t k = 0; k < kh * kh * ci; k++)
             for (uint32_t c = 0; c < co; c++)
                 wp[(c / 32) * kb * 1024 + (k / 32) * 1024 + ((k % 32) / 2) * 64 + (c % 32) * 2 +
                    k % 2] = (k + c) % 2 ? 0xac00 : 0x2c00;
@@ -95,7 +197,7 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
     HxGraph g = {&header, t, &o, io, constants, arena, NULL};
     static uint32_t tables[4096];
     static struct HxFp16Plan plan;
-    if (!hx_fp16_plan(&g, &plan, tables, arena + 0x800000)) {
+    if (!hx_fp16_plan(&g, &plan, tables, arena + vtcm_size)) {
         printf("FAIL plan kind%u\n", (unsigned)kind);
         return 1;
     }
@@ -107,6 +209,10 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
             for (uint32_t c = 0; c < t[n].stride; c++)
                 v[i * t[n].stride + c] =
                     c < t[n].c ? ((int)((i * 7 + c * 3 + n) % 23) - 11) * .25f : 0;
+        /* HX_ACT_SQRT takes |x|: signed inputs are NaN, which check() cannot compare. */
+        if (kind == HX_ACT && axis == HX_ACT_SQRT)
+            for (uint32_t j = 0; j < t[n].h * t[n].w * t[n].stride; j++)
+                v[j] = fabsf(v[j]);
         hx_fp16_import(&g, n, v, NULL);
         hx_fp16_export(&g, n, actual, NULL);
         if (memcmp(actual, v, t[n].h * t[n].w * t[n].stride * 4)) {
@@ -202,7 +308,7 @@ static int check_rgb(uint32_t base, uint32_t ih, uint32_t iw, uint32_t kh, uint3
     static uint32_t tables[4096];
     static struct HxFp16Plan plan;
     g.arena = arena;
-    if (!hx_fp16_plan(&g, &plan, tables, arena + 0x800000)) {
+    if (!hx_fp16_plan(&g, &plan, tables, arena + vtcm_size)) {
         puts("FAIL RGB plan");
         return 1;
     }
@@ -243,6 +349,7 @@ int main(void) {
         errors += check(base, HX_PRELU, 7, 9, ci, ci, 1, 1, 0);
         errors += check(base, HX_PAD, 7, 9, ci, ci, 1, 1, 0);
         errors += check(base, HX_RESIZE, 7, 9, ci, ci, 1, 1, 0);
+        errors += check(base, HX_RESIZE, 7, 9, ci, ci, 1, 1, 1);
         errors += check(base, HX_MEAN, 7, 9, ci, ci, 1, 1, 0);
         for (uint32_t axis = 0; axis < 3; axis++)
             errors += check(base, HX_CONCAT, 7, 9, ci, ci, 1, 1, axis);
@@ -262,10 +369,89 @@ int main(void) {
     pad_shift = 0;
     errors += check(base, HX_RESHAPE, 7, 9, 36, 18, 1, 1, 0);
     errors += check(base, HX_RESHAPE, 3, 3, 108, 18, 1, 1, 0);
+    errors += check(base, HX_RESHAPE, 7, 9, 36, 18, 1, 1, 1); /* NCHW flatten, 2268 channels */
+    errors += check(base, HX_RESHAPE, 5, 6, 33, 33, 1, 1, 1);
+    errors += check(base, HX_RESHAPE, 7, 9, 36, 18, 1, 1, 2); /* NCHW unflatten */
+    errors += check(base, HX_RESHAPE, 5, 6, 33, 33, 1, 1, 2);
+    for (uint32_t perm = 0; perm < 6; perm++) {
+        errors += check(base, HX_TRANSPOSE, 7, 9, 40, 40, 1, 1, perm);
+        errors += check(base, HX_TRANSPOSE, 5, 6, 33, 33, 1, 1, perm);
+    }
     errors += check(base, HX_CONV, 8, 8, 24, 24, 1, 1, 0);
     errors += check(base, HX_CONV, 8, 8, 32, 32, 1, 1, 0);
     errors += check(base, HX_LOGISTIC, 1, 1, 1, 1, 1, 1, 0);
+    errors += check(base, HX_SLICE, 7, 9, 40, 20, 1, 1, 0);
+    errors += check(base, HX_SLICE, 8, 8, 33, 17, 1, 1, 0);
+    errors += check(base, HX_ZEROINSERT, 7, 9, 40, 40, 1, 2, 0);
+    errors += check(base, HX_ZEROINSERT, 8, 8, 33, 33, 1, 3, 0);
+    errors += check(base, HX_ZEROINSERT, 5, 6, 24, 24, 1, 1, 0);
+    /* Normalisation: channel mode; LayerNorm over C,H,W (1 group); two groups; InstanceNorm
+     * (one group per channel); three groups over two channel blocks. */
+    errors += check(base, HX_NORM, 7, 9, 40, 40, 1, 1, HX_NORM_CHANNEL);
+    errors += check(base, HX_NORM, 5, 6, 64, 64, 1, 1, HX_NORM_CHANNEL);
+    errors += check(base, HX_NORM, 7, 9, 40, 40, 1, 1, HX_NORM_GROUP);
+    errors += check(base, HX_NORM, 7, 9, 40, 40, 1, 2, HX_NORM_GROUP);
+    errors += check(base, HX_NORM, 7, 9, 40, 40, 1, 40, HX_NORM_GROUP);
+    errors += check(base, HX_NORM, 8, 8, 33, 33, 1, 3, HX_NORM_GROUP);
+    /* General reductions: every HWC subset (kh bitmask) and operation (axis), odd width. */
+    for (uint32_t mask = 1; mask < 8; mask++)
+        for (uint32_t red = 0; red < HX_RED_COUNT; red++)
+            errors += check(base, HX_REDUCE, 7, 9, 40, 40, mask, 1, red);
+    /* Softmax over channels per pixel: odd width (pad column), one and two channel blocks. */
+    errors += check(base, HX_SOFTMAX, 7, 9, 40, 40, 1, 1, 0);
+    errors += check(base, HX_SOFTMAX, 7, 9, 3, 3, 1, 1, 0);
+    errors += check(base, HX_SOFTMAX, 8, 8, 64, 64, 1, 1, 0);
     errors += check(base, HX_CONV, 1, 1, 1152, 63, 1, 1, 0);
+    /* Dense convolutions packed as im2col: kernel, stride, padding, channel blocks and tails. */
+    static const struct {
+        uint32_t h, w, ci, co, k, s;
+    } convs[] = {
+        {7, 9, 24, 35, 3, 1}, {7, 9, 40, 35, 3, 1}, {7, 9, 5, 8, 3, 1},  {8, 8, 32, 32, 3, 2},
+        {7, 9, 24, 35, 3, 2}, {9, 7, 33, 4, 3, 2},  {7, 9, 24, 35, 5, 1}, {16, 18, 32, 32, 5, 2},
+        {16, 18, 16, 32, 7, 2}, {7, 9, 40, 35, 1, 2}, {5, 5, 64, 40, 3, 1}, {1, 1, 32, 32, 3, 1},
+    };
+    for (unsigned i = 0; i < sizeof convs / sizeof convs[0]; i++) {
+        errors += check(base, HX_CONV, convs[i].h, convs[i].w, convs[i].ci, convs[i].co,
+                        convs[i].k, convs[i].s, 0);
+        pad_shift = convs[i].k > 1; /* no leading padding: SAME_UPPER style */
+        errors += check(base, HX_CONV, convs[i].h, convs[i].w, convs[i].ci, convs[i].co,
+                        convs[i].k, convs[i].s, 0);
+        pad_shift = 0;
+    }
+    /* Several batches: 18 K-tiles per output tile, so a workspace near 0x42000 holds about seven output tiles of nine. */
+    vtcm_size = 0x70000;
+    errors += check(base, HX_CONV, 16, 18, 64, 40, 3, 1, 0);
+    vtcm_size = 0x800000;
+    /* Depthwise shapes outside the hand-scheduled kernels use the scalar lanes. */
+    for (uint32_t step = 1; step <= 3; step++) {
+        errors += check(base, HX_DEPTHWISE, 9, 11, 40, 40, 7, step, 0);
+        errors += check(base, HX_DEPTHWISE, 9, 11, 33, 33, 3, 3, 0);
+        errors += check(base, HX_DEPTHWISE, 9, 11, 33, 33, 5, 4, 0);
+    }
+    /* Standalone activations, broadcasting binary operations and average pooling. */
+    for (uint32_t fn = 0; fn < HX_ACT_COUNT; fn++)
+        errors += check(base, HX_ACT, 7, 9, 40, 40, 1, 1, fn);
+    for (uint32_t opcode = 0; opcode < HX_BIN_COUNT; opcode++)
+        for (uint32_t mode = 0; mode <= 4; mode++)
+            for (uint32_t reversed = 0; reversed <= 1; reversed++)
+                errors += check(base, HX_BINARY, 7, 9, 40, 40, reversed, mode, opcode);
+    for (uint32_t include = 0; include <= 1; include++) {
+        errors += check(base, HX_AVGPOOL, 7, 9, 40, 40, 3, 1, include);
+        errors += check(base, HX_AVGPOOL, 8, 8, 33, 33, 2, 2, include);
+    }
+    /* Dilated convolution (im2col, incl. a strided one) and depthwise (scalar lanes). */
+    dilation_z = (2u << 8) | 2u;
+    errors += check(base, HX_CONV, 9, 11, 40, 40, 3, 1, 0);
+    errors += check(base, HX_CONV, 10, 12, 33, 33, 3, 2, 0);
+    dilation_z = (1u << 8) | 3u;
+    errors += check(base, HX_CONV, 9, 11, 24, 24, 3, 1, 0);
+    dilation_z = (3u << 8) | 3u;
+    errors += check(base, HX_CONV, 11, 9, 32, 40, 5, 2, 0); /* 25*32*64 floats stay below the bias at 0x50000 */
+    dilation_z = (2u << 8) | 1u;
+    errors += check(base, HX_DEPTHWISE, 9, 11, 40, 40, 3, 1, 0);
+    dilation_z = (3u << 8) | 3u;
+    errors += check(base, HX_DEPTHWISE, 16, 18, 64, 64, 5, 2, 0);
+    dilation_z = HXFG_NONE;
     for (uint32_t kh = 3; kh <= 5; kh += 2) {
         errors += check_rgb(base, 15, 18, kh, 35);
         errors += check_rgb(base, 16, 16, kh, 24);

@@ -215,8 +215,9 @@ struct Session::Impl {
     static bool feature(const Bytes &b, const std::string &s) {
         return std::search(b.begin(), b.end(), s.begin(), s.end()) != b.end();
     }
+    uint32_t max_allocation = 32u << 20, guard_floor = 0;
     uint32_t allocate(size_t n) {
-        require(n && n < 32u << 20, "invalid resident allocation");
+        require(n && n < max_allocation, "invalid resident allocation");
         uint32_t off = (cursor + 255) & ~127u, end = (off + uint32_t(n) + 127) & ~127u;
         require(end <= allocation_limit, "resident fixed data exceeds its region");
         guards.emplace_back(off - 128, 128);
@@ -381,7 +382,10 @@ struct Session::Impl {
             cursor = 32u << 20;
             /* The Q16P engine keeps its private, L1-cached scratch in
              * [56 MiB, 64 MiB - 4 KiB) of the same page (engine.c). */
-            allocation_limit = q ? (56u << 20) - 128 : (64u << 20) - 4096;
+            /* Tensor graphs may use relative [32, 96) MiB for constants; the Q16P engine keeps
+             * its scratch in [56, 64) MiB. */
+            allocation_limit = q ? (56u << 20) - 128 : (96u << 20) - 4096;
+            max_allocation = q ? 32u << 20 : HXFG_MAX_CONSTANT_BYTES + 1u;
             for (size_t i = 0; i < programs.size(); i++) {
                 auto &c = tensor_config.graph[i];
                 c.constant_bytes = uint32_t(tensor_constants[i].size());
@@ -390,6 +394,7 @@ struct Session::Impl {
                           memory + c.constants);
             }
             require(hx_session_config_valid(&tensor_config), "invalid tensor memory config");
+            guard_floor = cursor; /* canaries in [64, 96) MiB must not overwrite constants */
             install_guards();
             auto *arena = transport->arena();
             std::memset(arena, 0, 32768);
@@ -435,12 +440,15 @@ struct Session::Impl {
 #endif
     }
     void install_guards() {
-        guards.insert(guards.end(), {{(80u << 20) - 4096, 4096},
-                                     {88u << 20, 4096},
-                                     {(64u << 20) - 4096, 4096},
-                                     {(128u << 20) - 4096, 4096},
-                                     {(96u << 20) - 128, 128},
-                                     {104u << 20, 128}});
+        for (auto g : std::initializer_list<std::pair<uint32_t, uint32_t>>{
+                 {(80u << 20) - 4096, 4096},
+                 {88u << 20, 4096},
+                 {(64u << 20) - 4096, 4096},
+                 {(128u << 20) - 4096, 4096},
+                 {(96u << 20) - 128, 128},
+                 {104u << 20, 128}})
+            if (g.first >= guard_floor)
+                guards.push_back(g);
         if (l2) {
             for (uint32_t offset : {0u, 0x40000u, 0x58000u, 0x68000u, 0x78000u})
                 guards.emplace_back((112u << 20) + offset, 128);
