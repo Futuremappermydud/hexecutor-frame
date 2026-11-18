@@ -21,6 +21,19 @@ static const char qds_l2_boot_feature[] __attribute__((used))="QDL2BOOT02";
 /* Read from the actual ELF by the host, rather than inferred from a filename. */
 static const uint8_t qds_boot_features[12] __attribute__((used)) = {'Q','D','B','O','O','T','0','1',1,0,0,0};
 #endif
+#ifdef HEXECUTOR_TENSOR_BOOT
+#include "tensor/graph.h"
+static const char hx_boot_feature[] __attribute__((used))="HXTBOOT1";
+#define boot_config_valid(c) hx_session_config_valid((const HxSessionConfig *)(c))
+#define boot_code_bytes(c) (((const HxSessionConfig *)(c))->code_bytes)
+#define boot_config_error(c) (!boot_config_valid(c))
+#define boot_command_valid(c) qds_initial_command_valid_flags(c,QDS_OP_RUN,3u)
+#else
+#define boot_config_valid(c) qds_config_valid(c)
+#define boot_command_valid(c) qds_initial_command_valid(c,QDS_OP_RUN)
+#define boot_code_bytes(c) ((c)->code_bytes)
+#define boot_config_error(c) ((c)->magic!=QDS_MAGIC || (c)->version!=1 || !(c)->code_bytes || (c)->code_bytes>0x100000u)
+#endif
 #define ARENA 0xf1800000u
 #define QDS_SYNC_ERROR 7u
 #if QDS_PREPARED_THREADS==4
@@ -94,7 +107,7 @@ __attribute__((section(".text.entry"))) void payload(void) {
      * Reject unpublished/foreign commands before any memory ownership change.
      * A valid nonzero sequence also prevents followers passing the initial
      * zero-valued sync word before the master publishes initialization. */
-    if(!qds_initial_command_valid(a,QDS_OP_RUN) || !qds_config_valid(cfg)) {
+    if(!boot_command_valid(a) || !boot_config_valid(cfg)) {
         if(!tid) {
             volatile uint32_t *result=(volatile uint32_t *)(ARENA+QDS_RESULT);
             result[0]=QDS_MAGIC;result[1]=1;
@@ -120,7 +133,7 @@ __attribute__((section(".text.entry"))) void payload(void) {
     if(tid==0) {
         sync[0]=0;
         for(uint32_t i=1;i<=7;i++)sync[i]=0;
-        uint32_t err=cfg->magic!=QDS_MAGIC || cfg->version!=1 || !cfg->code_bytes || cfg->code_bytes>0x100000;
+        uint32_t err=boot_config_error(cfg);
 #if QDS_ENTRY_GUARD
         uint64_t arrival_deadline=cycles()+2000000000u;
 #if QDS_PREPARED_THREADS==4
@@ -173,7 +186,7 @@ __attribute__((section(".text.entry"))) void payload(void) {
         if(!err) {
             volatile uint32_t *w=(volatile uint32_t *)QDS_WORK_L2;
             for(uint32_t i=0;i<sizeof(QdsWork)/4;i++)w[i]=0;
-            for(uint32_t p=QDO_BASE;p<QDO_BASE+cfg->code_bytes;p+=32) {
+            for(uint32_t p=QDO_BASE;p<QDO_BASE+boot_code_bytes(cfg);p+=32) {
                 __asm__ volatile("dcinva(%0)\n icinva(%0)"::"r"(p):"memory");
             }
             __asm__ volatile("isync":::"memory");

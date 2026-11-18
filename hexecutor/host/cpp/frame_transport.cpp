@@ -1,16 +1,20 @@
 #include "detail.hpp"
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <random>
+#include <sstream>
 #include <thread>
 #ifdef __linux__
 #include <cerrno>
 #include <csignal>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sched.h>
 #include <sys/file.h>
 #include <sys/mman.h>
@@ -35,6 +39,20 @@ struct Transport::Impl {
     bool installed = false, registered = false, active = false, persistent = false, closed = false;
     unsigned calls = 0;
     std::string retained;
+    /* One firmware wake must not be held for long: see Artifacts::max_wake_seconds.
+     * Public entry points lock `mutex`; the watchdog re-wakes during idle gaps. */
+    std::recursive_mutex mutex;
+    std::condition_variable_any changed;
+    std::thread watchdog;
+    bool stopping = false;
+    Clock::time_point woke_at{};
+    uint32_t generation = 0, rotations = 0;
+    std::function<void()> exit_check;
+    std::exception_ptr watchdog_failure;
+    Clock::duration hold() const {
+        return std::chrono::duration_cast<Clock::duration>(
+            std::chrono::duration<double>(artifacts.max_wake_seconds));
+    }
 #ifdef __linux__
     pid_t eye = 0;
     bool eye_stopped = false;
@@ -86,13 +104,23 @@ struct Transport::Impl {
         if (retained.empty())
             retained = why;
     }
-    template <class F> void wait(F predicate, double timeout = -1, bool closing = false) {
+    /* spin_until: until then, poll without sleeping and keep slower checks to an
+     * occasional iteration. A completion is otherwise seen up to a sleep late. */
+    template <class F>
+    void wait(F predicate, double timeout = -1, bool closing = false,
+              Clock::time_point spin_until = Clock::time_point::min()) {
 #ifndef __linux__
         (void)closing;
 #endif
         const auto deadline = Clock::now() + std::chrono::duration<double>(
                                                  timeout < 0 ? artifacts.timeout_seconds : timeout);
-        while (!predicate()) {
+        for (unsigned iteration = 0; !predicate(); iteration++) {
+            if (Clock::now() < spin_until && (iteration & 255u)) {
+#if defined(__aarch64__)
+                __asm__ volatile("yield");
+#endif
+                continue;
+            }
 #ifdef __linux__
             if (installed && registered && !closing && load(work + 24) != code_base)
                 throw std::runtime_error("DSP callback disappeared after reset/suspend");
@@ -112,7 +140,8 @@ struct Transport::Impl {
 #endif
             require(Clock::now() < deadline,
                     "CDSP request timed out; workers may still own memory");
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            if (Clock::now() >= spin_until)
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
     }
 #ifdef __linux__
@@ -316,11 +345,10 @@ struct Transport::Impl {
         require(get<uint64_t>(memory, 0xa90000) == 0x1614df651d03f542 &&
                     get<uint64_t>(memory, 0xa90008) == 9,
                 "CDSP protocol header mismatch");
-        require(load(work + 24) == 0, "DSP callback already in use");
-        wait([&] { return idle(); }, 5);
+        require_idle_at_open();
         auto live = eyes();
         require(live.size() <= 1, "multiple eye clients are running");
-        if (!live.empty()) {
+        if (!live.empty() && !artifacts.keep_eye_running) {
             eye = live.front();
             auto dir = std::filesystem::path("/proc") / std::to_string(eye);
             auto raw = read_file(dir / "cmdline");
@@ -386,11 +414,105 @@ struct Transport::Impl {
             store(ctrl + 8, 4);
             active = true;
             send_all(socket, "work", 4);
+            woke_at = Clock::now();
+            ++generation;
         } catch (...) {
             sigprocmask(SIG_SETMASK, &previous, nullptr);
             throw;
         }
         sigprocmask(SIG_SETMASK, &previous, nullptr);
+        start_watchdog();
+        changed.notify_all();
+    }
+    void start_watchdog() {
+        if (watchdog.joinable())
+            return;
+        /* Signals stay with the application's threads; block them here first so
+         * the new thread inherits a fully blocked mask. */
+        sigset_t all, previous;
+        sigfillset(&all);
+        require(pthread_sigmask(SIG_BLOCK, &all, &previous) == 0, "cannot mask watchdog signals");
+        try {
+            watchdog = std::thread([this] { watch(); });
+        } catch (...) {
+            pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+            throw;
+        }
+        pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+    }
+    void watch() {
+        std::unique_lock<std::recursive_mutex> guard(mutex);
+        while (!stopping) {
+            if (!persistent || !retained.empty() || watchdog_failure) {
+                changed.wait(guard);
+                continue;
+            }
+            const auto due = woke_at + hold();
+            if (Clock::now() < due) {
+                changed.wait_until(guard, due);
+                continue;
+            }
+            try {
+                rotate();
+            } catch (const std::exception &e) {
+                retain(std::string("wake rotation failed: ") + e.what());
+                watchdog_failure = std::current_exception();
+            } catch (...) {
+                retain("wake rotation failed");
+                watchdog_failure = std::current_exception();
+            }
+        }
+    }
+    /* Let the workers exit and hand the wake back to the firmware. The next
+     * submit wakes them again; the engine re-stages its VTCM state then. */
+    void rotate() {
+        const auto t0 = Clock::now();
+        stop();
+        const auto t1 = Clock::now();
+        ++rotations;
+        if (exit_check)
+            exit_check();
+        if (std::getenv("HEXECUTOR_WAKE_TRACE"))
+            std::cerr << "[wake] exit_ms "
+                      << std::chrono::duration<double, std::milli>(t1 - t0).count()
+                      << " check_ms "
+                      << std::chrono::duration<double, std::milli>(Clock::now() - t1).count()
+                      << " vtcm_save_cycles " << get<uint64_t>(arena(), 3456)
+                      << " vtcm_restore_cycles " << get<uint64_t>(arena(), 3464) << '\n';
+    }
+    void quiesce() {
+        {
+            std::lock_guard<std::recursive_mutex> guard(mutex);
+            stopping = true;
+        }
+        changed.notify_all();
+        if (watchdog.joinable() && watchdog.get_id() != std::this_thread::get_id())
+            watchdog.join();
+    }
+    std::string control_text() const {
+        std::ostringstream text;
+        text << '(' << load(ctrl) << ',' << load(ctrl + 4) << ',' << load(ctrl + 8)
+             << ") callback 0x" << std::hex << load(work + 24);
+        return text.str();
+    }
+    /* Not idle: a firmware job (ours or XRService's) is running, or the firmware
+     * never came back from an earlier over-long wake. Wait out a normal job and
+     * report the stuck state plainly instead of a generic timeout. */
+    void require_idle_at_open() {
+        const auto deadline = Clock::now() + std::chrono::seconds(5);
+        while (!(idle() && load(work + 24) == 0)) {
+            if (Clock::now() >= deadline) {
+                const bool stuck = load(ctrl) == 2 && load(ctrl + 4) == 0;
+                throw std::runtime_error(
+                    std::string(stuck ? "CDSP firmware is stuck" : "CDSP is not idle") +
+                    " at control " + control_text() +
+                    (stuck ? ". An earlier session held one wake too long; only a headset "
+                             "reboot clears this, and XRService's own DSP work (eye "
+                             "tracking, stereo features) is failing until then."
+                           : ". Another DSP client may own it; retry after it exits."));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
     }
     void release() {
         store(ctrl + 8, 1);
@@ -405,31 +527,80 @@ struct Transport::Impl {
         if (fourth)
             workers.push_back(5);
     }
-    void submit(const std::function<void(uint32_t)> &prepare) {
+    void submit(const std::function<void(uint32_t)> &prepare, std::chrono::microseconds expected) {
 #ifdef __linux__
+        const auto began = Clock::now();
+        std::lock_guard<std::recursive_mutex> guard(mutex);
+        if (watchdog_failure)
+            std::rethrow_exception(watchdog_failure);
+        require(retained.empty(), "DSP session retained: " + retained);
         require(eye_paused(), "paused eye client changed state during inference");
         if (persistent && exited_all()) {
+            /* The engine ended its own wake (idle exit). */
             wait([&] { return load(ctrl) == 1 || load(ctrl) == 3; });
             release();
+            if (exit_check)
+                exit_check();
         }
+        const auto margin = std::chrono::milliseconds(50);
+        if (persistent && Clock::now() + expected + margin >= woke_at + hold())
+            rotate();
+        if (!persistent)
+            expected = std::chrono::microseconds(0); // a fresh wake re-stages first
         require(!persistent || registered, "persistent workers without registered callback");
         require(persistent || (!active && load(ctrl) == 1), "previous DSP job is active");
         require(sequence != UINT32_MAX, "DSP command sequence exhausted");
         prepare(++sequence);
-        if (!persistent) {
+        const bool fresh = !persistent;
+        const bool trace = fresh && std::getenv("HEXECUTOR_WAKE_TRACE");
+        Clock::time_point arrived{}, setup{};
+        if (fresh) {
             persistent = true;
             wake();
         }
-        wait([&] {
-            if (done())
-                return true;
-            require(!exited_all(), "DSP workers exited before completing the command");
-            return false;
-        });
+        if (trace) {
+            /* Bootstrap markers: worker 0's arrival slot (entry guard) and the
+             * master's published setup completion, both tagged with sequence. */
+            const auto deadline = Clock::now() + std::chrono::seconds(2);
+            auto *sync = arena() + 3584;
+            while (!done() && Clock::now() < deadline) {
+                if (arrived == Clock::time_point{} && get<uint32_t>(sync, 32) == sequence)
+                    arrived = Clock::now();
+                if (setup == Clock::time_point{} && get<uint32_t>(sync, 0) == sequence)
+                    setup = Clock::now();
+            }
+            auto ms = [&](Clock::time_point t) {
+                return t == Clock::time_point{}
+                           ? -1.0
+                           : std::chrono::duration<double, std::milli>(t - woke_at).count();
+            };
+            std::cerr << "[wake] arrive_ms " << ms(arrived) << " setup_ms " << ms(setup) << '\n';
+        }
+        /* Sleep through most of a command of known length, then spin briefly. */
+        auto spin_until = Clock::time_point::min();
+        if (expected.count()) {
+            const auto margin = std::chrono::microseconds(250);
+            if (expected > margin * 2)
+                std::this_thread::sleep_until(began + expected - margin);
+            spin_until = began + expected + margin * 2;
+        }
+        wait(
+            [&] {
+                if (done())
+                    return true;
+                require(!exited_all(), "DSP workers exited before completing the command");
+                return false;
+            },
+            -1, false, spin_until);
         fence();
+        if (fresh && std::getenv("HEXECUTOR_WAKE_TRACE"))
+            std::cerr << "[wake] wake_to_done_ms "
+                      << std::chrono::duration<double, std::milli>(Clock::now() - woke_at).count()
+                      << '\n';
         ++calls;
 #else
         (void)prepare;
+        (void)expected;
         throw std::runtime_error("Frame transport requires Linux");
 #endif
     }
@@ -467,9 +638,14 @@ struct Transport::Impl {
         if (closed)
             return;
 #ifdef __linux__
+        quiesce();
+#endif
+        std::lock_guard<std::recursive_mutex> guard(mutex);
+#ifdef __linux__
         if (errors())
             retain("four-worker status reports restoration error");
-        if (memory && !active && !idle())
+        /* Before install nothing was changed, so a busy DSP is not ours to retain. */
+        if (memory && installed && !active && !idle())
             retain("unexpected DSP control state without an owned job");
         if (memory && persistent && retained.empty() && registered &&
             load(work + 24) == code_base) {
@@ -483,7 +659,7 @@ struct Transport::Impl {
             (get<uint32_t>(arena(), 256) == 0x41584931 ||
              get<uint32_t>(arena(), 512) == 0x484d5831))
             retain("DSP clock/power restoration incomplete");
-        if (memory && !active && !idle())
+        if (memory && installed && !active && !idle())
             retain("DSP is not idle after owned worker shutdown");
         bool reset = false;
         if (memory && registered && load(work + 24) == 0 && retained.empty()) {
@@ -571,10 +747,14 @@ Transport::Transport(const Artifacts &a, const std::filesystem::path &payload, b
 Transport::~Transport() = default;
 uint8_t *Transport::arena() const { return impl_->arena(); }
 uint32_t Transport::sequence() const { return impl_->sequence; }
-void Transport::submit(const std::function<void(uint32_t)> &prepare) { impl_->submit(prepare); }
+void Transport::submit(const std::function<void(uint32_t)> &prepare,
+                       std::chrono::microseconds expected) {
+    impl_->submit(prepare, expected);
+}
 void Transport::invoke(const std::function<void(uint32_t)> &prepare,
                        const std::function<void()> &collect) {
 #ifdef __linux__
+    std::lock_guard<std::recursive_mutex> guard(impl_->mutex);
     require(!impl_->active && impl_->idle() && impl_->sequence != UINT32_MAX,
             "previous probe job is active");
     prepare(++impl_->sequence);
@@ -591,8 +771,28 @@ void Transport::invoke(const std::function<void(uint32_t)> &prepare,
     throw std::runtime_error("Frame transport requires Linux");
 #endif
 }
-void Transport::stop() { impl_->stop(); }
-void Transport::retain(const std::string &reason) { impl_->retain(reason); }
+void Transport::stop() {
+    std::lock_guard<std::recursive_mutex> guard(impl_->mutex);
+    impl_->stop();
+}
+std::unique_lock<std::recursive_mutex> Transport::lock() const {
+    return std::unique_lock<std::recursive_mutex>(impl_->mutex);
+}
+uint32_t Transport::generation() const { return impl_->generation; }
+uint32_t Transport::rotations() const { return impl_->rotations; }
+void Transport::set_exit_check(std::function<void()> check) {
+    std::lock_guard<std::recursive_mutex> guard(impl_->mutex);
+    impl_->exit_check = std::move(check);
+}
+void Transport::quiesce() {
+#ifdef __linux__
+    impl_->quiesce();
+#endif
+}
+void Transport::retain(const std::string &reason) {
+    std::lock_guard<std::recursive_mutex> guard(impl_->mutex);
+    impl_->retain(reason);
+}
 void Transport::close() { impl_->close(); }
 bool Transport::has_run() const { return impl_->active || impl_->persistent || impl_->calls != 0; }
 bool Transport::worker_errors() const { return impl_->any_worker_errors(); }

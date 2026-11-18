@@ -17,6 +17,12 @@ int main(void) {
     memcpy(command,original,sizeof command);command[6]=1;
     assert(qds_initial_command_valid(command,3));
     command[4]=command[5];assert(qds_initial_command_valid(command,3));
+    command[6]=2;
+    assert(!qds_initial_command_valid(command,3));
+    assert(qds_initial_command_valid_flags(command,3,3));
+    command[6]=4;
+    assert(!qds_initial_command_valid_flags(command,3,3));
+    command[6]=0;
     uint32_t arrivals[4]={0,0,0,0};
     assert(!qds_entry_all_arrived(arrivals,0,3));
     assert(!qds_entry_all_arrived(arrivals,1,0));

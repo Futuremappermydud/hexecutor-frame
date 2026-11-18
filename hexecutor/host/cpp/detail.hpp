@@ -1,8 +1,12 @@
 #pragma once
+#include <chrono>
 #include "hexecutor/executor.hpp"
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 
 namespace hexecutor::detail {
@@ -29,9 +33,22 @@ class Transport {
     ~Transport();
     uint8_t *arena() const;
     uint32_t sequence() const;
-    void submit(const std::function<void(uint32_t)> &prepare);
+    /* expected: the command's DSP time, or zero when unknown. It must come from
+     * the DSP timer: a duration observed here would include the predicted sleep. */
+    void submit(const std::function<void(uint32_t)> &prepare,
+                std::chrono::microseconds expected = std::chrono::microseconds(0));
     void invoke(const std::function<void(uint32_t)> &prepare, const std::function<void()> &collect);
     void stop();
+    /* Held by the session while it prepares inputs and reads results, so the
+     * wake watchdog cannot end a wake in between. Recursive with submit. */
+    std::unique_lock<std::recursive_mutex> lock() const;
+    // Counts wakes; a new generation means the engine re-staged its VTCM state.
+    uint32_t generation() const;
+    uint32_t rotations() const;
+    // Runs after every exit the transport starts or observes mid-session.
+    void set_exit_check(std::function<void()> check);
+    // Stop the watchdog thread; required before the session's final checks.
+    void quiesce();
     void retain(const std::string &reason);
     void close();
     bool has_run() const;

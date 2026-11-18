@@ -1,4 +1,6 @@
 #include "detail.hpp"
+#include "tensor/graph.h"
+#include "qnn16/program.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -44,8 +46,18 @@ size_t TensorSpec::bytes() const {
     return size;
 }
 void Program::validate() const {
-    require(inputs.size() == 4 && outputs.size() == 2,
-            "qdrx-v1 backend requires four inputs and two outputs");
+    if (backend == Backend::qdrx_v1)
+        require(inputs.size() == 4 && outputs.size() == 2,
+                "qdrx-v1 backend requires four inputs and two outputs");
+    else {
+        require((backend == Backend::tensor_f32 || backend == Backend::qnn16_f16) &&
+                    !inputs.empty() && !outputs.empty() && inputs.size() <= HXFG_MAX_IO &&
+                    outputs.size() <= HXFG_MAX_IO,
+                "invalid tensor backend I/O count");
+        for (const auto *group : {&inputs, &outputs})
+            for (const auto &spec : *group)
+                require(spec.type == ScalarType::f32, "tensor backend requires float32 I/O");
+    }
     for (const auto *group : {&inputs, &outputs}) {
         std::vector<std::string> names;
         for (const auto &spec : *group) {
@@ -105,17 +117,100 @@ Bytes load_elf(const Bytes &elf, uint32_t base, size_t capacity) {
     return code;
 }
 
+namespace {
+HxGraph preflight_tensor(const Bytes &image, const Bytes &constants) {
+    HxGraph graph{};
+    uint32_t bad = HXFG_NONE;
+    uint32_t error = hx_graph_open(&graph, image.data(), uint32_t(image.size()), constants.data(),
+                                   uint32_t(constants.size()), nullptr, 0x1000000u, &bad);
+    require(error == HX_OK, "tensor preflight failed: error " + std::to_string(error) + " at op " +
+                                std::to_string(bad));
+    std::array<uint8_t, 32> digest{};
+    nprg2_sha256(constants.data(), uint32_t(constants.size()), digest.data());
+    require(std::equal(digest.begin(), digest.end(), graph.header->constant_sha256),
+            "tensor constant pool hash mismatch");
+    return graph;
+}
+} // namespace
+static Q16Program preflight_qnn16(const Bytes &image, const Bytes &constants) {
+    Q16Program program{};
+    uint32_t bad = Q16P_NONE;
+    uint32_t error = q16_program_open(&program, image.data(), uint32_t(image.size()),
+                                      uint32_t(constants.size()), &bad);
+    require(error == Q16_OK, "Q16P preflight failed: error " + std::to_string(error) + " at op " +
+                                 std::to_string(bad));
+    std::array<uint8_t, 32> digest{};
+    nprg2_sha256(constants.data(), uint32_t(constants.size()), digest.data());
+    require(std::equal(digest.begin(), digest.end(), program.header->constant_sha256),
+            "Q16P constant pool hash mismatch");
+    return program;
+}
+// The arena holds only the exchange area; scratch is engine-private (engine.c).
+[[maybe_unused]] static uint32_t q16_arena_bytes(const Q16Header *h) {
+    require(h->scratch_bytes <= 0x7ff000u, "Q16P scratch exceeds the engine region");
+    return (h->exchange_bytes + 4095u) & ~4095u;
+}
+Program load_qnn16_program(const std::filesystem::path &image,
+                           const std::filesystem::path &constants) {
+    auto bytes = read_file(image), weights = read_file(constants);
+    auto q = preflight_qnn16(bytes, weights);
+    Program p;
+    p.image = image;
+    p.constants = constants;
+    p.backend = Backend::qnn16_f16;
+    for (uint32_t i = 0; i < q.header->inputs + q.header->outputs; i++) {
+        const auto &d = q.io[i].dims;
+        bool input = i < q.header->inputs;
+        auto &group = input ? p.inputs : p.outputs;
+        group.push_back({std::string(input ? "input" : "output") + std::to_string(group.size()),
+                         ScalarType::f32,
+                         {d.b, d.h, d.w, d.c}});
+    }
+    p.validate();
+    return p;
+}
+Program load_tensor_program(const std::filesystem::path &image,
+                            const std::filesystem::path &constants) {
+    auto bytes = read_file(image), weights = read_file(constants);
+    auto graph = preflight_tensor(bytes, weights);
+    Program p;
+    p.image = image;
+    p.constants = constants;
+    p.backend = Backend::tensor_f32;
+    for (uint32_t i = 0; i < graph.header->inputs + graph.header->outputs; i++) {
+        const auto &t = graph.tensors[graph.io[i]];
+        bool input = i < graph.header->inputs;
+        auto &group = input ? p.inputs : p.outputs;
+        group.push_back({std::string(input ? "input" : "output") + std::to_string(group.size()),
+                         ScalarType::f32,
+                         {1, t.h, t.w, t.c}});
+    }
+    p.validate();
+    return p;
+}
+
 struct Session::Impl {
     Program program;
+    std::vector<Program> programs;
+    std::vector<Bytes> tensor_images, tensor_constants;
+    std::vector<HxGraph> graphs;
+    std::vector<Q16Program> q16;
+    HxSessionConfig tensor_config{};
+    ExecutionProfile profile;
     Artifacts artifacts;
     Bytes image, constants, engine, prepared;
     std::unique_ptr<Transport> transport;
+    std::array<std::chrono::microseconds, HXFG_MAX_GRAPHS> last_dsp_time{};
+    /* A run is warm when the previous command ran the same graph in the same
+     * wake: only then are its resident VTCM records still staged. */
+    size_t last_graph = SIZE_MAX;
+    uint32_t last_generation = 0;
     uint8_t *memory = nullptr;
     std::array<uint32_t, 7> sizes{}, pools{};
     std::array<uint32_t, 4> inputs{}, input_bytes{};
     std::array<uint32_t, 2> outputs{}, output_bytes{};
     std::vector<std::pair<uint32_t, uint32_t>> guards;
-    uint32_t cursor = 1 << 20, commands = 0;
+    uint32_t cursor = 1 << 20, allocation_limit = (32u << 20) - 128, commands = 0;
     bool preserving = false, l2 = false, fourth = false, closed = false, initialized = false;
     static bool feature(const Bytes &b, const std::string &s) {
         return std::search(b.begin(), b.end(), s.begin(), s.end()) != b.end();
@@ -123,7 +218,7 @@ struct Session::Impl {
     uint32_t allocate(size_t n) {
         require(n && n < 32u << 20, "invalid resident allocation");
         uint32_t off = (cursor + 255) & ~127u, end = (off + uint32_t(n) + 127) & ~127u;
-        require(end <= ((32u << 20) - 128), "resident fixed data exceeds its region");
+        require(end <= allocation_limit, "resident fixed data exceeds its region");
         guards.emplace_back(off - 128, 128);
         guards.emplace_back(end, 128);
         cursor = end + 128;
@@ -131,14 +226,85 @@ struct Session::Impl {
     }
     void check_guards() {
         for (auto [at, n] : guards)
-            for (uint32_t i = 0; i < n; i++)
-                require(memory[at + i] == 0xa5, "resident allocation guard changed");
+            require(std::all_of(memory + at, memory + at + n, [](uint8_t v) { return v == 0xa5; }),
+                    "resident allocation guard changed");
     }
-    Impl(Program p, Artifacts a) : program(std::move(p)), artifacts(std::move(a)) {
+    Impl(std::vector<Program> ps, Artifacts a) : programs(std::move(ps)), artifacts(std::move(a)) {
+        require(!programs.empty() && programs.size() <= HXFG_MAX_GRAPHS, "invalid program count");
+        program = programs.front();
         require(std::isfinite(artifacts.timeout_seconds) && artifacts.timeout_seconds > 0 &&
                     artifacts.timeout_seconds <= 3600,
                 "invalid DSP timeout");
+        require(std::isfinite(artifacts.max_wake_seconds) && artifacts.max_wake_seconds > 0 &&
+                    artifacts.max_wake_seconds <= 3600,
+                "invalid DSP wake limit");
         program.validate();
+        if (program.backend == Backend::qnn16_f16) {
+            for (const auto &p : programs) {
+                p.validate();
+                require(p.backend == Backend::qnn16_f16, "cannot mix executor backends");
+                tensor_images.push_back(read_file(p.image));
+                tensor_constants.push_back(read_file(p.constants));
+                q16.push_back(preflight_qnn16(tensor_images.back(), tensor_constants.back()));
+                const auto *h = q16.back().header;
+                require(p.inputs.size() == h->inputs && p.outputs.size() == h->outputs,
+                        "Q16P program I/O count differs from image");
+                for (uint32_t i = 0; i < h->inputs + h->outputs; i++) {
+                    const auto &spec = i < h->inputs ? p.inputs[i] : p.outputs[i - h->inputs];
+                    require(spec.bytes() == q16.back().io[i].bytes,
+                            "Q16P program I/O size differs from image");
+                }
+            }
+            auto boot = read_file(artifacts.bootstrap);
+            require(feature(boot, "HXTBOOT1") && feature(boot, std::string("QDBOOT01\1\0\0\0", 12)),
+                    "Q16P backend requires the preserving tensor bootstrap");
+            fourth = feature(boot, std::string("QDTHRD51\1\0\0\0", 12));
+            engine = load_elf(read_file(artifacts.engine), 0xa0000000, 1 << 20);
+            require(feature(engine, "HXQ16E01"), "Q16P engine feature missing");
+            require(fourth && feature(engine, "HXTPART4"),
+                    "Q16P engine and bootstrap must both use four workers");
+            preserving = true;
+            return;
+        }
+        if (program.backend == Backend::tensor_f32) {
+            for (const auto &p : programs) {
+                p.validate();
+                require(p.backend == Backend::tensor_f32, "cannot mix executor backends");
+                tensor_images.push_back(read_file(p.image));
+                tensor_constants.push_back(read_file(p.constants));
+                graphs.push_back(preflight_tensor(tensor_images.back(), tensor_constants.back()));
+                const auto &g = graphs.back();
+                require(p.inputs.size() == g.header->inputs &&
+                            p.outputs.size() == g.header->outputs,
+                        "tensor program I/O count differs from image");
+                for (uint32_t i = 0; i < g.header->inputs + g.header->outputs; i++) {
+                    const auto &spec =
+                        i < g.header->inputs ? p.inputs[i] : p.outputs[i - g.header->inputs];
+                    const auto &t = g.tensors[g.io[i]];
+                    std::vector<size_t> shape;
+                    for (auto d : spec.shape)
+                        if (d != 1)
+                            shape.push_back(d);
+                    std::vector<size_t> expected;
+                    for (auto d : {t.h, t.w, t.c})
+                        if (d != 1)
+                            expected.push_back(d);
+                    require(shape == expected && spec.bytes() == size_t(hx_tensor_elements(&t)) * 4,
+                            "tensor program I/O shape differs from image");
+                }
+            }
+            auto boot = read_file(artifacts.bootstrap);
+            require(feature(boot, "HXTBOOT1") && feature(boot, std::string("QDBOOT01\1\0\0\0", 12)),
+                    "tensor backend requires a preserving tensor bootstrap");
+            fourth = feature(boot, std::string("QDTHRD51\1\0\0\0", 12));
+            engine = load_elf(read_file(artifacts.engine), 0xa0000000, 1 << 20);
+            require(feature(engine, "HXTENG01"), "tensor engine feature missing");
+            require(fourth && feature(engine, "HXTPART4"),
+                    "tensor engine and bootstrap must both use four workers");
+            preserving = true;
+            return;
+        }
+        require(programs.size() == 1, "QDRX supports one program per session");
         image = read_file(program.image);
         constants = read_file(program.constants);
         require(image.size() >= 256 && get<uint32_t>(image.data(), 0) == 0x58524451,
@@ -177,6 +343,7 @@ struct Session::Impl {
 #ifdef __linux__
         verify_chunk_map(artifacts);
         transport = std::make_unique<Transport>(artifacts, artifacts.bootstrap, fourth);
+        transport->set_exit_check([this] { verify_exit(true); });
         require(std::stoul(std::string(read_text("/sys/module/cdsp_mem/parameters/size_mb"))) ==
                     128,
                 "requires a 128 MB cdsp_mem allocation");
@@ -189,6 +356,47 @@ struct Session::Impl {
         require(mapped != MAP_FAILED, "cannot map cdsp_mem");
         memory = static_cast<uint8_t *>(mapped);
         std::copy(engine.begin(), engine.end(), memory);
+        if (program.backend == Backend::tensor_f32 || program.backend == Backend::qnn16_f16) {
+            const bool q = program.backend == Backend::qnn16_f16;
+            tensor_config.magic = HXFG_CONFIG_MAGIC;
+            tensor_config.version = 1;
+            tensor_config.code_bytes = uint32_t(engine.size());
+            tensor_config.graphs = uint32_t(programs.size());
+            allocation_limit = (16u << 20) - 4096;
+            for (size_t i = 0; i < programs.size(); i++) {
+                auto &c = tensor_config.graph[i];
+                c.image = allocate(tensor_images[i].size());
+                c.image_bytes = uint32_t(tensor_images[i].size());
+                std::copy(tensor_images[i].begin(), tensor_images[i].end(), memory + c.image);
+            }
+            cursor = 16u << 20;
+            allocation_limit = (32u << 20) - 4096;
+            for (size_t i = 0; i < programs.size(); i++) {
+                auto &c = tensor_config.graph[i];
+                c.arena_bytes = q ? q16_arena_bytes(q16[i].header) : graphs[i].header->arena_bytes;
+                c.arena = allocate(c.arena_bytes);
+                if (!q)
+                    graphs[i].arena = memory + c.arena;
+            }
+            cursor = 32u << 20;
+            /* The Q16P engine keeps its private, L1-cached scratch in
+             * [56 MiB, 64 MiB - 4 KiB) of the same page (engine.c). */
+            allocation_limit = q ? (56u << 20) - 128 : (64u << 20) - 4096;
+            for (size_t i = 0; i < programs.size(); i++) {
+                auto &c = tensor_config.graph[i];
+                c.constant_bytes = uint32_t(tensor_constants[i].size());
+                c.constants = allocate(c.constant_bytes);
+                std::copy(tensor_constants[i].begin(), tensor_constants[i].end(),
+                          memory + c.constants);
+            }
+            require(hx_session_config_valid(&tensor_config), "invalid tensor memory config");
+            install_guards();
+            auto *arena = transport->arena();
+            std::memset(arena, 0, 32768);
+            std::memcpy(arena + 4096, &tensor_config, sizeof(tensor_config));
+            initialized = true;
+            return;
+        }
         auto image_off = allocate(image.size());
         std::copy(image.begin(), image.end(), memory + image_off);
         pools[5] = allocate(sizes[5]);
@@ -204,19 +412,7 @@ struct Session::Impl {
             inputs[i] = allocate(input_bytes[i]);
         for (unsigned i = 0; i < 2; i++)
             outputs[i] = allocate(output_bytes[i]);
-        guards.insert(guards.end(), {{(80u << 20) - 4096, 4096},
-                                     {88u << 20, 4096},
-                                     {(64u << 20) - 4096, 4096},
-                                     {(128u << 20) - 4096, 4096},
-                                     {(96u << 20) - 128, 128},
-                                     {104u << 20, 128}});
-        if (l2) {
-            for (uint32_t offset : {0u, 0x40000u, 0x58000u, 0x68000u, 0x78000u})
-                guards.emplace_back((112u << 20) + offset, 128);
-            guards.emplace_back((112u << 20) + (fourth ? 0xc3e00 : 0xa0000), 128);
-        }
-        for (auto [at, n] : guards)
-            std::memset(memory + at, 0xa5, n);
+        install_guards();
         auto *arena = transport->arena();
         std::memset(arena, 0, 32768);
         std::vector<uint32_t> config = {0x31534451, 1, image_off, uint32_t(image.size())};
@@ -238,12 +434,92 @@ struct Session::Impl {
         throw std::runtime_error("Frame DSP execution requires Linux");
 #endif
     }
+    void install_guards() {
+        guards.insert(guards.end(), {{(80u << 20) - 4096, 4096},
+                                     {88u << 20, 4096},
+                                     {(64u << 20) - 4096, 4096},
+                                     {(128u << 20) - 4096, 4096},
+                                     {(96u << 20) - 128, 128},
+                                     {104u << 20, 128}});
+        if (l2) {
+            for (uint32_t offset : {0u, 0x40000u, 0x58000u, 0x68000u, 0x78000u})
+                guards.emplace_back((112u << 20) + offset, 128);
+            guards.emplace_back((112u << 20) + (fourth ? 0xc3e00 : 0xa0000), 128);
+        }
+        for (auto [at, n] : guards)
+            std::memset(memory + at, 0xa5, n);
+    }
     static std::string read_text(const char *path) {
         auto bytes = read_file(path);
         return {bytes.begin(), bytes.end()};
     }
-    std::vector<Bytes> run(const std::vector<Buffer> &values) {
+    std::vector<Bytes> run(const std::vector<Buffer> &values, size_t program_index) {
         require(!closed && transport && memory, "session is closed");
+        require(program_index < programs.size(), "program index out of range");
+        auto guard = transport->lock();
+        if (program.backend == Backend::qnn16_f16)
+            return run_qnn16(values, program_index);
+        if (program.backend == Backend::tensor_f32) {
+            auto &g = graphs[program_index];
+            const auto &p = programs[program_index];
+            require(values.size() == p.inputs.size(), "input count mismatch");
+            for (size_t i = 0; i < values.size(); i++)
+                require(values[i].data && values[i].bytes == p.inputs[i].bytes(),
+                        "input buffer size mismatch");
+            for (size_t i = 0; i < values.size(); i++) {
+                const auto &t = g.tensors[g.io[i]];
+                hx_pack(reinterpret_cast<float *>(g.arena + t.offset),
+                        static_cast<const float *>(values[i].data), &t);
+            }
+            auto *arena = transport->arena();
+            const bool warm = last_graph == program_index &&
+                              last_generation == transport->generation();
+            transport->submit([&](uint32_t sequence) {
+                std::memset(arena + 128, 0, 48);
+                uint32_t packet[7] = {0x32564451,
+                                      6,
+                                      sequence - 1,
+                                      3,
+                                      uint32_t(program_index),
+                                      uint32_t(programs.size()),
+                                      (artifacts.tensor_hmx ? 0u : 1u) | (artifacts.tensor_fp16 ? 0u : 2u)};
+                std::memcpy(arena, packet, sizeof(packet));
+                put<uint32_t>(arena, 3840, 0);
+                __atomic_thread_fence(__ATOMIC_SEQ_CST);
+                put<uint32_t>(arena, 8, sequence);
+                __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            }, warm ? last_dsp_time[program_index] : std::chrono::microseconds(0));
+            require(get<uint32_t>(arena, 2048) == HXFG_RESULT_MAGIC &&
+                        get<uint32_t>(arena, 2052) == HX_OK &&
+                        get<uint32_t>(arena, 2060) == g.header->ops,
+                    "tensor DSP command failed: error " +
+                        std::to_string(get<uint32_t>(arena, 2052)) + " at op " +
+                        std::to_string(get<uint32_t>(arena, 2056)));
+            profile.cycles = get<uint64_t>(arena, 2064);
+            profile.timer_ticks = get<uint64_t>(arena, 2080);
+            /* A prediction delays seeing a completion by its error, so keep only
+             * the time of a run that did not stage resident records: a graph
+             * switch or a new wake re-stages, and later warm runs are far shorter. */
+            const auto dsp_time = std::chrono::microseconds(profile.timer_ticks * 10 / 192);
+            const uint32_t generation = transport->generation();
+            if (last_graph == program_index && last_generation == generation)
+                last_dsp_time[program_index] = dsp_time;
+            last_graph = program_index;
+            last_generation = generation;
+            profile.matrix_ops = get<uint32_t>(arena, 2072);
+            profile.blocked_fp16 = get<uint32_t>(arena, 2076) != 0;
+            profile.op_cycles.resize(g.header->ops);
+            std::memcpy(profile.op_cycles.data(), arena + 16384, profile.op_cycles.size() * 8);
+            std::vector<Bytes> out;
+            for (size_t i = 0; i < p.outputs.size(); i++) {
+                const auto &t = g.tensors[g.io[g.header->inputs + i]];
+                out.emplace_back(p.outputs[i].bytes());
+                hx_unpack(reinterpret_cast<float *>(out.back().data()),
+                          reinterpret_cast<const float *>(g.arena + t.offset), &t);
+            }
+            check_guards();
+            return out;
+        }
         require(values.size() == 4, "input count mismatch");
         for (unsigned i = 0; i < 4; i++)
             require(values[i].data && values[i].bytes == input_bytes[i],
@@ -272,11 +548,88 @@ struct Session::Impl {
         check_guards();
         return out;
     }
+    std::vector<Bytes> run_qnn16(const std::vector<Buffer> &values, size_t index) {
+        const auto &q = q16[index];
+        const auto &p = programs[index];
+        const auto *h = q.header;
+        uint8_t *exchange = memory + tensor_config.graph[index].arena;
+        require(values.size() == p.inputs.size(), "input count mismatch");
+        for (size_t i = 0; i < values.size(); i++)
+            require(values[i].data && values[i].bytes == p.inputs[i].bytes(),
+                    "input buffer size mismatch");
+        for (size_t i = 0; i < values.size(); i++)
+            std::memcpy(exchange + q.io[i].offset, values[i].data, values[i].bytes);
+        auto *arena = transport->arena();
+        transport->submit([&](uint32_t sequence) {
+            std::memset(arena + 128, 0, 48);
+            uint32_t packet[7] = {0x32564451, 6, sequence - 1, 3, uint32_t(index),
+                                  uint32_t(programs.size()), 0};
+            std::memcpy(arena, packet, sizeof(packet));
+            put<uint32_t>(arena, 3840, 0);
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            put<uint32_t>(arena, 8, sequence);
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        }, last_dsp_time[index]);
+        require(get<uint32_t>(arena, 2048) == 0x52363151 && get<uint32_t>(arena, 2052) == Q16_OK &&
+                    get<uint32_t>(arena, 2060) == h->ops,
+                "Q16P DSP command failed: error " + std::to_string(get<uint32_t>(arena, 2052)) +
+                    " at op " + std::to_string(get<uint32_t>(arena, 2056)));
+        profile.cycles = get<uint64_t>(arena, 2064);
+        profile.timer_ticks = get<uint64_t>(arena, 2080);
+        profile.matrix_ops = get<uint32_t>(arena, 2072);
+        profile.blocked_fp16 = true;
+        /* Runs re-stage everything, so every run predicts the next one. */
+        last_dsp_time[index] = std::chrono::microseconds(profile.timer_ticks * 10 / 192);
+        profile.op_cycles.resize(std::min<uint32_t>(h->ops, 2048));
+        std::memcpy(profile.op_cycles.data(), arena + 16384, profile.op_cycles.size() * 8);
+        std::vector<Bytes> out;
+        for (size_t i = 0; i < p.outputs.size(); i++) {
+            const auto &io = q.io[h->inputs + i];
+            out.emplace_back(exchange + io.offset, exchange + io.offset + io.bytes);
+        }
+        check_guards();
+        return out;
+    }
+    /* After every worker exit, not only the last: each wake leases VTCM again
+     * and overwrites the snapshot, so a missed check could not be redone later. */
+    void verify_exit(bool ran) {
+        if (transport->worker_errors()) {
+            transport->retain("worker exit/stack verification failed");
+            throw std::runtime_error("worker exit/stack check failed");
+        }
+        auto *a = transport->arena();
+        if (get<uint32_t>(a, 3072)) {
+            transport->retain("resident translations still active");
+            throw std::runtime_error("resident JTLB still active");
+        }
+        if (ran) {
+            if (get<uint32_t>(a, 3328) != 0x31545651 || get<uint32_t>(a, 3332) != 2 ||
+                get<uint32_t>(a, 3336)) {
+                transport->retain("VTCM restoration not verified");
+                throw std::runtime_error("VTCM lease restoration failed");
+            }
+            uint32_t hx = 0, hs = 0;
+            for (uint32_t row = 0; row < (8u << 20) / 128; row++) {
+                uint32_t sum = 0;
+                for (unsigned i = 0; i < 32; i++) {
+                    auto word = get<uint32_t>(memory, (96u << 20) + row * 128 + i * 4);
+                    hx ^= word;
+                    sum += word;
+                }
+                hs += sum * (row + 1);
+            }
+            if (hx != get<uint32_t>(a, 3328 + 44) || hs != get<uint32_t>(a, 3328 + 48)) {
+                transport->retain("VTCM snapshot fingerprint mismatch");
+                throw std::runtime_error("VTCM fingerprint mismatch");
+            }
+        }
+    }
     void close() {
         if (closed)
             return;
         try {
             if (transport) {
+                transport->quiesce();
                 if (transport->worker_errors()) {
                     transport->retain("bootstrap/worker failure");
                     throw std::runtime_error("worker restoration failed");
@@ -288,40 +641,19 @@ struct Session::Impl {
                     transport->retain("VTCM lease exit did not complete");
                     throw;
                 }
-                if (transport->worker_errors()) {
-                    transport->retain("worker exit/stack verification failed");
-                    throw std::runtime_error("worker exit/stack check failed");
-                }
-                auto *a = transport->arena();
-                if (get<uint32_t>(a, 3072)) {
-                    transport->retain("resident translations still active");
-                    throw std::runtime_error("resident JTLB still active");
-                }
-                if (ran) {
-                    if (get<uint32_t>(a, 3328) != 0x31545651 || get<uint32_t>(a, 3332) != 2 ||
-                        get<uint32_t>(a, 3336)) {
-                        transport->retain("VTCM restoration not verified");
-                        throw std::runtime_error("VTCM lease restoration failed");
-                    }
-                    uint32_t hx = 0, hs = 0;
-                    for (uint32_t row = 0; row < (8u << 20) / 128; row++) {
-                        uint32_t sum = 0;
-                        for (unsigned i = 0; i < 32; i++) {
-                            auto word = get<uint32_t>(memory, (96u << 20) + row * 128 + i * 4);
-                            hx ^= word;
-                            sum += word;
-                        }
-                        hs += sum * (row + 1);
-                    }
-                    if (hx != get<uint32_t>(a, 3328 + 44) || hs != get<uint32_t>(a, 3328 + 48)) {
-                        transport->retain("VTCM snapshot fingerprint mismatch");
-                        throw std::runtime_error("VTCM fingerprint mismatch");
-                    }
-                }
+                verify_exit(ran);
                 if (memory && initialized) {
                     check_guards();
-                    require(std::equal(constants.begin(), constants.end(), memory + pools[5]),
-                            "constant pool changed");
+                    if (program.backend == Backend::tensor_f32 ||
+                        program.backend == Backend::qnn16_f16) {
+                        for (size_t i = 0; i < tensor_constants.size(); i++)
+                            require(std::equal(tensor_constants[i].begin(),
+                                               tensor_constants[i].end(),
+                                               memory + tensor_config.graph[i].constants),
+                                    "tensor constant pool changed");
+                    } else
+                        require(std::equal(constants.begin(), constants.end(), memory + pools[5]),
+                                "constant pool changed");
                 }
             }
         } catch (...) {
@@ -364,10 +696,15 @@ struct Session::Impl {
     }
 };
 Session::Session(Program p, Artifacts a)
-    : impl_(std::make_unique<Impl>(std::move(p), std::move(a))) {
+    : Session(std::vector<Program>{std::move(p)}, std::move(a)) {}
+Session::Session(std::vector<Program> ps, Artifacts a)
+    : impl_(std::make_unique<Impl>(std::move(ps), std::move(a))) {
     impl_->open();
 }
 Session::~Session() = default;
-std::vector<Bytes> Session::run(const std::vector<Buffer> &values) { return impl_->run(values); }
+std::vector<Bytes> Session::run(const std::vector<Buffer> &values, size_t index) {
+    return impl_->run(values, index);
+}
+const ExecutionProfile &Session::profile() const { return impl_->profile; }
 void Session::close() { impl_->close(); }
 } // namespace hexecutor

@@ -44,6 +44,19 @@ int main() {
     bad = p;
     bad.inputs[1].name = "a";
     rejects([&] { bad.validate(); });
+    auto tensor = p;
+    tensor.backend = Backend::tensor_f32;
+    tensor.inputs = {{"rgb", ScalarType::f32, {1, 192, 192, 3}}};
+    tensor.outputs = {{"joints", ScalarType::f32, {21, 3}},
+                      {"presence", ScalarType::f32, {1}},
+                      {"handedness", ScalarType::f32, {1}},
+                      {"world", ScalarType::f32, {21, 3}}};
+    tensor.validate();
+    auto wrong_type = tensor;
+    wrong_type.inputs[0].type = ScalarType::u8;
+    rejects([&] { wrong_type.validate(); });
+    tensor.inputs.clear();
+    rejects([&] { tensor.validate(); });
     Bytes elf(86);
     std::memcpy(elf.data(), "\177ELF\1\1\1", 7);
     put<uint16_t>(elf, 18, 164);

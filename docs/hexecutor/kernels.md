@@ -24,6 +24,18 @@ HMX halfword conversion, packed weight traversal, scaling, and signedness have t
 
 Later standalone graph comparisons found Conv, Add, Convert, and a tested dynamic-weight MatMul byte-identical to the compatible simulator on their exercised inputs. The cause of the legacy full-model differences on textured inputs remains unresolved. The old explanation that all such differences are inevitably caused by HMX midpoint rounding should not be revived.
 
+## One HMX owner per transaction
+
+HMX accumulator state is shared by hardware threads 0, 1 and 2. If one thread clears and loads the accumulator, a store issued afterwards by any thread returns that thread's product, and the store consumes the state. Interleaving two transactions corrupts both, even when no two instructions overlap in time. Every HMX clear/load/store sequence must therefore run to completion on one thread before another thread starts one. The executor already follows this: HMX stays on the main list, and the worker lanes and helpers do HVX and scalar work only ([scheduling](scheduling.md)). Keep it that way when moving work between lanes. A lock around a whole transaction would be correct, but it gives no extra HMX throughput.
+
+Evidence: FrameNPU `docs/HMX_ACCUMULATOR.md` (2026-11-14). That test used exact integer-valued FP16 tiles on every pair of workers 0/1/2 and on all three at once. Serialized controls passed 8/8. Deferred stores failed 24/24 and concurrent transactions failed 24/24.
+
+## Unavailable HVX IEEE float
+
+The optional HVX IEEE float extension (`-mhvx-ieee-fp`: `.sf`/`.hf` multiply, add and accumulate) is unusable on the Frame's CDSP. The compiler emits these instructions and they execute without trapping, but they write zero to their destination. FP32/FP16 echo instructions and qfloat arithmetic in the same job behave correctly. A Qualcomm QEMU patch series describes this destination zeroing as the behaviour when the extension is disabled. Use qf16/qf32 arithmetic with explicit conversion. Do not build engines with `-mhvx-ieee-fp`.
+
+Evidence: FrameNPU `docs/NATIVE_ARITHMETIC.md` (2026-11-16) on CDSP firmware `4f9fd567…`, the same image as `/opt/steamvr/drivers/cv/bin/linuxarm64/cdsp_sm8650.mbn` here.
+
 ## Adapter coverage
 
 `native_adapter`, `native_kernels`, `native_stride2`, `native_runtime/stride2`, and `native_u16` contain probes and adapters for particular provider layouts. Their results are shape-specific. See [kernel adapters](kernel-adapters.md) before expanding a resolver's accepted feature set.

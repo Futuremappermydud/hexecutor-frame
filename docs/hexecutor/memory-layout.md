@@ -28,6 +28,20 @@ Block tables describe maximum geometry, not the subset one command accesses. Sum
 
 All 3,840 model blocks are touched somewhere in the run. The tail has 504 KiB after its control area. Larger scratch needs a proved dead interval and ordering edges, not an assumption that quiet memory is free. Once pool 1 is VTCM, legacy convolution staging at the same base cannot coexist with it.
 
+## Stock eye-tracking thread and VTCM
+
+Pool 1 covers all of VTCM, including the range the stock eye-tracking code uses. This comes from the disassembly of the deployed firmware (`cdsp_sm8650.mbn` sha256 `4f9fd567…`, disassembly in `depth-model/.work/frame-direct-kernels-20261030/cdsp.asm`). FrameNPU's independent VTCM map agrees with it:
+
+- At boot, hardware thread 3 takes its own path (`0x870002f8`). It sets r19 = `0xf1522004` and polls the block at DMA offset `0x1522000`: state at +0, active at +4, job at +8.
+- Whenever active = 1, it services job 2 (load: invalidate `0x10080` bytes from +0x80, then `0x870154c0`, which copies into `0x31700000`). It also services job 4 (evaluate: invalidate `0x20180` bytes, then call `0x87015500` once per eye, writing 0x80 bytes per eye at +0x20100/+0x20180).
+- `0x87015500` uses VTCM `0x31700000–0x31776600` for tables and weights, and `0x31776600–~0x317d4600` as a work buffer. It runs concurrently with the master loop and with our callback wake. Nothing in our wake stops or serializes it.
+
+So while a Hexecutor session holds VTCM, a job 2 or 4 posted to that block makes the stock eye code read tables we have overwritten and write over our activations. Ordinary sessions avoid this only by pausing the `eyetracking` process. VTCM restoration at exit puts the eye tables back for later.
+
+Open: the broker treats `0x1522000` as the XRService FeatureNN block (job 8) and `0x445000` as the Gazenet block ([broker](broker.md#gazenet)). But the firmware's thread-3 handler serves jobs 2/4 at `0x1522000`, with Gazenet's input (+0x100) and output (+0x20100, 64 floats) layout. Which client posts jobs 2/4 to `0x1522000`, and whether the firmware ever reads `0x445000`, have not been checked on device. A search of the disassembly finds no immediate operand for `0x445000` (cached `0x87445000` or uncached `0xf0445000`).
+
+Other firmware-owned VTCM, from FrameNPU `docs/VTCM_MAP.md`: FeatureNN worker scratch at `0x31000000 + HTID*0xf0000` (960 KiB each, reset per request), and the FeatureNN model blob at `0x311e0000–0x316eea80` (copied by op 7 and persistent after it). The only ranges nothing references are `0x316eea80–0x31700000` and `~0x317d4600–0x31800000`.
+
 ## L2-TCM/cache lease
 
 The L2 array is 1 MiB at `0x30000000..0x30100000`. `QDS_L2_CACHE=1` converts the upper 512 KiB to cache and preserves the lower half as TCM. Mode 5 converts the entire array; no L2-TCM address is usable while that lease is active. Mixing these maps caused real faults and large slowdowns.

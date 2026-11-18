@@ -21,8 +21,10 @@
 #define QDS_PREPARED_THREADS 1
 #endif
 /* The existing callback wakes physical hthreads 0, 1, and 2. In the opt-in
- * four-worker experiment htid5 is explicitly resumed by the master; htid3 is
- * the firmware manager and htid4 owns CPU/IPCC servicing. Keep engine work
+ * four-worker experiment htid5 is explicitly resumed by the master; htid3
+ * runs the stock eye-tracking loop (it polls DMA 0x1522000 independently of
+ * our wake and uses VTCM 0x31700000..~0x317d4600) and htid4 owns CPU/IPCC
+ * servicing. Keep engine work
  * indices dense even though the fourth physical id is sparse. */
 #if QDS_PREPARED_THREADS == 4
 #define QDS_WORKER_SLOTS 4u
@@ -33,8 +35,15 @@ static inline uint32_t qds_physical_tid(uint32_t logical) { return logical==3u?5
 static inline uint32_t qds_logical_tid(uint32_t tid) { return tid; }
 static inline uint32_t qds_physical_tid(uint32_t logical) { return logical; }
 #endif
+#ifdef HEXECUTOR_TENSOR_BOOT
+/* A DDR stack makes this worker's C code about ten times slower, and every
+ * operator joins on its slowest part. */
+#define QDS_HTID5_STACK_BOTTOM 0x300e0000u
+#define QDS_HTID5_STACK_TOP    0x300f0000u
+#else
 #define QDS_HTID5_STACK_BOTTOM 0xa70a0000u
 #define QDS_HTID5_STACK_TOP    0xa70b0000u
+#endif
 #define QDS_HTID5_HVX_STATE    0xa70d0000u
 #define QDS_HTID5_HVX_STATE_BYTES 0x1200u
 #ifndef QDS_PREPARED_DMA_ASYNC

@@ -20,7 +20,7 @@ Other established steps in the measured recipe include compact staging windows, 
 
 ## Workers and waiting
 
-The normal callback wakes physical threads 0, 1, and 2. The four-worker path uses physical thread 5 as logical worker 3; firmware manager/service threads 3 and 4 are not spare model workers. Shared work records use generation/completion counters and bounded joins.
+The normal callback wakes physical threads 0, 1, and 2. The four-worker path uses physical thread 5 as logical worker 3. Threads 3 and 4 are not spare model workers. Thread 4 runs the firmware's CPU request loop. Thread 3 runs the stock eye-tracking loop. Our wake does not stop that loop, and it uses VTCM ([memory layout](memory-layout.md#stock-eye-tracking-thread-and-vtcm)). Only thread 0, 1 or 2 code from the main list may issue HMX ([one HMX owner](kernels.md#one-hmx-owner-per-transaction)). Shared work records use generation/completion counters and bounded joins.
 
 Measured optimization showed that idle/waiting threads could slow busy ones. Longer bounded pauses, fewer unnecessary barriers, and progress publication only where consumers wait improved the total even when individual kernels changed little. Pause 255 is part of the recorded best recipe. This does not justify removing arbitrary ordering: publish/acquire semantics and rare-race risk still require device stress evidence.
 

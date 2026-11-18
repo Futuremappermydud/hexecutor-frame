@@ -1,6 +1,6 @@
 # Hexecutor architecture
 
-Hexecutor executes native Hexagon work through the Frame's existing CDSP callback infrastructure. Its main depth path validates a prepared program, binds privately owned memory, runs native handlers, and returns outputs through a host-controlled session. It is not a general-purpose QNN replacement or a loader for arbitrary model containers.
+Hexecutor executes native Hexagon work through the Frame's existing CDSP callback infrastructure. Its main depth path validates a prepared program, binds privately owned memory, runs native handlers, and returns outputs through a host-controlled session. It is not a general-purpose QNN replacement or a loader for arbitrary model containers. The separate [generic tensor backend](tensor-backend.md) supports explicitly lowered static graphs and shared multi-model sessions, including [MediaPipe hands](../model-development/hand-tracking.md).
 
 ## Host and DSP responsibilities
 
@@ -15,7 +15,7 @@ Hexecutor executes native Hexagon work through the Frame's existing CDSP callbac
 | Kernels | `hexecutor/native/kernels/` and native HMX headers | Convolution, layout, elementwise and data movement |
 
 
-Paths in the table are relative to the repository root. Read [the native API guide](api.md) for embedding the host.
+Paths in the table are relative to the repository root. Read [the native API guide](api.md) for embedding the host. The proposed [CDSP broker](broker.md) would make one process the only owner of the CDSP and schedule depth, hands, controller and eye work through it.
 
 The fixed loader at `0x87606000` invalidates the payload instruction/data-cache range before entry. Basic callback payloads use the linker-defined region starting at `0x87610000`. The full prepared engine has its own private code/heap allocation contract; do not treat the small callback payload limit as the size of every engine.
 

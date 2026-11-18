@@ -10,15 +10,19 @@
 
 /* Validate the published host command before mapping DDR, borrowing VTCM, or
  * starting followers. Sequence zero is the unpublished setup state. */
-static inline int qds_initial_command_valid(const volatile uint32_t *command,
-                                           uint32_t run_op) {
+static inline int qds_initial_command_valid_flags(const volatile uint32_t *command,
+                                                 uint32_t run_op, uint32_t allowed_flags) {
     if(!command)return 0;
     uint32_t sequence=command[2];
     QDS_ENTRY_BARRIER();
     int valid=sequence && command[0]==QDC_MAGIC && command[1]==QDC_VERSION &&
-              command[3]==run_op && command[4]<=command[5] && !(command[6]&~1u);
+              command[3]==run_op && command[4]<=command[5] && !(command[6]&~allowed_flags);
     QDS_ENTRY_BARRIER();
     return valid && command[2]==sequence;
+}
+
+static inline int qds_initial_command_valid(const volatile uint32_t *command, uint32_t run_op) {
+    return qds_initial_command_valid_flags(command, run_op, 1u);
 }
 
 static inline int qds_entry_all_arrived(const volatile uint32_t *arrivals,
