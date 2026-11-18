@@ -64,6 +64,7 @@ KINDS = {
     "native_group_norm.default": "norm",
     "instance_norm.default": "norm",
     "native_instance_norm.default": "norm",
+    "rms_norm.default": "rmsnorm",
     "_native_batch_norm_legit.no_stats": "norm",
     "_native_batch_norm_legit.default": "norm",
     "addmm.default": "addmm",
@@ -157,7 +158,7 @@ def static_shape(node):
 
 
 def hwc_of(shape, name="tensor", multihead=False):
-    """HXFG [H, W, C] for a batch-one rank-4 or rank-2 PyTorch shape, or multi-head [B, H, L, D] / rank-3 [B, L, C]."""
+    """HXFG [H, W, C] for a batch-one rank-4 or rank-2/3 PyTorch shape, or multi-head [B, H, L, D] / rank-3 [B, L, C]."""
     shape = tuple(shape)
     if multihead:
         if len(shape) == 4:
@@ -168,12 +169,12 @@ def hwc_of(shape, name="tensor", multihead=False):
             raise Unsupported(f"{name}: multihead shape {shape} must be rank 3 or 4")
     elif len(shape) == 4 and shape[0] == 1:
         h, w, c = shape[2], shape[3], shape[1]
-    elif len(shape) == 3 and shape[0] == 1:
-        h, w, c = shape[1], 1, shape[2]
-    elif len(shape) == 2 and shape[0] == 1:
-        h, w, c = 1, 1, shape[1]
+    elif len(shape) == 3:
+        h, w, c = shape[0] * shape[1], 1, shape[2]
+    elif len(shape) == 2:
+        h, w, c = shape[0], 1, shape[1]
     else:
-        raise Unsupported(f"{name}: shape {shape} is not batch-one rank 2, 3 or 4")
+        raise Unsupported(f"{name}: shape {shape} is not rank 2, 3 or batch-one rank 4")
     if min(h, w, c) < 1 or c > MAX_CHANNELS:
         raise Unsupported(f"{name}: unsupported size {shape}")
     return [h, w, c]
@@ -484,12 +485,12 @@ def _norm_plan(node, ep, data=False):
         x = node.args[0]
         ishape = static_shape(x)
         hwc = hwc_of(ishape, x.name)
-        if len(ishape) != 4:
-            raise Unsupported(f"{node.name}: instance norm requires a rank-4 tensor")
+        if len(ishape) not in (3, 4):
+            raise Unsupported(f"{node.name}: instance norm requires a rank-3 or rank-4 tensor")
         c = hwc[2]
         weight = node.args[1] if len(node.args) > 1 else None
         bias = node.args[2] if len(node.args) > 2 else None
-        eps = float(node.args[7]) if len(node.args) > 7 else (float(node.args[3]) if len(node.args) > 3 and isinstance(node.args[3], float) else 1e-5)
+        eps = float(node.args[7]) if len(node.args) > 7 and node.args[7] is not None else (float(node.args[3]) if len(node.args) > 3 and isinstance(node.args[3], float) else 1e-5)
         mode, groups, spatial, target = hx.NORM_GROUP, c, False, (c,)
         gamma = _norm_affine(ep, weight, target, "normalisation weight", data, spatial)
         beta = _norm_affine(ep, bias, target, "normalisation bias", data, spatial)
@@ -531,9 +532,9 @@ def _norm_plan(node, ep, data=False):
     if name == "native_layer_norm.default":
         normalized = [int(v) for v in node.args[1]]
         weight, bias, eps = node.args[2], node.args[3], float(node.args[4])
-        if len(ishape) == 2:
+        if len(ishape) in (2, 3):
             if normalized != [c]:
-                raise Unsupported(f"{node.name}: a [1, C] layer norm must normalise over C")
+                raise Unsupported(f"{node.name}: a token layer norm must normalise over C")
             mode, groups, spatial, target = hx.NORM_CHANNEL, 0, False, (c,)
         else:
             if normalized != list(ishape[1:]):
@@ -556,6 +557,22 @@ def _norm_plan(node, ep, data=False):
         gamma = np.ones(c, np.float32) if gamma is None else gamma
         beta = np.zeros(c, np.float32) if beta is None else beta
     return mode, groups, eps, gamma, beta, True
+
+
+def _rms_norm_plan(node, ep, data=False):
+    x = node.args[0]
+    ishape = static_shape(x)
+    hwc = hwc_of(ishape, x.name)
+    c = hwc[2]
+    if len(node.args) > 1 and node.args[1] is not None:
+        normalized = [int(v) for v in node.args[1]]
+        if normalized != [c]:
+            raise Unsupported(f"{node.name}: rms_norm normalized_shape {normalized} must match last dimension {c}")
+    weight = node.args[2] if len(node.args) > 2 else None
+    eps = float(node.args[3]) if len(node.args) > 3 and node.args[3] is not None else 1e-5
+    target = (c,)
+    gamma = _norm_affine(ep, weight, target, "rms_norm weight", data, spatial=False)
+    return eps, gamma
 
 
 def check(kind, node, ep):
@@ -706,6 +723,8 @@ def check(kind, node, ep):
             raise Unsupported("max pooling output shape")
     elif kind == "norm":
         _norm_plan(node, ep)
+    elif kind == "rmsnorm":
+        _rms_norm_plan(node, ep)
     elif kind == "getitem":
         prod = args[0]
         if not (
@@ -1295,6 +1314,12 @@ def lower_program(ep, destination):
                 b.emit(hx.NORM, b.tid(node.args[0]), NONE, node,
                        [mode, groups, hx.f32_bits(eps), b.pool.emit(_pad32(gamma)),
                         b.pool.emit(_pad32(beta))])
+            b.record(node, name)
+        elif kind == "rmsnorm":
+            eps, gamma = _rms_norm_plan(node, ep, data=True)
+            gamma_off = b.pool.emit(_pad32(gamma)) if gamma is not None else NONE
+            b.emit(hx.RMSNORM, b.tid(node.args[0]), NONE, node,
+                   [hx.f32_bits(eps), gamma_off, NONE])
             b.record(node, name)
         elif kind == "getitem":
             prod = node.args[0]
