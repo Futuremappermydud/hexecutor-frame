@@ -1133,23 +1133,6 @@ void hx_execute_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t par
     for (uint32_t i = lo; i < hi; i++) {
         uint32_t oy = i / b->w, ox = i % b->w;
         float *dst = out + i * b->stride;
-        if (o->kind == HX_MATMUL) {
-            /* Row i of A against B (float32 accumulate), then the scalar; padding lanes zero. */
-            const float *src = x + i * a->stride;
-            const float scale = p[1] ? hx_float(p[1]) : 1.0f;
-            for (uint32_t c = 0; c < b->stride; c++) {
-                float v = 0;
-                if (c < b->c) {
-                    float acc = 0;
-                    for (uint32_t k = 0; k < a->c; k++)
-                        acc += src[k] * (p[0] ? y[c * g->tensors[o->y].stride + k]
-                                              : y[k * g->tensors[o->y].stride + c]);
-                    v = acc * scale;
-                }
-                dst[c] = v;
-            }
-            continue;
-        }
         if (o->kind == HX_ACT) {
             const float *src = x + i * a->stride;
             for (uint32_t c = 0; c < b->stride; c++)

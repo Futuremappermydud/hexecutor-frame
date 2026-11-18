@@ -1064,6 +1064,131 @@ def model_token_reshape_alias():
     return b.model([("x", [1, length, dim])], [(out, [1, 2, 16])]), length, dim
 
 
+def model_batched_matmul_explicit():
+    """Batched MatMul of two runtime operands: Q [1, 2, 4, 8] and K [1, 2, 8, 4] -> [1, 2, 4, 4]."""
+    length, dim, heads = 4, 8, 2
+    dh = dim // heads
+    b = Builder(seed=71)
+    tok = linear_token(b, "x", dim * 2, dim * 2)
+    q_tok = b.node("Slice", [tok, b.const([0]), b.const([dim]), b.const([2])])
+    k_tok = b.node("Slice", [tok, b.const([dim]), b.const([dim * 2]), b.const([2])])
+    shape = b.const(np.array([1, length, heads, dh], np.int64))
+    q = b.node("Reshape", [q_tok, shape])
+    k = b.node("Reshape", [k_tok, shape])
+    qh = b.node("Transpose", [q], perm=[0, 2, 1, 3])
+    kh = b.node("Transpose", [k], perm=[0, 2, 1, 3])
+    kt = b.node("Transpose", [kh], perm=[0, 1, 3, 2])  # [1, H, dh, L]
+    scores = b.node("MatMul", [qh, kt])  # [1, 2, 4, 4]
+    merged = b.node("Transpose", [scores], perm=[0, 2, 1, 3])
+    out = b.node("Reshape", [merged, b.const(np.array([1, length, heads * length], np.int64))])
+    return b.model([("x", [1, length, dim * 2])], [(out, [1, length, heads * length])]), length, dim * 2
+
+
+def model_einsum_attention():
+    """Einsum for attention patterns: Q.K^T ("bhqd,bhkd->bhqk") and Attn.V ("bhqk,bhkd->bhqd")."""
+    length, dim, heads = 4, 8, 2
+    dh = dim // heads
+    b = Builder(seed=72)
+    x = "x"
+    shape = b.const(np.array([1, length, heads, dh], np.int64))
+    q, k, v = (b.node("Reshape", [linear_token(b, x, dim, dim), shape]) for _ in range(3))
+    qh = b.node("Transpose", [q], perm=[0, 2, 1, 3])
+    kh = b.node("Transpose", [k], perm=[0, 2, 1, 3])
+    vh = b.node("Transpose", [v], perm=[0, 2, 1, 3])
+    scores = b.node("Einsum", [qh, kh], equation="bhqd,bhkd->bhqk")
+    probs = b.node("Softmax", [scores], axis=-1)
+    ctx = b.node("Einsum", [probs, vh], equation="bhqk,bhkd->bhqd")
+    merged = b.node("Transpose", [ctx], perm=[0, 2, 1, 3])
+    out = b.node("Reshape", [merged, b.const(np.array([1, length, dim], np.int64))])
+    return b.model([(x, [1, length, dim])], [(out, [1, length, dim])]), length, dim
+
+
+def model_vit_batched_attention():
+    """ViT multi-head attention block using batched MatMul lowering."""
+    length, dim, heads = 4, 8, 2
+    dh = dim // heads
+    b = Builder(seed=73)
+    x = "x"
+    shape = b.const(np.array([1, length, heads, dh], np.int64))
+    q, k, v = (b.node("Reshape", [linear_token(b, x, dim, dim), shape]) for _ in range(3))
+    qh = b.node("Transpose", [q], perm=[0, 2, 1, 3])
+    kh = b.node("Transpose", [k], perm=[0, 2, 1, 3])
+    vh = b.node("Transpose", [v], perm=[0, 2, 1, 3])
+    kt = b.node("Transpose", [kh], perm=[0, 1, 3, 2])
+    scores = b.node("Mul", [b.node("MatMul", [qh, kt]), b.const(np.float32(1.0 / np.sqrt(dh)))])
+    probs = b.node("Softmax", [scores], axis=-1)
+    ctx = b.node("MatMul", [probs, vh])
+    merged = b.node("Transpose", [ctx], perm=[0, 2, 1, 3])
+    flat = b.node("Reshape", [merged, b.const(np.array([1, length, dim], np.int64))])
+    out = b.node("Add", [x, linear_token(b, flat, dim, dim)])
+    return b.model([(x, [1, length, dim])], [(out, [1, length, dim])]), length, dim
+
+
+def model_causal_decoder_attention():
+    """Causal decoder multi-head attention block with additive causal mask."""
+    length, dim, heads = 4, 8, 2
+    dh = dim // heads
+    b = Builder(seed=74)
+    x = "x"
+    shape = b.const(np.array([1, length, heads, dh], np.int64))
+    q, k, v = (b.node("Reshape", [linear_token(b, x, dim, dim), shape]) for _ in range(3))
+    qh = b.node("Transpose", [q], perm=[0, 2, 1, 3])
+    kh = b.node("Transpose", [k], perm=[0, 2, 1, 3])
+    vh = b.node("Transpose", [v], perm=[0, 2, 1, 3])
+    kt = b.node("Transpose", [kh], perm=[0, 1, 3, 2])
+    scores = b.node("Mul", [b.node("MatMul", [qh, kt]), b.const(np.float32(1.0 / np.sqrt(dh)))])
+    mask = np.zeros((1, heads, length, length), dtype=np.float32)
+    for h in range(heads):
+        for i in range(length):
+            for j in range(i + 1, length):
+                mask[0, h, i, j] = -10000.0
+    masked_scores = b.node("Add", [scores, b.const(mask)])
+    probs = b.node("Softmax", [masked_scores], axis=-1)
+    ctx = b.node("MatMul", [probs, vh])
+    merged = b.node("Transpose", [ctx], perm=[0, 2, 1, 3])
+    flat = b.node("Reshape", [merged, b.const(np.array([1, length, dim], np.int64))])
+    out = b.node("Add", [x, linear_token(b, flat, dim, dim)])
+    return b.model([(x, [1, length, dim])], [(out, [1, length, dim])]), length, dim
+
+
+def model_rank6_pixel_unshuffle():
+    """Rank-6 reshape and transpose unshuffle (conv.merge_unshuffle) on token/image patches."""
+    b = Builder(seed=75)
+    tok = linear_token(b, "x", 16, 16)
+    r6 = b.node("Reshape", [tok, b.const(np.array([1, 1, 1, 2, 2, 16], np.int64))])
+    t6 = b.node("Transpose", [r6], perm=[0, 1, 3, 2, 4, 5])
+    r_out = b.node("Reshape", [t6, b.const(np.array([1, 4, 16], np.int64))])
+    out = linear_token(b, r_out, 16, 16)
+    return b.model([("x", [1, 4, 16])], [(out, [1, 4, 16])]), 4, 16
+
+
+def model_sdpa_op():
+    """ScaledDotProductAttention op lowered to HX_SDPA."""
+    length, dim, heads = 4, 8, 2
+    dh = dim // heads
+    b = Builder(seed=76)
+    x = "x"
+    shape = b.const(np.array([1, length, heads, dh], np.int64))
+    q, k, v = (b.node("Reshape", [linear_token(b, x, dim, dim), shape]) for _ in range(3))
+    qh = b.node("Transpose", [q], perm=[0, 2, 1, 3])
+    kh = b.node("Transpose", [k], perm=[0, 2, 1, 3])
+    vh = b.node("Transpose", [v], perm=[0, 2, 1, 3])
+    ctx = b.node("ScaledDotProductAttention", [qh, kh, vh], scale=float(1.0 / np.sqrt(dh)))
+    merged = b.node("Transpose", [ctx], perm=[0, 2, 1, 3])
+    out = b.node("Reshape", [merged, b.const(np.array([1, length, dim], np.int64))])
+    return b.model([(x, [1, length, dim])], [(out, [1, length, dim])], check=False), length, dim
+
+
+def model_arbitrary_axis_softmax():
+    """Softmax along sequence axis (axis 1) of a token tensor."""
+    length, dim = 4, 8
+    b = Builder(seed=77)
+    tok = linear_token(b, "x", dim, dim)
+    s1 = b.node("Softmax", [tok], axis=1)
+    out = linear_token(b, s1, dim, dim)
+    return b.model([("x", [1, length, dim])], [(out, [1, length, dim])]), length, dim
+
+
 def ops_of(tmp):
 
     """All operation records of an HXFG image: 16 uint32 fields (kind, x, y, z, out, p[11])."""
@@ -1161,6 +1286,46 @@ class TransformerLoweringTests(unittest.TestCase):
         m, length, dim = model_token_reshape_alias()
         _, ops = self.numeric(m, (1, length, dim))
         self.assertIn(hx.RESHAPE, ops)
+
+    def test_batched_matmul_direct_matches_onnxruntime(self):
+        m, length, dim = model_batched_matmul_explicit()
+        _, ops = self.numeric(m, (1, length, dim), tol=5e-4)
+        self.assertIn(hx.MATMUL, ops)
+
+    def test_einsum_attention_matches_onnxruntime(self):
+        m, length, dim = model_einsum_attention()
+        _, ops = self.numeric(m, (1, length, dim), tol=5e-4)
+        self.assertEqual(ops.count(hx.MATMUL), 2, ops)
+        self.assertIn(hx.ATTN_SOFTMAX, ops)
+
+    def test_vit_batched_attention_matches_onnxruntime(self):
+        m, length, dim = model_vit_batched_attention()
+        _, ops = self.numeric(m, (1, length, dim), tol=5e-4)
+        self.assertEqual(ops.count(hx.MATMUL), 2, ops)
+
+    def test_causal_decoder_attention_matches_onnxruntime(self):
+        m, length, dim = model_causal_decoder_attention()
+        _, ops = self.numeric(m, (1, length, dim), tol=5e-4)
+        self.assertEqual(ops.count(hx.MATMUL), 2, ops)
+
+    def test_rank6_pixel_unshuffle_matches_onnxruntime(self):
+        m, length, dim = model_rank6_pixel_unshuffle()
+        _, ops = self.numeric(m, (1, length, dim), tol=5e-4)
+        self.assertEqual(ops.count(hx.CONV), 2, ops)
+
+    def test_sdpa_op_lowering_and_fields(self):
+        m, length, dim = model_sdpa_op()
+        with tempfile.TemporaryDirectory() as tmp:
+            lower_model(m, tmp)
+            ops = ops_of(tmp)
+            sdpa_ops = [op for op in ops if op[0] == hx.SDPA]
+            self.assertEqual(len(sdpa_ops), 1)
+            self.assertEqual(sdpa_ops[0][8], 2)
+
+    def test_arbitrary_axis_softmax_matches_onnxruntime(self):
+        m, length, dim = model_arbitrary_axis_softmax()
+        _, ops = self.numeric(m, (1, length, dim), tol=5e-4)
+        self.assertIn(hx.ATTN_SOFTMAX, ops)
 
     def test_transformer_rejections_name_the_node(self):
 
