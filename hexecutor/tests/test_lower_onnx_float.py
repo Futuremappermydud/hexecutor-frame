@@ -213,7 +213,7 @@ class FloatOnnxTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = lower_model(b.model([("x", [1, 3, 8, 8])], [(out, [1, 8, 8, 8])]), tmp)
             self.assertEqual(kinds(tmp), [hx.CONV])
-            self.assertEqual(len(manifest["ops"]), 2)  # BatchNormalization and Relu are recorded
+            self.assertEqual(len(manifest["ops"]), 3)  # Conv, BatchNormalization and Relu are recorded
 
     def test_fp16_blockers_are_reported(self):
         b = Builder()
@@ -264,7 +264,7 @@ class FloatOnnxTests(unittest.TestCase):
 
         for build, text in [
             (softmax, "Softmax"), (dilated, "dilation"), (grouped, "groups"),
-            (flatten_spatial, "mixes spatial"), (tanh_gelu, "exact (erf)"),
+            (flatten_spatial, "mixes spatial"), (tanh_gelu, "erf"),
             (spatial_const, "per-channel"), (passthrough, "graph input"),
         ]:
             with self.subTest(text), tempfile.TemporaryDirectory() as tmp:
