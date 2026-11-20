@@ -50,6 +50,9 @@ extern PFN_xrConvertTimespecTimeToTimeKHR gConvertTimespecTime;
 extern PFN_xrLocateSpace gLocateSpace;
 extern std::mutex gCloudMutex;
 extern std::vector<PointVertex> gCloud;
+// Incremented under gCloudMutex by every worker publication or clear of gCloud, so a
+// consumer can skip re-reading an unchanged mesh.
+extern std::atomic<uint64_t> gCloudRevision;
 extern std::atomic<uint32_t> gDepthFrames, gValidDepth, gStablePoints;
 extern std::atomic<float> gStereoMs;
 extern std::atomic<double> gCloudTime;

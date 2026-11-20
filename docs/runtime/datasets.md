@@ -8,6 +8,8 @@ The dataset harness records raw observations and the provenance needed to replay
 
 The launcher records until stopped unless a cap is configured. Holding trigger and grip together requests a clean stop. `FRAME_DATASET_FRAMES`, `FRAME_DATASET_SPACING_MS`, and `FRAME_DATASET_MIN_FREE_GB` configure limits. Raw data can consume roughly 228 MB/s in the recorded RGB-plus-IR configuration; the free-space stop is operationally significant.
 
+For camera-only capture, `room_dataset.py capture --no-color` skips the full-resolution NV12 pair while retaining the rectified, spherical, and pinhole luma used by offline inference and tag detection. `--keep-floods` preserves the current IR flood setting.
+
 Controller marks store poses, timestamps, a class, and strokes. A controller's device origin is not a measured surface-contact point. Supply a measured `--controller-tip` offset before using those marks as a metric reference.
 
 | Session entry | Purpose |
@@ -46,6 +48,8 @@ IR-to-RGB projection needs the session's measured stereo yaw, extrinsics, and ex
 Compositor loss and DSP cleanup failures are retained in session logs. The launcher blocks another NPU capture in a boot marked by failed cleanup. After reboot, restore ptrace/memory prerequisites before recording again.
 
 The dataset index, offline depth pass, transfer helper and IR refinement live under `depth-runtime/scripts/`. Keep capture metadata, model artifact identities and replay parameters with the dataset.
+
+For recordings collected across rooms or devices, retain rig identity, per-eye timing, and exposure-aligned poses so calibration and depth errors can be evaluated independently. Keep validation sessions disjoint from tuning sessions and review recordings for identifying content before sharing.
 
 ## Offline IR yaw normalization
 

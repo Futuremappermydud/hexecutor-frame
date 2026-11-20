@@ -162,6 +162,28 @@ int main() {
     assert(opening[size_t(300) * W + 300] == 2.80f);
     std::cout << "[Test] Opening behind the plane preserved: PASS" << std::endl;
 
+    // A blank side wall meeting the plane at a corner (x_cam = 0.5 m) lies inside
+    // the dome band near the corner, but faces 90 degrees away: it stays put.
+    std::vector<float> corner(N);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const float rx = (float(x) - RECT_CX) / RECT_FOCAL;
+            corner[size_t(y) * W + x] = rx > 0.25f ? 0.5f / rx : 2.0f;
+        }
+    const std::vector<float> cornerBefore = corner;
+    refiner.apply(corner, luma, &pose0);
+    int sideChecked = 0;
+    for (int y = 10; y < H - 10; ++y)
+        for (int x = 0; x < W; ++x) {
+            const float rx = (float(x) - RECT_CX) / RECT_FOCAL;
+            if (rx < 0.27f || rx > 0.32f) continue;  // 1.56-1.85 m: in front, inside the band
+            const size_t i = size_t(y) * W + x;
+            assert(corner[i] == cornerBefore[i]);
+            ++sideChecked;
+        }
+    assert(sideChecked > 0);
+    std::cout << "[Test] Side wall at a corner preserved: PASS" << std::endl;
+
     // Dots seen in front of the plane mark their cells; blank RGB there stays put.
     IrDotRefine blockedRefiner;
     IrDotRefine::WorldPlane blockedPlane = testPlane;

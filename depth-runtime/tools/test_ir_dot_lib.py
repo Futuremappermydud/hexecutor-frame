@@ -76,8 +76,22 @@ def test_footprint_follows_the_surface():
     def cell(x, y):
         iv, iu = lib.plane_cells(np.array([[x, y, 2.0]]), fit)
         return grid[iv[0], iu[0]]
-    assert cell(1.2, 0.0) == 1 and cell(0.0, 1.2) == 1 and cell(0.0, 0.0) == 1
-    assert cell(1.2, 1.2) == 0 and cell(-1.2, 1.2) == 0
+    # wall() lays its strips along a = n x (0.3, 1, 0.2) and b = n x a.
+    ax = np.cross([0, 0, 1], [0.3, 1, 0.2]); ax /= np.linalg.norm(ax)
+    bx = np.cross([0, 0, 1], ax)
+    assert cell(*(1.2 * ax[:2])) == 1 and cell(*(1.2 * bx[:2])) == 1 and cell(0.0, 0.0) == 1
+    assert cell(*(1.2 * (ax + bx)[:2])) == 0 and cell(*(1.2 * (bx - ax)[:2])) == 0
+
+
+def test_footprint_stops_at_the_dotted_edge():
+    # A corner: the plane must not reach past the last dotted cell onto the next wall.
+    pts = wall([0, 0, 1], 2.0, count=6000, half=(0.6, 0.6))
+    fit = lib.fit_dominant_plane(pts, rng=np.random.default_rng(0))
+    grid = lib.plane_footprint(pts, fit)
+    def cell(x, y):
+        iv, iu = lib.plane_cells(np.array([[x, y, 2.0]]), fit)
+        return grid[iv[0], iu[0]]
+    assert cell(0.55, 0.0) == 1 and cell(0.95, 0.0) == 0 and cell(0.0, -0.95) == 0
 
 
 def test_foreground_dots_block_their_cells():

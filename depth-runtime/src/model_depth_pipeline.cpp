@@ -220,19 +220,17 @@ bool ModelDepthPipeline::process(const std::vector<uint8_t>& left,const std::vec
                          <<milliseconds_<<" ms"<<std::endl;
         }
         const auto postprocessBegin=std::chrono::steady_clock::now();
-        std::array<float,256> confidenceOf;
-        for(size_t u=0;u<confidenceOf.size();++u)
-            confidenceOf[u]=std::clamp((maxUncertainty_-float(u))/float(maxUncertainty_-50),.05f,1.f);
-        confidence_.resize(size_t(RECT_WIDTH)*RECT_HEIGHT);
         if(useSpherical) {
             if(sphericalMap_.step!=sphericalStep)
                 sphericalMap_=modelSphericalMap(sphericalStep,FOCAL_BASELINE/RECT_FOCAL,RECT_WIDTH,RECT_HEIGHT,
                                                 RECT_FOCAL,RECT_CX,RECT_CY);
-            depth=modelSphericalDepth(disparity_,uncertainty_,sphericalMap_,maxUncertainty_);
-            for(size_t i=0;i<confidence_.size();i++)
-                confidence_[i]=sphericalMap_.modelIndex[i]>=0 ?
-                    confidenceOf[uncertainty_[sphericalMap_.modelIndex[i]]] : .05f;
+            modelSphericalPostprocess(disparity_,uncertainty_,sphericalMap_,maxUncertainty_,sphericalWorkspace_,
+                                      depth,confidence_);
         } else {
+            std::array<float,256> confidenceOf;
+            for(size_t u=0;u<confidenceOf.size();++u)
+                confidenceOf[u]=std::clamp((maxUncertainty_-float(u))/float(maxUncertainty_-50),.05f,1.f);
+            confidence_.resize(size_t(RECT_WIDTH)*RECT_HEIGHT);
             depth=modelMetricDepth(disparity_,l,r,RECT_WIDTH,RECT_HEIGHT,FOCAL_BASELINE,.25f,5.f,
                                    censusGate_?nullptr:&uncertainty_,maxUncertainty_);
             for(int y=0;y<RECT_HEIGHT;y++)for(int x=0;x<RECT_WIDTH;x++) {

@@ -18,11 +18,11 @@ Surface extraction uses surface nets and requires sufficient corner weight. Leaf
 
 ## Downstream CPU processing
 
-The learned-depth path validates disparity and reprojects it into rectified metric depth before eight-connected speckle rejection. Live mesh modes then apply the separable inverse-depth power-mean filter and triangulate accepted depth cells. Persistent mesh mode integrates the accepted depth into the TSDF and periodically extracts surface nets.
+The learned-depth path validates disparity and reprojects it into rectified metric depth before eight-connected speckle rejection with a banded union-find. Live mesh modes then apply the separable inverse-depth power-mean filter and triangulate accepted depth cells. Persistent mesh mode integrates the accepted depth into the TSDF and periodically extracts surface nets.
 
 Spherical conversion computes left-ray tangents per column and elevation cosines per row. Confidence expansion uses a 256-entry uncertainty lookup with the existing weight formula. Speckle rejection and filtering retain worker-owned scratch capacity; every frame resets validity and output values so rejected samples cannot survive from an earlier frame. The filter supports radii 0 through 2. Live triangulation lazily projects a shared grid point once using a two-row cache, retaining the original tear gates, triangle ordering, face normals and shading.
 
-TSDF integration also retains its touched-leaf/work buffers. Surface extraction skips a leaf neighborhood when its sufficiently weighted voxels have only one sign, since it cannot emit any crossing. Mixed neighborhoods still use the same surface-net construction and focus ordering. Mesh publication reuses buffers through the existing mutex-protected swap, with all processing on the background depth worker.
+TSDF integration retains its work buffers, samples allocation keys in parallel row bands, and scans a flat leaf index for frustum culling. The live surface-net cache rebuilds changed leaves and their one-leaf neighbor halo. It emits triangles in cache order and uses full-extraction focus ordering when capped. The background worker writes publication vertices directly and swaps the buffer under a mutex. The OpenXR viewer uploads it when the cloud revision changes.
 
 `[Mesh]` logs separate `postprocess`, `speckles`, `filter` and `mesh` milliseconds. `[TSDF]` logs `postprocess`, `speckles`, `integrate` and `mesh`; the mesh time remains the most recent scheduled extraction/publication time. The model's `postprocess` covers CPU metric conversion and confidence expansion, including spherical-map construction on first use. `stereo` remains the backend's inference time.
 
@@ -56,6 +56,12 @@ The full depth, filter, live geometry/color and TSDF geometry/luma checksums mat
 Distinguish per-frame depth error from fused-surface error. Repeated frames can reinforce a systematic calibration bias. A pose error often produces multiple displaced surfaces, while disparity uncertainty can produce local thickness or silhouette leakage. Measure these separately before tuning weight caps or carving to hide the symptom.
 
 The replay tools allow the same recorded observations to be integrated under different configurations. Compare configuration, source hashes, pose timing, spatial coverage, and retained versus rejected samples. Saved outputs must identify whether geometry came from RGB depth, IR refinement, or a combined diagnostic run.
+
+From `depth-runtime/`, `replay_room_tsdf --incremental --mesh-every 5` uses cached extraction in full-extraction order. `scripts/tsdf_incremental_test.py` compares the resulting PLY bytes in paired replays, and `bin/test_tsdf_incremental` exercises cache updates, caps, and ordering with synthetic inputs.
+
+To profile the live CPU processing stages from recorded model outputs, run `python3 scripts/model_mesh_replay.py pack SESSION/depth out.mmr` and feed the result to `bin/replay_model_mesh`. Its depth and mesh hashes support comparisons across full, incremental, and live-order runs. Use the triangle-set hash when comparing different triangle orders and match compiler floating-point contraction settings for byte-level comparisons.
+
+The offline plane tools can fit local patches from individual depth frames, extract planes from fused geometry, and compare IR-dot wall estimates against independent references. Keep per-frame and fused results separate, and measure plane offsets and corner leakage before using a plane to refine RGB depth. [Plane patch replay](../../depth-runtime/scripts/plane_patch_test.py), [TSDF plane analysis](../../depth-runtime/scripts/tsdf_planes.py), [IR-dot plane analysis](../../depth-runtime/scripts/ir_dot_planes.py)
 
 This guide describes the implemented representations. It does not replace or modify the ongoing temporal-fusion report or its related notes.
 

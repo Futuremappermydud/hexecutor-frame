@@ -66,6 +66,7 @@ PFN_xrConvertTimespecTimeToTimeKHR gConvertTimespecTime = nullptr;
 
 std::mutex gCloudMutex;
 std::vector<PointVertex> gCloud;
+std::atomic<uint64_t> gCloudRevision{0};
 std::atomic<uint32_t> gDepthFrames{0};
 std::atomic<uint32_t> gValidDepth{0};
 std::atomic<uint32_t> gStablePoints{0};
@@ -73,7 +74,7 @@ std::atomic<float> gStereoMs{0.0f};
 
 void clearPublishedCloud() {
     std::lock_guard<std::mutex> lock(gCloudMutex);
-    gCloud.clear(); gCloudTime.store(0); gCloudExpiry.store(0);
+    gCloud.clear(); gCloudRevision.fetch_add(1); gCloudTime.store(0); gCloudExpiry.store(0);
 }
 
 void setOcclusionCaptureEnabled(bool enabled) {
@@ -81,7 +82,7 @@ void setOcclusionCaptureEnabled(bool enabled) {
     const bool previous=gCaptureEnabled.exchange(enabled);
     if(!enabled) {
         if(previous) gCaptureGeneration.fetch_add(1);
-        gCloud.clear(); gCloudTime.store(0); gCloudExpiry.store(0);
+        gCloud.clear(); gCloudRevision.fetch_add(1); gCloudTime.store(0); gCloudExpiry.store(0);
     }
 }
 
@@ -96,9 +97,9 @@ bool publishOcclusionCloud(std::vector<PointVertex>& surface,double captureTime,
                            double expiry,uint64_t generation,bool captureAligned) {
     std::lock_guard<std::mutex> lock(gCloudMutex);
     if(!captureAligned || !gCaptureEnabled.load() || !gRunning.load() || generation!=gCaptureGeneration.load()) {
-        gCloud.clear(); gCloudTime.store(0); gCloudExpiry.store(0); return false;
+        gCloud.clear(); gCloudRevision.fetch_add(1); gCloudTime.store(0); gCloudExpiry.store(0); return false;
     }
-    gCloud.swap(surface); gCloudTime.store(captureTime);
+    gCloud.swap(surface); gCloudRevision.fetch_add(1); gCloudTime.store(captureTime);
     gCloudExpiry.store(gCloud.empty()?0:expiry);
     return true;
 }
@@ -404,7 +405,9 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
     size_t tsdfTriangles = 0;
     FrameSpatial::DepthFilterWorkspace meshFilterWorkspace;
     FrameSpatial::DepthSpeckleWorkspace speckleWorkspace;
-    std::vector<FrameSpatial::TsdfVertex> tsdfMeshScratch;
+    // packGray depends only on the integer part of luma.
+    std::array<uint32_t, 256> tsdfGray;
+    for (size_t i = 0; i < tsdfGray.size(); ++i) tsdfGray[i] = packGray(float(i), 8);
     std::vector<PointVertex> meshPublicationScratch;
 
     uint32_t frame = 0;
@@ -979,18 +982,19 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
             }
             if (frame == 1 || frame % kTsdfMeshEvery == 0) {
                 const auto meshStart = Clock::now();
-                auto& triangles = tsdfMeshScratch;
                 const float focus[3]{head.pose.position.x, head.pose.position.y, head.pose.position.z};
-                tsdf.extractMesh(triangles, kTsdfMaxTriangles, focus);
+                // Rebuilds only leaves changed since the last mesh and writes publication
+                // vertices directly. Triangle order follows the cache unless the cap is hit.
                 auto& meshVertices = meshPublicationScratch;
-                meshVertices.clear();
-                meshVertices.reserve(triangles.size());
-                for (const auto& v : triangles)
-                    meshVertices.push_back({v.x, v.y, v.z, packGray(v.luma, 8)});
-                tsdfTriangles = triangles.size() / 3;
+                tsdf.extractMeshAs(meshVertices, kTsdfMaxTriangles, focus,
+                    [&tsdfGray](const FrameSpatial::TsdfVertex& v) {
+                        return PointVertex{v.x, v.y, v.z, tsdfGray[std::clamp(int(v.luma), 0, 255)], 0.f};
+                    });
+                tsdfTriangles = meshVertices.size() / 3;
                 {
                     std::lock_guard<std::mutex> lock(gCloudMutex);
                     gCloud.swap(meshVertices);
+                    gCloudRevision.fetch_add(1);
                 }
                 gCloudTime.store(captureEnd.tv_sec + captureEnd.tv_nsec * 1e-9);
                 tsdfMeshMs = milliseconds(meshStart);
@@ -1031,6 +1035,7 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
             {
                 std::lock_guard<std::mutex> lock(gCloudMutex);
                 gCloud.swap(meshSurface);
+                gCloudRevision.fetch_add(1);
             }
             gCloudTime.store(captureEnd.tv_sec + captureEnd.tv_nsec * 1e-9);
             gDepthFrames.store(frame);
@@ -1294,6 +1299,7 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
         {
             std::lock_guard<std::mutex> lock(gCloudMutex);
             gCloud.swap(stable);
+            gCloudRevision.fetch_add(1);
         }
         gCloudTime.store(captureEnd.tv_sec + captureEnd.tv_nsec * 1e-9);
         gDepthFrames.store(frame);

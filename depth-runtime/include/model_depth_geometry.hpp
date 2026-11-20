@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
+#include "frame_omp.hpp"
 
 namespace FrameSpatial {
 constexpr int MODEL_WIDTH = 256;
@@ -116,13 +117,30 @@ inline ModelSphericalMap modelSphericalMap(float step,float baseline,int width,i
     }
     return m;
 }
-inline std::vector<float> modelSphericalDepth(const std::vector<float>& disparity,
-    const std::vector<uint8_t>& uncertainty,const ModelSphericalMap& map,int maxUncertainty=89,
+// Persistent scratch for one depth worker: rho on the model grid and, per
+// model pixel, the supported rho (0 if rejected) next to its confidence.
+struct ModelSphericalWorkspace {
+    struct Cell {float rho,confidence;};
+    std::vector<float> rho;
+    std::vector<Cell> cells;
+};
+// Depth and confidence (cell-rate confidence of the uncertainty value; .05 outside
+// the model grid) in one pass; both outputs are fully overwritten.
+inline void modelSphericalPostprocess(const std::vector<float>& disparity,
+    const std::vector<uint8_t>& uncertainty,const ModelSphericalMap& map,int maxUncertainty,
+    ModelSphericalWorkspace& workspace,std::vector<float>& depth,std::vector<float>& confidence,
     float minDepth=.25f,float maxDepth=5.f) {
     const size_t pixels=MODEL_WIDTH*MODEL_HEIGHT;
     if(disparity.size()!=pixels || uncertainty.size()!=pixels || !(map.step>0))
         throw std::invalid_argument("invalid Model spherical depth input");
-    std::vector<float> rho(pixels,0),supported(pixels,0);
+    // Border rows/columns of rho are never written and stay zero.
+    if(workspace.rho.size()!=pixels)workspace.rho.assign(pixels,0);
+    workspace.cells.resize(pixels);
+    float* const rho=workspace.rho.data();
+    ModelSphericalWorkspace::Cell* const cells=workspace.cells.data();
+    std::array<float,256> confidenceOf;
+    for(size_t u=0;u<confidenceOf.size();++u)
+        confidenceOf[u]=std::clamp((maxUncertainty-float(u))/float(maxUncertainty-50),.05f,1.f);
     // These depend only on the column/row, not on the predicted disparity.
     std::array<float,MODEL_WIDTH> azimuth{},tanAzimuth{};
     std::array<float,MODEL_HEIGHT> cosElevation{};
@@ -132,33 +150,60 @@ inline std::vector<float> modelSphericalDepth(const std::vector<float>& disparit
     }
     for(int v=0;v<MODEL_HEIGHT;++v)
         cosElevation[v]=std::cos((v-(MODEL_HEIGHT-1)*.5f)*map.step);
+    FRAME_OMP_FOR
     for(int v=2;v<MODEL_HEIGHT-2;v++)for(int u=2;u<MODEL_WIDTH-2;u++) {
         const size_t i=size_t(v)*MODEL_WIDTH+u;const float d=disparity[i];
-        if(!std::isfinite(d) || d<=0 || uncertainty[i]>=maxUncertainty || u-d<2)continue;
-        const float al=azimuth[u],ar=al-d*map.step;
-        if(al>1.5f || ar<-1.5f)continue;
-        const float gap=tanAzimuth[u]-std::tan(ar);
-        if(!(gap>0))continue;
-        const float r=map.baseline/gap;
-        const float z=r*cosElevation[v];
-        if(z<minDepth || z>maxDepth)continue;
-        rho[i]=r;
-    }
-    for(int v=2;v<MODEL_HEIGHT-2;v++)for(int u=2;u<MODEL_WIDTH-2;u++) {
-        const size_t i=size_t(v)*MODEL_WIDTH+u;const float r=rho[i];if(r<=0)continue;
-        int support=0;
-        for(int dy=-1;dy<=1;dy++)for(int dx=-1;dx<=1;dx++) {
-            if(!dx && !dy)continue;
-            const float n=rho[size_t(v+dy)*MODEL_WIDTH+u+dx];
-            if(n>0 && std::abs(n-r)<=std::max(.04f,.04f*r))++support;
+        float out=0;
+        if(std::isfinite(d) && d>0 && uncertainty[i]<maxUncertainty && u-d>=2) {
+            const float al=azimuth[u],ar=al-d*map.step;
+            if(!(al>1.5f || ar<-1.5f)) {
+                const float gap=tanAzimuth[u]-std::tan(ar);
+                if(gap>0) {
+                    const float r=map.baseline/gap;
+                    const float z=r*cosElevation[v];
+                    if(!(z<minDepth || z>maxDepth))out=r;
+                }
+            }
         }
-        if(support>=3)supported[i]=r;
+        rho[i]=out;
     }
-    std::vector<float> out(size_t(map.width)*map.height,0);
-    for(size_t i=0;i<out.size();i++) {
-        const int m=map.modelIndex[i];
-        if(m>=0 && supported[m]>0)out[i]=supported[m]*map.cosElevation[i];
+    FRAME_OMP_FOR
+    for(int v=0;v<MODEL_HEIGHT;v++)for(int u=0;u<MODEL_WIDTH;u++) {
+        const size_t i=size_t(v)*MODEL_WIDTH+u;
+        float supported=0;
+        const float r=rho[i];
+        if(r>0) {
+            int support=0;
+            for(int dy=-1;dy<=1;dy++)for(int dx=-1;dx<=1;dx++) {
+                if(!dx && !dy)continue;
+                const float n=rho[size_t(v+dy)*MODEL_WIDTH+u+dx];
+                if(n>0 && std::abs(n-r)<=std::max(.04f,.04f*r))++support;
+            }
+            if(support>=3)supported=r;
+        }
+        cells[i]={supported,confidenceOf[uncertainty[i]]};
     }
-    return out;
+    const size_t count=size_t(map.width)*map.height;
+    depth.resize(count);confidence.resize(count);
+    const int32_t* const index=map.modelIndex.data();
+    const float* const cosine=map.cosElevation.data();
+    float* const depthOut=depth.data();float* const confidenceOut=confidence.data();
+    FRAME_OMP_FOR
+    for(int y=0;y<map.height;y++)for(size_t i=size_t(y)*map.width,e=i+map.width;i<e;i++) {
+        const int m=index[i];
+        if(m>=0) {
+            const auto c=cells[m];
+            depthOut[i]=c.rho>0?c.rho*cosine[i]:0.f;
+            confidenceOut[i]=c.confidence;
+        } else {depthOut[i]=0;confidenceOut[i]=.05f;}
+    }
+}
+inline std::vector<float> modelSphericalDepth(const std::vector<float>& disparity,
+    const std::vector<uint8_t>& uncertainty,const ModelSphericalMap& map,int maxUncertainty=89,
+    float minDepth=.25f,float maxDepth=5.f) {
+    ModelSphericalWorkspace workspace;
+    std::vector<float> depth,confidence;
+    modelSphericalPostprocess(disparity,uncertainty,map,maxUncertainty,workspace,depth,confidence,minDepth,maxDepth);
+    return depth;
 }
 } // namespace FrameSpatial

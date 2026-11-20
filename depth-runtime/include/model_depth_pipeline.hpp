@@ -92,6 +92,7 @@ private:
     std::vector<float> disparity_;
     std::vector<uint8_t> uncertainty_;
     ModelSphericalMap sphericalMap_;
+    ModelSphericalWorkspace sphericalWorkspace_;
     uint32_t recordLimit_=0,recorded_=0;
     uint32_t sequence_=0;
     float milliseconds_=0;

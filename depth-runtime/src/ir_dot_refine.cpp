@@ -17,6 +17,9 @@ constexpr float kMaxBehindPlane = 0.65f;
 // Anything nearer the camera than this is kept as foreground.
 constexpr float kMaxDomeInFront = 0.50f;
 constexpr int64_t kPlaneMaxAgeMs = 2000;
+// RGB surface normal must be within acos(kMinNormalCos) of the IR plane's normal.
+constexpr float kMinNormalCos = 0.707f;  // 45 degrees
+constexpr int kNormalStep = 3;
 constexpr uint32_t kMinObservationPoints = 80;
 constexpr int kCaptureFailuresBeforeReopen = 5;
 
@@ -36,6 +39,35 @@ bool localFlat(const std::vector<uint8_t>& luma, int x, int y) {
             hi = std::max(hi, v);
         }
     return int(hi) - int(lo) < 12;
+}
+
+// Unit normal of the RGB surface at (x, y) from central differences over `step`
+// pixels, in the rectified camera frame. False when a neighbour has no depth.
+bool rgbNormal(const std::vector<float>& depth, int x, int y, int step, float out[3]) {
+    // Neighbours clamp to the image, so border pixels use one-sided differences.
+    const int x0 = std::max(0, x - step), x1 = std::min(RECT_WIDTH - 1, x + step);
+    const int y0 = std::max(0, y - step), y1 = std::min(RECT_HEIGHT - 1, y + step);
+    if (x0 == x1 || y0 == y1) return false;
+    auto point = [&](int px, int py, float p[3]) {
+        const float z = depth[size_t(py) * RECT_WIDTH + px];
+        if (!(z > 0.f)) return false;
+        p[0] = (float(px) - RECT_CX) / RECT_FOCAL * z;
+        p[1] = (float(py) - RECT_CY) / RECT_FOCAL * z;
+        p[2] = z;
+        return true;
+    };
+    float l[3], r[3], u[3], d[3];
+    if (!point(x0, y, l) || !point(x1, y, r) || !point(x, y0, u) || !point(x, y1, d))
+        return false;
+    const float a[3]{r[0] - l[0], r[1] - l[1], r[2] - l[2]};
+    const float b[3]{d[0] - u[0], d[1] - u[1], d[2] - u[2]};
+    out[0] = a[1] * b[2] - a[2] * b[1];
+    out[1] = a[2] * b[0] - a[0] * b[2];
+    out[2] = a[0] * b[1] - a[1] * b[0];
+    const float len = std::sqrt(out[0] * out[0] + out[1] * out[1] + out[2] * out[2]);
+    if (!(len > 0.f)) return false;
+    for (int i = 0; i < 3; ++i) out[i] /= len;
+    return true;
 }
 
 void rotate(const TsdfPose& pose, const float in[3], float out[3]) {
@@ -202,6 +234,9 @@ void IrDotRefine::apply(std::vector<float>& rgbDepth, const std::vector<uint8_t>
     const float cCam = wp.c - (wp.n[0] * t[0] + wp.n[1] * t[1] + wp.n[2] * t[2]);
     if (cCam <= 0.f) return;  // the camera is behind the surface it measured
 
+    // Normals come from the uncorrected depth so earlier rows' writes do not bias them.
+    thread_local std::vector<float> original;
+    original = rgbDepth;
     uint32_t overwritten = 0;
     for (int y = 2; y < RECT_HEIGHT - 2; ++y) {
         const float ry = (float(y) - RECT_CY) / RECT_FOCAL;
@@ -223,6 +258,12 @@ void IrDotRefine::apply(std::vector<float>& rgbDepth, const std::vector<uint8_t>
             // In front of the plane, only textureless pixels can be dome: textured
             // RGB depth is reliable and may be a real object on the wall.
             if (diff < 0.f && !localFlat(rgbLuma, x, y)) continue;
+            // A pixel on another surface (the adjacent wall at a corner) faces
+            // elsewhere; the dome only tilts the wall by tens of degrees.
+            float nRgb[3];
+            if (!rgbNormal(original, x, y, kNormalStep, nRgb) ||
+                std::abs(nRgb[0] * nCam[0] + nRgb[1] * nCam[1] + nRgb[2] * nCam[2]) < kMinNormalCos)
+                continue;
             rgbDepth[i] = zp;
             ++overwritten;
         }

@@ -34,8 +34,14 @@ Tag observations also showed short-timescale yaw drift outside the history sprea
 
 `timed_stereo_capture`, `v4l2_capture_clock`, and the IR capture tools retain sequence/timestamp information. Prefer measured exposure-related timing over whichever headset pose is newest at processing completion. A DMA read midpoint is a fallback estimate, not proof of exposure time.
 
+For RGB timestamps, the capture-clock helper first checks XRService for a descriptor matching the requested 2464 × 2464 NV12 node. It can duplicate the matching descriptor from another owner when a separate camera service streams the pair.
+
 Dataset processing associates a camera pose with the estimated exposure and rejects missing or excessively distant poses. The historical 8 ms exposure offset is configurable and is not a universal calibration. Compositor restart, camera sequence gaps, and uncertain clock alignment must remain visible in metadata.
 
 Source: [capture](../../depth-runtime/src/dma_capture.cpp), [rectification](../../depth-runtime/src/depth_pipeline.cpp), [calibration definitions](../../depth-runtime/include/calibration.hpp).
 
 The capture-clock helper maps V4L2 and raw monotonic timestamps into the runtime clock domain. Verify its calibration against measured exposure timing for the camera stream under test. [Capture-clock code](../../depth-runtime/src/v4l2_capture_clock.cpp)
+
+## Offline stereo self-calibration
+
+The tools under `depth-runtime/tools/` can assess stereo alignment from natural features and recorded headset motion. Keep the nominal rectifier and the fitted lens model distinct, and score horizontal prediction on independent recordings in a common camera frame. Small fitted residuals can coexist with a biased yaw estimate. Use an independent reference and report its uncertainty alongside the candidate error. The experimental estimates have not met the criteria for replacing the live calibration. [Motion-stereo replay](../../depth-runtime/tools/replay_ir_motion_yaw.cpp)

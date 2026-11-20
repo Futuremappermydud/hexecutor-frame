@@ -346,8 +346,10 @@ def plane_footprint(pts, fit):
     front = ~fit.inliers & (along_n > 0.1) & (along_n < fit.c - FRONT_MARGIN)
     in_front = count(pts[front] * (fit.c / along_n[front])[:, None])
     good = on_plane >= FOOT_MIN_POINTS
+    # Fill one-cell gaps between dotted cells, but never grow past the dotted edge:
+    # growing outward carried the plane round corners onto the neighbouring wall.
     p = np.pad(good, 1)
-    grown = p[:-2, 1:-1] | p[2:, 1:-1] | p[1:-1, :-2] | p[1:-1, 2:] | good
+    grown = (p[:-2, 1:-1] & p[2:, 1:-1]) | (p[1:-1, :-2] & p[1:-1, 2:]) | good
     grid = grown.astype(np.uint8)
     grid[(in_front >= FOOT_MIN_POINTS) & (in_front > on_plane)] = 2
     return grid

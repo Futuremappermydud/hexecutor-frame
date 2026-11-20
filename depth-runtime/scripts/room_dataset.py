@@ -212,7 +212,7 @@ def capture(args):
                          'lead_ms': pulse_lead_ms, 'lead_source': pulse_lead_source,
                          'sham_percent': args.sham_percent} if args.dots else None,
                'floods_disabled_requested': not args.keep_floods,
-               'rgb_color_format': 'raw stereo NV12, 2464 x 2464; rectified luma is separate',
+               'rgb_color_format': None if args.no_color else 'raw stereo NV12, 2464 x 2464; rectified luma is separate',
                'clock_contract': 'RGB and IR pose matching uses CLOCK_MONOTONIC; IR raw clock also retained',
                'controller_markers_requested': not args.no_markers,
                'live_viewer': args.live_viewer,
@@ -267,7 +267,7 @@ def capture(args):
             env = os.environ.copy()
             env['FRAME_CAPTURE_TIMING'] = 'v4l2'
             env['FRAME_DEPTH_SPHERICAL'] = '1'
-            env['FRAME_SAVE_COLOR'] = '1'
+            env['FRAME_SAVE_COLOR'] = '0' if args.no_color else '1'
             if args.save_raw:
                 env['FRAME_SAVE_RAW'] = '1'
             if args.live_viewer:
@@ -563,6 +563,32 @@ def pose_from_row(row, extrinsic):
     return rotation.astype(np.float32).ravel().tolist(), translation.astype(np.float32).tolist()
 
 
+def write_depth_metadata(frames, depth_dir, poses, extrinsic, exposure_offset_ms):
+    """Write each frame's exposure-aligned pose JSON beside its converted depth; return skips."""
+    skipped = []
+    for path in frames:
+        meta = json.loads(path.read_text())
+        name = path.stem
+        if not meta.get('timed') or not meta.get('left_end_of_readout_ns'):
+            skipped.append({'frame': name, 'reason': 'no V4L2 exposure timestamp'})
+            continue
+        exposure_ns = int(meta['left_end_of_readout_ns']) - int(exposure_offset_ms * 1e6)
+        row, delta = nearest_pose(poses, exposure_ns)
+        if row is None:
+            skipped.append({'frame': name, 'reason': 'missing capture-time pose', 'nearest_delta_ns': delta})
+            continue
+        rotation, translation = pose_from_row(row, extrinsic)
+        outmeta = {'version': 2, 'sequence': int(name.split('-')[1]), 'files_prefix': name,
+                   'camera_to_world_rotation': rotation, 'camera_to_world_translation_m': translation,
+                   'capture_begin_ns': meta['capture_begin_ns'], 'capture_end_ns': meta['capture_end_ns'],
+                   'pose_time_ns': int(row['mono_ns']), 'capture_time_pose': True, 'pose_valid': True,
+                   'pose_timing': 'v4l2_end_of_readout_minus_offset_nearest_openvr',
+                   'pose_delta_ns': delta, 'exposure_offset_ms': exposure_offset_ms,
+                   'camera_sequence': meta.get('camera_sequence', 0), 'spherical_step_rad': meta['spherical_step_rad']}
+        write_json(depth_dir / (name + '.json'), outmeta)
+    return skipped
+
+
 def finalize(args):
     out = args.output.resolve()
     stage_start = time.monotonic()
@@ -609,27 +635,7 @@ def finalize(args):
                'exposure_timestamp': True, 'config_sha256': ''}
     if not live:
         write_json(depth_dir / 'capture.json', capture)
-    skipped = []
-    for path in [] if live else frames:
-        meta = json.loads(path.read_text())
-        name = path.stem
-        if not meta.get('timed') or not meta.get('left_end_of_readout_ns'):
-            skipped.append({'frame': name, 'reason': 'no V4L2 exposure timestamp'})
-            continue
-        exposure_ns = int(meta['left_end_of_readout_ns']) - int(args.exposure_offset_ms * 1e6)
-        row, delta = nearest_pose(poses, exposure_ns)
-        if row is None:
-            skipped.append({'frame': name, 'reason': 'missing capture-time pose', 'nearest_delta_ns': delta})
-            continue
-        rotation, translation = pose_from_row(row, extrinsic)
-        outmeta = {'version': 2, 'sequence': int(name.split('-')[1]), 'files_prefix': name,
-                   'camera_to_world_rotation': rotation, 'camera_to_world_translation_m': translation,
-                   'capture_begin_ns': meta['capture_begin_ns'], 'capture_end_ns': meta['capture_end_ns'],
-                   'pose_time_ns': int(row['mono_ns']), 'capture_time_pose': True, 'pose_valid': True,
-                   'pose_timing': 'v4l2_end_of_readout_minus_offset_nearest_openvr',
-                   'pose_delta_ns': delta, 'exposure_offset_ms': args.exposure_offset_ms,
-                   'camera_sequence': meta.get('camera_sequence', 0), 'spherical_step_rad': meta['spherical_step_rad']}
-        write_json(depth_dir / (name + '.json'), outmeta)
+    skipped = [] if live else write_depth_metadata(frames, depth_dir, poses, extrinsic, args.exposure_offset_ms)
     if skipped:
         write_json(out / 'skipped_frames.json', skipped)
     if not list(depth_dir.glob('frame-*.json')):
@@ -815,6 +821,8 @@ def main():
     cap.add_argument('--sham-percent', type=int, default=10, help='pulses left dark as a false-positive control')
     cap.add_argument('--keep-floods', action='store_true', help='leave the headset IR floods in their current mode')
     cap.add_argument('--save-raw', action='store_true', help='also save full-resolution detiled RGB luma')
+    cap.add_argument('--no-color', action='store_true',
+                     help='skip the full-resolution NV12 colour (about 18 MB of the 19 MB per frame)')
     fin = sub.add_parser('finalize', help='run inference, pose alignment, tags and TSDF replay')
     fin.add_argument('output', type=Path)
     fin.add_argument('--python', type=Path, default=MODEL_PY)

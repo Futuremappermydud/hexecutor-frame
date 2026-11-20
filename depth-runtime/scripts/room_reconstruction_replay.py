@@ -65,7 +65,7 @@ def replay(directory, output, executable, max_frames=None):
     return manifest
 
 
-def replay_stream(directory, output, executable, max_frames=None):
+def replay_stream(directory, output, executable, max_frames=None, tsdf_args=()):
     """Replay without retaining all frames in RAM or a multi-gigabyte frames.bin."""
     capture = json.loads((directory / 'capture.json').read_text())
     if capture['version'] != 2 or capture['model_shape'] != [320, 256]:
@@ -77,7 +77,7 @@ def replay_stream(directory, output, executable, max_frames=None):
         raise ValueError('invalid replay frame count')
     output.mkdir(parents=True, exist_ok=True)
     mesh = output / 'mesh.ply'
-    process = subprocess.Popen([str(executable), '-', str(mesh)], stdin=subprocess.PIPE,
+    process = subprocess.Popen([str(executable), *tsdf_args, '-', str(mesh)], stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         process.stdin.write(struct.pack('<I', len(paths)))
@@ -110,7 +110,8 @@ def replay_stream(directory, output, executable, max_frames=None):
               for path in directory.iterdir() if path.is_file()}
     manifest = {'version': 1, 'source': str(directory), 'input_sha256': hashes,
                 'frames': len(paths), 'capture': capture,
-                'replay_stdout': stdout.decode(errors='replace').strip(), 'streamed': True}
+                'replay_stdout': stdout.decode(errors='replace').strip(), 'streamed': True,
+                'tsdf_args': list(tsdf_args)}
     (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     return manifest
 

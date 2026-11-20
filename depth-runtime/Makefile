@@ -141,6 +141,18 @@ shaders/occlusion.frag.spv: shaders/occlusion.frag
 bin/test_tsdf_volume: tools/test_tsdf_volume.cpp src/tsdf_volume.cpp include/tsdf_volume.hpp | dirs
 	$(CXX) -O3 -std=c++17 -Wall -Wextra -fopenmp -Iinclude tools/test_tsdf_volume.cpp src/tsdf_volume.cpp -o $@
 
+bin/test_tsdf_incremental: tools/test_tsdf_incremental.cpp src/tsdf_volume.cpp include/tsdf_volume.hpp | dirs
+	$(CXX) -O3 -std=c++17 -Wall -Wextra -fopenmp -Iinclude tools/test_tsdf_incremental.cpp src/tsdf_volume.cpp -o $@
+
+bin/replay_model_mesh: tools/replay_model_mesh.cpp src/tsdf_volume.cpp include/tsdf_volume.hpp include/model_depth_geometry.hpp include/depth_speckle_filter.hpp | dirs
+	$(CXX) -O3 -std=c++17 -Wall -Wextra -fopenmp -Iinclude tools/replay_model_mesh.cpp src/tsdf_volume.cpp -o $@
+
+bin/test_plane_patches: tools/test_plane_patches.cpp src/plane_patches.cpp include/plane_patches.hpp | dirs
+	$(CXX) -O3 -std=c++17 -Wall -Wextra -Iinclude tools/test_plane_patches.cpp src/plane_patches.cpp -o $@
+
+bin/replay_plane_patches: tools/replay_plane_patches.cpp src/plane_patches.cpp include/plane_patches.hpp | dirs
+	$(CXX) -O3 -std=c++17 -Wall -Wextra -Iinclude tools/replay_plane_patches.cpp src/plane_patches.cpp -o $@
+
 bin/test_depth_postprocess: tools/test_depth_postprocess.cpp include/model_depth_geometry.hpp include/depth_speckle_filter.hpp | dirs
 	$(CXX) $(CXXFLAGS) -UNDEBUG $< -o $@
 

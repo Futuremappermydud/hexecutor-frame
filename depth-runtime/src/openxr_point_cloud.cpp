@@ -191,6 +191,8 @@ private:
     void* mPointMapped = nullptr;
     bool mPointCoherent = false;
     size_t mPointCapacity = 260000;
+    uint32_t mPointCount = 0;             // vertices currently in the mapped buffer
+    uint64_t mUploadedRevision = ~0ull;   // gCloudRevision of those vertices
     std::vector<XrViewConfigurationView> mViewConfig;
     std::vector<XrView> mViews;
     std::vector<EyeSwapchain> mEyes;
@@ -868,10 +870,27 @@ bool OpenXrPointRenderer::renderFrame() {
     profile.mark(timing,ApplicationRenderProfile::Locate,stageStart);
     if (state.shouldRender && viewsValid) {
         stageStart=profile.now();
-        std::vector<PointVertex> points;
+        // Each eye's draw is fenced before this point, so the vertex buffer is idle here.
+        // The worker's mesh is copied straight into it, and only when it has changed.
+        const auto uploadVertices = [this](const std::vector<PointVertex>& points) {
+            mPointCount = static_cast<uint32_t>(std::min(points.size(), mPointCapacity));
+            if (mPointCount == 0) return;
+            std::memcpy(mPointMapped, points.data(), mPointCount * sizeof(PointVertex));
+            if (!mPointCoherent) {
+                VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+                range.memory = mPointMemory;
+                range.offset = 0;
+                range.size = VK_WHOLE_SIZE;
+                vkFlushMappedMemoryRanges(mDevice, 1, &range);
+            }
+        };
         if (!mDemo) {
             std::lock_guard<std::mutex> lock(gCloudMutex);
-            points = gCloud;
+            const uint64_t revision = gCloudRevision.load();
+            if (revision != mUploadedRevision) {
+                uploadVertices(gCloud);
+                mUploadedRevision = revision;
+            }
         }
         if (mDemo) {
             if (mDemoVertices.empty()) {
@@ -894,21 +913,9 @@ bool OpenXrPointRenderer::renderFrame() {
                 }
                 std::cout << "[Demo] Stage-locked panels at 1, 2, and 3 metres; submitting application depth" << std::endl;
             }
-            points=mDemoVertices;
+            if (mPointCount == 0) uploadVertices(mDemoVertices);
         }
-        const uint32_t pointCount = static_cast<uint32_t>(
-            std::min(points.size(), mPointCapacity));
-        if (pointCount > 0) {
-            const VkDeviceSize bytes = pointCount * sizeof(PointVertex);
-            std::memcpy(mPointMapped, points.data(), bytes);
-            if (!mPointCoherent) {
-                VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
-                range.memory = mPointMemory;
-                range.offset = 0;
-                range.size = VK_WHOLE_SIZE;
-                vkFlushMappedMemoryRanges(mDevice, 1, &range);
-            }
-        }
+        const uint32_t pointCount = mPointCount;
 
         profile.mark(timing,ApplicationRenderProfile::Upload,stageStart);
         stageStart=profile.now();

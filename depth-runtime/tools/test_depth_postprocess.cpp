@@ -112,8 +112,94 @@ static void checkSpeckles() {
     for(float z:diagonal) assert(z==0);
 }
 
+static void expectSpeckles(std::vector<float> depth, int width, int height, size_t minimum,
+                           DepthSpeckleWorkspace& workspace) {
+    auto expected = depth;
+    referenceSpeckles(expected, width, height, minimum);
+    removeDepthSpeckles(depth, width, height, workspace, minimum);
+    assert(std::memcmp(depth.data(), expected.data(), depth.size() * sizeof(float)) == 0);
+}
+
+// Sizes straddle the band split (height >= 64, 65536+ pixels) and the minimum.
+static void checkSpecklesLarge() {
+    std::mt19937 rng(4421);
+    DepthSpeckleWorkspace workspace;
+    const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
+    for (const auto& [width, height] : {std::pair{256, 256}, std::pair{301, 223}, std::pair{616, 616}, std::pair{1000, 66}}) {
+        // Smooth plateaus separated by invalid pixels, speckled with tolerance-edge values.
+        std::vector<float> depth(size_t(width) * height);
+        for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) {
+            float z = 1.f + .02f * float((x / 37 + y / 29) % 5) + .0005f * float(rng() % 3);
+            switch (rng() % 23) {
+                case 0: z = 0; break;
+                case 1: z = -3; break;
+                case 2: z = nan; break;
+                case 3: z = inf; break;
+                case 4: z = z * 1.0399f; break;
+                case 5: z = z * 1.05f; break;
+                default: break;
+            }
+            if ((x / 41 + y / 31) % 3 == 0 && rng() % 4) z = 0;
+            depth[size_t(y) * width + x] = z;
+        }
+        for (size_t minimum : {size_t(2), size_t(32), size_t(500)}) expectSpeckles(depth, width, height, minimum, workspace);
+        // Vertical walls and a column-wide component that crosses every band boundary.
+        std::vector<float> walls(depth.size(), 0.f);
+        for (int y = 0; y < height; ++y) for (int x = 0; x < width; x += 5) walls[size_t(y) * width + x] = 2.f;
+        for (int y = 0; y < height; ++y) walls[size_t(y) * width + 1] = 2.f;
+        expectSpeckles(walls, width, height, 32, workspace);
+        // Diagonals zig-zagging across band boundaries, i.e. only NW/NE links join the bands.
+        std::vector<float> diagonals(depth.size(), 0.f);
+        for (int y = 0; y < height; ++y) {
+            const int x = (y % 2 ? y : -y) / 2 + width / 2;
+            if (x >= 0 && x < width) diagonals[size_t(y) * width + x] = 3.f;
+            const int x2 = std::abs((y * 3) % (2 * (width - 1)) - (width - 1));
+            diagonals[size_t(y) * width + x2] = 1.f + .001f * float(y % 7);
+        }
+        expectSpeckles(diagonals, width, height, 32, workspace);
+        expectSpeckles(diagonals, width, height, 70, workspace);
+    }
+}
+
+static void checkSpecklesSizes() {
+    DepthSpeckleWorkspace workspace;
+    const int width = 200, height = 128;
+    // Components of exactly 31/32/33 pixels: a row segment, plus an L-shaped one touching each border.
+    for (int length : {30, 31, 32, 33, 34}) for (int y0 : {0, 1, 63, 64, 126, 127}) for (int x0 : {0, 1, width - length}) {
+        std::vector<float> depth(size_t(width) * height, 0.f);
+        for (int i = 0; i < length; ++i) depth[size_t(y0) * width + x0 + i] = 1.5f;
+        expectSpeckles(depth, width, height, 32, workspace);
+        std::vector<float> vertical(size_t(width) * height, 0.f);
+        for (int i = 0; i < length; ++i) vertical[size_t(std::min(i, height - 1)) * width + x0] = 1.5f;
+        expectSpeckles(vertical, width, height, 32, workspace);
+    }
+    // Tolerance chains: a-b and b-c link but a-c does not; 8-connected chain on a diagonal and in a row.
+    for (int chain : {31, 32, 33}) {
+        std::vector<float> row(size_t(width) * height, 0.f), diagonal(row.size(), 0.f);
+        for (int i = 0; i < chain; ++i) {
+            const float z = 1.f + .035f * float(i);   // 1.035 apart-ish: linked pairs exceed 0.04 over three steps
+            row[size_t(60) * width + 10 + i] = z;
+            diagonal[size_t(60 + i) * width + 10 + i] = z;
+        }
+        expectSpeckles(row, width, height, 32, workspace);
+        expectSpeckles(diagonal, width, height, 32, workspace);
+    }
+    // Two chains that only touch through a tolerance-failing pair stay separate.
+    std::vector<float> apart(size_t(width) * height, 0.f);
+    for (int i = 0; i < 20; ++i) { apart[size_t(10) * width + i] = 1.f; apart[size_t(11) * width + i] = 1.5f; }
+    expectSpeckles(apart, width, height, 32, workspace);
+    // A single-pixel-high U that joins late: labels merge after both arms were counted separately.
+    std::vector<float> u(size_t(width) * height, 0.f);
+    for (int y = 60; y < 80; ++y) { u[size_t(y) * width + 3] = 1.f; u[size_t(y) * width + 9] = 1.f; }
+    for (int x = 3; x <= 9; ++x) u[size_t(80) * width + x] = 1.f;
+    expectSpeckles(u, width, height, 32, workspace);
+    expectSpeckles(u, width, height, 48, workspace);
+}
+
 int main() {
     checkSpeckles();
+    checkSpecklesSizes();
+    checkSpecklesLarge();
     std::mt19937 rng(1147);
     for (const float degrees : {.29f, .42f}) {
         const auto map = modelSphericalMap(degrees * .01745329252f, .075f, 616, 616, 380, 308, 308);
@@ -144,6 +230,22 @@ int main() {
             valid += actual[i] > 0;
         }
         assert(valid > 10000 && valid < actual.size());
+        ModelSphericalWorkspace workspace;
+        std::vector<float> depth, confidence;
+        auto reduced = disparity;
+        for (size_t i = 0; i < reduced.size(); i += 5) reduced[i] = 0;
+        const auto reducedExpected = reference(reduced, uncertainty, map);
+        for (int pass = 0; pass < 3; ++pass) {   // alternating inputs reuse a dirty workspace
+            const bool full = pass != 1;
+            modelSphericalPostprocess(full ? disparity : reduced, uncertainty, map, 89, workspace, depth, confidence);
+            const auto& want = full ? expected : reducedExpected;
+            assert(depth.size() == want.size() && confidence.size() == want.size());
+            for (size_t i = 0; i < depth.size(); ++i) {
+                assert(depth[i] == want[i]);
+                const int m = map.modelIndex[i];
+                assert(confidence[i] == (m >= 0 ? std::clamp((89 - float(uncertainty[m])) / float(89 - 50), .05f, 1.f) : .05f));
+            }
+        }
         std::fill(uncertainty.begin(), uncertainty.end(), 89);
         for (float z : modelSphericalDepth(disparity, uncertainty, map)) assert(z == 0);
     }

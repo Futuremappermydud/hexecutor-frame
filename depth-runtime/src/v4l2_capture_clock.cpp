@@ -60,14 +60,14 @@ int64_t V4l2CaptureClock::monotonicNs() { return nowNs(CLOCK_MONOTONIC); }
 int64_t V4l2CaptureClock::monotonicMinusRawNs() { return monotonicMinusRaw(); }
 int V4l2CaptureClock::findXrServicePid() { return findXrService(); }
 
-V4l2CaptureClock::V4l2CaptureClock(const std::string& node) {
-    const pid_t pid = findXrService();
-    if (pid <= 0) throw std::runtime_error("XRService not running");
+// Duplicates `node` from `pid` if that process holds it at 2464x2464 NV12; -1 otherwise.
+static int grabCameraNode(pid_t pid, const std::string& node) {
     const int pidfd = int(syscall(__NR_pidfd_open, pid, 0));
-    if (pidfd < 0) throw std::runtime_error("pidfd_open(XRService) failed; check ptrace_scope");
+    if (pidfd < 0) return -1;
     const std::string dir = "/proc/" + std::to_string(pid) + "/fd";
     DIR* fds = opendir(dir.c_str());
-    while (fds && fd_ < 0) {
+    int found = -1;
+    while (fds && found < 0) {
         dirent* e = readdir(fds);
         if (!e) break;
         char target[256] = {};
@@ -78,16 +78,40 @@ V4l2CaptureClock::V4l2CaptureClock(const std::string& node) {
         v4l2_format format{};
         format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         if (ioctl(fd, VIDIOC_G_FMT, &format) == 0 && format.fmt.pix_mp.width == 2464 &&
-            format.fmt.pix_mp.height == 2464 && format.fmt.pix_mp.pixelformat == V4L2_PIX_FMT_NV12) {
-            fd_ = fd;
-            description_ = node + " (XRService pid " + std::to_string(pid) + ")";
-        } else {
+            format.fmt.pix_mp.height == 2464 && format.fmt.pix_mp.pixelformat == V4L2_PIX_FMT_NV12)
+            found = fd;
+        else
             close(fd);
-        }
     }
     if (fds) closedir(fds);
     close(pidfd);
-    if (fd_ < 0) throw std::runtime_error("XRService camera node " + node + " (2464x2464 NV12) not found");
+    return found;
+}
+
+V4l2CaptureClock::V4l2CaptureClock(const std::string& node) {
+    // XRService used to own the RGB nodes; on newer images a separate camera
+    // service (CameraSwitch) streams them, so fall back to any holder.
+    const pid_t xr = findXrService();
+    if (xr > 0 && (fd_ = grabCameraNode(xr, node)) >= 0) {
+        description_ = node + " (XRService pid " + std::to_string(xr) + ")";
+        return;
+    }
+    if (DIR* proc = opendir("/proc")) {
+        while (fd_ < 0) {
+            dirent* e = readdir(proc);
+            if (!e) break;
+            const pid_t pid = pid_t(std::atoi(e->d_name));
+            if (pid <= 0 || pid == xr || pid == getpid()) continue;
+            if ((fd_ = grabCameraNode(pid, node)) >= 0) {
+                std::ifstream comm("/proc/" + std::to_string(pid) + "/comm");
+                std::string name;
+                std::getline(comm, name);
+                description_ = node + " (" + name + " pid " + std::to_string(pid) + ")";
+            }
+        }
+        closedir(proc);
+    }
+    if (fd_ < 0) throw std::runtime_error("camera node " + node + " (2464x2464 NV12) not held by XRService or any other process; check ptrace_scope");
 }
 
 V4l2CaptureClock::~V4l2CaptureClock() {
