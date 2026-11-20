@@ -120,6 +120,8 @@ int main() {
     check(f.open() == HX_ALIAS);
     f.tensor(1).offset = 256;
     f.tensor(0).stride = 1;
+    check(f.open() == HX_OK); // Single-channel tensors may use a packed stride.
+    f.tensor(0).stride = 2;
     check(f.open() == HX_SHAPE);
     f.tensor(0).stride = 32;
     f.op().kind = 999;
