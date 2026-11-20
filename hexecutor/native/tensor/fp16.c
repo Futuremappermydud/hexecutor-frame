@@ -24,6 +24,9 @@ static inline float hx_float(uint32_t bits) {
     return pun.f;
 }
 static inline uint32_t physical_width(const HxTensor *t) { return (t->w + 1u) & ~1u; }
+/* A compact image input: RGB with stride 3, or one channel with stride 1 (graph.c accepts only these
+ * sub-32 strides). Its one convolution consumer packs windows of stride words per pixel. */
+static inline int compact(const HxTensor *t) { return t->stride < 32u; }
 static inline uint32_t tiles(const HxTensor *t) { return (t->h * physical_width(t) + 31u) / 32u; }
 static inline uint32_t plane_bytes(const HxTensor *t) { return tiles(t) * 2048u; }
 static inline uint8_t *tensor_data(const HxGraph *g, uint32_t tensor) {
@@ -144,7 +147,7 @@ static int pointwise(const HxOp *o, const HxTensor *a, const HxTensor *b) {
            a->h == b->h && a->w == b->w;
 }
 static int packed_conv(const HxOp *o, const HxTensor *a, const HxTensor *b) {
-    return a->stride == 3 || !pointwise(o, a, b);
+    return compact(a) || !pointwise(o, a, b);
 }
 /* Depthwise shapes with a hand-scheduled HVX kernel; every other shape (including any dilated
  * one) runs the scalar-lane path. */
@@ -164,25 +167,49 @@ static float scalar_activation(float x, uint32_t a) {
 static int supported(const HxGraph *g) {
     uint32_t compact_consumer = HXFG_NONE;
     for (uint32_t i = 0; i < g->header->tensors; i++)
-        if (g->tensors[i].stride == 3 && (!is_input(g, i) || is_output(g, i)))
+        if (compact(&g->tensors[i]) && (!is_input(g, i) || is_output(g, i)))
             return 0;
     for (uint32_t i = 0; i < g->header->ops; i++) {
         const HxOp *o = &g->ops[i];
         if (o->kind < 1 || o->kind > 38)
             return 0;
         const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
-        if (a->stride == 3 && o->kind != HX_CONV)
+        if (compact(a) && o->kind != HX_CONV)
             return 0;
+        /* Persistent state is float32 row-major. Only the state ops know that layout; a matrix
+         * product, softmax or SDPA reading a persistent KV cache needs the FP32 graph path. */
+        /* Position operands: the FP16 kernels read them as half-precision tiles or float32 state. */
+        if ((o->kind == HX_ROPE || o->kind == HX_KV_WRITE) && o->y < g->header->tensors &&
+            g->tensors[o->y].dtype != HX_DTYPE_FLOAT32)
+            return 0;
+        if (o->kind != HX_SHORTCONV && o->kind != HX_ROPE && o->kind != HX_KV_WRITE) {
+            const uint32_t refs[3] = {o->x, o->y, o->z};
+            for (uint32_t r = 0; r < 3; r++)
+                if (refs[r] < g->header->tensors && (g->tensors[refs[r]].flags & HX_TENSOR_PERSISTENT) &&
+                    !(r == 2 && o->kind != HX_SDPA && o->kind != HX_WHERE && o->kind != HX_SCATTER_ND))
+                    return 0;
+            if (o->kind == HX_SDPA && o->p[0] < g->header->tensors &&
+                (g->tensors[o->p[0]].flags & HX_TENSOR_PERSISTENT))
+                return 0;
+        }
         if (o->kind == HX_CONV) {
             const uint32_t kb = o->p[10];
             if (!kb)
                 return 0;
-            if (a->stride == 3) {
+            if (compact(a)) {
                 if (o->z != HXFG_NONE || o->p[0] != o->p[1] || (o->p[0] != 3 && o->p[0] != 5) ||
                     o->p[2] != o->p[3] || o->p[2] > 2u || kb * 2048u * 4u > HX_FP16_MIN_WORKSPACE)
                     return 0;
-                if (compact_consumer != HXFG_NONE)
-                    return 0;
+                /* The plan holds one image geometry: further compact inputs (a second hand)
+                 * must match the first in shape and window. */
+                if (compact_consumer != HXFG_NONE) {
+                    const HxOp *f = &g->ops[compact_consumer];
+                    const HxTensor *fa = &g->tensors[f->x], *fb = &g->tensors[f->out];
+                    if (fa->h != a->h || fa->w != a->w || fa->stride != a->stride ||
+                        f->p[0] != o->p[0] || f->p[2] != o->p[2] || f->p[4] != o->p[4] ||
+                        fb->h != b->h)
+                        return 0;
+                }
                 compact_consumer = i;
             } else if (pointwise(o, a, b)) {
                 if (kb * 32u > a->stride)
@@ -203,6 +230,28 @@ static uint32_t aux_bytes(const HxGraph *g, const HxOp *o) {
         return blocks * 128u;
     return 0;
 }
+/* Gives every not-yet-placed convolution whose packed weights equal those of graphs[k] op i the same
+ * resident copy at `at`: a repeated subnetwork (one module called on two hands) or the same model in
+ * two graphs of a session keeps one copy. Same graph and offset needs no compare (the lowering
+ * deduplicates its constant pool); across graphs the bytes are compared once at planning. */
+static void share_weights(HxGraph *const *graphs, uint32_t count, uint32_t k, uint32_t i,
+                          uint32_t at) {
+    const HxGraph *g = graphs[k];
+    const HxOp *o = &g->ops[i];
+    const uint32_t n = o->p[10] * (g->tensors[o->out].stride / 32u) * 2048u;
+    for (uint32_t k2 = 0; k2 < count; k2++) {
+        const HxGraph *h = graphs[k2];
+        for (uint32_t j = 0; j < h->header->ops; j++) {
+            const HxOp *q = &h->ops[j];
+            if (q->kind != HX_CONV || h->fp16->weights[j] || q->p[10] != o->p[10] ||
+                h->tensors[q->out].stride != g->tensors[o->out].stride)
+                continue;
+            if (h == g ? q->p[9] == o->p[9]
+                       : !memcmp(h->constants + q->p[9], g->constants + o->p[9], n))
+                ((struct HxFp16Plan *)h->fp16)->weights[j] = at;
+        }
+    }
+}
 int hx_fp16_plan(const HxGraph *g, struct HxFp16Plan *plan, uint32_t *tables, uint8_t *vtcm_end) {
     const uint32_t tensors = g->header->tensors, ops = g->header->ops;
     if (!supported(g))
@@ -215,13 +264,13 @@ int hx_fp16_plan(const HxGraph *g, struct HxFp16Plan *plan, uint32_t *tables, ui
     for (uint32_t i = 0; i < ops; i++) {
         const HxOp *o = &g->ops[i];
         const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
-        if (o->kind == HX_CONV && a->stride == 3) {
+        if (o->kind == HX_CONV && compact(a)) {
             /* One vector of zeros either side covers any window offset. */
             const int32_t below = (int32_t)((b->h - 1u) * o->p[2]) - (int32_t)o->p[4] +
                                   (int32_t)o->p[0] - (int32_t)a->h;
             plan->image_top = o->p[4];
             plan->image_rows = o->p[4] + a->h + (below > 0 ? (uint32_t)below : 0u);
-            plan->image_row_words = ((a->w * 3u + 31u) & ~31u) + 64u;
+            plan->image_row_words = ((a->w * a->stride + 31u) & ~31u) + 64u;
         }
     }
     /* First-fit over liveness with whole tiles. An output is placed before its
@@ -239,7 +288,7 @@ int hx_fp16_plan(const HxGraph *g, struct HxFp16Plan *plan, uint32_t *tables, ui
             plan->offset[id] = t_->offset;                                                         \
             break;                                                                                 \
         }                                                                                          \
-        uint32_t need = t_->stride == 3                                                            \
+        uint32_t need = compact(t_)                                                                \
                             ? (plan->image_rows * plan->image_row_words * 4u + 2047u) & ~2047u     \
                                         : plane_bytes(t_) * (t_->stride / 32u),                    \
                  at_ = 0;                                                                          \
@@ -306,6 +355,13 @@ int hx_fp16_plan(const HxGraph *g, struct HxFp16Plan *plan, uint32_t *tables, ui
         if (best == HXFG_NONE)
             break;
         plan->weights[best] = (uint32_t)(g->arena + next);
+        {
+            HxGraph *self = (HxGraph *)g;
+            const struct HxFp16Plan *saved = g->fp16;
+            self->fp16 = plan; /* share_weights reads the plan being built through the graph */
+            share_weights(&self, 1u, 0u, best, plan->weights[best]);
+            self->fp16 = saved;
+        }
         next += best_bytes;
     }
     next = (next + 2047u) & ~2047u;
@@ -405,6 +461,7 @@ int hx_fp16_share(HxGraph *const *graphs, uint32_t count, uint8_t *vtcm_end) {
         if (best == HXFG_NONE)
             break;
         graphs[best_graph]->fp16->weights[best] = (uint32_t)(base + next);
+        share_weights(graphs, count, best_graph, best, (uint32_t)(base + next));
         next += best_bytes;
     }
     for (uint32_t k = 0; k < count; k++) {
@@ -472,16 +529,16 @@ static inline HVX_Vector rgb_mask(uint32_t dst, uint32_t count) {
 }
 void hx_fp16_import(const HxGraph *g, uint32_t tensor, const float *src, HxFp16Parallel parallel) {
     const HxTensor *t = &g->tensors[tensor];
-    if (t->stride == 3) {
+    if (compact(t)) {
         /* One thread reads DDR and lays out the padded image; all convert. */
         const struct HxFp16Plan *plan = g->fp16;
         const uint32_t row_vectors = plan->image_row_words / 32u, data = row_vectors - 2u,
-                       tail = (t->w * 3u) & 31u;
+                       tail = (t->w * t->stride) & 31u;
         const HVX_Vector zero = Q6_V_vzero(),
                          last = tail ? rgb_mask(0, tail) : Q6_V_vnot_V(zero);
         HVX_Vector *d = (HVX_Vector *)tensor_data(g, tensor);
         const uint8_t *row = (const uint8_t *)src;
-        const uint32_t row_bytes = t->w * 12u;
+        const uint32_t row_bytes = t->w * t->stride * 4u;
         const int whole = !((uintptr_t)src & 127u) && !(row_bytes & 127u);
         for (uint32_t y = 0; y < plan->image_rows; y++) {
             const int inside = y >= plan->image_top && y < plan->image_top + t->h;
@@ -510,16 +567,11 @@ void hx_fp16_import(const HxGraph *g, uint32_t tensor, const float *src, HxFp16P
         run(&job, parallel);
         return;
     }
-    uint16_t *d = (uint16_t *)tensor_data(g, tensor);
-    for (uint32_t y = 0; y < t->h; y++)
-        for (uint32_t x = 0; x < t->w; x += 2)
-            for (uint32_t c = 0; c < t->stride; c += 32) {
-                const float *s = src + (y * t->w + x) * t->stride + c;
-                HVX_Vector a = *(const HVX_Vector *)s;
-                HVX_Vector b = x + 1u < t->w ? *(const HVX_Vector *)(s + t->stride) : Q6_V_vzero();
-                *(HVX_Vector *)(d + at(t, y * physical_width(t) + x, c)) =
-                    Q6_Vh_vshuffe_VhVh(half_words(b), half_words(a));
-            }
+    HxFp16Job job = {.kind = HX_JOB_IMPORT};
+    job.t = t;
+    job.src = src;
+    job.dst = tensor_data(g, tensor);
+    run(&job, parallel);
 }
 static void export_part(const HxTensor *t, const uint16_t *s, float *dst, uint32_t part,
                         uint32_t parts) {
@@ -558,9 +610,16 @@ void hx_fp16_export(const HxGraph *g, uint32_t tensor, float *dst, HxFp16Paralle
 typedef struct {
     HVX_Vector m[7];
 } RgbMasks;
-static void rgb_masks(RgbMasks *r, uint32_t K) {
+/* Masks of the window rows in the K tiles. A one-channel image (s = 1) puts window row r at lanes
+ * [r * K, r * K + K) of a single tile, the order the generic im2col uses for one channel. */
+static void rgb_masks(RgbMasks *r, uint32_t K, uint32_t s) {
     static const uint8_t k3[3][2] = {{0, 9}, {9, 9}, {18, 9}};
     static const uint8_t k5[7][2] = {{0, 15}, {15, 15}, {30, 2}, {0, 13}, {13, 15}, {28, 4}, {0, 11}};
+    if (s == 1) {
+        for (uint32_t i = 0; i < K; i++)
+            r->m[i] = rgb_mask(i * K, K);
+        return;
+    }
     for (uint32_t i = 0; i < (K == 3 ? 3u : 7u); i++)
         r->m[i] = K == 3 ? rgb_mask(k3[i][0], k3[i][1]) : rgb_mask(k5[i][0], k5[i][1]);
 }
@@ -573,7 +632,8 @@ static void rgb_pack_tile(const HxGraph *g, const HxOp *o, const uint32_t *image
     const struct HxFp16Plan *plan = g->fp16;
     const uint32_t *p = o->p, K = p[0], pw = physical_width(b), rw = plan->image_row_words;
     const uint32_t kb = p[10], stride = p[2], step = p[3];
-    const int32_t shift = (int32_t)(step * 12u);
+    const uint32_t s = g->tensors[o->x].stride;
+    const int32_t shift = (int32_t)(step * s * 4u);
     const HVX_Vector *m = masks->m;
     uint32_t pixel = tile * 32u, oy = pixel / pw, ox = pixel % pw;
     HVX_Vector *out = (HVX_Vector *)ap;
@@ -588,8 +648,19 @@ static void rgb_pack_tile(const HxGraph *g, const HxOp *o, const uint32_t *image
                 out[k * 16u + r] = Q6_V_vzero();
         } else {
             const uint32_t *src = image + (oy * stride - p[4] + plan->image_top) * rw + 32u +
-                                  (int32_t)(ox * step - p[5]) * 3;
-            if (K == 3) {
+                                  (int32_t)(ox * step - p[5]) * (int32_t)s;
+            if (s == 1 && K == 3) {
+                const HVX_Vector r0 = HX_ROW(0), r1 = HX_ROW(1), r2 = HX_ROW(2);
+                out[r] = Q6_V_vor_VV(HX_RGB(r0, 0, 0, 0),
+                                     Q6_V_vor_VV(HX_RGB(r1, 0, 3, 1), HX_RGB(r2, 0, 6, 2)));
+            } else if (s == 1) {
+                const HVX_Vector r0 = HX_ROW(0), r1 = HX_ROW(1), r2 = HX_ROW(2), r3 = HX_ROW(3),
+                                 r4 = HX_ROW(4);
+                out[r] = Q6_V_vor_VV(
+                    Q6_V_vor_VV(HX_RGB(r0, 0, 0, 0), HX_RGB(r1, 0, 5, 1)),
+                    Q6_V_vor_VV(HX_RGB(r2, 0, 10, 2),
+                                Q6_V_vor_VV(HX_RGB(r3, 0, 15, 3), HX_RGB(r4, 0, 20, 4))));
+            } else if (K == 3) {
                 const HVX_Vector r0 = HX_ROW(0), r1 = HX_ROW(1), r2 = HX_ROW(2);
                 out[r] = Q6_V_vor_VV(HX_RGB(r0, 0, 0, 0),
                                      Q6_V_vor_VV(HX_RGB(r1, 0, 9, 1), HX_RGB(r2, 0, 18, 2)));
@@ -663,7 +734,7 @@ void hx_fp16_conv(const HxGraph *g, uint32_t index, HxFp16Parallel parallel) {
                        space = (uint32_t)(workspace + g->fp16->workspace_bytes - cursor);
         const uint32_t batch = space / (kb * 2048u);
         for (uint32_t first = 0; first < total; first += batch) {
-            HxFp16Job job = {.kind = a->stride == 3 ? HX_JOB_RGB_PACK : HX_JOB_IM2COL};
+            HxFp16Job job = {.kind = compact(a) ? HX_JOB_RGB_PACK : HX_JOB_IM2COL};
             job.g = g;
             job.src = tensor_data(g, o->x);
             job.dst = cursor;
@@ -694,6 +765,163 @@ void hx_fp16_complete(const HxGraph *g, uint32_t index) {
             *v = Q6_V_vand_VV(*v, keep);
         }
 }
+/* hx_im2col_tile for a 3x3, stride 1, pad 1, undilated convolution on an even-width input of the
+ * output's size with channels a multiple of 32. K-tile (tap, channel block) of an output tile is
+ * then the input's blocked tile shifted by s = (ky - 1) * W + (kx - 1) pixels: one vector per pixel
+ * pair, read whole when s is even and spliced from two neighbours when it is odd. Taps off the
+ * image (rows outside the input, the left column for kx 0, the right column for kx 2) and pixels
+ * past the output are zero. Returns 0 for any other shape; the caller packs with the scalar form. */
+static int im2col_tile_3x3(HVX_Vector *dst, const HVX_Vector *src, const HxTensor *a, const HxTensor *b,
+                           const HxOp *o, uint32_t tile) {
+    const uint32_t *p = o->p;
+    if (p[0] != 3u || p[1] != 3u || p[2] != 1u || p[3] != 1u || p[4] != 1u || p[5] != 1u ||
+        hx_dilation_h(o) != 1u || hx_dilation_w(o) != 1u || a->h != b->h || a->w != b->w ||
+        (a->w & 1u) || (a->c & 31u) || a->stride != a->c || p[10] != 9u * (a->c / 32u))
+        return 0;
+    const uint32_t w = a->w, h = a->h, cblocks = a->c / 32u, plane = plane_bytes(a) / 128u;
+    const uint32_t pairs = h * w / 2u; /* valid source vectors per plane */
+    const HVX_Vector lo16 = Q6_V_vsplat_R(0xffff), hi16 = Q6_V_vsplat_R(0xffff0000);
+    for (uint32_t tap = 0; tap < 9u; tap++) {
+        const int32_t dy = (int32_t)(tap / 3u) - 1, dx = (int32_t)(tap % 3u) - 1;
+        const int32_t shift = dy * (int32_t)w + dx;
+        for (uint32_t cb = 0; cb < cblocks; cb++) {
+            const HVX_Vector *s = src + cb * plane;
+            HVX_Vector *d = dst + (tap * cblocks + cb) * 16u;
+            for (uint32_t r = 0; r < 16u; r++) {
+                const uint32_t px = tile * 32u + 2u * r, oy = px / w, ox = px % w;
+                const int32_t iy = (int32_t)oy + dy;
+                if (oy >= h || iy < 0 || iy >= (int32_t)h) {
+                    d[r] = Q6_V_vzero();
+                    continue;
+                }
+                const int32_t q = (int32_t)px + shift; /* source pixel of the even output pixel */
+                HVX_Vector v;
+                if (!(shift & 1)) {
+                    v = s[q >> 1];
+                } else {
+                    /* q is odd: low half from the high half of pair q >> 1, high half from the
+                     * low half of the next pair (each zero when that pair is off the image). */
+                    const int32_t j = (q - 1) / 2;
+                    const HVX_Vector v0 = j >= 0 ? s[j] : Q6_V_vzero();
+                    const HVX_Vector v1 = (uint32_t)(j + 1) < pairs ? s[j + 1] : Q6_V_vzero();
+                    v = Q6_V_vor_VV(Q6_Vuw_vlsr_VuwR(v0, 16), Q6_Vw_vasl_VwR(v1, 16));
+                }
+                if (dx < 0 && ox == 0u)
+                    v = Q6_V_vand_VV(v, hi16); /* the even pixel's left tap is off the image */
+                if (dx > 0 && ox + 1u == w - 1u)
+                    v = Q6_V_vand_VV(v, lo16); /* the odd pixel's right tap is off the image */
+                d[r] = v;
+            }
+        }
+    }
+    return 1;
+}
+/* General 3x3 stride-one gather for whole 32-channel input blocks. The earlier shift form
+ * handles pad-one same-shape convolutions; this form also covers Mercury's pad-two border
+ * expansion without scattering one halfword at a time. */
+static int im2col_tile_3x3_rows(HVX_Vector *dst, const HVX_Vector *src, const HxTensor *a,
+                                const HxTensor *b, const HxOp *o, uint32_t tile) {
+    const uint32_t *p = o->p;
+    if (p[0] != 3u || p[1] != 3u || p[2] != 1u || p[3] != 1u ||
+        hx_dilation_h(o) != 1u || hx_dilation_w(o) != 1u || (b->w & 1u) ||
+        (a->c & 31u) || a->stride != a->c || p[10] != 9u * a->c / 32u)
+        return 0;
+    const uint32_t blocks = a->c / 32u, aw = physical_width(a);
+    for (uint32_t tap = 0; tap < 9u; tap++) {
+        const uint32_t ky = tap / 3u, kx = tap % 3u;
+        for (uint32_t block = 0; block < blocks; block++) {
+            HVX_Vector *d = dst + (tap * blocks + block) * 16u;
+            for (uint32_t pair = 0; pair < 16u; pair++) {
+                const uint32_t px = tile * 32u + pair * 2u;
+                int32_t s[2] = {-1, -1};
+                for (uint32_t q = 0; q < 2u; q++) {
+                    if (px + q >= b->h * b->w) continue;
+                    const uint32_t oy = (px + q) / b->w, ox = (px + q) % b->w;
+                    const int32_t iy = (int32_t)(oy + ky) - (int32_t)p[4];
+                    const int32_t ix = (int32_t)(ox + kx) - (int32_t)p[5];
+                    if (iy >= 0 && ix >= 0 && iy < (int32_t)a->h && ix < (int32_t)a->w)
+                        s[q] = iy * (int32_t)aw + ix;
+                }
+                d[pair] = rows((const uint16_t *)src, a, s[0], s[1], block * 32u);
+            }
+        }
+    }
+    return 1;
+}
+/* A stride-2 pointwise convolution selects the even source pixel from each adjacent input pair.
+ * The two selected pixels form one output vector; the remaining output tile is zero-padded. */
+static int im2col_tile_1x1_s2(HVX_Vector *dst, const HVX_Vector *src, const HxTensor *a,
+                               const HxTensor *b, const HxOp *o, uint32_t tile) {
+    const uint32_t *p = o->p;
+    if (p[0] != 1u || p[1] != 1u || p[2] != 2u || p[3] != 2u || p[4] || p[5] ||
+        hx_dilation_h(o) != 1u || hx_dilation_w(o) != 1u || (a->w & 3u) ||
+        b->h != (a->h + 1u) / 2u || b->w != a->w / 2u ||
+        (a->c & 31u) || a->stride != a->c || p[10] != a->c / 32u)
+        return 0;
+    const uint32_t pairs_per_row = a->w / 2u, blocks = a->c / 32u;
+    const uint32_t plane = plane_bytes(a) / 128u;
+    for (uint32_t cb = 0; cb < blocks; cb++) {
+        const HVX_Vector *s = src + cb * plane;
+        HVX_Vector *d = dst + cb * 16u;
+        for (uint32_t r = 0; r < 16u; r++) {
+            const uint32_t px = tile * 32u + 2u * r;
+            if (px >= b->h * b->w) {
+                d[r] = Q6_V_vzero();
+                continue;
+            }
+            const uint32_t oy = px / b->w, ox = px % b->w;
+            const uint32_t source = (oy * 2u) * pairs_per_row + ox;
+            d[r] = Q6_Vh_vshuffe_VhVh(s[source + 1u], s[source]);
+        }
+    }
+    return 1;
+}
+/* hx_im2col_tile for any other shape, in vectors. Column i = tap * C + c of the im2col row lives in
+ * lane i % 32 of K-tile i / 32, so each (tap, 32-channel block) is one pixel-pair vector of the
+ * blocked input rotated to lane (tap * C + 32 * block) % 32 and split by two masks between that
+ * K-tile and the next. The same columns as the scalar form, so the operand is identical. */
+static void im2col_tile_any(HVX_Vector *dst, const uint16_t *src, const HxTensor *a,
+                            const HxTensor *b, const HxOp *o, uint32_t tile) {
+    const uint32_t *p = o->p, kb = p[10], C = a->c, blocks = (C + 31u) / 32u;
+    const uint32_t opw = physical_width(b), apw = physical_width(a), dh = hx_dilation_h(o),
+                   dw = hx_dilation_w(o);
+    int32_t oy[32], ox[32];
+    for (uint32_t m = 0; m < 32u; m++) {
+        const uint32_t pixel = tile * 32u + m, y = pixel / opw, x = pixel % opw;
+        const int valid = y < b->h && x < b->w;
+        oy[m] = valid ? (int32_t)(y * p[2]) - (int32_t)p[4] : INT32_MIN / 2;
+        ox[m] = valid ? (int32_t)(x * p[3]) - (int32_t)p[5] : INT32_MIN / 2;
+    }
+    for (uint32_t k = 0; k < kb * 16u; k++)
+        dst[k] = Q6_V_vzero();
+    for (uint32_t ky = 0; ky < p[0]; ky++)
+        for (uint32_t kx = 0; kx < p[1]; kx++)
+            for (uint32_t cb = 0; cb < blocks; cb++) {
+                const uint32_t col = (ky * p[1] + kx) * C + cb * 32u, k = col / 32u,
+                               off = col % 32u, count = C - cb * 32u < 32u ? C - cb * 32u : 32u;
+                const int32_t rot = -(int32_t)(off * 4u);
+                const HVX_Vector lo = rgb_mask(off, off + count < 32u ? count : 32u - off);
+                const int spill = off + count > 32u;
+                const HVX_Vector hi = spill ? rgb_mask(0, off + count - 32u) : Q6_V_vzero();
+                HVX_Vector *d0 = dst + k * 16u, *d1 = dst + (k + 1u) * 16u;
+                for (uint32_t r = 0; r < 16u; r++) {
+                    int32_t s[2];
+                    for (uint32_t q = 0; q < 2u; q++) {
+                        const int32_t iy = oy[2u * r + q] + (int32_t)(ky * dh),
+                                      ix = ox[2u * r + q] + (int32_t)(kx * dw);
+                        s[q] = iy >= 0 && ix >= 0 && iy < (int32_t)a->h && ix < (int32_t)a->w
+                                   ? iy * (int32_t)apw + ix
+                                   : -1;
+                    }
+                    if (s[0] < 0 && s[1] < 0)
+                        continue;
+                    const HVX_Vector v = Q6_V_vror_VR(rows(src, a, s[0], s[1], cb * 32u), rot);
+                    d0[r] = Q6_V_vor_VV(d0[r], Q6_V_vand_VV(v, lo));
+                    if (spill)
+                        d1[r] = Q6_V_vor_VV(d1[r], Q6_V_vand_VV(v, hi));
+                }
+            }
+}
 void hx_fp16_job(const HxFp16Job *job, uint32_t part, uint32_t parts) {
     switch (job->kind) {
     case HX_JOB_COPY: {
@@ -721,12 +949,27 @@ void hx_fp16_job(const HxFp16Job *job, uint32_t part, uint32_t parts) {
         }
         break;
     }
+    case HX_JOB_IMPORT: {
+        const HxTensor *t = job->t;
+        const float *src = (const float *)job->src;
+        uint16_t *d = (uint16_t *)job->dst;
+        for (uint32_t y = t->h * part / parts; y < t->h * (part + 1u) / parts; y++)
+            for (uint32_t x = 0; x < t->w; x += 2)
+                for (uint32_t c = 0; c < t->stride; c += 32) {
+                    const float *s = src + (y * t->w + x) * t->stride + c;
+                    HVX_Vector a = *(const HVX_Vector *)s;
+                    HVX_Vector b = x + 1u < t->w ? *(const HVX_Vector *)(s + t->stride) : Q6_V_vzero();
+                    *(HVX_Vector *)(d + at(t, y * physical_width(t) + x, c)) =
+                        Q6_Vh_vshuffe_VhVh(half_words(b), half_words(a));
+                }
+        break;
+    }
     case HX_JOB_RGB_PACK: {
         const HxOp *o = &job->g->ops[job->index];
         const uint32_t kb = o->p[10], t0 = job->count * part / parts,
                        t1 = job->count * (part + 1u) / parts;
         RgbMasks masks;
-        rgb_masks(&masks, o->p[0]);
+        rgb_masks(&masks, o->p[0], job->g->tensors[o->x].stride);
         for (uint32_t t = t0; t < t1; t++)
             rgb_pack_tile(job->g, o, (const uint32_t *)job->src,
                           (uint16_t *)((uint8_t *)job->dst + t * kb * 2048u), job->first + t,
@@ -739,9 +982,14 @@ void hx_fp16_job(const HxFp16Job *job, uint32_t part, uint32_t parts) {
         const uint32_t kb = o->p[10], t0 = job->count * part / parts,
                        t1 = job->count * (part + 1u) / parts;
         for (uint32_t t = t0; t < t1; t++)
-            hx_im2col_tile((uint16_t *)((uint8_t *)job->dst + t * kb * 2048u),
-                           (const uint16_t *)job->src, a->h, a->w, a->c, plane_bytes(a) / 2u, b->h,
-                           b->w, o->p, kb, job->first + t, hx_dilation_h(o), hx_dilation_w(o));
+            if (!im2col_tile_3x3((HVX_Vector *)((uint8_t *)job->dst + t * kb * 2048u),
+                                 (const HVX_Vector *)job->src, a, b, o, job->first + t) &&
+                !im2col_tile_3x3_rows((HVX_Vector *)((uint8_t *)job->dst + t * kb * 2048u),
+                                       (const HVX_Vector *)job->src, a, b, o, job->first + t) &&
+                !im2col_tile_1x1_s2((HVX_Vector *)((uint8_t *)job->dst + t * kb * 2048u),
+                                     (const HVX_Vector *)job->src, a, b, o, job->first + t))
+            im2col_tile_any((HVX_Vector *)((uint8_t *)job->dst + t * kb * 2048u),
+                            (const uint16_t *)job->src, a, b, o, job->first + t);
         break;
     }
     case HX_JOB_ACTIVATE: {
@@ -1075,6 +1323,491 @@ static void norm_scalar(const HxGraph *g, const HxOp *o, uint32_t lo, uint32_t h
             }
     }
 }
+/* Float lane arithmetic through qf32, rounded back to IEEE single after each step. */
+static inline HVX_Vector vf_add(HVX_Vector a, HVX_Vector b) { return Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(a, b)); }
+static inline HVX_Vector vf_sub(HVX_Vector a, HVX_Vector b) { return Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(a, b)); }
+static inline HVX_Vector vf_mul(HVX_Vector a, HVX_Vector b) { return Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(a, b)); }
+/* e^z for |z| <= 30: z * log2(e) = n + f with n rounded by the 1.5 * 2^23 shift and |f| <= 0.5,
+ * 2^f by its degree-6 Taylor polynomial (relative error about 1e-7), then n added to the exponent. */
+static inline HVX_Vector vf_exp(HVX_Vector z) {
+    const HVX_Vector shift = splat(12582912.0f);
+    const HVX_Vector t = vf_mul(z, splat(1.44269504f)), tn = vf_add(t, shift);
+    const HVX_Vector n = Q6_Vw_vsub_VwVw(tn, shift), f = vf_sub(t, vf_sub(tn, shift));
+    HVX_Vector r = splat(1.5403530e-4f);
+    r = vf_add(vf_mul(r, f), splat(1.3333558e-3f));
+    r = vf_add(vf_mul(r, f), splat(9.6181291e-3f));
+    r = vf_add(vf_mul(r, f), splat(5.5504109e-2f));
+    r = vf_add(vf_mul(r, f), splat(2.4022651e-1f));
+    r = vf_add(vf_mul(r, f), splat(6.9314718e-1f));
+    r = vf_add(vf_mul(r, f), splat(1.0f));
+    return Q6_Vw_vadd_VwVw(r, Q6_Vw_vasl_VwR(n, 23));
+}
+/* 1 / d for normal positive d: bit-trick estimate and three Newton steps. */
+static inline HVX_Vector vf_recip(HVX_Vector d) {
+    HVX_Vector y = Q6_Vw_vsub_VwVw(Q6_V_vsplat_R(0x7ef311c3), d);
+    for (int i = 0; i < 3; i++)
+        y = vf_mul(y, vf_sub(splat(2.0f), vf_mul(d, y)));
+    return y;
+}
+/* sigmoid(x) = 1 / (1 + e^-x), with the exponent clamped to +-30 (below -30 the FP16 result of
+ * both sigmoid and x * sigmoid is zero or one anyway). */
+static inline HVX_Vector vf_sigmoid(HVX_Vector x) {
+    const HVX_Vector z = Q6_Vsf_vmax_VsfVsf(splat(-30.0f), Q6_Vsf_vmin_VsfVsf(splat(30.0f), x));
+    return vf_recip(vf_add(splat(1.0f), vf_exp(Q6_V_vxor_VV(z, Q6_V_vsplat_R(0x80000000)))));
+}
+/* Pair loop shared by the elementwise vector forms: for each 32-channel block and each of this
+ * part's pixel pairs, fn(even floats, odd floats, ...) gives the two results; the pad odd pixel
+ * of an odd-width row and the lanes beyond C are written zero. */
+#define HX_PAIR_LOOP(b_, part_, parts_, ...)                                                     \
+    do {                                                                                           \
+        const uint32_t ppr_ = physical_width(b_) / 2u, opairs_ = (b_)->h * ppr_;                   \
+        const uint32_t lo_ = opairs_ * (part_) / (parts_), hi_ = opairs_ * ((part_) + 1u) / (parts_); \
+        const uint32_t plane_ = plane_bytes(b_) / 128u, blocks_ = (b_)->stride / 32u;              \
+        const int odd_pad_ = ((b_)->w & 1u) != 0;                                                  \
+        for (uint32_t kb = 0; kb < blocks_; kb++) {                                                \
+            const uint32_t left_ = (b_)->c > kb * 32u ? (b_)->c - kb * 32u : 0u;                   \
+            const HVX_Vector lanes_ = left_ >= 32u ? Q6_V_vnot_V(Q6_V_vzero())                     \
+                                      : left_ ? rgb_mask(0, left_) : Q6_V_vzero();                 \
+            for (uint32_t i = lo_; i < hi_; i++) {                                                 \
+                const uint32_t at_ = kb * plane_ + i;                                              \
+                HVX_Vector re, ro;                                                                 \
+                __VA_ARGS__;                                                                       \
+                if (odd_pad_ && i % ppr_ == ppr_ - 1u)                                             \
+                    ro = Q6_V_vzero();                                                             \
+                dst[at_] = Q6_Vh_vshuffe_VhVh(half_words(Q6_V_vand_VV(ro, lanes_)),                \
+                                              half_words(Q6_V_vand_VV(re, lanes_)));               \
+            }                                                                                      \
+        }                                                                                          \
+    } while (0)
+static inline int same_layout(const HxTensor *a, const HxTensor *b) {
+    return a->h == b->h && a->w == b->w && a->stride == b->stride;
+}
+static inline HVX_Vector vf_simple_activation(HVX_Vector x, uint32_t fn, uint32_t alpha,
+                                               uint32_t beta) {
+    const HVX_Vector zero = Q6_V_vzero();
+    switch (fn) {
+    case HX_ACT_RELU:
+        return Q6_Vsf_vmax_VsfVsf(x, zero);
+    case HX_ACT_RELU6:
+        return Q6_Vsf_vmin_VsfVsf(Q6_Vsf_vmax_VsfVsf(x, zero), splat(6.0f));
+    case HX_ACT_ABS:
+        return Q6_V_vand_VV(x, Q6_V_vsplat_R(0x7fffffffu));
+    case HX_ACT_NEG:
+        return Q6_V_vxor_VV(x, Q6_V_vsplat_R(0x80000000u));
+    case HX_ACT_LEAKY:
+        return Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VsfVsf(zero, x),
+                             vf_mul(x, splat(hx_float(alpha))), x);
+    case HX_ACT_HARDSIGMOID:
+        return Q6_Vsf_vmin_VsfVsf(Q6_Vsf_vmax_VsfVsf(
+            vf_add(vf_mul(x, splat(hx_float(alpha))), splat(hx_float(beta))), zero),
+            splat(1.0f));
+    case HX_ACT_HARDSWISH: {
+        const HVX_Vector gate = Q6_Vsf_vmin_VsfVsf(
+            Q6_Vsf_vmax_VsfVsf(vf_add(x, splat(3.0f)), zero), splat(6.0f));
+        return vf_mul(vf_mul(x, gate), splat(1.0f / 6.0f));
+    }
+    default:
+        return x;
+    }
+}
+/* Simple activations, SiLU and logistic in vector lanes. Returns 0 for other functions. */
+static int act_vector(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
+    const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
+    const int silu = o->kind == HX_ACT && o->p[0] == HX_ACT_SILU;
+    const uint32_t fn = o->p[0];
+    const int simple = o->kind == HX_ACT &&
+        (fn == HX_ACT_RELU || fn == HX_ACT_RELU6 || fn == HX_ACT_ABS ||
+         fn == HX_ACT_NEG || fn == HX_ACT_LEAKY || fn == HX_ACT_HARDSIGMOID ||
+         fn == HX_ACT_HARDSWISH);
+    if (!(simple || silu || o->kind == HX_LOGISTIC) || !same_layout(a, b))
+        return 0;
+    const HVX_Vector *in = (const HVX_Vector *)tensor_data(g, o->x);
+    HVX_Vector *dst = (HVX_Vector *)tensor_data(g, o->out);
+    HX_PAIR_LOOP(b, part, parts, {
+        const HVX_Vector v = in[at_];
+        const HVX_Vector e = float_words(v), d = float_words(Q6_Vuw_vlsr_VuwR(v, 16));
+        if (simple) {
+            re = vf_simple_activation(e, fn, o->p[1], o->p[2]);
+            ro = vf_simple_activation(d, fn, o->p[1], o->p[2]);
+        } else {
+            re = vf_sigmoid(e);
+            ro = vf_sigmoid(d);
+            if (silu) {
+                re = vf_mul(e, re);
+                ro = vf_mul(d, ro);
+            }
+        }
+    });
+    return 1;
+}
+static inline HVX_Vector vf_binary(uint32_t op, HVX_Vector l, HVX_Vector u) {
+    switch (op) {
+    case HX_BIN_ADD: return vf_add(l, u);
+    case HX_BIN_SUB: return vf_sub(l, u);
+    case HX_BIN_MIN: return Q6_Vsf_vmin_VsfVsf(l, u);
+    case HX_BIN_MAX: return Q6_Vsf_vmax_VsfVsf(l, u);
+    default: return vf_mul(l, u); /* HX_BIN_MUL, and HX_BIN_DIV by a precomputed reciprocal */
+    }
+}
+/* HX_BINARY in vector lanes for add, sub, mul, min and max with y a same-shape tensor, a
+ * per-channel tensor (h = w = 1) or a per-channel constant (p[1] 1), and division by a
+ * per-channel constant (x * (1 / u), zero where u is zero, as the scalar form). Returns 0 for
+ * anything else, having written nothing. */
+static int binary_vector(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
+    const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
+    const uint32_t *p = o->p, op = p[0], stride = b->stride;
+    if (!same_layout(a, b) || a->c != b->c || p[1] > 1u)
+        return 0;
+    if (op != HX_BIN_ADD && op != HX_BIN_SUB && op != HX_BIN_MUL && op != HX_BIN_MIN &&
+        op != HX_BIN_MAX && !(op == HX_BIN_DIV && p[1] == 1u && !p[3]))
+        return 0;
+    const HxTensor *t = p[1] ? NULL : &g->tensors[o->y];
+    int full = 0, scalar_y = 0;
+    if (t) {
+        if (t->h == 1u && t->w == 1u && t->c == 1u)
+            scalar_y = 1;
+        else if (t->c != b->c || t->stride != stride)
+            return 0;
+        else if (t->h == b->h && t->w == b->w)
+            full = 1;
+        else if (!(t->h == 1u && t->w == 1u))
+            return 0;
+    }
+    const uint32_t slice = (g->fp16->workspace_bytes / parts) & ~2047u;
+    if (stride * 4u > slice)
+        return 0;
+    float *vec = (float *)(g->fp16->workspace + part * slice);
+    if (p[1]) {
+        const float *k = (const float *)(g->constants + p[2]);
+        for (uint32_t c = 0; c < stride; c++)
+            vec[c] = op == HX_BIN_DIV ? (k[c] == 0.0f ? 0.0f : 1.0f / k[c]) : k[c];
+    } else if (scalar_y) {
+        const uint16_t *y = (const uint16_t *)tensor_data(g, o->y);
+        *(HVX_Vector *)vec = splat(scalar(y[at(t, 0, 0)]));
+    } else if (!full) {
+        const HVX_Vector *yv = (const HVX_Vector *)tensor_data(g, o->y);
+        const uint32_t yplane = plane_bytes(t) / 128u;
+        for (uint32_t kb = 0; kb < stride / 32u; kb++)
+            *(HVX_Vector *)(vec + kb * 32u) = float_words(yv[kb * yplane]);
+    }
+    const HVX_Vector *in = (const HVX_Vector *)tensor_data(g, o->x);
+    const HVX_Vector *yin = full ? (const HVX_Vector *)tensor_data(g, o->y) : NULL;
+    HVX_Vector *dst = (HVX_Vector *)tensor_data(g, o->out);
+    const uint32_t rev = p[3];
+    HX_PAIR_LOOP(b, part, parts, {
+        const HVX_Vector v = in[at_];
+        const HVX_Vector le = float_words(v), lo = float_words(Q6_Vuw_vlsr_VuwR(v, 16));
+        HVX_Vector ue, uo;
+        if (full) {
+            const HVX_Vector w = yin[at_];
+            ue = float_words(w);
+            uo = float_words(Q6_Vuw_vlsr_VuwR(w, 16));
+        } else {
+            ue = uo = *(const HVX_Vector *)(vec + (scalar_y ? 0u : kb * 32u));
+        }
+        re = rev ? vf_binary(op, ue, le) : vf_binary(op, le, ue);
+        ro = rev ? vf_binary(op, uo, lo) : vf_binary(op, lo, uo);
+    });
+    return 1;
+}
+
+/* Copy whole blocked channel vectors into the sparse output grid. Each physical pixel pair
+ * belongs to one worker, including the zero pad column of an odd-width row. */
+static int zero_insert_vector(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
+    const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
+    const uint32_t *p = o->p;
+    if (a->c != b->c || a->stride != b->stride || !p[0] || !p[1])
+        return 0;
+    const uint16_t *src = (const uint16_t *)tensor_data(g, o->x);
+    HVX_Vector *dst = (HVX_Vector *)tensor_data(g, o->out);
+    const uint32_t pairs_per_row = physical_width(b) / 2u;
+    const uint32_t pairs = b->h * pairs_per_row;
+    const uint32_t lo = pairs * part / parts, hi = pairs * (part + 1u) / parts;
+    const uint32_t plane = plane_bytes(b) / 128u;
+    for (uint32_t pair = lo; pair < hi; pair++) {
+        const uint32_t oy = pair / pairs_per_row, ox = (pair % pairs_per_row) * 2u;
+        int32_t s[2] = {-1, -1};
+        if (oy >= p[2] && (oy - p[2]) % p[0] == 0 && (oy - p[2]) / p[0] < a->h) {
+            const uint32_t sy = (oy - p[2]) / p[0];
+            for (uint32_t q = 0; q < 2u; q++) {
+                const uint32_t x = ox + q;
+                if (x < b->w && x >= p[3] && (x - p[3]) % p[1] == 0 &&
+                    (x - p[3]) / p[1] < a->w)
+                    s[q] = (int32_t)(sy * physical_width(a) + (x - p[3]) / p[1]);
+            }
+        }
+        for (uint32_t block = 0; block < b->stride / 32u; block++)
+            dst[block * plane + pair] = rows(src, a, s[0], s[1], block * 32u);
+    }
+    return 1;
+}
+
+/* Every lane of the result holds the max (or sum) of the 32 float lanes of v. */
+static inline HVX_Vector vf_all_max(HVX_Vector v) {
+    for (int bytes = 64; bytes >= 4; bytes /= 2)
+        v = Q6_Vsf_vmax_VsfVsf(v, Q6_V_vror_VR(v, bytes));
+    return v;
+}
+static inline HVX_Vector vf_all_sum(HVX_Vector v) {
+    for (int bytes = 64; bytes >= 4; bytes /= 2)
+        v = vf_add(v, Q6_V_vror_VR(v, bytes));
+    return v;
+}
+static inline HVX_VectorPred softmax_lanes(uint32_t channels, uint32_t block, uint32_t query,
+                                           int causal) {
+    static const uint32_t lane_index[32] __attribute__((aligned(128))) = {
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
+    };
+    const uint32_t start = block * 32u;
+    uint32_t count = channels - start;
+    if (count > 32u) count = 32u;
+    if (causal) {
+        const uint32_t allowed = query >= start ? query - start + 1u : 0u;
+        if (count > allowed) count = allowed;
+    }
+    return Q6_Q_vcmp_gt_VwVw(Q6_V_vsplat_R(count), *(const HVX_Vector *)lane_index);
+}
+/* HX_SOFTMAX and channel-axis HX_ATTN_SOFTMAX in vector lanes, one pixel pair at a time: lane-wise max across the
+ * channel blocks, then across lanes; e^(x - max) (clamped at -30, below which FP16 holds zero);
+ * the sum likewise; the output is e^(x - max) times the reciprocal of the sum. Lanes beyond C
+ * take no part (they read as -1e30) and are written zero. Returns 0, having written nothing, when
+ * x and out differ in layout or the part's workspace slice cannot hold a pixel pair's floats. */
+static int softmax_vector(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
+    const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
+    const uint32_t blocks = b->stride / 32u;
+    const uint32_t slice = (g->fp16->workspace_bytes / parts) & ~2047u;
+    const int channel_axis = o->kind == HX_SOFTMAX ||
+        (o->kind == HX_ATTN_SOFTMAX && o->p[0] == 2u);
+    if (!channel_axis || !same_layout(a, b) || a->c != b->c || blocks * 256u > slice)
+        return 0;
+    const uint32_t ppr = physical_width(b) / 2u, opairs = b->h * ppr, plane = plane_bytes(b) / 128u;
+    const uint32_t lo = opairs * part / parts, hi = opairs * (part + 1u) / parts;
+    const int odd_pad = (b->w & 1u) != 0;
+    const HVX_Vector *in = (const HVX_Vector *)tensor_data(g, o->x);
+    HVX_Vector *dst = (HVX_Vector *)tensor_data(g, o->out);
+    const HxTensor *mask_t = o->kind == HX_ATTN_SOFTMAX && o->y != HXFG_NONE ?
+                             &g->tensors[o->y] : NULL;
+    const uint16_t *mask = mask_t ? (const uint16_t *)tensor_data(g, o->y) : NULL;
+    const uint32_t mpw = mask_t ? physical_width(mask_t) : 0u;
+    const uint32_t causal = o->kind == HX_ATTN_SOFTMAX && o->p[1];
+    const uint32_t M = b->w > 1u ? b->w : (o->p[2] ? o->p[2] : b->h);
+    const HVX_Vector ninf = splat(-1e30f), floor30 = splat(-30.0f);
+    HVX_Vector *ee = (HVX_Vector *)(g->fp16->workspace + part * slice), *eo = ee + blocks;
+    for (uint32_t i = lo; i < hi; i++) {
+        const int odd = !(odd_pad && i % ppr == ppr - 1u);
+        const uint32_t oy = i / ppr, ox = (i % ppr) * 2u;
+        const uint32_t qeven = (oy * b->w + ox) % M, qodd = (oy * b->w + ox + 1u) % M;
+        const int32_t m0 = mask_t ? (int32_t)((mask_t->h == 1u ? 0u : oy) * mpw +
+                                             (mask_t->w == 1u ? 0u : ox)) : -1;
+        const int32_t m1 = mask_t && odd ? (int32_t)((mask_t->h == 1u ? 0u : oy) * mpw +
+                                                     (mask_t->w == 1u ? 0u : ox + 1u)) : -1;
+        const float scalar_mask_e = mask_t && mask_t->c == 1u ? scalar(mask[at(mask_t, m0, 0)]) : 0.0f;
+        const float scalar_mask_o = mask_t && mask_t->c == 1u && odd ?
+                                    scalar(mask[at(mask_t, m1, 0)]) : 0.0f;
+        HVX_Vector me = ninf, mo = ninf;
+        for (uint32_t kb = 0; kb < blocks; kb++) {
+            const HVX_VectorPred qe = softmax_lanes(b->c, kb, qeven, causal);
+            const HVX_VectorPred qo = softmax_lanes(b->c, kb, qodd, causal);
+            const HVX_Vector v = in[kb * plane + i];
+            HVX_Vector ve = float_words(v), vo = float_words(Q6_Vuw_vlsr_VuwR(v, 16));
+            if (mask_t) {
+                if (mask_t->c == 1u) {
+                    ve = vf_add(ve, splat(scalar_mask_e));
+                    vo = vf_add(vo, splat(scalar_mask_o));
+                } else {
+                    const HVX_Vector mh = rows(mask, mask_t, m0, m1, kb * 32u);
+                    ve = vf_add(ve, float_words(mh));
+                    vo = vf_add(vo, float_words(Q6_Vuw_vlsr_VuwR(mh, 16)));
+                }
+            }
+            ee[kb] = Q6_V_vmux_QVV(qe, ve, ninf);
+            eo[kb] = Q6_V_vmux_QVV(qo, vo, ninf);
+            me = Q6_Vsf_vmax_VsfVsf(me, ee[kb]);
+            mo = Q6_Vsf_vmax_VsfVsf(mo, eo[kb]);
+        }
+        me = vf_all_max(me);
+        mo = vf_all_max(mo);
+        HVX_Vector se = Q6_V_vzero(), so = Q6_V_vzero();
+        for (uint32_t kb = 0; kb < blocks; kb++) {
+            const HVX_VectorPred qe = softmax_lanes(b->c, kb, qeven, causal);
+            const HVX_VectorPred qo = softmax_lanes(b->c, kb, qodd, causal);
+            ee[kb] = Q6_V_vmux_QVV(qe, vf_exp(Q6_Vsf_vmax_VsfVsf(floor30, vf_sub(ee[kb], me))), Q6_V_vzero());
+            eo[kb] = Q6_V_vmux_QVV(qo, vf_exp(Q6_Vsf_vmax_VsfVsf(floor30, vf_sub(eo[kb], mo))), Q6_V_vzero());
+            se = vf_add(se, ee[kb]);
+            so = vf_add(so, eo[kb]);
+        }
+        const HVX_Vector re = vf_recip(vf_all_sum(se));
+        const HVX_Vector ro = odd ? vf_recip(vf_all_sum(so)) : Q6_V_vzero();
+        for (uint32_t kb = 0; kb < blocks; kb++) {
+            const HVX_Vector yo = odd ? vf_mul(eo[kb], ro) : Q6_V_vzero();
+            dst[kb * plane + i] = Q6_Vh_vshuffe_VhVh(half_words(yo), half_words(vf_mul(ee[kb], re)));
+        }
+    }
+    return 1;
+}
+
+/* Channel norm: reduce each pixel's live channels in HVX, then apply the affine transform
+ * across channel vectors. The two pixels in a blocked vector have independent statistics. */
+static int norm_channel_vector(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
+    const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
+    if (o->p[0] != HX_NORM_CHANNEL || !same_layout(a, b) || a->c != b->c)
+        return 0;
+    const uint32_t ppr = physical_width(b) / 2u, pairs = b->h * ppr;
+    const uint32_t lo = pairs * part / parts, hi = pairs * (part + 1u) / parts;
+    const uint32_t plane = plane_bytes(b) / 128u, blocks = b->stride / 32u;
+    const HVX_Vector *in = (const HVX_Vector *)tensor_data(g, o->x);
+    HVX_Vector *out = (HVX_Vector *)tensor_data(g, o->out);
+    const float *gamma = (const float *)(g->constants + o->p[3]);
+    const float *beta = (const float *)(g->constants + o->p[4]);
+    float eps;
+    memcpy(&eps, &o->p[2], sizeof eps);
+    for (uint32_t i = lo; i < hi; i++) {
+        const int odd = !(b->w & 1u) || i % ppr != ppr - 1u;
+        HVX_Vector se = Q6_V_vzero(), so = Q6_V_vzero();
+        for (uint32_t kb = 0; kb < blocks; kb++) {
+            const uint32_t left = b->c - kb * 32u;
+            const HVX_VectorPred live = Q6_Q_vsetq2_R(left >= 32u ? 128u : left * 4u);
+            const HVX_Vector v = in[kb * plane + i];
+            se = vf_add(se, Q6_V_vmux_QVV(live, float_words(v), Q6_V_vzero()));
+            if (odd)
+                so = vf_add(so, Q6_V_vmux_QVV(live,
+                    float_words(Q6_Vuw_vlsr_VuwR(v, 16)), Q6_V_vzero()));
+        }
+        union { HVX_Vector v; float f[32]; } e_sum, o_sum;
+        e_sum.v = vf_all_sum(se);
+        o_sum.v = vf_all_sum(so);
+        const float me = e_sum.f[0] / (float)b->c, mo = o_sum.f[0] / (float)b->c;
+        HVX_Vector ve = Q6_V_vzero(), vo = Q6_V_vzero();
+        for (uint32_t kb = 0; kb < blocks; kb++) {
+            const uint32_t left = b->c - kb * 32u;
+            const HVX_VectorPred live = Q6_Q_vsetq2_R(left >= 32u ? 128u : left * 4u);
+            const HVX_Vector v = in[kb * plane + i];
+            const HVX_Vector de = vf_sub(float_words(v), splat(me));
+            ve = vf_add(ve, Q6_V_vmux_QVV(live, vf_mul(de, de), Q6_V_vzero()));
+            if (odd) {
+                const HVX_Vector dd = vf_sub(float_words(Q6_Vuw_vlsr_VuwR(v, 16)), splat(mo));
+                vo = vf_add(vo, Q6_V_vmux_QVV(live, vf_mul(dd, dd), Q6_V_vzero()));
+            }
+        }
+        e_sum.v = vf_all_sum(ve);
+        o_sum.v = vf_all_sum(vo);
+        const HVX_Vector ie = splat(1.0f / sqrtf(e_sum.f[0] / (float)b->c + eps));
+        const HVX_Vector io = splat(odd ? 1.0f / sqrtf(o_sum.f[0] / (float)b->c + eps) : 0.0f);
+        for (uint32_t kb = 0; kb < blocks; kb++) {
+            const uint32_t left = b->c - kb * 32u;
+            const HVX_VectorPred live = Q6_Q_vsetq2_R(left >= 32u ? 128u : left * 4u);
+            const HVX_Vector v = in[kb * plane + i];
+            const HVX_Vector ga = *(const HVX_UVector *)(gamma + kb * 32u);
+            const HVX_Vector be = *(const HVX_UVector *)(beta + kb * 32u);
+            const HVX_Vector re = vf_add(vf_mul(vf_mul(vf_sub(float_words(v), splat(me)), ie), ga), be);
+            const HVX_Vector ro = odd ? vf_add(vf_mul(vf_mul(
+                vf_sub(float_words(Q6_Vuw_vlsr_VuwR(v, 16)), splat(mo)), io), ga), be)
+                : Q6_V_vzero();
+            out[kb * plane + i] = Q6_Vh_vshuffe_VhVh(
+                half_words(Q6_V_vmux_QVV(live, ro, Q6_V_vzero())),
+                half_words(Q6_V_vmux_QVV(live, re, Q6_V_vzero())));
+        }
+    }
+    return 1;
+}
+
+/* HX_NORM group mode in vector lanes. Each vector holds a pixel pair (even pixel in the low half
+ * of each word). Statistics are float and two-pass, as in norm_scalar: per-channel sums over all
+ * pixels accumulate in qf32, then each group's mean, then per-channel squared deviations from it.
+ * The output is x * scale[c] + shift[c] with scale = gamma / sqrt(var + eps) and shift = beta -
+ * mean * scale (zero beyond C, so pad lanes stay zero). Parts cannot share the statistics, so each
+ * part computes them over the whole tensor and writes only its own pixel pairs. Returns 0, having
+ * written nothing, when the part's workspace slice cannot hold the per-channel vectors. */
+static int norm_group_vector(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
+    const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
+    const uint32_t *p = o->p;
+    const uint32_t c = b->c, stride = b->stride, blocks = stride / 32u, groups = p[1];
+    const uint32_t slice = (g->fp16->workspace_bytes / parts) & ~2047u;
+    if (3u * stride * 4u > slice || a->h != b->h || a->w != b->w || a->stride != stride)
+        return 0;
+    const uint32_t pw = physical_width(b), ppr = pw / 2u, rows = b->h, plane = plane_bytes(b) / 128u;
+    const int odd_pad = (b->w & 1u) != 0; /* the last pair of each row has a pad odd pixel */
+    float *sums = (float *)(g->fp16->workspace + part * slice), *scale = sums + stride,
+          *shift = scale + stride;
+    const HVX_Vector *in = (const HVX_Vector *)tensor_data(g, o->x);
+    HVX_Vector *out = (HVX_Vector *)tensor_data(g, o->out);
+    float eps;
+    memcpy(&eps, &p[2], sizeof eps);
+    const float *gamma = (const float *)(g->constants + p[3]),
+                *beta = (const float *)(g->constants + p[4]);
+    const uint32_t size = c / groups;
+    const float count = (float)(b->h * b->w * size);
+    /* Pass 1: per-channel sums; pass 2 (center != NULL): per-channel squared deviations. */
+    for (int pass = 0; pass < 2; pass++) {
+        for (uint32_t kb = 0; kb < blocks; kb++) {
+            const HVX_Vector *src = in + kb * plane;
+            const HVX_Vector m = pass ? *(const HVX_Vector *)(scale + kb * 32u) : Q6_V_vzero();
+            HVX_Vector acc = Q6_V_vzero();
+            for (uint32_t y = 0; y < rows; y++)
+                for (uint32_t j = 0; j < ppr; j++) {
+                    const HVX_Vector v = src[y * ppr + j];
+                    HVX_Vector e = float_words(v), d;
+                    const int odd = !(odd_pad && j == ppr - 1u);
+                    if (pass) {
+                        d = Q6_Vqf32_vsub_VsfVsf(e, m);
+                        acc = Q6_Vqf32_vadd_Vqf32Vqf32(acc, Q6_Vqf32_vmpy_Vqf32Vqf32(d, d));
+                    } else {
+                        acc = Q6_Vqf32_vadd_Vqf32Vsf(acc, e);
+                    }
+                    if (odd) {
+                        e = float_words(Q6_Vuw_vlsr_VuwR(v, 16));
+                        if (pass) {
+                            d = Q6_Vqf32_vsub_VsfVsf(e, m);
+                            acc = Q6_Vqf32_vadd_Vqf32Vqf32(acc, Q6_Vqf32_vmpy_Vqf32Vqf32(d, d));
+                        } else {
+                            acc = Q6_Vqf32_vadd_Vqf32Vsf(acc, e);
+                        }
+                    }
+                }
+            *(HVX_Vector *)(sums + kb * 32u) = Q6_Vsf_equals_Vqf32(acc);
+        }
+        /* Group reduction in float; scale[] holds the per-channel group mean for pass 2. */
+        for (uint32_t grp = 0; grp < groups; grp++) {
+            const uint32_t k0 = grp * size, k1 = k0 + size;
+            float total = 0.0f;
+            for (uint32_t k = k0; k < k1; k++)
+                total += sums[k];
+            if (!pass) {
+                const float mean = total / count;
+                for (uint32_t k = k0; k < k1; k++)
+                    scale[k] = mean;
+            } else {
+                const float mean = scale[k0], inv = 1.0f / sqrtf(total / count + eps);
+                for (uint32_t k = k0; k < k1; k++) {
+                    scale[k] = inv * gamma[k];
+                    shift[k] = beta[k] - mean * scale[k];
+                }
+            }
+        }
+        for (uint32_t k = c; k < stride; k++)
+            scale[k] = shift[k] = 0.0f;
+    }
+    const uint32_t opairs = rows * ppr, lo = opairs * part / parts, hi = opairs * (part + 1u) / parts;
+    for (uint32_t kb = 0; kb < blocks; kb++) {
+        const HVX_Vector sc = *(const HVX_Vector *)(scale + kb * 32u),
+                         sh = *(const HVX_Vector *)(shift + kb * 32u);
+        const HVX_Vector *src = in + kb * plane;
+        HVX_Vector *dst = out + kb * plane;
+        for (uint32_t i = lo; i < hi; i++) {
+            const HVX_Vector v = src[i];
+            HVX_Vector ye = Q6_Vsf_equals_Vqf32(
+                Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(float_words(v), sc), sh));
+            HVX_Vector yo = Q6_V_vzero();
+            if (!(odd_pad && i % ppr == ppr - 1u))
+                yo = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(
+                    Q6_Vqf32_vmpy_VsfVsf(float_words(Q6_Vuw_vlsr_VuwR(v, 16)), sc), sh));
+            dst[i] = Q6_Vh_vshuffe_VhVh(half_words(yo), half_words(ye));
+        }
+    }
+    return 1;
+}
+
 /* HX_MATMUL in vector lanes, same scratch slice as matmul_scalar. B is kept as float blocks
  * [K][NBP] (32 lanes each, zero beyond N and beyond NB blocks, NBP = NB rounded up to 4). Each A
  * row is converted once by HVX, and each output row accumulates four 32-channel blocks at a time
@@ -1311,10 +2044,18 @@ static void rmsnorm_fp16(const HxGraph *g, const HxOp *o, uint32_t part, uint32_
     }
 }
 
+static inline float hx_fp16_float_bits(uint32_t bits) {
+    union { uint32_t u; float f; } v;
+    v.u = bits;
+    return v.f;
+}
+
 static void rope_fp16(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
     const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
     const uint32_t *p = o->p;
-    const uint32_t head_dim = p[0], num_heads = p[1], half_dim = head_dim / 2u;
+    const uint32_t head_dim = p[0], num_heads = p[1];
+    const uint32_t rot = p[5] ? p[5] : head_dim, half_dim = rot / 2u;
+    const double rope_base = p[4] ? (double)hx_fp16_float_bits(p[4]) : 10000.0;
     const uint32_t mode = p[3];
 
     uint32_t pos = p[2];
@@ -1333,7 +2074,8 @@ static void rope_fp16(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t p
     const uint16_t *x = (const uint16_t *)tensor_data(g, o->x);
     uint16_t *out = (uint16_t *)tensor_data(g, o->out);
 
-    if (b->w == 1u && head_dim == 64u && mode == 0 && (b->stride % 32u == 0)) {
+    if (b->w == 1u && head_dim == 64u && rot == 64u && !p[4] && !p[6] && mode == 0 &&
+        (b->stride % 32u == 0)) {
         float cos_tab[32] __attribute__((aligned(128)));
         float sin_tab[32] __attribute__((aligned(128)));
         for (uint32_t j = 0; j < 32u; j++) {
@@ -1382,8 +2124,8 @@ static void rope_fp16(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t p
             for (uint32_t h = 0; h < num_heads; h++) {
                 uint32_t h_base = h * head_dim;
                 for (uint32_t j = 0; j < half_dim; j++) {
-                    double theta = pow(10000.0, -2.0 * (double)j / (double)head_dim);
-                    double angle = (double)pos * theta;
+                    double theta = pow(rope_base, -2.0 * (double)j / (double)rot);
+                    double angle = (double)(pos + (p[6] ? px / obw : 0u)) * theta;
                     float cos_v = (float)cos(angle);
                     float sin_v = (float)sin(angle);
                     if (mode == 0) {
@@ -1398,6 +2140,8 @@ static void rope_fp16(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t p
                         out[at(b, px, h_base + 2u * j + 1u)] = half(v0 * sin_v + v1 * cos_v);
                     }
                 }
+                for (uint32_t j = rot; j < head_dim; j++)
+                    out[at(b, px, h_base + j)] = x[at(a, px, h_base + j)];
             }
             for (uint32_t ch = num_heads * head_dim; ch < b->c; ch++) {
                 out[at(b, px, ch)] = x[at(a, px, ch)];
@@ -1509,13 +2253,16 @@ static void linear_q_fp16(const HxGraph *g, const HxOp *o, uint32_t part, uint32
     const uint16_t *x = (const uint16_t *)tensor_data(g, o->x);
     uint16_t *out = (uint16_t *)tensor_data(g, o->out);
 
+    for (uint32_t row = 0; row < b->h; row++) {
+    /* Rows are physical pixels: a row of width one is followed by its zero pad column. */
+    const uint32_t xpx = row * physical_width(&g->tensors[o->x]), opx = row * physical_width(b);
     if (k * 4u <= slice) {
         for (uint32_t b_idx = 0; b_idx < blocks; b_idx++) {
-            HVX_Vector in_h = load(x, &g->tensors[o->x], 0, b_idx * 32u);
+            HVX_Vector in_h = load(x, &g->tensors[o->x], xpx, b_idx * 32u);
             *(HVX_Vector *)(xf + b_idx * 32u) = float_words(in_h);
         }
         for (uint32_t rem = blocks * 32u; rem < k; rem++) {
-            xf[rem] = scalar(x[at(&g->tensors[o->x], 0, rem)]);
+            xf[rem] = scalar(x[at(&g->tensors[o->x], xpx, rem)]);
         }
     }
 
@@ -1541,8 +2288,8 @@ static void linear_q_fp16(const HxGraph *g, const HxOp *o, uint32_t part, uint32
                         const uint8_t byte = blk[j];
                         const int32_t q0 = (int32_t)(byte & 0x0fu) - 8;
                         const int32_t q1 = (int32_t)(byte >> 4u) - 8;
-                        float x0 = scalar(x[at(&g->tensors[o->x], 0, b_idx * 32u + 2u * j)]);
-                        float x1 = scalar(x[at(&g->tensors[o->x], 0, b_idx * 32u + 2u * j + 1u)]);
+                        float x0 = scalar(x[at(&g->tensors[o->x], xpx, b_idx * 32u + 2u * j)]);
+                        float x1 = scalar(x[at(&g->tensors[o->x], xpx, b_idx * 32u + 2u * j + 1u)]);
                         blk_acc += x0 * (float)q0 + x1 * (float)q1;
                     }
                 }
@@ -1564,7 +2311,7 @@ static void linear_q_fp16(const HxGraph *g, const HxOp *o, uint32_t part, uint32
                 } else {
                     for (uint32_t j = 0; j < 32u; j++) {
                         const int8_t q = (int8_t)blk[j];
-                        float xj = scalar(x[at(&g->tensors[o->x], 0, b_idx * 32u + j)]);
+                        float xj = scalar(x[at(&g->tensors[o->x], xpx, b_idx * 32u + j)]);
                         blk_acc += xj * (float)q;
                     }
                 }
@@ -1575,13 +2322,14 @@ static void linear_q_fp16(const HxGraph *g, const HxOp *o, uint32_t part, uint32
         if (o->p[5] == 1) val = fmaxf(0.0f, val);
         else if (o->p[5] == 2) val = fmaxf(-1.0f, fminf(1.0f, val));
         else if (o->p[5] == 3) val = val / (1.0f + expf(-val));
-        out[at(b, 0, r)] = half(val);
+        out[at(b, opx, r)] = half(val);
     }
     if (part == 0) {
         for (uint32_t r = n; r < b->stride; r++)
-            out[at(b, 0, r)] = 0;
+            out[at(b, opx, r)] = 0;
         for (uint32_t r = 0; r < b->stride; r++)
-            out[at(b, 1, r)] = 0;
+            out[at(b, opx + 1u, r)] = 0;
+    }
     }
 }
 
@@ -1858,7 +2606,80 @@ static void softmax_fp16_scalar(const HxGraph *g, const HxOp *o, uint32_t part, 
     }
 }
 
-/* HX_SDPA in scalar lanes. */
+/* Batch-one, width-one SDPA: qf32 channel dot products and value accumulation. Each output
+ * pixel occupies the even half of its own blocked pair, so workers never share a store. */
+static int sdpa_fp16_vector(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
+    const HxTensor *q = &g->tensors[o->x], *k = &g->tensors[o->y],
+                   *v = &g->tensors[o->z], *b = &g->tensors[o->out];
+    if (o->p[0] != HXFG_NONE || o->p[3] > 1u || q->w != 1u || k->w != 1u ||
+        v->w != 1u || b->w != 1u || q->h != b->h || k->h != v->h ||
+        q->c != k->c || v->c != b->c || k->h > 4096u)
+        return 0;
+    const uint32_t kb = q->stride / 32u, vb = b->stride / 32u;
+    const uint32_t score_bytes = (k->h * 4u + 127u) & ~127u;
+    const uint32_t slice = (g->fp16->workspace_bytes / parts) & ~2047u;
+    if (score_bytes + kb * 128u > slice)
+        return 0;
+    uint8_t *ws = g->fp16->workspace + part * slice;
+    float *scores = (float *)ws;
+    HVX_Vector *qf = (HVX_Vector *)(ws + score_bytes);
+    const uint16_t *qsrc = (const uint16_t *)tensor_data(g, o->x);
+    const uint16_t *ksrc = (const uint16_t *)tensor_data(g, o->y);
+    const uint16_t *vsrc = (const uint16_t *)tensor_data(g, o->z);
+    HVX_Vector *out = (HVX_Vector *)tensor_data(g, o->out);
+    const uint32_t oplane = plane_bytes(b) / 128u;
+    float scale = 1.0f / sqrtf((float)q->c);
+    if (o->p[1])
+        memcpy(&scale, &o->p[1], sizeof scale);
+    const uint32_t lo = b->h * part / parts, hi = b->h * (part + 1u) / parts;
+    for (uint32_t i = lo; i < hi; i++) {
+        for (uint32_t cb = 0; cb < kb; cb++)
+            qf[cb] = float_words(load(qsrc, q, i * 2u, cb * 32u));
+        float peak = -FLT_MAX, sum = 0.0f;
+        for (uint32_t row = 0; row < k->h; row++) {
+            if (o->p[2] && row > i) {
+                scores[row] = -FLT_MAX;
+                continue;
+            }
+            HVX_Vector dot = Q6_V_vzero();
+            for (uint32_t cb = 0; cb < kb; cb++)
+                dot = Q6_Vqf32_vadd_Vqf32Vqf32(dot, Q6_Vqf32_vmpy_VsfVsf(
+                    qf[cb], float_words(load(ksrc, k, row * 2u, cb * 32u))));
+            union { HVX_Vector v; float f[32]; } reduced;
+            reduced.v = vf_all_sum(Q6_Vsf_equals_Vqf32(dot));
+            const float score = reduced.f[0] * scale;
+            scores[row] = score;
+            if (score > peak) peak = score;
+        }
+        if (peak == -FLT_MAX)
+            peak = 0.0f;
+        for (uint32_t row = 0; row < k->h; row++) {
+            if (o->p[2] && row > i) {
+                scores[row] = 0.0f;
+            } else {
+                scores[row] = expf(scores[row] - peak);
+                sum += scores[row];
+            }
+        }
+        const float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+        for (uint32_t cb = 0; cb < vb; cb++) {
+            HVX_Vector acc = Q6_V_vzero();
+            for (uint32_t row = 0; row < k->h; row++) {
+                const float weight = scores[row] * inv_sum;
+                if (weight > 0.0f)
+                    acc = Q6_Vqf32_vadd_Vqf32Vqf32(acc, Q6_Vqf32_vmpy_VsfVsf(
+                        splat(weight), float_words(load(vsrc, v, row * 2u, cb * 32u))));
+            }
+            const uint32_t left = b->c - cb * 32u;
+            const HVX_VectorPred live = Q6_Q_vsetq2_R(left >= 32u ? 128u : left * 4u);
+            const HVX_Vector result = Q6_V_vmux_QVV(live, Q6_Vsf_equals_Vqf32(acc), Q6_V_vzero());
+            out[cb * oplane + i] = Q6_Vh_vshuffe_VhVh(Q6_V_vzero(), half_words(result));
+        }
+    }
+    return 1;
+}
+
+/* HX_SDPA in scalar lanes for general shape, mask, or workspace constraints. */
 static void sdpa_fp16_scalar(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
     const HxTensor *q_t = &g->tensors[o->x], *k_t = &g->tensors[o->y], *v_t = &g->tensors[o->z], *b = &g->tensors[o->out];
     const uint16_t *qv = (const uint16_t *)tensor_data(g, o->x);
@@ -1960,6 +2781,145 @@ static void sdpa_fp16_scalar(const HxGraph *g, const HxOp *o, uint32_t part, uin
         for (uint32_t d = Dv; d < b->stride; d++)
             out[at(b, out_px, d)] = 0;
     }
+}
+
+/* Slice whole channel blocks while selecting the source's two pixels for each output pair.
+ * Misaligned channel origins retain the general scalar halfword path. */
+static int slice_vector(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
+    const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
+    if (o->p[2] & 31u)
+        return 0;
+    const uint32_t apw = physical_width(a), bpw = physical_width(b);
+    const uint32_t pairs = b->h * bpw / 2u, lo = pairs * part / parts,
+                   hi = pairs * (part + 1u) / parts, plane = plane_bytes(b) / 128u;
+    const uint16_t *src = (const uint16_t *)tensor_data(g, o->x);
+    HVX_Vector *dst = (HVX_Vector *)tensor_data(g, o->out);
+    for (uint32_t cb = 0; cb < b->stride / 32u; cb++) {
+        const uint32_t left = b->c - cb * 32u;
+        const HVX_VectorPred live = Q6_Q_vsetq2_R(left >= 32u ? 128u : left * 4u);
+        for (uint32_t pair = lo; pair < hi; pair++) {
+            const uint32_t oy = pair * 2u / bpw, ox = pair * 2u % bpw;
+            const int32_t p0 = (int32_t)((oy + o->p[0]) * apw + ox + o->p[1]);
+            const int32_t p1 = ox + 1u < b->w ? p0 + 1 : -1;
+            const HVX_Vector v = rows(src, a, p0, p1, o->p[2] + cb * 32u);
+            dst[cb * plane + pair] = Q6_V_vmux_QVV(live, v, Q6_V_vzero());
+        }
+    }
+    return 1;
+}
+
+/* Spatial reductions preserve channels, so each channel vector can accumulate independently.
+ * Channel-reducing masks keep the scalar path, which has a different horizontal reduction. */
+static int reduce_spatial_vector(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
+    const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
+    const uint32_t axes = o->p[1], op = o->p[0];
+    if (!axes || (axes & 4u) || a->c != b->c || a->stride != b->stride)
+        return 0;
+    const uint32_t apw = physical_width(a), bpw = physical_width(b);
+    const uint32_t pairs = b->h * bpw / 2u, lo = pairs * part / parts,
+                   hi = pairs * (part + 1u) / parts;
+    const uint32_t plane = plane_bytes(b) / 128u, blocks = b->stride / 32u;
+    const uint16_t *src = (const uint16_t *)tensor_data(g, o->x);
+    HVX_Vector *dst = (HVX_Vector *)tensor_data(g, o->out);
+    for (uint32_t cb = 0; cb < blocks; cb++) {
+        const uint32_t left = b->c - cb * 32u;
+        const HVX_VectorPred live = Q6_Q_vsetq2_R(left >= 32u ? 128u : left * 4u);
+        for (uint32_t pair = lo; pair < hi; pair++) {
+            const uint32_t oy = pair * 2u / bpw, ox = pair * 2u % bpw;
+            const int odd = ox + 1u < b->w;
+            const uint32_t h0 = axes & 1u ? 0u : oy, h1 = axes & 1u ? a->h : oy + 1u;
+            const uint32_t w0 = axes & 2u ? 0u : ox, w1 = axes & 2u ? a->w : ox + 1u;
+            const HVX_Vector init = op == HX_RED_MAX ? splat(-FLT_MAX) :
+                                    op == HX_RED_MIN ? splat(FLT_MAX) : Q6_V_vzero();
+            HVX_Vector even = init, oddv = init;
+            for (uint32_t sy = h0; sy < h1; sy++)
+                for (uint32_t sx = w0; sx < w1; sx++) {
+                    const int32_t p0 = (int32_t)(sy * apw + sx);
+                    const int32_t p1 = odd && !(axes & 2u) ? p0 + 1 : -1;
+                    const HVX_Vector h = rows(src, a, p0, p1, cb * 32u);
+                    const HVX_Vector e = float_words(h);
+                    const HVX_Vector d = float_words(Q6_Vuw_vlsr_VuwR(h, 16));
+                    if (op == HX_RED_MAX) {
+                        even = Q6_Vsf_vmax_VsfVsf(even, e);
+                        oddv = Q6_Vsf_vmax_VsfVsf(oddv, d);
+                    } else if (op == HX_RED_MIN) {
+                        even = Q6_Vsf_vmin_VsfVsf(even, e);
+                        oddv = Q6_Vsf_vmin_VsfVsf(oddv, d);
+                    } else {
+                        even = vf_add(even, e);
+                        oddv = vf_add(oddv, d);
+                    }
+                }
+            if (op == HX_RED_MEAN) {
+                const HVX_Vector inv = splat(1.0f / (float)((h1 - h0) * (w1 - w0)));
+                even = vf_mul(even, inv);
+                oddv = vf_mul(oddv, inv);
+            }
+            if (!odd)
+                oddv = Q6_V_vzero();
+            dst[cb * plane + pair] = Q6_Vh_vshuffe_VhVh(
+                half_words(Q6_V_vmux_QVV(live, oddv, Q6_V_vzero())),
+                half_words(Q6_V_vmux_QVV(live, even, Q6_V_vzero())));
+        }
+    }
+    return 1;
+}
+
+/* General depthwise geometry: the tap coordinates are scalar, while 32 independent channels
+ * and both pixels of an output pair accumulate in qf32 vectors. */
+static int depthwise_generic_vector(const HxGraph *g, const HxOp *o, uint32_t part,
+                                    uint32_t parts) {
+    const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
+    if (a->c != b->c || a->stride != b->stride)
+        return 0;
+    const uint32_t *p = o->p, apw = physical_width(a), bpw = physical_width(b);
+    const uint32_t pairs = b->h * bpw / 2u, lo = pairs * part / parts,
+                   hi = pairs * (part + 1u) / parts;
+    const uint32_t plane = plane_bytes(b) / 128u, blocks = b->stride / 32u;
+    const uint32_t dh = hx_dilation_h(o), dw = hx_dilation_w(o);
+    const uint16_t *src = (const uint16_t *)tensor_data(g, o->x);
+    HVX_Vector *dst = (HVX_Vector *)tensor_data(g, o->out);
+    const float *weights = (const float *)(g->constants + p[6]);
+    const float *bias = (const float *)(g->constants + p[7]);
+    for (uint32_t cb = 0; cb < blocks; cb++) {
+        const uint32_t left = b->c - cb * 32u;
+        const HVX_VectorPred live = Q6_Q_vsetq2_R(left >= 32u ? 128u : left * 4u);
+        const HVX_Vector init = *(const HVX_UVector *)(bias + cb * 32u);
+        for (uint32_t pair = lo; pair < hi; pair++) {
+            const uint32_t oy = pair * 2u / bpw, ox = pair * 2u % bpw;
+            const int odd = ox + 1u < b->w;
+            HVX_Vector even = Q6_Vqf32_vadd_VsfVsf(init, Q6_V_vzero());
+            HVX_Vector oddv = even;
+            for (uint32_t ky = 0; ky < p[0]; ky++) {
+                const int32_t iy = (int32_t)(oy * p[2] + ky * dh) - (int32_t)p[4];
+                if (iy < 0 || iy >= (int32_t)a->h)
+                    continue;
+                for (uint32_t kx = 0; kx < p[1]; kx++) {
+                    const int32_t ix0 = (int32_t)(ox * p[3] + kx * dw) - (int32_t)p[5];
+                    const int32_t ix1 = (int32_t)((ox + 1u) * p[3] + kx * dw) - (int32_t)p[5];
+                    const int32_t p0 = ix0 >= 0 && ix0 < (int32_t)a->w ? iy * (int32_t)apw + ix0 : -1;
+                    const int32_t p1 = odd && ix1 >= 0 && ix1 < (int32_t)a->w ?
+                                       iy * (int32_t)apw + ix1 : -1;
+                    if (p0 < 0 && p1 < 0)
+                        continue;
+                    const HVX_Vector h = rows(src, a, p0, p1, cb * 32u);
+                    const HVX_Vector w = *(const HVX_UVector *)(weights +
+                        (ky * p[1] + kx) * b->stride + cb * 32u);
+                    even = Q6_Vqf32_vadd_Vqf32Vqf32(even,
+                        Q6_Vqf32_vmpy_VsfVsf(float_words(h), w));
+                    if (odd)
+                        oddv = Q6_Vqf32_vadd_Vqf32Vqf32(oddv,
+                            Q6_Vqf32_vmpy_VsfVsf(float_words(Q6_Vuw_vlsr_VuwR(h, 16)), w));
+                }
+            }
+            const HVX_Vector ev = Q6_V_vmux_QVV(live, Q6_Vsf_equals_Vqf32(even), Q6_V_vzero());
+            const HVX_Vector ov = odd ? Q6_V_vmux_QVV(live, Q6_Vsf_equals_Vqf32(oddv), Q6_V_vzero())
+                                      : Q6_V_vzero();
+            dst[cb * plane + pair] = activate_half(
+                Q6_Vh_vshuffe_VhVh(half_words(ov), half_words(ev)), p[8]);
+        }
+    }
+    return 1;
 }
 
 static inline int32_t get_index_val(const HxGraph *g, const HxTensor *t, const uint16_t *t_fp16,
@@ -2378,6 +3338,156 @@ static void scatter_nd_fp16_scalar(const HxGraph *g, const HxOp *o, uint32_t par
     }
 }
 
+/* Channel concatenation of two tensors of the output's size. Each 32-channel source block is one
+ * vector per pixel pair, rotated to its output lane and split by two masks between two output
+ * blocks, so the result equals the scalar copy (pad lanes zero; pad pixels are already zero). */
+static int concat_channels_vector(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
+    const HxTensor *a = &g->tensors[o->x], *y = &g->tensors[o->y], *b = &g->tensors[o->out];
+    if (o->p[0] != 2u || a->h != b->h || a->w != b->w || y->h != b->h || y->w != b->w ||
+        a->c + y->c != b->c || compact(a) || compact(y))
+        return 0;
+    const uint32_t plane = plane_bytes(b) / 128u, pairs = tiles(b) * 16u,
+                   v0 = pairs * part / parts, v1 = pairs * (part + 1u) / parts;
+    HVX_Vector *d = (HVX_Vector *)tensor_data(g, o->out);
+    for (uint32_t k = 0; k < b->stride / 32u; k++)
+        for (uint32_t v = v0; v < v1; v++)
+            d[k * plane + v] = Q6_V_vzero();
+    for (uint32_t which = 0; which < 2u; which++) {
+        const HxTensor *t = which ? y : a;
+        const HVX_Vector *src = (const HVX_Vector *)tensor_data(g, which ? o->y : o->x);
+        const uint32_t base = which ? a->c : 0u;
+        for (uint32_t sb = 0; sb < (t->c + 31u) / 32u; sb++) {
+            const uint32_t col = base + sb * 32u, k = col / 32u, off = col % 32u,
+                           count = t->c - sb * 32u < 32u ? t->c - sb * 32u : 32u;
+            const int32_t rot = -(int32_t)(off * 4u);
+            const HVX_Vector lo = rgb_mask(off, off + count < 32u ? count : 32u - off);
+            const int spill = off + count > 32u;
+            const HVX_Vector hi = spill ? rgb_mask(0, off + count - 32u) : Q6_V_vzero();
+            const HVX_Vector *s = src + sb * plane;
+            HVX_Vector *d0 = d + k * plane, *d1 = d + (k + 1u) * plane;
+            if (!off && count == 32u)
+                for (uint32_t v = v0; v < v1; v++)
+                    d0[v] = s[v];
+            else
+                for (uint32_t v = v0; v < v1; v++) {
+                    const HVX_Vector r = Q6_V_vror_VR(s[v], rot);
+                    d0[v] = Q6_V_vor_VV(d0[v], Q6_V_vand_VV(r, lo));
+                    if (spill)
+                        d1[v] = Q6_V_vor_VV(d1[v], Q6_V_vand_VV(r, hi));
+                }
+        }
+    }
+    return 1;
+}
+/* Average pooling: per pixel, the same float32 sums in the same tap order as the scalar lanes
+ * (each tap's 32 channels widened exactly in one vector, then scalar adds), then the scalar
+ * division and rounding. */
+static int avgpool_vector(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
+    const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
+    const uint32_t *p = o->p;
+    if (compact(a) || a->stride != b->stride)
+        return 0;
+    const uint32_t obw = physical_width(b), apw = physical_width(a), opairs = b->h * obw / 2u,
+                   lo = opairs * part / parts, hi = opairs * (part + 1u) / parts;
+    const uint32_t dh = hx_dilation_h(o), dw = hx_dilation_w(o);
+    const uint16_t *x = (const uint16_t *)tensor_data(g, o->x);
+    uint16_t *out = (uint16_t *)tensor_data(g, o->out);
+    float sums[32], widened[32] __attribute__((aligned(128)));
+    for (uint32_t pair = lo; pair < hi; pair++)
+        for (uint32_t q = 0; q < 2u; q++) {
+            const uint32_t px = pair * 2u + q, oy = px / obw, ox = px % obw;
+            for (uint32_t cb = 0; cb < b->stride / 32u; cb++) {
+                if (ox >= b->w) {
+                    for (uint32_t c = 0; c < 32u; c++)
+                        out[at(b, px, cb * 32u + c)] = 0;
+                    continue;
+                }
+                for (uint32_t c = 0; c < 32u; c++)
+                    sums[c] = 0.0f;
+                uint32_t taps = 0;
+                for (uint32_t ky = 0; ky < p[0]; ky++) {
+                    const int32_t iy = (int32_t)(oy * p[2] + ky * dh) - (int32_t)p[4];
+                    if (iy < 0 || iy >= (int32_t)a->h)
+                        continue;
+                    for (uint32_t kx = 0; kx < p[1]; kx++) {
+                        const int32_t ix = (int32_t)(ox * p[3] + kx * dw) - (int32_t)p[5];
+                        if (ix < 0 || ix >= (int32_t)a->w)
+                            continue;
+                        const uint32_t ip = (uint32_t)iy * apw + (uint32_t)ix;
+                        HVX_Vector v = load(x, a, ip, cb * 32u);
+                        if (ip & 1u)
+                            v = Q6_Vuw_vlsr_VuwR(v, 16);
+                        *(HVX_Vector *)widened = float_words(v);
+                        for (uint32_t c = 0; c < 32u; c++)
+                            sums[c] += widened[c];
+                        taps++;
+                    }
+                }
+                if (p[6])
+                    taps = p[0] * p[1];
+                for (uint32_t c = 0; c < 32u; c++)
+                    out[at(b, px, cb * 32u + c)] =
+                        cb * 32u + c < b->c ? half(taps ? sums[c] / (float)taps : 0.0f) : 0;
+            }
+        }
+    return 1;
+}
+/* NCHW flatten (p[0] 1: HxWxC to 1x1xN, n = c*H*W + h*W + w) and unflatten (p[0] 2: 1x1xN to
+ * HxWxC), the same element copies as the scalar lanes with incremental indices and one vector
+ * store per output pixel pair and block. Pad lanes and the pad pixel are zero. */
+static int reshape_nchw(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
+    const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
+    const uint32_t mode = o->p[0];
+    if ((mode != 1u && mode != 2u) || compact(a) || compact(b) ||
+        (mode == 1u && (b->h != 1u || b->w != 1u || b->c != a->h * a->w * a->c)) ||
+        (mode == 2u && (a->h != 1u || a->w != 1u || a->c != b->h * b->w * b->c)))
+        return 0;
+    const uint16_t *x = (const uint16_t *)tensor_data(g, o->x);
+    HVX_Vector *out = (HVX_Vector *)tensor_data(g, o->out);
+    const uint32_t iplane = plane_bytes(a) / 2u, oplane = plane_bytes(b) / 128u;
+    uint16_t buf[64] __attribute__((aligned(128)));
+    if (mode == 1u) {
+        const uint32_t hw = a->h * a->w, apw = physical_width(a), blocks = b->stride / 32u,
+                       k0 = blocks * part / parts, k1 = blocks * (part + 1u) / parts;
+        for (uint32_t k = k0; k < k1; k++) {
+            uint32_t n = k * 32u, ch = n / hw, rem = n % hw, iy = rem / a->w, ix = rem % a->w;
+            for (uint32_t l = 0; l < 32u; l++, n++) {
+                uint16_t v = 0;
+                if (n < b->c) {
+                    const uint32_t ip = iy * apw + ix;
+                    v = x[(ch >> 5) * iplane + (ip >> 1) * 64u + (ch & 31u) * 2u + (ip & 1u)];
+                    if (++ix == a->w) {
+                        ix = 0;
+                        if (++iy == a->h) {
+                            iy = 0;
+                            ch++;
+                        }
+                    }
+                }
+                buf[2u * l] = v;
+                buf[2u * l + 1u] = 0;
+            }
+            out[k * oplane] = *(const HVX_Vector *)buf;
+        }
+        return 1;
+    }
+    const uint32_t obw = physical_width(b), hw = b->h * b->w, opairs = b->h * obw / 2u,
+                   lo = opairs * part / parts, hi = opairs * (part + 1u) / parts;
+    for (uint32_t pair = lo; pair < hi; pair++) {
+        const uint32_t oy = pair * 2u / obw, ox = pair * 2u % obw;
+        for (uint32_t k = 0; k < b->stride / 32u; k++) {
+            for (uint32_t q = 0; q < 2u; q++) {
+                uint32_t n = k * 32u * hw + oy * b->w + ox + q;
+                for (uint32_t l = 0; l < 32u; l++, n += hw)
+                    buf[2u * l + q] = ox + q < b->w && k * 32u + l < b->c
+                                          ? x[(n >> 5) * iplane + (n & 31u) * 2u]
+                                          : 0;
+            }
+            out[k * oplane + pair] = *(const HVX_Vector *)buf;
+        }
+    }
+    return 1;
+}
 void hx_fp16_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts) {
     const HxOp *o = &g->ops[index];
     const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
@@ -2410,8 +3520,29 @@ void hx_fp16_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts)
         }
         break;
     case HX_SDPA:
+        if (sdpa_fp16_vector(g, o, part, parts))
+            return;
         sdpa_fp16_scalar(g, o, part, parts);
         return;
+    case HX_NORM:
+        if (norm_channel_vector(g, o, part, parts))
+            return;
+        if (o->p[0] == HX_NORM_GROUP && norm_group_vector(g, o, part, parts))
+            return;
+        break;
+    case HX_ACT:
+    case HX_LOGISTIC:
+        if (act_vector(g, o, part, parts))
+            return;
+        break;
+    case HX_BINARY:
+        if (binary_vector(g, o, part, parts))
+            return;
+        break;
+    case HX_ZEROINSERT:
+        if (zero_insert_vector(g, o, part, parts))
+            return;
+        break;
     case HX_GATHER:
         gather_fp16_scalar(g, o, part, parts);
         return;
@@ -2425,7 +3556,13 @@ void hx_fp16_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts)
         scatter_nd_fp16_scalar(g, o, part, parts);
         return;
     case HX_SOFTMAX:
+        if (softmax_vector(g, o, part, parts))
+            return;
+        softmax_fp16_scalar(g, o, part, parts);
+        return;
     case HX_ATTN_SOFTMAX:
+        if (softmax_vector(g, o, part, parts))
+            return;
         softmax_fp16_scalar(g, o, part, parts);
         return;
     case HX_DEPTHWISE:
@@ -2433,11 +3570,21 @@ void hx_fp16_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts)
             blocked_depthwise(g, index, part, parts);
             return;
         }
+        if (depthwise_generic_vector(g, o, part, parts))
+            return;
         break; /* other shapes: scalar lanes below */
     case HX_ADD:
     case HX_PRELU:
         elementwise(g, o, index, part, parts);
         return;
+    case HX_CONCAT:
+        if (concat_channels_vector(g, o, part, parts))
+            return;
+        break;
+    case HX_AVGPOOL:
+        if (avgpool_vector(g, o, part, parts))
+            return;
+        break;
     case HX_MAXPOOL:
         maxpool(g, o, part, parts);
         return;
@@ -2451,10 +3598,16 @@ void hx_fp16_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts)
         }
         break; /* nearest: scalar lanes below */
     case HX_RESHAPE:
-        if (!p[0]) { /* NCHW flatten/unflatten (p[0] 1 or 2) run in the scalar lanes below */
+        if (!p[0]) {
             reshape(g, o, part, parts);
             return;
         }
+        if (reshape_nchw(g, o, part, parts))
+            return;
+        break; /* other NCHW shapes: scalar lanes below */
+    case HX_SLICE:
+        if (slice_vector(g, o, part, parts))
+            return;
         break;
     default:
         break;
@@ -2512,6 +3665,8 @@ void hx_fp16_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts)
         return;
     }
     if (o->kind == HX_REDUCE) {
+        if (reduce_spatial_vector(g, o, part, parts))
+            return;
         /* Reduction over the p[1] axes, scalar lanes as in graph.c: accumulate in float per output
          * element; padding lanes and the pad column are written as zero. */
         const uint16_t *src_tensor = (const uint16_t *)tensor_data(g, o->x);

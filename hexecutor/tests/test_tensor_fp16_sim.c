@@ -14,14 +14,22 @@ static uint32_t pad_shift;
 static uint32_t vtcm_size = 0x800000;
 /* z of the next convolution/depthwise check(): HXFG_NONE or (dh << 8) | dw. */
 static uint32_t dilation_z = HXFG_NONE;
+static uint32_t slice_channel_offset = 5;
 /* Simulator pcycles spent in the FP16 operator calls of the last check(), summed over parts. */
 static uint64_t op_pcycles;
+/* Extra ROPE fields of the next check(): theta float bits (0: 10000), rotated width per head
+ * (0: all) and 1 to add the row index to the position. */
+static uint32_t rope_theta_bits, rope_rot, rope_row_pos;
 /* Simulator processor cycles: the service call behind hexagon_sim_read_pcycles, inlined because
  * the tensor build does not link libhexagon. */
 static uint64_t pcycles(void) {
     uint64_t c;
     __asm__ volatile("r0 = #0x52\n\ttrap0(#0x0)\n\t%0 = combine(r1,r0)" : "=r"(c) : : "r0", "r1");
     return c;
+}
+static void import_four_parts(const HxFp16Job *job) {
+    for (uint32_t part = 0; part < 4; part++)
+        hx_fp16_job(job, part, 4);
 }
 static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t ci, uint32_t co,
                  uint32_t kh, uint32_t step, uint32_t axis) {
@@ -59,6 +67,10 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
         o.p[8] = 3;
         t[2].h = (h + step - 1) / step;
         t[2].w = (w + step - 1) / step;
+        if (kind == HX_CONV && kh == 3u && step == 1u && pad_shift == UINT32_MAX) {
+            t[2].h = h + 2u;
+            t[2].w = w + 2u;
+        }
         if (kind == HX_MAXPOOL || kind == HX_AVGPOOL) {
             o.p[6] = o.p[7] = o.p[8] = 0;
             if (kind == HX_AVGPOOL)
@@ -129,6 +141,17 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
             o.p[3] = 2;
         } else
             o.p[1] = 1; /* bilinear half-pixel */
+    } else if (kind == HX_ATTN_SOFTMAX) {
+        /* step bits: causal, additive mask, scalar-per-pixel mask. */
+        o.p[0] = 2;
+        o.p[1] = step & 1u;
+        if (step & 2u) {
+            o.y = 1;
+            if (step & 4u) {
+                t[1].c = 1;
+                t[1].stride = 32;
+            }
+        }
     } else if (kind == HX_ZEROINSERT) {
         /* Stride step, pad 1 on top and left, one trailing row/column: output (h-1)*step + 3. */
         o.p[0] = o.p[1] = step;
@@ -139,7 +162,7 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
         /* Sub-box starting at (1, 2, 5): the output keeps co channels (co + 5 <= ci). */
         o.p[0] = 1;
         o.p[1] = 2;
-        o.p[2] = 5;
+        o.p[2] = slice_channel_offset;
         t[2].h = h - 1;
         t[2].w = w - 2;
     } else if (kind == HX_MEAN)
@@ -233,6 +256,9 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
         o.p[1] = ci / step;
         o.p[2] = axis >> 1;
         o.p[3] = axis & 1u;
+        o.p[4] = rope_theta_bits;
+        o.p[5] = rope_rot;
+        o.p[6] = rope_row_pos;
     } else if (kind == HX_LINEAR_Q) {
         /* One token: ci is K, co is N, kh is the format (0 Q4_0, 1 Q8_0), axis the activation.
          * Blocks of 32 weights per output row, fp16 scale last; bias at 0x98000. */
@@ -303,7 +329,7 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
         if (kind == HX_BINARY && axis == HX_BIN_POW)
             for (uint32_t j = 0; j < t[n].h * t[n].w * t[n].stride; j++)
                 v[j] = fabsf(v[j]) * 0.25f + 0.5f;
-        hx_fp16_import(&g, n, v, NULL);
+        hx_fp16_import(&g, n, v, import_four_parts);
         hx_fp16_export(&g, n, actual, NULL);
         if (memcmp(actual, v, t[n].h * t[n].w * t[n].stride * 4)) {
             printf("FAIL round trip kind%u c%u\n", (unsigned)kind, (unsigned)ci);
@@ -474,6 +500,37 @@ static int check_state(uint32_t base, uint32_t c, uint32_t taps, uint32_t steps,
     free(actual);
     free(reference);
     free(constants);
+    return 0;
+}
+/* The FP16 plan holds activations as half-precision tiles but persistent state as float32 rows, so a
+ * kernel that reads a persistent tensor other than the state ops must make the plan refuse, leaving
+ * the graph to the FP32 path (which reads the caches directly). */
+static int check_persistent_rejected(uint32_t base) {
+    HxHeader header = {0};
+    header.tensors = 4;
+    header.inputs = 1;
+    header.outputs = 1;
+    header.ops = 1;
+    uint32_t io[2] = {0, 3};
+    HxTensor t[4] = {{0, 1, 1, 64, 64, {0}},
+                     {0, 8, 1, 64, 64, {HX_TENSOR_PERSISTENT, 1, 0}},
+                     {0x4000, 8, 1, 64, 64, {HX_TENSOR_PERSISTENT, 2, 0}},
+                     {0x1000, 1, 1, 64, 64, {0}}};
+    HxOp o = {0};
+    o.kind = HX_SDPA;
+    o.x = 0;
+    o.y = 1;
+    o.z = 2;
+    o.out = 3;
+    o.p[0] = HXFG_NONE;
+    o.p[3] = 1;
+    HxGraph g = {&header, t, &o, io, NULL, (uint8_t *)base, NULL};
+    static uint32_t tables[4096];
+    static struct HxFp16Plan plan;
+    if (hx_fp16_plan(&g, &plan, tables, (uint8_t *)base + vtcm_size)) {
+        printf("FAIL FP16 plan accepted SDPA over a persistent KV cache\n");
+        return 1;
+    }
     return 0;
 }
 /* Compact RGB entry: staged image, parallel-shaped pack, direct matrix output. */
@@ -880,6 +937,60 @@ static int check_indexing(uint32_t base) {
     return errors;
 }
 
+static int check_sdpa_vector(uint32_t base, uint32_t causal, uint32_t dk, uint32_t dv) {
+    uint8_t *constants = aligned_alloc(128, 0x100000);
+    float *reference = aligned_alloc(128, 0x100000), *actual = aligned_alloc(128, 0x100000);
+    if (!constants || !reference || !actual) return 1;
+    memset(constants, 0, 0x100000);
+    memset(reference, 0, 0x100000);
+    HxHeader header = {0};
+    header.tensors = 4; header.inputs = 3; header.outputs = 1; header.ops = 1;
+    uint32_t io[4] = {0, 1, 2, 3};
+    const uint32_t sd = (dk + 31u) & ~31u, sv = (dv + 31u) & ~31u;
+    HxTensor t[4] = {{0, 7, 1, dk, sd, {0}},
+                     {0x20000, 11, 1, dk, sd, {0}},
+                     {0x40000, 11, 1, dv, sv, {0}},
+                     {0x60000, 7, 1, dv, sv, {0}}};
+    HxOp o = {0};
+    o.kind = HX_SDPA; o.x = 0; o.y = 1; o.z = 2; o.out = 3;
+    o.p[0] = HXFG_NONE; o.p[2] = causal;
+    HxGraph g = {&header, t, &o, io, constants, (uint8_t *)reference, NULL};
+    static uint32_t tables[4096];
+    static struct HxFp16Plan plan;
+    if (!hx_fp16_plan(&g, &plan, tables, (uint8_t *)base + 0x800000)) {
+        printf("FAIL SDPA plan dk%u dv%u\n", (unsigned)dk, (unsigned)dv);
+        return 1;
+    }
+    g.fp16 = &plan;
+    hx_fp16_stage(&g, NULL);
+    for (uint32_t n = 0; n < 3; n++) {
+        float *data = reference + t[n].offset / 4u;
+        for (uint32_t row = 0; row < t[n].h; row++)
+            for (uint32_t c = 0; c < t[n].stride; c++)
+                data[row * t[n].stride + c] = c < t[n].c ?
+                    ((int)((row * 7u + c * 3u + n) % 9u) - 4) * 0.125f : 0.0f;
+        g.arena = (uint8_t *)base;
+        hx_fp16_import(&g, n, data, NULL);
+    }
+    g.arena = (uint8_t *)reference;
+    for (uint32_t p = 0; p < 3; p++) hx_execute_op(&g, 0, p, 3);
+    g.arena = (uint8_t *)base;
+    for (uint32_t p = 0; p < 3; p++) hx_fp16_op(&g, 0, p, 3);
+    hx_fp16_export(&g, 3, actual, NULL);
+    const float *expected = reference + t[3].offset / 4u;
+    int bad = 0;
+    for (uint32_t row = 0; row < t[3].h && !bad; row++)
+        for (uint32_t c = 0; c < dv; c++)
+            if (fabsf(actual[row * sv + c] - expected[row * sv + c]) > .004f) {
+                printf("FAIL SDPA causal%u dk%u dv%u row%u c%u got%f expected%f\n",
+                       (unsigned)causal, (unsigned)dk, (unsigned)dv, (unsigned)row,
+                       (unsigned)c, actual[row * sv + c], expected[row * sv + c]);
+                bad = 1; break;
+            }
+    free(actual); free(reference); free(constants);
+    return bad;
+}
+
 int main(void) {
     uint32_t base = __rdcfg(__vtcm_base) << 16;
     for (uint32_t i = 0; i < 0x800000; i += 4096)
@@ -889,6 +1000,46 @@ int main(void) {
     ssr |= 1u << 26;
     __asm__ volatile("ssr=%0\n isync" ::"r"(ssr) : "memory");
     unsigned errors = 0;
+#ifdef HX_MERCURY_QUICK
+    errors += check(base, HX_BINARY, 16, 16, 32, 32, 0, 3, HX_BIN_MUL);
+    printf("Mercury scalar multiply 16x16x32: %llu pcycles\n", (unsigned long long)op_pcycles);
+    errors += check(base, HX_ZEROINSERT, 10, 10, 63, 63, 1, 2, 0);
+    printf("Mercury zero insertion 10x10x63 to 21x21x63: %llu pcycles\n",
+           (unsigned long long)op_pcycles);
+    pad_shift = UINT32_MAX;
+    errors += check(base, HX_CONV, 8, 8, 32, 32, 3, 1, 0);
+    printf("Mercury pad-two 3x3 conv 8x8x32 to 10x10x32: %llu pcycles\n",
+           (unsigned long long)op_pcycles);
+    pad_shift = 0;
+    puts(errors ? "FAIL Mercury quick" : "PASS Mercury quick");
+    return errors != 0;
+#elif defined(HX_VECTOR_QUICK)
+    errors += check_sdpa_vector(base, 0, 64, 32);
+    errors += check_sdpa_vector(base, 1, 40, 33);
+    errors += check(base, HX_DEPTHWISE, 9, 11, 40, 40, 7, 1, 0);
+    errors += check(base, HX_DEPTHWISE, 9, 11, 33, 33, 3, 3, 0);
+    dilation_z = (2u << 8) | 1u;
+    errors += check(base, HX_DEPTHWISE, 9, 11, 40, 40, 3, 1, 0);
+    dilation_z = HXFG_NONE;
+    errors += check(base, HX_CONV, 8, 8, 32, 32, 1, 2, 0);
+    errors += check(base, HX_CONV, 16, 12, 64, 40, 1, 2, 0);
+    slice_channel_offset = 32;
+    errors += check(base, HX_SLICE, 7, 9, 64, 32, 1, 1, 0);
+    errors += check(base, HX_SLICE, 8, 10, 96, 40, 1, 1, 0);
+    errors += check(base, HX_NORM, 7, 9, 40, 40, 1, 1, HX_NORM_CHANNEL);
+    errors += check(base, HX_NORM, 5, 6, 64, 64, 1, 1, HX_NORM_CHANNEL);
+    errors += check(base, HX_ATTN_SOFTMAX, 7, 9, 40, 40, 1, 0, 0);
+    for (uint32_t mode = 1; mode <= 3; mode++)
+        errors += check(base, HX_ATTN_SOFTMAX, 7, 9, 40, 40, 1, mode, 0);
+    errors += check(base, HX_ATTN_SOFTMAX, 7, 9, 40, 40, 1, 7, 0);
+    for (uint32_t axes = 1; axes <= 3; axes++)
+        for (uint32_t red = 0; red < HX_RED_COUNT; red++)
+            errors += check(base, HX_REDUCE, 7, 9, 40, 40, axes, 1, red);
+    for (uint32_t fn = 0; fn < HX_ACT_COUNT; fn++)
+        errors += check(base, HX_ACT, 7, 9, 40, 40, 1, 1, fn);
+    if (!errors) puts("PASS vector quick");
+    return errors ? 1 : 0;
+#endif
     for (uint32_t ci = 24; ci <= 64; ci += 8) {
         errors += check(base, HX_CONV, 7, 9, ci, 35, 1, 1, 0);
         for (uint32_t k = 3; k <= 5; k += 2)
@@ -934,9 +1085,19 @@ int main(void) {
     errors += check(base, HX_LOGISTIC, 1, 1, 1, 1, 1, 1, 0);
     errors += check(base, HX_SLICE, 7, 9, 40, 20, 1, 1, 0);
     errors += check(base, HX_SLICE, 8, 8, 33, 17, 1, 1, 0);
+    slice_channel_offset = 32;
+    errors += check(base, HX_SLICE, 7, 9, 64, 32, 1, 1, 0);
+    errors += check(base, HX_SLICE, 8, 10, 96, 40, 1, 1, 0);
+    slice_channel_offset = 5;
     errors += check(base, HX_ZEROINSERT, 7, 9, 40, 40, 1, 2, 0);
     errors += check(base, HX_ZEROINSERT, 8, 8, 33, 33, 1, 3, 0);
     errors += check(base, HX_ZEROINSERT, 5, 6, 24, 24, 1, 1, 0);
+    errors += check(base, HX_ZEROINSERT, 10, 10, 63, 63, 1, 2, 0);
+    printf("Mercury zero insertion 10x10x63 to 21x21x63: %llu pcycles\n",
+           (unsigned long long)op_pcycles);
+    pad_shift = UINT32_MAX;
+    errors += check(base, HX_CONV, 8, 8, 32, 32, 3, 1, 0);
+    pad_shift = 0;
     /* Normalisation: channel mode; LayerNorm over C,H,W (1 group); two groups; InstanceNorm
      * (one group per channel); three groups over two channel blocks. */
     errors += check(base, HX_NORM, 7, 9, 40, 40, 1, 1, HX_NORM_CHANNEL);
@@ -957,12 +1118,18 @@ int main(void) {
     errors += check(base, HX_SOFTMAX, 7, 9, 40, 40, 1, 1, 0);
     errors += check(base, HX_SOFTMAX, 7, 9, 3, 3, 1, 1, 0);
     errors += check(base, HX_SOFTMAX, 8, 8, 64, 64, 1, 1, 0);
+    errors += check(base, HX_ATTN_SOFTMAX, 7, 9, 40, 40, 1, 0, 0);
+    errors += check(base, HX_ATTN_SOFTMAX, 8, 8, 64, 64, 1, 0, 0);
+    for (uint32_t mode = 1; mode <= 3; mode++)
+        errors += check(base, HX_ATTN_SOFTMAX, 7, 9, 40, 40, 1, mode, 0);
+    errors += check(base, HX_ATTN_SOFTMAX, 7, 9, 40, 40, 1, 7, 0);
     errors += check(base, HX_CONV, 1, 1, 1152, 63, 1, 1, 0);
     /* Dense convolutions packed as im2col: kernel, stride, padding, channel blocks and tails. */
     static const struct {
         uint32_t h, w, ci, co, k, s;
     } convs[] = {
         {7, 9, 24, 35, 3, 1}, {7, 9, 40, 35, 3, 1}, {7, 9, 5, 8, 3, 1},  {8, 8, 32, 32, 3, 2},
+        {8, 8, 32, 32, 1, 2}, {16, 12, 64, 40, 1, 2},
         {7, 9, 24, 35, 3, 2}, {9, 7, 33, 4, 3, 2},  {7, 9, 24, 35, 5, 1}, {16, 18, 32, 32, 5, 2},
         {16, 18, 16, 32, 7, 2}, {7, 9, 40, 35, 1, 2}, {5, 5, 64, 40, 3, 1}, {1, 1, 32, 32, 3, 1},
     };
@@ -991,6 +1158,8 @@ int main(void) {
         for (uint32_t mode = 0; mode <= 5; mode++)
             for (uint32_t reversed = 0; reversed <= 1; reversed++)
                 errors += check(base, HX_BINARY, 7, 9, 40, 40, reversed, mode, opcode);
+    errors += check(base, HX_BINARY, 16, 16, 32, 32, 0, 3, HX_BIN_MUL);
+    printf("Mercury scalar multiply 16x16x32: %llu pcycles\n", (unsigned long long)op_pcycles);
     for (uint32_t include = 0; include <= 1; include++) {
         errors += check(base, HX_AVGPOOL, 7, 9, 40, 40, 3, 1, include);
         errors += check(base, HX_AVGPOOL, 8, 8, 33, 33, 2, 2, include);
@@ -1039,6 +1208,24 @@ int main(void) {
     }
     errors += check(base, HX_ROPE, 2, 1, 96, 96, 1, 32, 3 << 1);
     errors += check(base, HX_ROPE, 2, 1, 128, 128, 1, 64, (9 << 1) | 1);
+    /* Theta 1e6 (0x49742400), partial rotation and a position that advances with the row. */
+    rope_theta_bits = 0x49742400u;
+    errors += check(base, HX_ROPE, 1, 1, 128, 128, 1, 64, 11 << 1);
+    rope_rot = 32;
+    errors += check(base, HX_ROPE, 1, 1, 64, 64, 1, 64, 5 << 1);
+    errors += check(base, HX_ROPE, 2, 1, 256, 256, 1, 128, (9 << 1) | 1);
+    rope_row_pos = 1;
+    errors += check(base, HX_ROPE, 5, 1, 128, 128, 1, 64, 3 << 1);
+    rope_rot = 0;
+    errors += check(base, HX_ROPE, 5, 1, 64, 64, 1, 64, 0);
+    rope_theta_bits = 0;
+    errors += check(base, HX_ROPE, 4, 1, 64, 64, 1, 64, 7 << 1);
+    rope_row_pos = 0;
+    /* Several token rows through one quantized linear. */
+    for (uint32_t fmt = 0; fmt <= 1; fmt++) {
+        errors += check(base, HX_LINEAR_Q, 3, 1, 256, 64, fmt, 1, 0);
+        errors += check(base, HX_LINEAR_Q, 5, 1, 96, 32, fmt, 1, 3);
+    }
     for (uint32_t fmt = 0; fmt <= 1; fmt++)
         for (uint32_t act = 0; act <= 3; act += 3) {
             errors += check(base, HX_LINEAR_Q, 1, 1, 256, 64, fmt, 1, act);
@@ -1053,6 +1240,7 @@ int main(void) {
     errors += check_state(base, 96, 7, 9, 1, 3);
     errors += check_state(base, 33, 4, 6, 0, 3);
     errors += check_state(base, 2048, 7, 8, 1, 0);
+    errors += check_persistent_rejected(base);
     /* Matrix product of two runtime tensors: transB 0 and 1, scale 1 and 0.5, odd sizes. */
     for (uint32_t trans = 0; trans <= 1; trans++)
         for (uint32_t scaled = 0; scaled <= 1; scaled++) {
@@ -1084,6 +1272,8 @@ int main(void) {
     for (uint32_t trans = 0; trans <= 1; trans++)
         errors += check(base, HX_MATMUL, 8, 1, 197, 197, 1, trans, 0);
     vtcm_size = 0x800000;
+    errors += check_sdpa_vector(base, 0, 64, 32);
+    errors += check_sdpa_vector(base, 1, 40, 33);
     errors += check_indexing(base);
     if (errors)
         return 1;

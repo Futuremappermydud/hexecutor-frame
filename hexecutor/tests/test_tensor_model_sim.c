@@ -2,7 +2,8 @@
 /* Whole-graph FP16 check on the instruction simulator. Runs one model serially
  * and compares output bits with a saved reference (normally a Frame report),
  * so a backend change that should not alter numerics can be checked off-device.
- * usage: test_model IMAGE CONSTANTS INPUT_F32 REFERENCE_PREFIX */
+ * usage: test_model IMAGE CONSTANTS INPUT_F32_OR_PREFIX REFERENCE_PREFIX [OUTPUT_PREFIX]
+ * For multiple inputs, INPUT_PREFIX is followed by 0.f32, 1.f32, etc. */
 #include "../native/tensor/fp16.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -26,7 +27,21 @@ static void *slurp(const char *path, uint32_t *bytes) {
     return p;
 }
 int main(int argc, char **argv) {
-    if (argc != 5)
+    char paths[5][512];
+    char *input_argv[6] = {argv[0]};
+    if (argc == 1) {
+        for (int i = 0; i < 5; i++) {
+            if (!fgets(paths[i], sizeof paths[i], stdin)) {
+                if (i < 4) return 2;
+                break;
+            }
+            paths[i][strcspn(paths[i], "\r\n")] = 0;
+            input_argv[i + 1] = paths[i];
+            argc++;
+        }
+        argv = input_argv;
+    }
+    if (argc != 5 && argc != 6)
         return 2;
     uint32_t base = __rdcfg(__vtcm_base) << 16;
     for (uint32_t i = 0; i < 0x800000u; i += 4096)
@@ -35,9 +50,8 @@ int main(int argc, char **argv) {
     __asm__ volatile("%0=ssr" : "=r"(ssr));
     ssr |= 1u << 26;
     __asm__ volatile("ssr=%0\n isync" ::"r"(ssr) : "memory");
-    uint32_t image_bytes, constant_bytes, input_bytes, bad = 0;
+    uint32_t image_bytes, constant_bytes, bad = 0;
     void *image = slurp(argv[1], &image_bytes), *constants = slurp(argv[2], &constant_bytes);
-    void *input = slurp(argv[3], &input_bytes);
     const HxHeader *h = image;
     uint8_t *exchange = aligned_alloc(128, h->arena_bytes);
     static HxGraph g;
@@ -70,14 +84,36 @@ int main(int argc, char **argv) {
     hx_fp16_stage(&g, NULL);
     /* Simulated cycles per operator kind: three per packet for one thread, so
      * this tracks issue cost. The simulator does not model HMX or memory time. */
-    static const char *const names[] = {"",    "CONV", "DW",   "ADD",  "PRELU", "MAX",
-                                        "PAD", "RESZ", "RSHP", "CAT",  "MEAN",  "LOGI"};
-    uint64_t kinds[12] = {0}, begin, end, total = 0;
-    begin = hexagon_sim_read_pcycles();
-    hx_fp16_import(&g, g.io[0], input, NULL);
-    end = hexagon_sim_read_pcycles();
-    printf("cycles IMPORT=%llu", (unsigned long long)(end - begin));
-    total += end - begin;
+    uint64_t kinds[39] = {0}, begin, end, total = 0;
+    for (uint32_t i = 0; i < h->inputs; i++) {
+        char path[512];
+        if (h->inputs == 1u)
+            snprintf(path, sizeof path, "%s", argv[3]);
+        else
+            snprintf(path, sizeof path, "%s%u.f32", argv[3], (unsigned)i);
+        uint32_t input_bytes;
+        float *input = slurp(path, &input_bytes);
+        const HxTensor *t = &g.tensors[g.io[i]];
+        const uint32_t logical = t->h * t->w * t->c * 4u;
+        if (input_bytes != logical && input_bytes != hx_tensor_bytes(t)) {
+            printf("FAIL input size %u expected %u or %u\n", (unsigned)input_bytes,
+                   (unsigned)logical, (unsigned)hx_tensor_bytes(t));
+            return 1;
+        }
+        float *padded = input;
+        if (input_bytes == logical && t->c != t->stride) {
+            padded = calloc(t->h * t->w * t->stride, sizeof(float));
+            for (uint32_t pixel = 0; pixel < t->h * t->w; pixel++)
+                memcpy(padded + pixel * t->stride, input + pixel * t->c, t->c * 4u);
+        }
+        begin = hexagon_sim_read_pcycles();
+        hx_fp16_import(&g, g.io[i], padded, NULL);
+        end = hexagon_sim_read_pcycles();
+        printf("cycles IMPORT%u=%llu\n", (unsigned)i, (unsigned long long)(end - begin));
+        total += end - begin;
+        if (padded != input) free(padded);
+        free(input);
+    }
     for (uint32_t i = 0; i < h->ops; i++) {
         begin = hexagon_sim_read_pcycles();
         if (g.ops[i].kind == HX_CONV)
@@ -87,11 +123,14 @@ int main(int argc, char **argv) {
         hx_fp16_complete(&g, i);
         end = hexagon_sim_read_pcycles();
         kinds[g.ops[i].kind] += end - begin;
+        if (i == 0 || i == 3 || i == 12 || i == 61 || i == 68 || i == 76 || i == 77 || i == 82)
+            printf("op %u kind %u cycles %llu\n", (unsigned)i, (unsigned)g.ops[i].kind,
+                   (unsigned long long)(end - begin));
         total += end - begin;
     }
-    for (uint32_t k = 1; k < 12; k++)
+    for (uint32_t k = 1; k < 39; k++)
         if (kinds[k])
-            printf(" %s=%llu", names[k], (unsigned long long)kinds[k]);
+            printf(" kind%u=%llu", (unsigned)k, (unsigned long long)kinds[k]);
     printf(" total=%llu\n", (unsigned long long)total);
     int failed = 0;
     for (uint32_t i = 0; i < h->outputs; i++) {
@@ -120,6 +159,16 @@ int main(int argc, char **argv) {
                 if (d > worst)
                     worst = d;
             }
+        }
+        if (argc == 6) {
+            snprintf(path, sizeof path, "%s%u.f32", argv[5], (unsigned)i);
+            FILE *out = fopen(path, "wb");
+            if (!out) return 1;
+            for (uint32_t j = 0; j < n; j++) {
+                float v = got[(j / t->c) * t->stride + j % t->c];
+                if (fwrite(&v, sizeof(v), 1, out) != 1) return 1;
+            }
+            fclose(out);
         }
         printf("output %u: %u/%u differ, first %u, worst %g\n", (unsigned)i, (unsigned)differ,
                (unsigned)n, (unsigned)first, (double)worst);

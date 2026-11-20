@@ -780,8 +780,8 @@ int main() {
         bad.op().y = HXFG_NONE;
         check(bad.open() == HX_OK);
     }
-    {  // Constant pools up to 64 MiB open; one byte past that, or a session placing them past
-       // 96 MiB, does not.
+    {  // Constant pools up to 256 MiB open; one past that does not. A low-region pool may not
+       // extend past 96 MiB.
         auto op0 = op(HX_LOGISTIC);
         Fixture big({shape(1, 1, 1), shape(1, 1, 1)}, op0, {0});
         auto setup = [&](uint32_t bytes) {
@@ -799,9 +799,23 @@ int main() {
         s.version = 1;
         s.code_bytes = 4096;
         s.graphs = 1;
-        s.graph[0] = {0x100000, 256, 0x2000000, HXFG_MAX_CONSTANT_BYTES, 0x1000000, 4096};
+        s.graph[0] = {0x100000, 256, 0x2000000, 0x4000000, 0x1000000, 4096};
         check(hx_session_config_valid(&s)); // ends exactly at 96 MiB
         s.graph[0].constant_bytes += 128;
+        check(!hx_session_config_valid(&s));
+        // The high region (128 MiB up to 1.5 GiB) holds a full-size pool and a following state region.
+        s.graph[0] = {0x100000, 256, HXFG_HIGH_CONSTANT_START, HXFG_MAX_CONSTANT_BYTES, 0x1000000, 4096};
+        check(hx_session_config_valid(&s));
+        s.state = HXFG_HIGH_CONSTANT_START + HXFG_MAX_CONSTANT_BYTES;
+        s.state_bytes = 0x1000000;
+        check(hx_session_config_valid(&s));
+        s.state_bytes = HXFG_HIGH_CONSTANT_END; // past the region
+        check(!hx_session_config_valid(&s));
+        s.state = 0;
+        s.state_bytes = 0;
+        s.graph[0].constants = HXFG_HIGH_CONSTANT_END - 4096; // runs off the end
+        check(!hx_session_config_valid(&s));
+        s.graph[0].constants = 0x7000000; // between the regions
         check(!hx_session_config_valid(&s));
         s.graph[0].constants = 0x1ffff80; // below the region start
         s.graph[0].constant_bytes = 4096;

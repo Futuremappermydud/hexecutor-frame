@@ -23,6 +23,9 @@ static const char hx_engine_feature[] __attribute__((used, section(".rodata.hexe
 #define HX_PARTS 4u
 static const char hx_engine_parts[] __attribute__((used, section(".rodata.hexecutor_features"))) =
     "HXTPART4";
+/* LINEAR_Q also takes the grouped fmt 2/3 layouts (hx_lq_group_layout); a host repacks only for this. */
+static const char hx_engine_lq_grouped[] __attribute__((used, section(".rodata.hexecutor_features"))) =
+    "HXLQG001";
 static inline uint32_t part_of(uint32_t tid) { return tid == 5u ? 3u : tid; }
 typedef struct {
     volatile uint32_t ready, generation, done[4], op, graph, sequence, fp16, resident;
@@ -151,9 +154,9 @@ __attribute__((section(".text.resident_entry"))) void resident_entry(uint32_t ti
     memset(s, 0, sizeof *s);
     uint32_t init_error = hx_session_config_valid(cfg) ? HX_OK : HX_HEADER, bad = HXFG_NONE;
     if (!init_error) {
-        if (cfg->state_bytes) {
-            memset((void *)(QDO_BASE + cfg->state), 0, cfg->state_bytes);
-        }
+        /* Persistent state (KV caches, conv rings) must survive wakes: the transport ends a wake after
+         * max_wake_seconds and decode continues in the next one. The host zeroes it at session open and
+         * QDS_OP_RESET_STATE clears it on request; clearing it here wiped every token's history. */
         for (uint32_t i = 0; i < cfg->graphs; i++) {
             const HxGraphConfig *c = &cfg->graph[i];
             /* hx_graph_open keeps a state pointer set beforehand and checks persistent tensors

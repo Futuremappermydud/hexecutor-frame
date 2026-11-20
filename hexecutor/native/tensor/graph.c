@@ -212,6 +212,7 @@ static int sdpa_dims(const HxGraph *g, const HxOp *o,
     if (Dv_out) *Dv_out = Dv;
     return 1;
 }
+static float hx_float(uint32_t bits);
 static int op_valid(const HxGraph *g, const HxOp *o) {
     const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
     const uint32_t *p = o->p;
@@ -248,7 +249,7 @@ static int op_valid(const HxGraph *g, const HxOp *o) {
         used = 3;
         break;
     case HX_ROPE:
-        used = 4;
+        used = 7;
         break;
     case HX_SHORTCONV:
         used = 4;
@@ -433,7 +434,7 @@ static int op_valid(const HxGraph *g, const HxOp *o) {
                b->c == ((p[1] & 4u) ? 1u : a->c);
     case HX_ACT:
         return same(a, b) && p[0] < HX_ACT_COUNT &&
-               ((p[0] == HX_ACT_LEAKY && !p[2]) || (p[0] == HX_ACT_HARDSIGMOID) ||
+               (((p[0] == HX_ACT_LEAKY || p[0] == HX_ACT_ELU || p[0] == HX_ACT_CELU) && !p[2]) || (p[0] == HX_ACT_HARDSIGMOID) ||
                 (!p[1] && !p[2]));
     case HX_BINARY: {
         if (!same(a, b) || p[0] >= HX_BIN_COUNT || p[1] > 2 || p[3] > 1)
@@ -457,6 +458,13 @@ static int op_valid(const HxGraph *g, const HxOp *o) {
             if (yt->h != 1 || yt->w != 1 || yt->c < 1)
                 return 0;
         }
+        /* p[4] theta float bits (0: 10000), p[5] rotated width per head (0: head_dim; even, at most
+         * head_dim; the rest of each head is copied), p[6] 1 adds the row index to the position. */
+        const uint32_t rot = p[5] ? p[5] : p[0];
+        if (rot > p[0] || (rot & 1u) || p[6] > 1u || (p[6] && a->w != 1))
+            return 0;
+        if (p[4] && !(hx_float(p[4]) > 1.0f && hx_float(p[4]) < 1e30f))
+            return 0;
         return p[3] <= 1;
     }
     case HX_SHORTCONV: {
@@ -477,9 +485,12 @@ static int op_valid(const HxGraph *g, const HxOp *o) {
     case HX_LINEAR_Q: {
         const uint32_t fmt = p[0], k = p[3], n = p[4];
         if (a->h != b->h || a->w != 1 || b->w != 1 || !k || !n || (k & 31u) || (n & 31u) ||
-            a->c != k || b->c != n || fmt > 1)
+            a->c != k || b->c != n || fmt > 3)
             return 0;
-        const uint64_t block_bytes = fmt == 0 ? 18u : 34u;
+        /* 2, 3: the 32-row grouped Q4 / Q8 layouts a host makes from 0, 1 in place (hx_lq_group_layout) */
+        if (fmt >= 2 && ((k & 63u) || (p[1] & 127u)))
+            return 0;
+        const uint64_t block_bytes = (fmt & 1u) ? 34u : 18u;
         const uint64_t total_w_bytes = (uint64_t)(k / 32u) * n * block_bytes;
         if (!constant(g, p[1], total_w_bytes))
             return 0;
@@ -703,7 +714,7 @@ uint32_t hx_graph_open(HxGraph *g, const void *image, uint32_t image_bytes, cons
         const HxTensor *t = &g->tensors[i];
         uint32_t limit = ((t->flags & HX_TENSOR_PERSISTENT) && g->state) ? g->state_bytes : h->arena_bytes;
         if (!t->h || !t->w || !t->c || t->h > 4096 || t->w > 4096 || t->c > 4096 ||
-            (t->stride != ((t->c + 31u) & ~31u) && !(t->c == 3 && t->stride == 3)) ||
+            (t->stride != ((t->c + 31u) & ~31u) && !((t->c == 3 || t->c == 1) && t->stride == t->c)) ||
             (t->offset & 127u) || !hx_tensor_bytes(t) ||
             !span(t->offset, hx_tensor_bytes(t), limit) || (t->flags > 1u) ||
             (t->dtype >= HX_DTYPE_COUNT))
@@ -884,6 +895,28 @@ float hx_activation(uint32_t function, uint32_t alpha_bits, uint32_t beta_bits, 
         return x > 0.0f ? 1.0f : (x < 0.0f ? -1.0f : 0.0f);
     case HX_ACT_ROUND:
         return roundf(x);
+    case HX_ACT_ELU:
+        return x < 0 ? hx_float(alpha_bits) * (expf(x) - 1.0f) : x;
+    case HX_ACT_SELU:
+        return 1.05070102f * (x < 0 ? 1.67326319f * (expf(x) - 1.0f) : x);
+    case HX_ACT_CELU: {
+        float a = hx_float(alpha_bits);
+        return x < 0 ? a * (expf(x / a) - 1.0f) : x;
+    }
+    case HX_ACT_SOFTPLUS:
+        return x > 20.0f ? x : (x < -20.0f ? expf(x) : logf(1.0f + expf(x)));
+    case HX_ACT_MISH: {
+        float sp = x > 20.0f ? x : (x < -20.0f ? expf(x) : logf(1.0f + expf(x)));
+        return x * (1.0f - 2.0f / (expf(2.0f * sp) + 1.0f));
+    }
+    case HX_ACT_SOFTSIGN:
+        return x / (1.0f + fabsf(x));
+    case HX_ACT_LOGSIGMOID:
+        return x < -20.0f ? x : (x > 20.0f ? -expf(-x) : -logf(1.0f + expf(-x)));
+    case HX_ACT_SINH:
+        return 0.5f * (expf(x) - expf(-x));
+    case HX_ACT_COSH:
+        return 0.5f * (expf(x) + expf(-x));
     default:
         return x;
     }
@@ -912,6 +945,39 @@ static HVX_Vector mul(HVX_Vector a, HVX_Vector b) {
 }
 static HVX_Vector add(HVX_Vector a, HVX_Vector b) {
     return Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(a, b));
+}
+/* exp and 1/d (d >= 1) on HVX, from the Qwen engine (examples/llm/qwen_dsp.c); SiLU checked in test_linear_q_hvx_sim. */
+static HVX_Vector hx_vexpf(HVX_Vector v) {
+    v = Q6_Vsf_vmax_VsfVsf(v, splat(-87.0f));
+    v = Q6_Vsf_vmin_VsfVsf(v, splat(80.0f));
+    const HVX_Vector scaled = mul(v, splat(1.4426950408889634f));
+    const HVX_Vector magic = splat(12582912.0f); /* 1.5 * 2^23 */
+    const HVX_Vector rounded = add(scaled, magic);
+    const HVX_Vector n = Q6_Vw_vsub_VwVw(rounded, magic);
+    const HVX_Vector r = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(scaled, Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(rounded, magic))));
+    /* Taylor series of 2^r to degree 9: the qf32 rounding above is not always nearest, so |r| can approach 1
+     * (degree 6 is then off by 1.5e-5). */
+    HVX_Vector q = splat(1.0178086e-07f);
+    q = add(mul(q, r), splat(1.3215487e-06f));
+    q = add(mul(q, r), splat(1.5252734e-05f));
+    q = add(mul(q, r), splat(0.00015403530f));
+    q = add(mul(q, r), splat(0.00133335581f));
+    q = add(mul(q, r), splat(0.00961812911f));
+    q = add(mul(q, r), splat(0.05550410866f));
+    q = add(mul(q, r), splat(0.24022650695f));
+    q = add(mul(q, r), splat(0.69314718056f));
+    q = add(mul(q, r), splat(1.0f));
+    return mul(Q6_Vw_vasl_VwR(Q6_Vw_vadd_VwVw(n, Q6_V_vsplat_R(127)), 23), q);
+}
+static HVX_Vector hx_vrecipf(HVX_Vector d) {
+    HVX_Vector r = Q6_Vw_vsub_VwVw(Q6_V_vsplat_R(0x7ef311c7), d);
+    for (int i = 0; i < 3; i++)
+        r = mul(r, Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(splat(2.0f), mul(d, r))));
+    return r;
+}
+static HVX_Vector hx_vsilu(HVX_Vector v) {
+    const HVX_Vector e = hx_vexpf(Q6_V_vxor_VV(v, Q6_V_vsplat_R(0x80000000u)));
+    return mul(v, hx_vrecipf(add(splat(1.0f), e)));
 }
 static HVX_Vector act(HVX_Vector v, uint32_t a) {
     if (a == 1 || a == 3)
@@ -1014,6 +1080,38 @@ static void hx_rmsnorm_op(const HxGraph *g, const HxOp *o, const float *x, float
     for (uint32_t i = lo; i < hi; i++) {
         const float *src = x + i * a->stride;
         float *dst = out + i * b->stride;
+#ifdef __hexagon__
+        /* Vector form (the double one is emulated, and gamma/beta are uncached: per-element round trips). */
+        if (c % 32u == 0) {
+            HVX_Vector acc = Q6_V_vzero();
+            for (uint32_t k = 0; k < c; k += 32u) {
+                const HVX_Vector v = *(const HVX_UVector *)(src + k);
+                acc = Q6_Vqf32_vadd_Vqf32Vqf32(acc, Q6_Vqf32_vmpy_VsfVsf(v, v));
+            }
+            HVX_Vector s = Q6_Vsf_equals_Vqf32(acc);
+            for (int shift = 64; shift >= 4; shift >>= 1)
+                s = add(s, Q6_V_vror_VR(s, shift));
+            union {
+                HVX_Vector v;
+                float f[32];
+                uint32_t u[32];
+            } r;
+            r.v = s;
+            r.f[1] = 1.0f / sqrtf(r.f[0] / (float)c + eps_f);
+            const HVX_Vector inv = Q6_V_vsplat_R(r.u[1]);
+            for (uint32_t k = 0; k < c; k += 32u) {
+                HVX_Vector v = mul(*(const HVX_UVector *)(src + k), inv);
+                if (gamma)
+                    v = mul(v, *(const HVX_UVector *)(gamma + k));
+                if (beta)
+                    v = add(v, *(const HVX_UVector *)(beta + k));
+                *(HVX_UVector *)(dst + k) = v;
+            }
+            for (uint32_t k = c; k < b->stride; k++)
+                dst[k] = 0.0f;
+            continue;
+        }
+#endif
         double sum_sq = 0.0;
         for (uint32_t k = 0; k < c; k++)
             sum_sq += (double)src[k] * (double)src[k];
@@ -1030,27 +1128,79 @@ static void hx_rmsnorm_op(const HxGraph *g, const HxOp *o, const float *x, float
             dst[k] = 0.0f;
     }
 }
+/* A position operand: float32 (the scalar written by a host that tracks it as float) or int32. */
+static inline uint32_t hx_position(const HxGraph *g, uint32_t tensor, const float *y) {
+    if (g->tensors[tensor].dtype == HX_DTYPE_INT32)
+        return (uint32_t)*(const int32_t *)y;
+    return (uint32_t)y[0];
+}
 static void hx_rope_op(const HxGraph *g, const HxOp *o, const float *x, const float *y,
                        float *out, uint32_t lo, uint32_t hi) {
     const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
     const uint32_t *p = o->p;
-    const uint32_t head_dim = p[0], num_heads = p[1], half = head_dim / 2u;
+    const uint32_t head_dim = p[0], num_heads = p[1];
+    const uint32_t rot = p[5] ? p[5] : head_dim, half = rot / 2u;
     const uint32_t mode = p[3];
+    const double base = p[4] ? (double)hx_float(p[4]) : 10000.0;
+    /* The angles depend only on (pos, base, rot): compute them once per row for all heads, and in decode (one row,
+     * so one worker runs this op) keep the last table, which every ROPE op of a token shares. Same double math. */
+    static struct {
+        uint32_t valid, pos, base_bits, rot;
+        float cos_v[256], sin_v[256];
+    } cache;
+    float cos_t[256], sin_t[256];
+#ifdef __hexagon__
+    const int cacheable = b->h * b->w == 1u && half <= 256u;
+#else
+    const int cacheable = 0; /* host sessions may run graphs concurrently */
+#endif
     for (uint32_t i = lo; i < hi; i++) {
         const float *src = x + i * a->stride;
         float *dst = out + i * b->stride;
         uint32_t pos = p[2];
         if (o->y != HXFG_NONE && y) {
-            pos = (uint32_t)y[0];
+            pos = hx_position(g, o->y, y);
+        }
+        if (p[6])
+            pos += i;
+        const float *cos_row = cos_t, *sin_row = sin_t;
+        if (half <= 256u) {
+            if (cacheable && cache.valid && cache.pos == pos && cache.base_bits == p[4] && cache.rot == rot) {
+                cos_row = cache.cos_v;
+                sin_row = cache.sin_v;
+            } else {
+                float *cw = cacheable ? cache.cos_v : cos_t, *sw = cacheable ? cache.sin_v : sin_t;
+                cache.valid = 0;
+                for (uint32_t j = 0; j < half; j++) {
+                    const double theta = pow(base, -2.0 * (double)j / (double)rot);
+                    const double angle = (double)pos * theta;
+                    cw[j] = (float)cos(angle);
+                    sw[j] = (float)sin(angle);
+                }
+                if (cacheable) {
+                    cache.pos = pos;
+                    cache.base_bits = p[4];
+                    cache.rot = rot;
+                    cache.valid = 1;
+                    cos_row = cache.cos_v;
+                    sin_row = cache.sin_v;
+                }
+            }
         }
         for (uint32_t h = 0; h < num_heads; h++) {
             const float *h_in = src + h * head_dim;
             float *h_out = dst + h * head_dim;
             for (uint32_t j = 0; j < half; j++) {
-                double theta = pow(10000.0, -2.0 * (double)j / (double)head_dim);
-                double angle = (double)pos * theta;
-                float cos_v = (float)cos(angle);
-                float sin_v = (float)sin(angle);
+                float cos_v, sin_v;
+                if (half <= 256u) {
+                    cos_v = cos_row[j];
+                    sin_v = sin_row[j];
+                } else {
+                    double theta = pow(base, -2.0 * (double)j / (double)rot);
+                    double angle = (double)pos * theta;
+                    cos_v = (float)cos(angle);
+                    sin_v = (float)sin(angle);
+                }
                 if (mode == 0) {
                     float v0 = h_in[j], v1 = h_in[half + j];
                     h_out[j] = v0 * cos_v - v1 * sin_v;
@@ -1061,6 +1211,8 @@ static void hx_rope_op(const HxGraph *g, const HxOp *o, const float *x, const fl
                     h_out[2 * j + 1] = v0 * sin_v + v1 * cos_v;
                 }
             }
+            for (uint32_t j = rot; j < head_dim; j++)
+                h_out[j] = h_in[j];
         }
         for (uint32_t k = num_heads * head_dim; k < b->c; k++)
             dst[k] = src[k];
@@ -1083,6 +1235,37 @@ static void hx_shortconv_op(const HxGraph *g, const HxOp *o, const float *x, flo
     const float *gate = o->z != HXFG_NONE ? (const float *)(hx_tensor_base(g, &g->tensors[o->z]) + g->tensors[o->z].offset) : NULL;
     const uint32_t k_taps = o->p[0], s_len = k_taps - 1u, c = b->c;
     const uint32_t c0 = c * part / parts, c1 = c * (part + 1u) / parts;
+#ifdef __hexagon__
+    /* Vector form over channel vectors (the scalar one is emulated double over uncached state). */
+    if (!(c & 31u) && k_taps >= 2u && o->p[3] != 2u && o->p[3] <= 3u) {
+        const uint32_t vectors = c / 32u, v0 = vectors * part / parts, v1 = vectors * (part + 1u) / parts;
+        for (uint32_t v = v0; v < v1; v++) {
+            const uint32_t d = v * 32u;
+            HVX_Vector acc = bias ? Q6_Vqf32_vadd_VsfVsf(*(const HVX_UVector *)(bias + d), Q6_V_vzero()) : Q6_V_vzero();
+            const HVX_Vector xv = *(const HVX_UVector *)(x + d);
+            HVX_Vector prev = *(const HVX_UVector *)(s_buf + d);
+            for (uint32_t j = 0; j < s_len; j++) {
+                acc = Q6_Vqf32_vadd_Vqf32Vqf32(acc, Q6_Vqf32_vmpy_VsfVsf(prev, *(const HVX_UVector *)(w + j * b->stride + d)));
+                const HVX_Vector next = j + 1u < s_len ? *(const HVX_UVector *)(s_buf + (j + 1u) * st->stride + d) : xv;
+                *(HVX_UVector *)(s_buf + j * st->stride + d) = next;
+                prev = next;
+            }
+            acc = Q6_Vqf32_vadd_Vqf32Vqf32(acc, Q6_Vqf32_vmpy_VsfVsf(xv, *(const HVX_UVector *)(w + s_len * b->stride + d)));
+            HVX_Vector val = Q6_Vsf_equals_Vqf32(acc);
+            if (o->p[3] == 1)
+                val = Q6_Vsf_vmax_VsfVsf(val, Q6_V_vzero());
+            else if (o->p[3] == 3)
+                val = hx_vsilu(val);
+            if (gate)
+                val = mul(val, *(const HVX_UVector *)(gate + d));
+            *(HVX_UVector *)(out + d) = val;
+        }
+        if (part == 0)
+            for (uint32_t d = c; d < b->stride; d++)
+                out[d] = 0.0f;
+        return;
+    }
+#endif
 
     for (uint32_t d = c0; d < c1; d++) {
         double acc = bias ? (double)bias[d] : 0.0;
@@ -1109,23 +1292,551 @@ static void hx_shortconv_op(const HxGraph *g, const HxOp *o, const float *x, flo
             out[d] = 0.0f;
     }
 }
+#ifdef __hexagon__
+/* One quantized row dot product on HVX: each 32-weight block becomes one float vector (32 lanes), multiplied
+ * by the matching 32 activations and the block scale. The weights are uncached DDR (L2 is TCM), where every
+ * access is a full round trip, so the row is read only through aligned vectors, one per 128 bytes, and each
+ * block is cut out of a two-vector window with valign. The fp16 scale is also taken from the window (a scalar
+ * read would be another round trip): moved to the low halfword, broadcast, and widened to fp32 bits in
+ * vector registers (zero and subnormal scales read as 0). The integers convert exactly with vconv (v73+);
+ * a magic-number subtraction in qf32 loses one unit at 2^23. The pool keeps padding after every constant, so
+ * the window may read up to 256 bytes past the last block. */
+static float hx_linear_q_row_hvx(const uint8_t *w_row, const float *x, uint32_t blocks, uint32_t fmt) {
+    const HVX_Vector offset = Q6_V_vsplat_R(fmt == 0 ? 8u : 0u);
+    const HVX_Vector low_nibble = Q6_Vh_vsplat_R(0x000f);
+    const HVX_Vector abs_bits = Q6_V_vsplat_R(0x7fffu), sign_bit = Q6_V_vsplat_R(0x8000u);
+    const HVX_Vector exp_bits = Q6_V_vsplat_R(0x7c00u), bias = Q6_V_vsplat_R(112u << 23);
+    const HVX_VectorPred first_half = Q6_Q_vsetq_R(2);
+    const uint32_t pitch = fmt == 0 ? 18u : 34u, scale_at = fmt == 0 ? 16u : 32u;
+    const uint8_t *base = (const uint8_t *)((uintptr_t)w_row & ~(uintptr_t)127u);
+    HVX_Vector lo_v = *(const HVX_Vector *)base, hi_v = *(const HVX_Vector *)(base + 128);
+    uint32_t at = (uint32_t)((uintptr_t)w_row & 127u);
+    HVX_Vector acc = Q6_V_vzero();
+    for (uint32_t b_idx = 0; b_idx < blocks; b_idx++) {
+        if (at >= 128u) {
+            base += 128;
+            at -= 128u;
+            lo_v = hi_v;
+            hi_v = *(const HVX_Vector *)(base + 128);
+        }
+        const HVX_Vector raw = Q6_V_valign_VVR(hi_v, lo_v, at);
+        at += pitch;
+        HVX_Vector words;
+        if (fmt == 0) {
+            /* byte j holds element 2j (low nibble) and 2j+1 (high nibble) */
+            const HVX_Vector h = Q6_V_lo_W(Q6_Wuh_vunpack_Vub(raw));
+            const HVX_Vector lo = Q6_V_vand_VV(h, low_nibble), hi = Q6_Vuh_vlsr_VuhR(h, 4);
+            words = Q6_V_lo_W(Q6_Ww_vunpack_Vh(Q6_V_lo_W(Q6_W_vshuff_VVR(hi, lo, -2))));
+        } else {
+            words = Q6_V_lo_W(Q6_Ww_vunpack_Vh(Q6_V_lo_W(Q6_Wh_vunpack_Vb(raw))));
+        }
+        const HVX_Vector q = Q6_Vsf_equals_Vw(Q6_Vw_vsub_VwVw(words, offset));
+        /* scale halfword -> every halfword -> fp32 bits in every word */
+        HVX_Vector d = Q6_V_vmux_QVV(first_half, Q6_V_vror_VR(raw, scale_at), Q6_V_vzero());
+        for (uint32_t sh = 2; sh < 128u; sh <<= 1)
+            d = Q6_V_vor_VV(d, Q6_V_vror_VR(d, 128u - sh));
+        const HVX_Vector magnitude = Q6_V_vand_VV(d, abs_bits);
+        HVX_Vector scale = Q6_V_vor_VV(Q6_Vw_vadd_VwVw(Q6_Vw_vasl_VwR(magnitude, 13), bias),
+                                       Q6_Vw_vasl_VwR(Q6_V_vand_VV(d, sign_bit), 16));
+        scale = Q6_V_vmux_QVV(Q6_Q_vcmp_eq_VwVw(Q6_V_vand_VV(d, exp_bits), Q6_V_vzero()), Q6_V_vzero(), scale);
+        const HVX_Vector xv = *(const HVX_UVector *)(x + b_idx * 32u);
+        acc = add(acc, mul(mul(q, xv), scale));
+    }
+    for (int shift = 64; shift >= 4; shift >>= 1)
+        acc = add(acc, Q6_V_vror_VR(acc, shift));
+    union {
+        HVX_Vector v;
+        float f[32];
+    } r;
+    r.v = acc;
+    return r.f[0];
+}
+/* Four rows at once (rows w0 + i * row_bytes): the activation load is shared and the four independent
+ * accumulation chains hide each other's latency. The block scale is moved to halfword 0, broadcast with one
+ * vdelta (control j & ~1 replicates halfword 0), and widened by an hf x hf -> qf32 multiply by 1.0 (even
+ * lanes). Products accumulate in qf32. Rows may be unaligned; reads stay inside the 256-byte pool padding. */
+static const uint8_t hx_lq_bcast[128] __attribute__((aligned(128))) = {
+#define HX_B8(n) (n), (n), (n) + 2, (n) + 2, (n) + 4, (n) + 4, (n) + 6, (n) + 6
+#define HX_B32(n) HX_B8(n), HX_B8((n) + 8), HX_B8((n) + 16), HX_B8((n) + 24)
+    HX_B32(0), HX_B32(32), HX_B32(64), HX_B32(96)
+#undef HX_B32
+#undef HX_B8
+};
+static void hx_linear_q_rows4_hvx(const uint8_t *w0, uint32_t row_bytes, const float *x, uint32_t blocks,
+                                  uint32_t fmt, float *out4) {
+    const HVX_Vector offset = Q6_V_vsplat_R(8u);
+    const HVX_Vector low_nibble = Q6_Vh_vsplat_R(0x000f);
+    const HVX_Vector one_hf = Q6_V_vsplat_R(0x3c003c00u);
+    const HVX_Vector bcast = *(const HVX_Vector *)hx_lq_bcast;
+    const uint32_t pitch = fmt == 0 ? 18u : 34u, scale_at = fmt == 0 ? 16u : 32u;
+    const uint8_t *base[4];
+    HVX_Vector lo_v[4], hi_v[4], acc[4];
+    uint32_t at[4];
+#pragma clang loop unroll(full)
+    for (uint32_t i = 0; i < 4u; i++) {
+        const uint8_t *w = w0 + i * row_bytes;
+        base[i] = (const uint8_t *)((uintptr_t)w & ~(uintptr_t)127u);
+        at[i] = (uint32_t)((uintptr_t)w & 127u);
+        lo_v[i] = *(const HVX_Vector *)base[i];
+        hi_v[i] = *(const HVX_Vector *)(base[i] + 128);
+        acc[i] = Q6_V_vzero();
+    }
+    for (uint32_t b_idx = 0; b_idx < blocks; b_idx++) {
+        const HVX_Vector xv = *(const HVX_UVector *)(x + b_idx * 32u);
+#pragma clang loop unroll(full)
+        for (uint32_t i = 0; i < 4u; i++) {
+            if (at[i] >= 128u) {
+                base[i] += 128;
+                at[i] -= 128u;
+                lo_v[i] = hi_v[i];
+                hi_v[i] = *(const HVX_Vector *)(base[i] + 128);
+            }
+            const HVX_Vector raw = Q6_V_valign_VVR(hi_v[i], lo_v[i], at[i]);
+            at[i] += pitch;
+            HVX_Vector words;
+            if (fmt == 0) {
+                const HVX_Vector h = Q6_V_lo_W(Q6_Wuh_vunpack_Vub(raw));
+                const HVX_Vector lo = Q6_V_vand_VV(h, low_nibble), hi = Q6_Vuh_vlsr_VuhR(h, 4);
+                words = Q6_Vw_vsub_VwVw(Q6_V_lo_W(Q6_Ww_vunpack_Vh(Q6_V_lo_W(Q6_W_vshuff_VVR(hi, lo, -2)))), offset);
+            } else {
+                words = Q6_V_lo_W(Q6_Ww_vunpack_Vh(Q6_V_lo_W(Q6_Wh_vunpack_Vb(raw))));
+            }
+            const HVX_Vector d = Q6_V_vdelta_VV(Q6_V_vror_VR(raw, scale_at), bcast);
+            const HVX_Vector scale = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(Q6_Wqf32_vmpy_VhfVhf(d, one_hf)));
+            const HVX_Vector qx = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vw(words), xv));
+            acc[i] = Q6_Vqf32_vadd_Vqf32Vqf32(acc[i], Q6_Vqf32_vmpy_VsfVsf(qx, scale));
+        }
+    }
+#pragma clang loop unroll(full)
+    for (uint32_t i = 0; i < 4u; i++) {
+        HVX_Vector a = Q6_Vsf_equals_Vqf32(acc[i]);
+        for (int shift = 64; shift >= 4; shift >>= 1)
+            a = add(a, Q6_V_vror_VR(a, shift));
+        union {
+            HVX_Vector v;
+            float f[32];
+        } r;
+        r.v = a;
+        out4[i] = r.f[0];
+    }
+}
+/* Activation row x[k] as int16 per 32-block for the grouped kernels: xq = round(x / sx[b]), sx[b] = max|x_b| / 32767
+ * (error <= one unit, 3.1e-5 of the block maximum: the qf32 rounding is not exactly nearest), and corr[b] = -8 * sum(xq_b) for the Q4 offset. xq gets 64
+ * bytes of slack: each block stores a whole vector whose upper half the next block overwrites. */
+static void hx_lq_quantize_x(const float *x, uint32_t blocks, int16_t *xq, float *sx, int32_t *corr) {
+    const HVX_Vector abs_mask = Q6_V_vsplat_R(0x7fffffffu);
+    const HVX_Vector magic = Q6_V_vsplat_R(0x4b400000u); /* 1.5 * 2^23: adding it rounds to an integer */
+    for (uint32_t b = 0; b < blocks; b++) {
+        const HVX_Vector xv = *(const HVX_UVector *)(x + b * 32u);
+        HVX_Vector m = Q6_V_vand_VV(xv, abs_mask);
+        for (int shift = 64; shift >= 4; shift >>= 1)
+            m = Q6_Vw_vmax_VwVw(m, Q6_V_vror_VR(m, shift)); /* non-negative floats order as integers */
+        union {
+            HVX_Vector v;
+            float f[32];
+            uint32_t u[32];
+            int32_t i[32];
+        } r;
+        r.v = m;
+        const float peak = r.f[0];
+        if (!(peak > 0.0f) || !(peak < FLT_MAX)) {
+            sx[b] = 0.0f;
+            corr[b] = 0;
+            *(HVX_UVector *)(xq + b * 32u) = Q6_V_vzero();
+            continue;
+        }
+        sx[b] = peak / 32767.0f;
+        r.f[0] = 32767.0f / peak;
+        const HVX_Vector inv = Q6_V_vsplat_R(r.u[0]);
+        const HVX_Vector y = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(mul(xv, inv), magic));
+        const HVX_Vector q = Q6_Vw_vsub_VwVw(y, magic); /* |q| <= 32767 (+1 at the rounding edge) */
+        *(HVX_UVector *)(xq + b * 32u) = Q6_Vh_vpacke_VwVw(q, q);
+        HVX_Vector t = q;
+        for (int shift = 64; shift >= 4; shift >>= 1)
+            t = Q6_Vw_vadd_VwVw(t, Q6_V_vror_VR(t, shift));
+        r.v = t;
+        corr[b] = -8 * r.i[0];
+    }
+}
+/* One 32-row group of the grouped layouts (fmt 2 = Q4, 3 = Q8; see hx_lq_group_bytes): out[0..32) gets the 32
+ * dot products. Per pair of 32-blocks: codes of block 2j, codes of block 2j+1 (Q8 1024 bytes each, Q4 512),
+ * then 64 fp16 scales, halfword 2r = row r of block 2j and 2r+1 = row r of block 2j+1, so an hf x 1.0 multiply
+ * yields both blocks' 32 row scales in order (even / odd lanes). A Q8 code vector v of a block is two k-pairs
+ * (4v, 4v+1) and (4v+2, 4v+3): byte s*64 + 2r + j holds row r, k = 4v + 2s + j, so vunpack gives one word lane
+ * per row holding its two halfwords, and vdmpy with the activation pair (xq[k], xq[k+1]) adds both products.
+ * A Q4 code vector v holds that Q8 vector 2v in its low nibbles and 2v+1 in its high nibbles (codes + 8). */
+static void hx_lq_group_hvx(const uint8_t *grp, const int16_t *xq, const float *sx, const int32_t *corr,
+                            uint32_t blocks, uint32_t q4, float *out) {
+    const HVX_Vector one_hf = Q6_V_vsplat_R(0x3c003c00u);
+    const HVX_Vector nib = Q6_Vb_vsplat_R(0x0f);
+    const uint32_t code_bytes = q4 ? 512u : 1024u;
+    const uint32_t *xw = (const uint32_t *)xq;
+    HVX_Vector acc = Q6_V_vzero();
+    for (uint32_t bp = 0; bp < blocks; bp += 2u) {
+        const uint8_t *pair = grp + (uint64_t)(bp / 2u) * (2u * code_bytes + 128u);
+        const HVX_VectorPair sc = Q6_Wqf32_vmpy_VhfVhf(*(const HVX_Vector *)(pair + 2u * code_bytes), one_hf);
+#pragma clang loop unroll(full)
+        for (uint32_t half = 0; half < 2u; half++) {
+            const uint32_t blk = bp + half;
+            const HVX_Vector *cv = (const HVX_Vector *)(pair + half * code_bytes);
+            const uint32_t *xp = xw + blk * 16u;
+            HVX_Vector ia = q4 ? Q6_V_vsplat_R((uint32_t)corr[blk]) : Q6_V_vzero();
+            HVX_Vector ib = Q6_V_vzero();
+            if (q4) {
+#pragma clang loop unroll(full)
+                for (uint32_t v = 0; v < 4u; v++) {
+                    const HVX_Vector c = cv[v];
+                    const HVX_VectorPair lo = Q6_Wuh_vunpack_Vub(Q6_V_vand_VV(c, nib));
+                    const HVX_VectorPair hi = Q6_Wuh_vunpack_Vub(Q6_Vub_vlsr_VubR(c, 4));
+                    ia = Q6_Vw_vdmpyacc_VwVhRh_sat(ia, Q6_V_lo_W(lo), xp[4u * v + 0u]);
+                    ib = Q6_Vw_vdmpyacc_VwVhRh_sat(ib, Q6_V_hi_W(lo), xp[4u * v + 1u]);
+                    ia = Q6_Vw_vdmpyacc_VwVhRh_sat(ia, Q6_V_lo_W(hi), xp[4u * v + 2u]);
+                    ib = Q6_Vw_vdmpyacc_VwVhRh_sat(ib, Q6_V_hi_W(hi), xp[4u * v + 3u]);
+                }
+            } else {
+#pragma clang loop unroll(full)
+                for (uint32_t v = 0; v < 8u; v++) {
+                    const HVX_VectorPair h = Q6_Wh_vunpack_Vb(cv[v]);
+                    ia = Q6_Vw_vdmpyacc_VwVhRh_sat(ia, Q6_V_lo_W(h), xp[2u * v + 0u]);
+                    ib = Q6_Vw_vdmpyacc_VwVhRh_sat(ib, Q6_V_hi_W(h), xp[2u * v + 1u]);
+                }
+            }
+            union {
+                float f;
+                uint32_t u;
+            } s = {sx[blk]};
+            const HVX_Vector row_scale = Q6_Vsf_equals_Vqf32(half ? Q6_V_hi_W(sc) : Q6_V_lo_W(sc));
+            const HVX_Vector comb = mul(row_scale, Q6_V_vsplat_R(s.u));
+            acc = Q6_Vqf32_vadd_Vqf32Vqf32(
+                acc, Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vw(Q6_Vw_vadd_VwVw(ia, ib)), comb));
+        }
+    }
+    *(HVX_UVector *)out = Q6_Vsf_equals_Vqf32(acc);
+}
+#endif
+#if defined(__hexagon__) && HX_LINEAR_Q_DMA
+/* LINEAR_Q weight streaming. Uncached HVX loads are one DDR round trip each (~1 GB/s over four workers);
+ * the user-DMA engine keeps many requests in flight. Every worker streams its own contiguous row range with
+ * its own engine (the descriptor sequence is the Qwen engine's) through a ring of slots in its quarter of the
+ * 1 MiB VTCM workspace (free outside HMX conv/staged ops), and computes from VTCM. A chunk is cut at row
+ * boundaries; its DMA starts at the aligned-down first byte and covers 256 bytes past the last row for the
+ * row kernel's window over-read (the constant pool keeps that padding). An engine that is busy or faults
+ * leaves the op on the direct DDR path. */
+#define HX_LQ_RING 0x31700000u
+#define HX_LQ_PART_BYTES 0x40000u
+#define HX_LQ_SLOTS 4u
+#define HX_LQ_SLOT_BYTES (HX_LQ_PART_BYTES / HX_LQ_SLOTS)
+#define HX_LQ_DESC (0xf1800000u + 0x7f0000u) /* uncached arena, 4 KiB per worker (Qwen's DESC_RING) */
+#define HX_LQ_TIMEOUT 400000000ull
+#ifndef HX_LQ_NOCOMPUTE
+#define HX_LQ_NOCOMPUTE 0 /* measurement only: stream the weights, skip the dot products */
+#endif
+static uint64_t hx_lq_cycles(void) {
+    uint64_t c;
+    __asm__ volatile("%0=upcycle" : "=r"(c));
+    return c;
+}
+static uint32_t hx_lq_dm_read(uint32_t index) {
+    uint32_t value;
+    __asm__ volatile("r1 = %1\n .word 0xa801c0a0\n %0 = r0" : "=r"(value) : "r"(index) : "r0", "r1", "memory");
+    return value;
+}
+static void hx_lq_dm_write(uint32_t index, uint32_t value) {
+    __asm__ volatile("r1 = %0\n r0 = %1\n .word 0xa801c0c0" ::"r"(index), "r"(value) : "r0", "r1", "memory");
+}
+static uint32_t hx_lq_poll(void) {
+    uint32_t state;
+    __asm__ volatile("%0 = dmpoll" : "=r"(state)::"memory");
+    return state;
+}
+/* Counters for the host: [part*4 + 0] chunks, +1 wait cycles>>8, +2 fallbacks, +3 last error. */
+#define HX_LQ_STATS ((volatile uint32_t *)(0xf1800000u + 0x7f4000u))
+static volatile uint32_t *hx_lq_issue(uint32_t part, uint32_t *ring, uint32_t *tail, uint32_t src,
+                                      uint32_t dst, uint32_t bytes) {
+    const uint32_t addr = HX_LQ_DESC + part * 0x1000u + ((*ring)++ % 63u) * 32u;
+    volatile uint32_t *d = (volatile uint32_t *)addr;
+    d[0] = 0;
+    d[1] = (bytes & 0xffffffu) | (1u << 24) | (1u << 28) | (1u << 29); /* 2D, bypass, !done */
+    d[2] = src;
+    d[3] = dst;
+    d[4] = 9u; /* 2D, 24-bit fields */
+    d[5] = (bytes & 0xffffffu) | (1u << 24);
+    d[6] = (bytes & 0xffffffu) << 8;
+    d[7] = 0;
+    __asm__ volatile("barrier" ::: "memory");
+    __asm__ volatile("release(%0):at" ::"r"(addr) : "memory");
+    __asm__ volatile("dmlink(%0, %1)" ::"r"(*tail), "r"(addr) : "memory");
+    *tail = addr;
+    return d;
+}
+/* Rows [r0, r1) of every activation row; returns 1 when all were written. The row formats stream whole rows
+ * (4 slots of 64 KiB); the grouped ones whole 32-row groups (2 slots of 128 KiB, the largest group is 127.5). */
+static int hx_linear_q_dma(const HxGraph *g, const HxOp *o, const float *x, float *out, uint32_t part,
+                           uint32_t r0, uint32_t r1) {
+    const HxTensor *b = &g->tensors[o->out], *xt = &g->tensors[o->x];
+    const uint32_t fmt = o->p[0], k = o->p[3], blocks = k / 32u, grouped = fmt >= 2u;
+    const uint32_t row_bytes = blocks * ((fmt & 1u) ? 34u : 18u);
+    const uint32_t unit_rows = grouped ? 32u : 1u, unit_bytes = row_bytes * unit_rows;
+    const uint32_t slots = grouped ? 2u : HX_LQ_SLOTS, slot_bytes = HX_LQ_PART_BYTES / slots;
+    const float *bias = o->p[2] != HXFG_NONE ? (const float *)(g->constants + o->p[2]) : NULL;
+    volatile uint32_t *stats = HX_LQ_STATS + part * 4u;
+    if (r0 >= r1 || part >= 4u || unit_bytes + 512u > slot_bytes || (grouped && (blocks > 128u || b->h > 1u)))
+        return 0;
+    const uint32_t state = hx_lq_poll();
+    if ((state & 3u) == 1u) { /* still running: not ours to touch */
+        stats[2]++;
+        return 0;
+    }
+    if (state & 3u) {
+        uint32_t ignored;
+        __asm__ volatile("%0 = dmpause" : "=r"(ignored)::"memory");
+    }
+    int16_t xq[128 * 32 + 64] __attribute__((aligned(128)));
+    float sx[128];
+    int32_t corr[128];
+    const uint32_t saved_dm2 = hx_lq_dm_read(2);
+    hx_lq_dm_write(2, 0x2e3u);
+    uint32_t tail = HX_LQ_DESC + part * 0x1000u + 63u * 32u, ring = 0;
+    for (uint32_t i = 0; i < 8u; i++)
+        ((volatile uint32_t *)tail)[i] = 0;
+    const uint32_t u0 = r0 / unit_rows, u1 = r1 / unit_rows;
+    uint32_t per = (slot_bytes - 512u) / unit_bytes;
+    if (!grouped && per >= 4u)
+        per &= ~3u; /* whole four-row groups per chunk */
+    const uint32_t chunks = (u1 - u0 + per - 1u) / per;
+    const uint8_t *w = (const uint8_t *)(g->constants + o->p[1]);
+    uint8_t *ring_base = (uint8_t *)(HX_LQ_RING + part * HX_LQ_PART_BYTES);
+    volatile uint32_t *desc[HX_LQ_SLOTS];
+    uint32_t delta[HX_LQ_SLOTS];
+    uint32_t issued = 0;
+    int ok = 1;
+#define HX_LQ_ISSUE_NEXT()                                                                          \
+    do {                                                                                            \
+        const uint32_t ca = u0 + issued * per, cb = ca + per < u1 ? ca + per : u1;                  \
+        const uint32_t first = (uint32_t)(uintptr_t)(w + (uint64_t)ca * unit_bytes);                \
+        const uint32_t start = first & ~127u;                                                       \
+        const uint32_t end = ((uint32_t)(uintptr_t)(w + (uint64_t)cb * unit_bytes) + 256u + 127u) & \
+                             ~127u;                                                                 \
+        const uint32_t slot = issued % slots;                                                       \
+        delta[slot] = first - start;                                                                \
+        desc[slot] = hx_lq_issue(part, &ring, &tail, start,                                         \
+                                 (uint32_t)(uintptr_t)(ring_base + slot * slot_bytes), end - start);  \
+        issued++;                                                                                   \
+    } while (0)
+    while (issued < chunks && issued < slots)
+        HX_LQ_ISSUE_NEXT();
+    if (grouped) /* while the first chunks stream in */
+        hx_lq_quantize_x(x, blocks, xq, sx, corr);
+    for (uint32_t c = 0; c < chunks; c++) {
+        const uint32_t slot = c % slots;
+        const uint64_t began = hx_lq_cycles(), deadline = began + HX_LQ_TIMEOUT;
+        while (!(desc[slot][1] >> 31)) {
+            if ((hx_lq_poll() & 3u) == 2u || hx_lq_cycles() > deadline) {
+                ok = 0;
+                break;
+            }
+            const uint64_t until = hx_lq_cycles() + 600u;
+            while (hx_lq_cycles() < until) {
+            }
+        }
+        stats[1] += (uint32_t)((hx_lq_cycles() - began) >> 8);
+        if (!ok) {
+            stats[3] = hx_lq_poll() | 0x80000000u;
+            break;
+        }
+        const uint32_t ca = u0 + c * per, cb = ca + per < u1 ? ca + per : u1;
+        const uint8_t *units = ring_base + slot * slot_bytes + delta[slot];
+        if (grouped) {
+            for (uint32_t gi = ca; gi < (HX_LQ_NOCOMPUTE ? ca : cb); gi++) {
+                float dots[32] __attribute__((aligned(128)));
+                hx_lq_group_hvx(units + (uint64_t)(gi - ca) * unit_bytes, xq, sx, corr, blocks, fmt == 2u, dots);
+                for (uint32_t i = 0; i < 32u; i++) {
+                    const uint32_t r = gi * 32u + i;
+                    float val = (bias ? bias[r] : 0.0f) + dots[i];
+                    if (o->p[5] == 1) val = fmaxf(0.0f, val);
+                    else if (o->p[5] == 3) val = val / (1.0f + expf(-val));
+                    out[r] = val;
+                }
+            }
+        } else
+        for (uint32_t row = 0; row < (HX_LQ_NOCOMPUTE ? 0u : b->h); row++) {
+            const float *xr = x + (uint64_t)row * xt->stride;
+            float *orow = out + (uint64_t)row * b->stride;
+            for (uint32_t r = ca; r < cb;) {
+                float dots[4];
+                uint32_t count = 1;
+                if (r + 4u <= cb) {
+                    hx_linear_q_rows4_hvx(units + (uint64_t)(r - ca) * row_bytes, row_bytes, xr, blocks, fmt, dots);
+                    count = 4;
+                } else
+                    dots[0] = hx_linear_q_row_hvx(units + (uint64_t)(r - ca) * row_bytes, xr, blocks, fmt);
+                for (uint32_t i = 0; i < count; i++, r++) {
+                    float val = (bias ? bias[r] : 0.0f) + dots[i];
+                    if (o->p[5] == 1) val = fmaxf(0.0f, val);
+                    else if (o->p[5] == 3) val = val / (1.0f + expf(-val));
+                    orow[r] = val;
+                }
+            }
+        }
+        if (issued < chunks)
+            HX_LQ_ISSUE_NEXT();
+    }
+#undef HX_LQ_ISSUE_NEXT
+    if (!ok) {
+        /* An engine that did not finish may still write this ring; leave DM2 as is and stop using DMA
+         * for this op. The caller recomputes every row from DDR. */
+        stats[2]++;
+        return 0;
+    }
+    hx_lq_dm_write(2, saved_dm2);
+    stats[0] += chunks;
+    return 1;
+}
+#endif
+/* Grouped layouts (fmt 2 Q4, 3 Q8): byte offset of row r's code for input kk of 32-block bk, and of its fp16 scale,
+ * inside the group that starts at the weight base + (r / 32) * 32 * row_bytes. See hx_lq_group_hvx. */
+static inline uint32_t hx_lq_group_code_at(uint32_t q4, uint32_t rr, uint32_t bk, uint32_t kk) {
+    const uint32_t code_bytes = q4 ? 512u : 1024u, pair = (bk / 2u) * (2u * code_bytes + 128u) + (bk & 1u) * code_bytes;
+    const uint32_t v = kk / 4u, s = (kk / 2u) & 1u, j = kk & 1u;
+    return pair + (q4 ? v / 2u : v) * 128u + s * 64u + 2u * rr + j;
+}
+static inline uint32_t hx_lq_group_scale_at(uint32_t q4, uint32_t rr, uint32_t bk) {
+    const uint32_t code_bytes = q4 ? 512u : 1024u;
+    return (bk / 2u) * (2u * code_bytes + 128u) + 2u * code_bytes + (2u * rr + (bk & 1u)) * 2u;
+}
+static inline int32_t hx_lq_group_code(const uint8_t *grp, uint32_t q4, uint32_t rr, uint32_t bk, uint32_t kk) {
+    const uint8_t byte = grp[hx_lq_group_code_at(q4, rr, bk, kk)];
+    if (!q4)
+        return (int8_t)byte;
+    return (int32_t)(((kk / 4u) & 1u) ? byte >> 4 : byte & 15u) - 8;
+}
+/* In place: rows of a fmt 0 (Q4_0) / 1 (Q8_0) weight [n][k/32 blocks] become the grouped layout of fmt 2 / 3,
+ * which has the same size. Needs k % 64 == 0, n % 32 == 0 and scratch of 32 rows (32 * k / 32 * 34 bytes). */
+void hx_lq_group_layout(uint8_t *w, uint32_t fmt, uint32_t k, uint32_t n, uint8_t *scratch) {
+    const uint32_t q4 = fmt == 0u, blocks = k / 32u, pitch = q4 ? 18u : 34u, row_bytes = blocks * pitch;
+    const uint32_t group_bytes = 32u * row_bytes;
+    for (uint32_t gi = 0; gi < n / 32u; gi++) {
+        uint8_t *grp = w + (uint64_t)gi * group_bytes;
+        memcpy(scratch, grp, group_bytes);
+        memset(grp, 0, group_bytes);
+        for (uint32_t rr = 0; rr < 32u; rr++)
+            for (uint32_t bk = 0; bk < blocks; bk++) {
+                const uint8_t *src = scratch + rr * row_bytes + bk * pitch;
+                const uint32_t sa = hx_lq_group_scale_at(q4, rr, bk);
+                grp[sa] = src[q4 ? 16 : 32];
+                grp[sa + 1] = src[q4 ? 17 : 33];
+                for (uint32_t kk = 0; kk < 32u; kk++) {
+                    const uint32_t at = hx_lq_group_code_at(q4, rr, bk, kk);
+                    if (!q4)
+                        grp[at] = src[kk];
+                    else {
+                        const uint8_t code = (kk & 1u) ? src[kk / 2u] >> 4 : src[kk / 2u] & 15u; /* code + 8 */
+                        grp[at] |= ((kk / 4u) & 1u) ? (uint8_t)(code << 4) : code;
+                    }
+                }
+            }
+    }
+}
+static void hx_linear_q_grouped_op(const HxGraph *g, const HxOp *o, const float *x, float *out, uint32_t part,
+                                   uint32_t parts) {
+    const HxTensor *b = &g->tensors[o->out], *xt = &g->tensors[o->x];
+    const uint32_t q4 = o->p[0] == 2u, k = o->p[3], n = o->p[4], blocks = k / 32u;
+    const uint32_t row_bytes = blocks * (q4 ? 18u : 34u), groups = n / 32u;
+    const uint32_t g0 = groups * part / parts, g1 = groups * (part + 1u) / parts;
+    const float *bias = o->p[2] != HXFG_NONE ? (const float *)(g->constants + o->p[2]) : NULL;
+    const uint8_t *w = (const uint8_t *)(g->constants + o->p[1]);
+    if (part == 0)
+        for (uint32_t row = 0; row < b->h; row++)
+            for (uint32_t r = n; r < b->stride; r++)
+                out[(uint64_t)row * b->stride + r] = 0.0f;
+#ifdef __hexagon__
+    if (b->h == 1u && blocks <= 128u && !((uintptr_t)w & 127u)) {
+#if HX_LINEAR_Q_DMA
+        if (parts == 4u && hx_linear_q_dma(g, o, x, out, part, g0 * 32u, g1 * 32u))
+            return;
+#endif
+        int16_t xq[128 * 32 + 64] __attribute__((aligned(128)));
+        float sx[128];
+        int32_t corr[128];
+        hx_lq_quantize_x(x, blocks, xq, sx, corr);
+        for (uint32_t gi = g0; gi < g1; gi++) {
+            float dots[32] __attribute__((aligned(128)));
+            hx_lq_group_hvx(w + (uint64_t)gi * 32u * row_bytes, xq, sx, corr, blocks, q4, dots);
+            for (uint32_t i = 0; i < 32u; i++) {
+                const uint32_t r = gi * 32u + i;
+                float val = (bias ? bias[r] : 0.0f) + dots[i];
+                if (o->p[5] == 1) val = fmaxf(0.0f, val);
+                else if (o->p[5] == 3) val = val / (1.0f + expf(-val));
+                out[r] = val;
+            }
+        }
+        return;
+    }
+#endif
+    for (uint32_t row = 0; row < b->h; row++) {
+        const float *xr = x + (uint64_t)row * xt->stride;
+        float *orow = out + (uint64_t)row * b->stride;
+        for (uint32_t r = g0 * 32u; r < g1 * 32u; r++) {
+            const uint8_t *grp = w + (uint64_t)(r / 32u) * 32u * row_bytes;
+            double sum = bias ? (double)bias[r] : 0.0;
+            for (uint32_t bk = 0; bk < blocks; bk++) {
+                const uint32_t at = hx_lq_group_scale_at(q4, r % 32u, bk);
+                const double scale = hx_half_to_float((uint16_t)(grp[at] | (grp[at + 1] << 8)));
+                double acc = 0.0;
+                for (uint32_t kk = 0; kk < 32u; kk++)
+                    acc += (double)xr[bk * 32u + kk] * (double)hx_lq_group_code(grp, q4, r % 32u, bk, kk);
+                sum += acc * scale;
+            }
+            float val = (float)sum;
+            if (o->p[5] == 1) val = fmaxf(0.0f, val);
+            else if (o->p[5] == 3) val = val / (1.0f + expf(-val));
+            orow[r] = val;
+        }
+    }
+}
 static void hx_linear_q_op(const HxGraph *g, const HxOp *o, const float *x, float *out,
                            uint32_t part, uint32_t parts) {
-    const HxTensor *b = &g->tensors[o->out];
+    const HxTensor *b = &g->tensors[o->out], *xt = &g->tensors[o->x];
     const uint32_t fmt = o->p[0], k = o->p[3], n = o->p[4];
     const float *bias = o->p[2] != HXFG_NONE ? (const float *)(g->constants + o->p[2]) : NULL;
     const uint32_t blocks = k / 32u;
+    if (fmt >= 2u) {
+        hx_linear_q_grouped_op(g, o, x, out, part, parts);
+        return;
+    }
     const uint32_t r0 = n * part / parts, r1 = n * (part + 1u) / parts;
+#if defined(__hexagon__) && HX_LINEAR_Q_DMA
+    if (k % 32u == 0 && parts == 4u && hx_linear_q_dma(g, o, x, out, part, r0, r1)) {
+        if (part == 0)
+            for (uint32_t row = 0; row < b->h; row++)
+                for (uint32_t r = n; r < b->stride; r++)
+                    out[(uint64_t)row * b->stride + r] = 0.0f;
+        return;
+    }
+#endif
 
+    for (uint32_t row = 0; row < b->h; row++) {
+    const float *xr = x + (uint64_t)row * xt->stride;
+    float *orow = out + (uint64_t)row * b->stride;
     for (uint32_t r = r0; r < r1; r++) {
         double sum = bias ? (double)bias[r] : 0.0;
+#ifdef __hexagon__
+        if (k % 32u == 0) {
+            const uint8_t *w_row = (const uint8_t *)(g->constants + o->p[1]) + (uint64_t)r * blocks * (fmt == 0 ? 18u : 34u);
+            float val = (bias ? bias[r] : 0.0f) + hx_linear_q_row_hvx(w_row, xr, blocks, fmt);
+            if (o->p[5] == 1) val = fmaxf(0.0f, val);
+            else if (o->p[5] == 3) val = val / (1.0f + expf(-val));
+            orow[r] = val;
+            continue;
+        }
+#endif
         if (fmt == 0) {
             const uint8_t *w_row = (const uint8_t *)(g->constants + o->p[1]) + (uint64_t)r * blocks * 18u;
             for (uint32_t b_idx = 0; b_idx < blocks; b_idx++) {
                 const uint8_t *blk = w_row + b_idx * 18u;
                 const uint16_t d16 = (uint16_t)blk[16] | ((uint16_t)blk[17] << 8);
                 const float scale = hx_half_to_float(d16);
-                const float *x_blk = x + b_idx * 32u;
+                const float *x_blk = xr + b_idx * 32u;
                 double blk_acc = 0.0;
                 for (uint32_t j = 0; j < 16u; j++) {
                     const uint8_t byte = blk[j];
@@ -1141,7 +1852,7 @@ static void hx_linear_q_op(const HxGraph *g, const HxOp *o, const float *x, floa
                 const uint8_t *blk = w_row + b_idx * 34u;
                 const uint16_t d16 = (uint16_t)blk[32] | ((uint16_t)blk[33] << 8);
                 const float scale = hx_half_to_float(d16);
-                const float *x_blk = x + b_idx * 32u;
+                const float *x_blk = xr + b_idx * 32u;
                 double blk_acc = 0.0;
                 for (uint32_t j = 0; j < 32u; j++) {
                     const int8_t q = (int8_t)blk[j];
@@ -1153,11 +1864,12 @@ static void hx_linear_q_op(const HxGraph *g, const HxOp *o, const float *x, floa
         float val = (float)sum;
         if (o->p[5] == 1) val = fmaxf(0.0f, val);
         else if (o->p[5] == 3) val = val / (1.0f + expf(-val));
-        out[r] = val;
+        orow[r] = val;
     }
     if (part == 0) {
         for (uint32_t r = n; r < b->stride; r++)
-            out[r] = 0.0f;
+            orow[r] = 0.0f;
+    }
     }
 }
 static void hx_kv_write_op(const HxGraph *g, const HxOp *o, const float *x, const float *y,
@@ -1166,7 +1878,7 @@ static void hx_kv_write_op(const HxGraph *g, const HxOp *o, const float *x, cons
     const HxTensor *outt = &g->tensors[o->out];
     uint32_t pos = o->p[0];
     if (o->y != HXFG_NONE && y) {
-        pos = (uint32_t)(*y);
+        pos = hx_position(g, o->y, y);
     }
     uint32_t tokens = xt->h * xt->w;
     uint32_t max_tokens = outt->h * outt->w;
@@ -1531,6 +2243,127 @@ static void hx_cubic_weights(float t, float w[4]) {
             w[i] = 0.0f;
     }
 }
+#ifdef __hexagon__
+/* One SDPA query row on HVX. Keys after `last` (causal) and keys whose additive mask is <= -1e8 are skipped:
+ * with any unmasked key their weight exp(score - peak) is exactly 0 in fp32. If every key is masked the
+ * caller's scalar path runs instead (return 0). Dots and the V sum accumulate in qf32 vectors; K/V rows are
+ * read as whole vectors (uncached persistent state: one round trip per vector instead of per element). */
+static __attribute__((noinline)) int hx_sdpa_row_hvx(const float *q_row, const float *kb, uint32_t ks, const float *vb, uint32_t vs,
+                           uint32_t lk, uint32_t dk, uint32_t dv, float scale, uint32_t last, const float *m_row,
+                           uint32_t mask_scalar, float *dst) {
+    float scores[2048]; /* worker stacks are 64 KiB and the caller already holds 16 KiB of scores */
+    uint16_t keep[2048];
+    HVX_Vector qv[16], ov[16];
+    uint32_t kept = 0;
+    for (uint32_t j = 0; j < dk / 32u; j++)
+        qv[j] = *(const HVX_UVector *)(q_row + j * 32u);
+    float peak = -FLT_MAX;
+    const uint32_t end = last < lk ? last + 1u : lk;
+    for (uint32_t k = 0; k < end; k++) {
+        const float m = m_row ? (mask_scalar ? m_row[0] : m_row[k]) : 0.0f;
+        if (m <= -1e8f)
+            continue;
+        const float *k_row = kb + (uint64_t)k * ks;
+        HVX_Vector acc = Q6_V_vzero();
+        for (uint32_t j = 0; j < dk / 32u; j++)
+            acc = Q6_Vqf32_vadd_Vqf32Vqf32(acc, Q6_Vqf32_vmpy_VsfVsf(qv[j], *(const HVX_UVector *)(k_row + j * 32u)));
+        HVX_Vector a = Q6_Vsf_equals_Vqf32(acc);
+        for (int shift = 64; shift >= 4; shift >>= 1)
+            a = add(a, Q6_V_vror_VR(a, shift));
+        union {
+            HVX_Vector v;
+            float f[32];
+        } r;
+        r.v = a;
+        const float dot = r.f[0] * scale + m;
+        scores[kept] = dot;
+        keep[kept++] = (uint16_t)k;
+        if (dot > peak)
+            peak = dot;
+    }
+    if (!kept)
+        return 0;
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < kept; i++) {
+        scores[i] = expf(scores[i] - peak);
+        sum += scores[i];
+    }
+    const float inv_sum = 1.0f / sum;
+    for (uint32_t j = 0; j < dv / 32u; j++)
+        ov[j] = Q6_V_vzero();
+    for (uint32_t i = 0; i < kept; i++) {
+        const float w = scores[i] * inv_sum;
+        if (!(w > 0.0f))
+            continue;
+        union {
+            float f;
+            uint32_t u;
+        } wb = {w};
+        const HVX_Vector wv = Q6_V_vsplat_R(wb.u);
+        const float *v_row = vb + (uint64_t)keep[i] * vs;
+        for (uint32_t j = 0; j < dv / 32u; j++)
+            ov[j] = Q6_Vqf32_vadd_Vqf32Vqf32(ov[j], Q6_Vqf32_vmpy_VsfVsf(wv, *(const HVX_UVector *)(v_row + j * 32u)));
+    }
+    for (uint32_t j = 0; j < dv / 32u; j++)
+        *(HVX_UVector *)(dst + j * 32u) = Q6_Vsf_equals_Vqf32(ov[j]);
+    return 1;
+}
+#endif
+#ifdef __hexagon__
+/* One pixel, many channels (decode): the pixel split would leave the whole op on one worker, so each worker takes
+ * a quarter of the channel vectors. Float ADD/SUB/MUL and SiLU only; returns 0 for anything else. */
+static int hx_single_pixel_hvx(const HxGraph *g, const HxOp *o, const float *x, const float *y, float *out,
+                               uint32_t part, uint32_t parts) {
+    const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
+    const uint32_t *p = o->p, c = b->c;
+    if (b->h * b->w != 1u || (c & 31u) || b->stride != c || a->stride < c || c < 256u ||
+        a->dtype != HX_DTYPE_FLOAT32 || b->dtype != HX_DTYPE_FLOAT32)
+        return 0;
+    const uint32_t vectors = c / 32u, v0 = vectors * part / parts, v1 = vectors * (part + 1u) / parts;
+    if (o->kind == HX_ACT) {
+        if (p[0] != HX_ACT_SILU)
+            return 0;
+        for (uint32_t v = v0; v < v1; v++)
+            *(HVX_UVector *)(out + v * 32u) = hx_vsilu(*(const HVX_UVector *)(x + v * 32u));
+        return 1;
+    }
+    if (o->kind != HX_BINARY || p[0] > HX_BIN_MUL)
+        return 0;
+    const HxTensor *t = o->y == HXFG_NONE ? NULL : &g->tensors[o->y];
+    const float *other;
+    uint32_t broadcast = 0;
+    if (p[1] == 1)
+        other = (const float *)(g->constants + p[2]); /* the constant wins over y, as in the generic path */
+    else if (t) {
+        if (t->dtype != HX_DTYPE_FLOAT32 || t->h * t->w != 1u || (t->c != c && t->c != 1u))
+            return 0;
+        other = y;
+        broadcast = t->c == 1u;
+    } else if (p[1] == 2)
+        other = (const float *)(g->constants + p[2]);
+    else
+        return 0;
+    const HVX_Vector one = broadcast ? splat(other[0]) : Q6_V_vzero();
+    for (uint32_t v = v0; v < v1; v++) {
+        HVX_Vector l = *(const HVX_UVector *)(x + v * 32u);
+        HVX_Vector u = broadcast ? one : *(const HVX_UVector *)(other + v * 32u);
+        if (p[3]) {
+            const HVX_Vector s = l;
+            l = u;
+            u = s;
+        }
+        HVX_Vector r;
+        if (p[0] == HX_BIN_ADD)
+            r = add(l, u);
+        else if (p[0] == HX_BIN_SUB)
+            r = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(l, u));
+        else
+            r = mul(l, u);
+        *(HVX_UVector *)(out + v * 32u) = r;
+    }
+    return 1;
+}
+#endif
 void hx_execute_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t parts) {
     const HxOp *o = &g->ops[index];
     const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
@@ -1552,6 +2385,31 @@ void hx_execute_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t par
     const uint32_t *p = o->p;
     const uint32_t dil_h = hx_dilation_h(o), dil_w = hx_dilation_w(o);
     uint32_t pixels = b->h * b->w, lo = pixels * part / parts, hi = pixels * (part + 1u) / parts;
+#ifdef __hexagon__
+    if ((o->kind == HX_ACT || o->kind == HX_BINARY) && pixels == 1u && hx_single_pixel_hvx(g, o, x, y, out, part, parts))
+        return;
+#endif
+    /* Row-major reshape of unpadded tensors is a flat copy; split it by element ranges, not output pixels. */
+    if (o->kind == HX_RESHAPE && !p[0] && a->stride == a->c && b->stride == b->c &&
+        a->dtype == b->dtype && hx_tensor_elements(a) == hx_tensor_elements(b)) {
+        const uint32_t n = hx_tensor_elements(b), e0 = (n * part / parts) & ~31u;
+        const uint32_t e1 = part + 1u == parts ? n : ((n * (part + 1u) / parts) & ~31u);
+        if (e1 > e0 && out != x)
+            memcpy(out + e0, x + e0, (e1 - e0) * 4u);
+        return;
+    }
+    /* Channel concat of one pixel: two copies. */
+    if (o->kind == HX_CONCAT && p[0] == 2u && pixels == 1u && o->y != HXFG_NONE && y &&
+        g->tensors[o->y].h * g->tensors[o->y].w == 1u && a->h * a->w == 1u &&
+        a->c + g->tensors[o->y].c == b->c) {
+        if (part == 0) {
+            memcpy(out, x, a->c * 4u);
+            memcpy(out + a->c, y, g->tensors[o->y].c * 4u);
+            for (uint32_t c = b->c; c < b->stride; c++)
+                out[c] = 0.0f;
+        }
+        return;
+    }
     if (o->kind == HX_MEAN) {
         for (uint32_t c = part * 32u; c < b->stride; c += parts * 32u) {
 #ifdef __hexagon__
@@ -1691,9 +2549,10 @@ void hx_execute_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t par
         }
         if (o->kind == HX_BINARY) {
             const HxTensor *t = o->y == HXFG_NONE ? NULL : &g->tensors[o->y];
+            /* The operand types pick the arithmetic; the output type only picks the store. A float
+             * comparison into a bool output compares floats (the float path stores 0/1 ints). */
             const int is_int = (a->dtype == HX_DTYPE_INT32 || a->dtype == HX_DTYPE_BOOL ||
-                                (t && (t->dtype == HX_DTYPE_INT32 || t->dtype == HX_DTYPE_BOOL)) ||
-                                b->dtype == HX_DTYPE_INT32 || b->dtype == HX_DTYPE_BOOL);
+                                (t && (t->dtype == HX_DTYPE_INT32 || t->dtype == HX_DTYPE_BOOL)));
             if (is_int) {
                 const int32_t *src = (const int32_t *)x + i * a->stride;
                 const int32_t *k = (const int32_t *)(g->constants + p[2]);
@@ -2038,10 +2897,10 @@ void hx_execute_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t par
 
             const HxTensor *q_t = a, *k_t = &g->tensors[o->y], *v_t = &g->tensors[o->z];
             const float *qv = x;
-            const float *kv = (const float *)(g->arena + k_t->offset);
-            const float *vv = (const float *)(g->arena + v_t->offset);
+            const float *kv = (const float *)(hx_tensor_base(g, k_t) + k_t->offset);
+            const float *vv = (const float *)(hx_tensor_base(g, v_t) + v_t->offset);
             const HxTensor *mask_t = (p[0] != HXFG_NONE) ? &g->tensors[p[0]] : NULL;
-            const float *mask_data = mask_t ? (const float *)(g->arena + mask_t->offset) : NULL;
+            const float *mask_data = mask_t ? (const float *)(hx_tensor_base(g, mask_t) + mask_t->offset) : NULL;
 
             uint32_t Bk = (k_t->w > 1) ? k_t->h : ((Bq > 1 && k_t->h % Bq == 0) ? Bq : 1);
             uint32_t Bv = (v_t->w > 1) ? v_t->h : ((Bq > 1 && v_t->h % Bq == 0) ? Bq : 1);
@@ -2063,6 +2922,18 @@ void hx_execute_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t par
                 m_row = mask_data + (mb * mask_t->w + mq) * mask_t->stride;
             }
 
+#ifdef __hexagon__
+            if (Dk % 32u == 0 && Dv % 32u == 0 && Dk <= 512u && Dv <= 512u && Lk <= 2048u &&
+                hx_sdpa_row_hvx(q_row, kv + (uint64_t)(k_t->w > 1 ? k_batch * k_t->w : k_batch * Lk) * k_t->stride,
+                                k_t->stride,
+                                vv + (uint64_t)(v_t->w > 1 ? v_batch * v_t->w : v_batch * Lk) * v_t->stride,
+                                v_t->stride, Lk, Dk, Dv, scale, causal ? q : 0xffffffffu, m_row,
+                                mask_t && mask_t->c == 1, dst)) {
+                for (uint32_t d = Dv; d < b->stride; d++)
+                    dst[d] = 0.0f;
+                continue;
+            }
+#endif
             float scores[4096];
             float peak = -FLT_MAX, sum = 0.0f;
             for (uint32_t k = 0; k < Lk; k++) {
@@ -2116,7 +2987,7 @@ void hx_execute_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t par
                 const uint32_t q = M > 0 ? (i % M) : 0;
 
                 const HxTensor *mask_t = (o->y != HXFG_NONE) ? &g->tensors[o->y] : NULL;
-                const float *mask_data = mask_t ? (const float *)(g->arena + mask_t->offset) : NULL;
+                const float *mask_data = mask_t ? (const float *)(hx_tensor_base(g, mask_t) + mask_t->offset) : NULL;
                 const float *m_row = NULL;
                 if (mask_data) {
                     uint32_t my = mask_t->h == 1 ? 0 : oy;

@@ -19,8 +19,12 @@ extern "C" {
 #define HXFG_NONE 0xffffffffu
 /* Immutable constants live at relative private DDR [32 MiB, 96 MiB): the VTCM backup starts at
  * 96 MiB and nothing of ours is mapped between 64 and 96 MiB. One graph's pool may use all 64. */
-#define HXFG_MAX_CONSTANT_BYTES 0x4000000u
+#define HXFG_MAX_CONSTANT_BYTES 0x20000000u /* 512 MiB per graph */
 #define HXFG_CONSTANT_REGION_END 0x6000000u
+/* Large pools (LFM-class models) live above the first 128 MiB, where nothing of ours is placed; the
+ * engine must map that far (QDO_SLOTS) and the lease must cover it. */
+#define HXFG_HIGH_CONSTANT_START 0x8000000u
+#define HXFG_HIGH_CONSTANT_END 0x60000000u
 
 enum {
     HX_CONV = 1,
@@ -96,6 +100,15 @@ enum {
     HX_ACT_NOT,
     HX_ACT_SIGN,
     HX_ACT_ROUND,
+    HX_ACT_ELU,     /* x < 0 ? alpha*(exp(x)-1) : x */
+    HX_ACT_SELU,    /* fixed ONNX defaults alpha 1.67326319, gamma 1.05070102 */
+    HX_ACT_CELU,    /* max(0,x) + min(0, alpha*(exp(x/alpha)-1)) */
+    HX_ACT_SOFTPLUS,
+    HX_ACT_MISH,
+    HX_ACT_SOFTSIGN,
+    HX_ACT_LOGSIGMOID,
+    HX_ACT_SINH,
+    HX_ACT_COSH,
     HX_ACT_COUNT
 };
 /* HX_BINARY p[0] operations. */
@@ -272,6 +285,8 @@ typedef struct {
     uint32_t state_bytes;
 } HxGraph;
 uint32_t hx_tensor_bytes(const HxTensor *t);
+/* LINEAR_Q fmt 0/1 rows -> grouped fmt 2/3 in place (same size); k % 64 == 0, n % 32 == 0, scratch k * 34 bytes. */
+void hx_lq_group_layout(uint8_t *w, uint32_t fmt, uint32_t k, uint32_t n, uint8_t *scratch);
 uint32_t hx_tensor_elements(const HxTensor *t);
 void hx_graph_set_state(HxGraph *g, void *state, uint32_t state_bytes);
 uint32_t hx_graph_open(HxGraph *, const void *image, uint32_t image_bytes, const void *constants,
