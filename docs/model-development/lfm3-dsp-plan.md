@@ -282,3 +282,37 @@ Keeping the $128,000 \times 2048$ embedding / `lm_head` lookup on the ARM host s
 ## 7. Engine Ops (Reserved for Worker 2)
 
 *Worker 2 (DSP kernels) will append engine op implementations, HVX scheduling, and simulator execution evidence here.*
+
+## Update 2026-11-19 — decode 1.70 s → 34.9 ms/token on the Frame DSP
+
+Measured with `hexecutor_lfm_run` (LFM3-1.7B, 4 stages, Lmax 256, prompt `1,1098`), engine `tensor-80`
+(`HEXECUTOR_QDO_SLOTS=80 build_tensor.sh`), staged on the Frame in `~/hexecutor-lfm/stage/dsp80dma`.
+Resize the lease to 1280 MiB (ioctl `0x40044301`) before **every** run: it is back at 128 after a session closes.
+
+| step | DSP ms/token |
+|---|---|
+| start (HVX row LINEAR_Q from uncached DDR) | 1702 |
+| LINEAR_Q weights by user DMA into a VTCM ring (each worker its own engine, 1 MiB at 0x31700000) | 1084 |
+| four-row LINEAR_Q kernel (shared x load, vdelta scale broadcast, qf32 accumulation) | 737 |
+| SDPA HVX row (skips masked/causal keys exactly) | 341 |
+| RMSNORM HVX (was emulated double) | 276 |
+| LINEAR_Q grouped layout + int16 activations + vdmpy | 112 |
+| SHORTCONV HVX; single-pixel ACT(SiLU)/BINARY split over channel vectors | 51.6 |
+| ROPE angle table per token; flat RESHAPE / channel CONCAT copies | 37.0 |
+| first DMA chunks issued before quantizing x | 34.9 |
+
+- Long context (240-token prompt, positions 0..246): DSP 34.5 → 41.0 ms, mean wall 42 ms (≈24 tok/s incl. wake
+  rotations); tokens equal the host CPU reference; hidden-state relative RMS error 0.0014 (the 1.70 s kernel: 0.016
+  at 7 positions; now 0.0007 there).
+- Grouped LINEAR_Q (fmt 2 Q4 / 3 Q8, `hx_lq_group_layout` in graph.c): the host rewrites decode LINEAR_Q weights
+  in place at session load (same size) when the engine has feature `HXLQG001`; `HEXECUTOR_LQ_GROUPED=0` disables.
+  Activations are int16 per 32-block (one unit = 3.1e-5 of the block max). Sim: 2.1 / 1.8 cycles per row-block
+  (row kernel 37.5 / 25.6). `HEXECUTOR_LQ_DMA=0` builds without DMA; `HEXECUTOR_ENGINE_CFLAGS=-DHX_LQ_NOCOMPUTE=1`
+  measures streaming only.
+- DMA-only streaming of all 1.1 GB runs at ~44 GB/s (26 ms/token): ≈ 64 B × the 750 MHz AXI-master clock. LINEAR_Q
+  is now 58 of 69 Mcycles per token, so that clock is the floor. Next levers: the 1000 MHz AXI point in
+  `qd_axim.h` (needs the NOM rail votes; not tried), DMA for the KV cache in SDPA (6.5 ms growth over 246
+  positions), and the ~38 ms wake rotation (every ~26 tokens; was ~240 ms before `qdo_clean` stopped sweeping
+  uncached pages on rotation wakes).
+- Tests: `test_linear_q_hvx_sim.c` (row, rows4, grouped layout + kernel, SDPA row, SiLU) in `test_lfm_sim.sh`;
+  `make check` 19/19.
