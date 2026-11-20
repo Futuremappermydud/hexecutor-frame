@@ -1,96 +1,96 @@
-cmake_minimum_required(VERSION 3.16)
-project(frame_spatial_runtime_host LANGUAGES C CXX)
+cmake_minimum_required(VERSION 3.20)
+project(frame-spatial-runtime C CXX)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
-option(FRAME_BUILD_TESTS "Build portable host/protocol tests" ON)
-find_package(Threads REQUIRED)
-add_library(hexecutor_host
-    hexecutor/host/cpp/executor.cpp
-    hexecutor/host/cpp/workload_memory.cpp
-    hexecutor/host/cpp/frame_transport.cpp
-    hexecutor/host/cpp/broker.cpp
-    hexecutor/host/cpp/xrservice_featurenn.cpp
-    hexecutor/native/tensor/graph.c
-    hexecutor/native/tensor/session.c
-    hexecutor/native/qnn16/program.c
-    hexecutor/native/program/nprg2_runtime.c)
-target_include_directories(hexecutor_host PUBLIC hexecutor/include)
-target_include_directories(hexecutor_host PRIVATE hexecutor/native/program hexecutor/native)
-target_link_libraries(hexecutor_host PUBLIC Threads::Threads)
-target_compile_options(hexecutor_host PRIVATE -Wall -Wextra -Wpedantic)
-set_target_properties(hexecutor_host PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+add_subdirectory(hexecutor/host/cpp)
+
+add_executable(hexecutord hexecutor/host/cpp/hexecutord.cpp)
+target_include_directories(hexecutord PRIVATE hexecutor/host/cpp)
+target_link_libraries(hexecutord PRIVATE hexecutor_host)
+set_target_properties(hexecutord PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
 add_executable(hexecutor_chunk_probe hexecutor/host/cpp/chunk_probe_run.cpp)
 target_include_directories(hexecutor_chunk_probe PRIVATE hexecutor/host/cpp)
 target_link_libraries(hexecutor_chunk_probe PRIVATE hexecutor_host)
 set_target_properties(hexecutor_chunk_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_executable(hexecutor_jtlb_probe hexecutor/host/cpp/jtlb_probe_run.cpp)
+target_include_directories(hexecutor_jtlb_probe PRIVATE hexecutor/host/cpp)
+target_link_libraries(hexecutor_jtlb_probe PRIVATE hexecutor_host)
+set_target_properties(hexecutor_jtlb_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_library(depth_model_host depth-model/deployment/cpp/package.cpp)
 target_include_directories(depth_model_host PUBLIC depth-model/include)
 target_link_libraries(depth_model_host PUBLIC hexecutor_host)
-add_library(depth_worker_protocol runtime/src/depth_worker_protocol.cpp)
-target_include_directories(depth_worker_protocol PUBLIC runtime/include)
-target_link_libraries(depth_worker_protocol PUBLIC hexecutor_host)
-add_executable(frame_depth_worker runtime/tools/frame_depth_worker.cpp)
-target_link_libraries(frame_depth_worker PRIVATE depth_model_host depth_worker_protocol)
-set_target_properties(frame_depth_worker PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-if(FRAME_BUILD_TESTS)
-    enable_testing()
-    add_executable(test_qnn16_hvx hexecutor/tests/test_qnn16_hvx.c
-        hexecutor/native/qnn16/qnn16_hvx.c)
-    target_include_directories(test_qnn16_hvx PRIVATE hexecutor/native/qnn16)
-    target_link_libraries(test_qnn16_hvx PRIVATE m)
-    add_test(NAME qnn16_hvx COMMAND test_qnn16_hvx)
-    add_executable(test_qnn16_transfer hexecutor/tests/test_qnn16_transfer.c
-        hexecutor/native/qnn16/qnn16_transfer.c)
-    target_include_directories(test_qnn16_transfer PRIVATE hexecutor/native/qnn16)
-    add_test(NAME qnn16_transfer COMMAND test_qnn16_transfer)
-    add_executable(test_executor_host hexecutor/tests/test_executor_host.cpp)
-    target_link_libraries(test_executor_host PRIVATE depth_model_host)
-    add_test(NAME executor_host COMMAND test_executor_host)
-    add_executable(test_depth_worker runtime/tools/test_depth_worker.cpp)
-    target_link_libraries(test_depth_worker PRIVATE depth_worker_protocol Threads::Threads)
-    add_test(NAME depth_worker_protocol COMMAND test_depth_worker)
-    add_executable(test_broker hexecutor/tests/test_broker.cpp)
-    target_link_libraries(test_broker PRIVATE hexecutor_host)
-    add_test(NAME broker COMMAND test_broker)
-    set_tests_properties(broker PROPERTIES TIMEOUT 60)
-    add_executable(test_xrservice_featurenn hexecutor/tests/test_xrservice_featurenn.cpp)
-    target_link_libraries(test_xrservice_featurenn PRIVATE hexecutor_host)
-    add_test(NAME xrservice_featurenn COMMAND test_xrservice_featurenn)
-    add_executable(test_xrservice_broker_shim hexecutor/tests/test_xrservice_broker_shim.cpp)
-    target_link_libraries(test_xrservice_broker_shim PRIVATE xrservice_broker_shim hexecutor_host)
-    add_test(NAME xrservice_broker_shim COMMAND test_xrservice_broker_shim)
-    add_executable(test_camera_groups runtime/tools/test_camera_groups.cpp)
-    target_include_directories(test_camera_groups PRIVATE runtime/include)
-    add_test(NAME camera_groups COMMAND test_camera_groups)
-    add_executable(test_dynamic_cdsp_mem hexecutor/tests/test_dynamic_cdsp_mem.cpp)
-    target_link_libraries(test_dynamic_cdsp_mem PRIVATE hexecutor_host Threads::Threads)
-    add_test(NAME dynamic_cdsp_mem COMMAND test_dynamic_cdsp_mem)
-    add_executable(test_cdsp_mem_core hexecutor/tests/test_cdsp_mem_core.cpp hexecutor/device/kmod/cdsp_mem_core.c)
-    target_include_directories(test_cdsp_mem_core PRIVATE hexecutor/device/kmod hexecutor/include)
-    target_link_libraries(test_cdsp_mem_core PRIVATE Threads::Threads)
-    add_test(NAME cdsp_mem_core COMMAND test_cdsp_mem_core)
+target_compile_options(depth_model_host PRIVATE -Wall -Wextra -Wpedantic)
+
+find_package(OpenCV QUIET COMPONENTS core imgproc imgcodecs highgui)
+
+include(FetchContent)
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+)
+FetchContent_MakeAvailable(nlohmann_json)
+
+add_library(fusion_core runtime/src/fusion_core.cpp)
+target_include_directories(fusion_core PUBLIC runtime/include)
+target_link_libraries(fusion_core PUBLIC nlohmann_json::nlohmann_json)
+target_compile_options(fusion_core PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(depth_host runtime/src/main.cpp)
+target_link_libraries(depth_host PRIVATE fusion_core)
+target_compile_options(depth_host PRIVATE -Wall -Wextra -Wpedantic)
+
+if(OpenCV_FOUND)
+    message(STATUS "OpenCV found: enabling viewer")
+    add_executable(depth_viewer runtime/src/viewer.cpp)
+    target_link_libraries(depth_viewer PRIVATE fusion_core ${OpenCV_LIBS})
+    target_compile_options(depth_viewer PRIVATE -Wall -Wextra -Wpedantic)
 endif()
+
+add_executable(depth_worker runtime/src/depth_worker.cpp)
+target_include_directories(depth_worker PRIVATE depth-model/include runtime/include)
+target_link_libraries(depth_worker PRIVATE depth_model_host fusion_core)
+target_compile_options(depth_worker PRIVATE -Wall -Wextra -Wpedantic)
+
+enable_testing()
+add_executable(test_fusion_core runtime/tests/test_fusion_core.cpp)
+target_link_libraries(test_fusion_core PRIVATE fusion_core)
+target_compile_options(test_fusion_core PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME test_fusion_core COMMAND test_fusion_core)
+
+add_executable(test_broker hexecutor/tests/test_broker.cpp)
+target_include_directories(test_broker PRIVATE hexecutor/include)
+target_link_libraries(test_broker PRIVATE hexecutor_host)
+add_test(NAME test_broker COMMAND test_broker)
+
+add_executable(test_cdsp_mem_core hexecutor/tests/test_cdsp_mem_core.cpp hexecutor/device/kmod/cdsp_mem_core.c)
+target_include_directories(test_cdsp_mem_core PRIVATE hexecutor/device/kmod)
+add_test(NAME test_cdsp_mem_core COMMAND test_cdsp_mem_core)
+
 add_library(xrservice_broker_shim SHARED hexecutor/host/cpp/xrservice_broker_shim.cpp)
-target_include_directories(xrservice_broker_shim PUBLIC hexecutor/include)
+target_include_directories(xrservice_broker_shim PRIVATE hexecutor/include)
 target_link_libraries(xrservice_broker_shim PRIVATE hexecutor_host)
-set_target_properties(xrservice_broker_shim PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-add_executable(hexecutord hexecutor/host/cpp/hexecutord.cpp)
-add_executable(hexecutor_broker_bench hexecutor/host/cpp/broker_bench.cpp)
-target_link_libraries(hexecutor_broker_bench PRIVATE hexecutor_host)
-set_target_properties(hexecutor_broker_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-target_link_libraries(hexecutord PRIVATE hexecutor_host)
-set_target_properties(hexecutord PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-install(TARGETS hexecutord xrservice_broker_shim
-    RUNTIME DESTINATION bin
-    LIBRARY DESTINATION lib
-    ARCHIVE DESTINATION lib)
-install(FILES hexecutor/include/hexecutor/xrservice_broker_shim.h DESTINATION include)
-add_executable(hexecutor_qnn16_run hexecutor/host/cpp/qnn16_run.cpp)
-target_link_libraries(hexecutor_qnn16_run PRIVATE hexecutor_host)
-set_target_properties(hexecutor_qnn16_run PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+target_compile_options(xrservice_broker_shim PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(test_xrservice_broker_shim hexecutor/tests/test_xrservice_broker_shim.cpp)
+target_include_directories(test_xrservice_broker_shim PRIVATE hexecutor/include)
+target_link_libraries(test_xrservice_broker_shim PRIVATE hexecutor_host xrservice_broker_shim)
+add_test(NAME test_xrservice_broker_shim COMMAND test_xrservice_broker_shim)
+
+add_executable(test_tensor_graph hexecutor/tests/test_tensor_graph.cpp hexecutor/native/tensor/graph.c hexecutor/native/tensor/session.c hexecutor/native/tensor/engine.c hexecutor/native/tensor/fp16.c)
+target_include_directories(test_tensor_graph PRIVATE hexecutor/native/tensor hexecutor/native)
+target_compile_options(test_tensor_graph PRIVATE -Wall -Wextra)
+add_test(NAME test_tensor_graph COMMAND test_tensor_graph)
+
 add_executable(hexecutor_tensor_run hexecutor/host/cpp/tensor_run.cpp hexecutor/host/cpp/tensor_reference.cpp)
 target_include_directories(hexecutor_tensor_run PRIVATE hexecutor/native)
 target_link_libraries(hexecutor_tensor_run PRIVATE hexecutor_host)
@@ -100,96 +100,6 @@ target_include_directories(hand_tracking_host PUBLIC hand-tracking/include)
 target_link_libraries(hand_tracking_host PUBLIC hexecutor_host)
 target_compile_options(hand_tracking_host PRIVATE -Wall -Wextra -Wpedantic)
 add_executable(frame_hand_tracker hand-tracking/tools/hand_tracker.cpp)
-target_link_libraries(frame_hand_tracker PRIVATE hand_tracking_host)
-set_target_properties(frame_hand_tracker PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-if(FRAME_BUILD_TESTS)
-    add_executable(test_graph_entry hexecutor/tests/test_graph_entry.c)
-    add_test(NAME graph_entry COMMAND test_graph_entry)
-    add_executable(test_tensor_graph hexecutor/tests/test_tensor_graph.cpp)
-    target_include_directories(test_tensor_graph PRIVATE hexecutor/native)
-    target_link_libraries(test_tensor_graph PRIVATE hexecutor_host)
-    add_test(NAME tensor_graph COMMAND test_tensor_graph)
-    add_executable(test_tensor_pack hexecutor/tests/test_tensor_pack.cpp)
-    target_include_directories(test_tensor_pack PRIVATE hexecutor/native)
-    add_test(NAME tensor_pack COMMAND test_tensor_pack)
-    add_executable(test_hand_tracker hand-tracking/tests/test_tracker.cpp)
-    target_link_libraries(test_hand_tracker PRIVATE hand_tracking_host)
-    add_test(NAME hand_tracker COMMAND test_hand_tracker)
-    add_executable(test_hand_viewer hand-tracking/tests/test_viewer.cpp)
-    target_link_libraries(test_hand_viewer PRIVATE hand_tracking_host Threads::Threads)
-    add_test(NAME hand_viewer COMMAND test_hand_viewer)
-    add_executable(test_nirhands_skeleton hand-tracking/nirhands/tests/test_skeleton.cpp
-        hand-tracking/nirhands/src/skeleton.cpp)
-    target_include_directories(test_nirhands_skeleton PRIVATE hand-tracking/nirhands/include)
-    add_test(NAME nirhands_skeleton COMMAND test_nirhands_skeleton)
-    set(ORT_ROOT "$ENV{ORT_ROOT}")
-    if(NOT ORT_ROOT)
-        if(APPLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/hand-tracking/.work/ort/onnxruntime-osx-arm64-1.24.1")
-            set(ORT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/hand-tracking/.work/ort/onnxruntime-osx-arm64-1.24.1")
-        elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/hand-tracking/.work/ort/onnxruntime-linux-aarch64-1.24.1")
-            set(ORT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/hand-tracking/.work/ort/onnxruntime-linux-aarch64-1.24.1")
-        endif()
-    endif()
-    if(ORT_ROOT AND EXISTS "${ORT_ROOT}/include/onnxruntime_cxx_api.h" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/hand-tracking/.work/nirhands-models/manifest.json")
-        add_executable(test_npu_layout hand-tracking/nirhands/tests/test_npu_layout.cpp
-            hand-tracking/nirhands/src/pipeline.cpp
-            hand-tracking/nirhands/src/skeleton.cpp
-            hand-tracking/nirhands/src/geometry.cpp
-            hand-tracking/nirhands/src/geometry_ops.cpp)
-        target_include_directories(test_npu_layout PRIVATE
-            hand-tracking/nirhands/include
-            ${ORT_ROOT}/include)
-        target_link_directories(test_npu_layout PRIVATE ${ORT_ROOT}/lib)
-        target_link_libraries(test_npu_layout PRIVATE onnxruntime Threads::Threads)
-        set_property(TARGET test_npu_layout PROPERTY BUILD_RPATH "${ORT_ROOT}/lib")
-        set(NPU_LAYOUT_SKELETON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/hand-tracking/.work/nirhands-skeleton-models")
-        if(EXISTS "${NPU_LAYOUT_SKELETON_DIR}/manifest.json")
-            add_test(NAME npu_layout COMMAND test_npu_layout "${CMAKE_CURRENT_SOURCE_DIR}/hand-tracking/.work/nirhands-models" "${NPU_LAYOUT_SKELETON_DIR}")
-        else()
-            add_test(NAME npu_layout COMMAND test_npu_layout "${CMAKE_CURRENT_SOURCE_DIR}/hand-tracking/.work/nirhands-models")
-        endif()
-    endif()
-endif()
-# Mercury stereo hand tracking (Monado port). Needs Eigen 3.3+ headers: a CMake
-# Eigen3 package, or MERCURY_EIGEN_INCLUDE pointing at an unpacked Eigen tree.
-set(MERCURY_EIGEN_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/hand-tracking/.work/external/eigen"
-    CACHE PATH "Eigen include root used when no Eigen3 package is found")
-find_package(Eigen3 3.3 NO_MODULE QUIET)
-if(NOT TARGET Eigen3::Eigen AND EXISTS "${MERCURY_EIGEN_INCLUDE}/Eigen/Core")
-    add_library(Eigen3::Eigen INTERFACE IMPORTED)
-    set_target_properties(Eigen3::Eigen PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${MERCURY_EIGEN_INCLUDE}")
-endif()
-if(TARGET Eigen3::Eigen)
-    set(MERCURY_DIR hand-tracking/mercury)
-    add_library(mercury_vendor OBJECT
-        ${MERCURY_DIR}/compat/math/m_api.cpp
-        ${MERCURY_DIR}/third_party/monado/mercury/hg_hand_size_opt.cpp
-        ${MERCURY_DIR}/third_party/monado/mercury/kine_lm/lm_main.cpp
-        ${MERCURY_DIR}/third_party/monado/mercury/kine_lm/lm_hand_init_guesser.cpp)
-    target_include_directories(mercury_vendor PUBLIC
-        ${MERCURY_DIR}/compat ${MERCURY_DIR}/third_party/monado ${MERCURY_DIR}/third_party/tinyceres/include)
-    target_link_libraries(mercury_vendor PUBLIC Eigen3::Eigen)
-    set_target_properties(mercury_vendor PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    add_library(mercury_hand_tracking ${MERCURY_DIR}/src/model_io.cpp ${MERCURY_DIR}/src/tracker.cpp
-        $<TARGET_OBJECTS:mercury_vendor>)
-    target_include_directories(mercury_hand_tracking PUBLIC ${MERCURY_DIR}/include)
-    target_link_libraries(mercury_hand_tracking PRIVATE mercury_vendor)
-    target_compile_options(mercury_hand_tracking PRIVATE -Wall -Wextra -Wpedantic)
-    add_library(mercury_executor_networks ${MERCURY_DIR}/src/executor_networks.cpp)
-    target_include_directories(mercury_executor_networks PUBLIC ${MERCURY_DIR}/include)
-    target_link_libraries(mercury_executor_networks PUBLIC mercury_hand_tracking hexecutor_host)
-    target_compile_options(mercury_executor_networks PRIVATE -Wall -Wextra -Wpedantic)
-    add_executable(mercury_replay ${MERCURY_DIR}/tools/mercury_replay.cpp)
-    target_link_libraries(mercury_replay PRIVATE mercury_hand_tracking)
-    set_target_properties(mercury_replay PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-    if(FRAME_BUILD_TESTS)
-        add_executable(test_mercury ${MERCURY_DIR}/tests/test_mercury.cpp)
-        target_link_libraries(test_mercury PRIVATE mercury_hand_tracking mercury_vendor)
-        add_test(NAME mercury COMMAND test_mercury)
-        add_executable(test_mercury_executor ${MERCURY_DIR}/tests/test_executor_networks.cpp)
-        target_link_libraries(test_mercury_executor PRIVATE mercury_executor_networks)
-        add_test(NAME mercury_executor COMMAND test_mercury_executor)
-    endif()
-else()
-    message(STATUS "Mercury hand tracking skipped: Eigen 3.3+ not found (set MERCURY_EIGEN_INCLUDE)")
-endif()
+target_include_directories(frame_hand_tracker PRIVATE hand-tracking/include)
+target_link_libraries(frame_hand_tracker PRIVATE hand_tracking_host hexecutor_host)
+target_compile_options(frame_hand_tracker PRIVATE -Wall -Wextra -Wpedantic)

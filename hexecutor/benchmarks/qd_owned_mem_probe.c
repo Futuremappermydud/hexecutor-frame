@@ -16,7 +16,7 @@ __attribute__((section(".text.entry"))) void payload(void) {
         out[0]=0x31544d51;out[1]=qdo_map(s);out[2]=0;out[3]=0;
         if(!out[1]) {
             for(uint32_t i=0;i<QDO_SLOTS;i++) {
-                uint64_t entry=qdo_tlbr(QDO_FIRST+i);
+                uint64_t entry=qdo_tlbr(QDO_IDX(s,i));
                 out[51+2*i]=(uint32_t)entry;out[52+2*i]=(uint32_t)(entry>>32);
             }
             uint64_t start=cycles();
