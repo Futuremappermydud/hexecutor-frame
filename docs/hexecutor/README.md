@@ -30,3 +30,10 @@ Before execution, validate the image and trusted hashes, bind non-overlapping po
 Firmware state is borrowed. Loader identity, TLB entries, L2 contents, stacks, vector context, callback registration, clocks, and the eye client all belong to the session's restoration contract. See [operations](operations.md), [memory layout](memory-layout.md), and [dynamic memory](dynamic-memory.md).
 
 Peripheral directories retain focused roles: `research/bringup/` contains early callback probes; `research/qurt-boot/` explores boot/runtime behavior; `native/kernels/adapters/` and `native/kernels/stride2/` investigate shape-specific kernels; `examples/llm/` demonstrates another DSP client. These do not independently expand the prepared executor's supported graph contract.
+
+## License
+
+hexecutor is under the GNU Lesser General Public License, version 3 or later (`LGPL-3.0-or-later`); the kernel
+modules in `hexecutor/device/kmod/` stay `GPL-2.0`. Programs under other licenses can use it as a dynamically
+linked library (`libhexecutor_et.so`, see [the ExecuTorch delegate](../../hexecutor/executorch/README.md)). Terms,
+exceptions and what a distributor must ship: [hexecutor/LICENSE.md](../../hexecutor/LICENSE.md).

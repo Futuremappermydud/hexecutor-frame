@@ -1,0 +1,18 @@
+[Unit]
+Description=Hexecutor CDSP workload broker
+After=local-fs.target
+
+[Service]
+Type=simple
+User=steamos
+Group=steamos
+RuntimeDirectory=hexecutor
+RuntimeDirectoryMode=0700
+ExecStartPre=+/usr/sbin/modprobe cdsp_mem
+AmbientCapabilities=CAP_SYS_ADMIN
+ExecStart=/opt/hexecutor/bin/hexecutord --socket /run/hexecutor/hexecutord.sock --loader /opt/hexecutor/dsp/qd_loader.elf --engine /opt/hexecutor/dsp/engine.elf --bootstrap /opt/hexecutor/dsp/bootstrap.elf --chunk-probe /opt/hexecutor/dsp/chunk_probe.elf
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

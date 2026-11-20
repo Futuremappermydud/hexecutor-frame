@@ -26,6 +26,7 @@ This is the maintained handbook for the spatial application, Hexecutor DSP execu
 | --- | --- |
 | [Generic tensor backend](hexecutor/tensor-backend.md) | Static tensor graphs, multi-model sessions, FP16 HMX and model-independent tooling |
 | [Native host API](hexecutor/api.md) | C++ tensors/programs, explicit packages, and worker lifecycle |
+| [Install the broker](hexecutor/install.md) | One-command Frame install, bundle contents, and release prerequisites |
 | [Executor architecture](hexecutor/README.md) | Host/DSP responsibilities, loader, transport, and execution modes |
 | [Memory layout](hexecutor/memory-layout.md) | Private DDR, VTCM, L2 leases, aliasing, and workspace limits |
 | [Dynamic CDSP memory](hexecutor/dynamic-memory.md) | Dynamic memory growth and shrinking from 128 MiB to 1.5 GiB based on workloads |
@@ -39,6 +40,7 @@ This is the maintained handbook for the spatial application, Hexecutor DSP execu
 | [Performance interpretation](hexecutor/performance.md) | The pinned deployment versus the latest measured primary recipe |
 | [Kernel adapters](hexecutor/kernel-adapters.md) | Shape-specific support boundaries and fixture generation |
 | [Language-model example](hexecutor/language-model.md) | The Qwen DSP client and its shared infrastructure |
+| [Frame wake word investigation](hexecutor/frame-wake-word.md) | Verified mic and aDSP callback paths, LPASS memory limits, and the low power implementation route |
 
 ## Models and repository policy
 
