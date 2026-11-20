@@ -18,7 +18,9 @@ produces the blob; it is not built or run here.
   float32 inputs, prints output summaries.
 - `CMakeLists.txt`: standalone project. It references the existing hexecutor
   host sources and `hexecutor/host/cpp/tensor_reference.cpp` by path. It does
-  not edit any existing CMake file.
+  not edit any existing CMake file. With `-DHEXECUTOR_ET_SHARED=ON` it also builds
+  `libhexecutor_et` (see "Shared library" below).
+- `hexecutor_et_shared.cpp`: the one source of `libhexecutor_et`.
 
 ## Blob format v1 (little-endian, no padding)
 
@@ -72,6 +74,7 @@ cmake --build hexecutor/.work/executorch-build -j8 --target hexecutor_et_selftes
 | Variable | Meaning |
 | --- | --- |
 | `HEXECUTOR_ET_REFERENCE=1` | Run the portable CPU reference (`tensor_reference`). Explicit only; there is no automatic fallback. Reads no device variables. |
+| `HEXECUTORD_SOCKET` | Broker socket. If set, the delegate registers its embedded graph there. Without it, an installed broker at `/run/hexecutor/hexecutord.sock` is detected automatically. |
 | `HEXECUTOR_LOADER`, `HEXECUTOR_ENGINE`, `HEXECUTOR_BOOTSTRAP`, `HEXECUTOR_CHUNK_PROBE` | Required in device mode. Explicit artifact paths; there are no defaults. Same roles as `hexecutor_tensor_run`. |
 | `HEXECUTOR_TENSOR_F32=1` | FP32 intermediates (`Artifacts::tensor_fp16=false`). |
 | `HEXECUTOR_TENSOR_PRECISE=1` | Float DSP path (`Artifacts::tensor_hmx=false`). |
@@ -86,13 +89,25 @@ Nothing is substituted silently.
   `mkdtemp` directory (mode 0700), loads the program with
   `hexecutor::load_tensor_program`, and checks it against the blob contract:
   count, float32 type, and shape (NHWC for layout 1, exact dims for layout 0).
-  In device mode it then opens one `hexecutor::Session`.
+- With the installed broker socket (or an explicit `HEXECUTORD_SOCKET`), `init()`
+  registers the embedded graph with `hexecutord`; `execute()` submits through
+  the broker. The daemon currently has eight registration slots per lifetime.
+- Device mode: every delegate handle in the process shares one multi-program
+  `hexecutor::Session` (the CDSP has one owner). Handles whose HXFG images are
+  byte-identical share one program slot, unless the image has a persistent
+  tensor: a stateful program can be loaded once per process. A new distinct
+  program closes the session and reopens it with every slot (at most
+  `HXFG_MAX_GRAPHS`, 8); if that fails the previous session is restored and
+  `init()` fails. Slots stay until the last handle is destroyed, then the
+  session closes and the files are removed. Every handle must see the same
+  `HEXECUTOR_*` artifacts. Runs from all handles are serialized by one mutex.
 - `execute()` validates every argument (float32, contract shape) before any
   device work. Arguments are inputs first, then outputs. It packs inputs, runs
   the session, checks output byte sizes, and unpacks into the output tensors.
   Calls on one handle are serialized by a mutex.
-- `destroy()` closes the session and removes the temp directory. Reference mode
-  reads the temp files on every run, so they stay until `destroy()`.
+- `destroy()` releases the handle's slot (the last one closes the session) and
+  its reference to the temp directory. Reference mode keeps one CPU reference per
+  handle and reads the temp files on every run, so they stay until `destroy()`.
 - Errors return `executorch::runtime::Error` codes. Nothing aborts.
 
 ## Verified on macOS (reference path only)
@@ -107,10 +122,25 @@ Built with `cmake --build hexecutor/.work/executorch-build --target hexecutor_bl
 
 Not run here: any device-mode session. The Frame DSP transport is unavailable on this Mac. ExecuTorch's `ET_LOG` is compiled out in this Release build (`EXECUTORCH_ENABLE_LOGGING` is off), so failures show only the `Error` code. Set `-DEXECUTORCH_ENABLE_LOGGING=ON` on the ExecuTorch configure to see reasons.
 
+## Shared library
+
+`-DHEXECUTOR_ET_SHARED=ON` builds `libhexecutor_et` (`.so.1` on Linux): the backend, the hexecutor host
+sources and the ExecuTorch runtime (`executorch_core`, the prim ops, `extension_data_loader`,
+`extension_tensor`) folded in as whole archives. A program links only this library and gets the ExecuTorch and
+backend headers through its interface. The runtime has to live inside it: the backend registry is a static
+object of `executorch_core`, so the process must hold exactly one copy, the one the backend registers into.
+Linking the static ExecuTorch archives as well would create a second registry. This is how an MIT or other
+non-LGPL program uses hexecutor (see [hexecutor/LICENSE.md](../LICENSE.md)). Steam-Frame-Hand-Tracking's
+`mercury/build.sh --executorch` is the first user. On the Mac (2026-11-20), its `fhm_nn_check` linked only
+`libhexecutor_et.1.dylib` and ran Mercury's two models as 12 handles in reference mode, within 1.03e-6 of
+ONNX Runtime.
+
 ## Limits
 
-- One `Session` per delegate handle. Merging delegates into one multi-program
-  Session or routing through the `hexecutord` broker is future work.
+- One `Session` per process (shared by all handles; see Runtime behavior). Routing through the `hexecutord`
+  broker is future work.
+- The shared session (2026-11-20) has only run in reference mode on the Mac, where it is not used. Its device
+  path (slot sharing, reopen on a new program) has not run on the Frame yet.
 - Float32 I/O only. Batch size and graph shape are fixed by the blob.
 - The CPU reference copies the image and constants from disk on every run, so
   it is for correctness checks only.
@@ -153,3 +183,69 @@ Built natively on the headset (`~/hexecutor-et`, `cmake --build build -j6`) agai
 - The DSP float path (`HEXECUTOR_TENSOR_PRECISE=1`) matches the reference to 1.4e-4 at 224 px but takes 618 ms, so the FP16 error is HMX arithmetic, not the delegate.
 - First execute after `load_method` is 20–47 ms (resident staging); `load_method` (session open) is 0.2–0.55 s. Occasional 70 ms outliers are the 1 s wake-limit re-wake.
 - Not yet run on the Frame: models that leave ops on the CPU. Linking ExecuTorch's portable kernels (`-DHEXECUTOR_ET_PORTABLE_OPS=ON`) needs Python `torchgen` at build time, which the Frame lacks. Delegation also needs BatchNorm folded beforehand; the partitioner does not fold it.
+
+## Diffusion UNet (Frame, 2026-11-19)
+
+`hexecutor/examples/diffusion/unet2d_export.py`: a diffusers `UNet2DModel` DDPM-style denoiser (32x32x3, channels
+32/64/64, one attention block at 16x16 down and up plus the mid block, random weights, 6.4 MiB constants), one
+denoising step per `forward(x, t)`. Fully delegated: one delegate, no CPU operators, 265 HXFG ops, `blocked_fp16=true`.
+Built in `~/hexecutor-et-diff` on the Frame (current tree, engine `0d0acc5c…` built with `build_tensor.sh` settings,
+`cdsp_mem` 128 MB).
+
+| Run | Result |
+| --- | --- |
+| CPU reference vs PyTorch (Mac, `hexecutor_tensor_run`) | max abs diff 2.2e-6 at t = 999, 500, 10 |
+| DSP FP16 vs reference (`hexecutor_et_run --seed 7`) | max 2.4e-3, mean 3.9e-4 (mean abs output 0.29), cosine 0.999999 |
+| Warm step through ExecuTorch, DSP | **23.7 ms** median (p90 23.9) over 20 runs; see the table below |
+| Warm step, CPU reference on the Frame | 157 ms (single-thread portable reference) |
+
+Speed steps, each checked on the Frame against the reference (cosine 0.999999 throughout, max error about 2e-3):
+
+| Change (engine `fp16.c` unless noted) | Step | What it removed |
+| --- | --- | --- |
+| baseline (HX_SDPA, scalar lanes) | 638 ms | |
+| single-head SDPA as MATMUL / SOFTMAX / MATMUL on token columns (lowering) | 197 ms | SDPA 781 M cycles -> matmul 8 M |
+| `norm_group_vector`: HVX group norm, two-pass qf32 statistics | 124 ms | 113 M -> 2 M cycles |
+| `act_vector` (SiLU, logistic: exp2 polynomial + Newton reciprocal), `binary_vector` (add/sub/mul/min/max/div-by-constant; same-shape, per-channel tensor or constant) | 78.6 ms | 86 M -> 1.4 M |
+| `softmax_vector`: HVX channel softmax | 64 ms | 27 M -> 0.7 M |
+| `im2col_tile_3x3`: 3x3 / stride 1 / pad 1 im2col as whole-vector shifts (even width, C % 32 = 0) | 23.7 ms | dense 3x3 conv 78 M -> 4 M (pack was 2-4 MAC/cycle) |
+
+Remaining 43 M cycles are copies in scalar lanes: RESHAPE 12 M (74 ops, mostly the token-view repacks), CONCAT 8 M,
+nearest RESIZE 6 M, plus matmul 8 M. Regression check with the previous engine: MobileNetV2 160 px and the hand
+landmark graph bit-identical; `tiny.pte` within one FP16 ulp (its sigmoid now runs in HVX), same error against the
+reference (max 3.7e-4) and 0.83 -> 0.31 ms. The FP16 simulator test (`test_tensor_fp16_sim.c`) passes.
+
+Rank-2 or rank-3 delegate I/O (such as the `[1, 1]` timestep) used to fail `load_method`: the program reports every
+tensor as `[1, h, w, c]` and the delegate compared that exactly with the PyTorch dims. It now compares shapes without
+their size-one dims, as `Session` does.
+
+## Mercury hand tracking simulator optimization (2026-11-20)
+
+The two Mercury HXFG exports in `hexecutor/.work/mercury-et/` use a scalar runtime tensor
+(`useLastKeypoints`, `[1,1,1]`) to multiply a `16x16x32` map in the keypoint graph. The FP16
+binary vector path now broadcasts that scalar across every 32-channel block. `HX_ZEROINSERT`
+also copies blocked channel vectors onto the sparse output grid, preserving its zeros and odd-width
+pad columns. A second blocked gather packs 3x3 stride-one convolution windows with whole
+32-channel input blocks, including the pad-two border expansion at keypoint op 68. Unsupported
+shapes retain the generic im2col gather. Unsupported binary broadcasts and zero-insert layouts
+retain the scalar path. On
+the single-thread Hexagon ISS, the Mercury scalar multiply fell from 2,298,294 to 29,556
+pcycles, and its `10x10x63` to `21x21x63` zero insert from 3,575,466 to 57,615 pcycles.
+A pad-two `8x8x32` to `10x10x32` convolution fixture fell from 383,451 to 97,491
+pcycles with the same FP16 result.
+These pcycles count instructions rather than predicting Frame latency.
+
+Ordinary FP16 external input packing now splits rows across the four DSP workers. Mercury's
+one-channel image is represented with a 32-channel stride, so import has a large padded footprint.
+The Frame profile placed 6.58 million detection cycles outside operator timing, which includes
+import and export; the precise share due to import has not been measured on device. Parallel
+packing is a candidate for reducing that interval, pending a Frame measurement. The HXFG and
+`.pte` files do not need re-export for these engine changes.
+
+The serial whole-graph ISS harness measured 23,700,072 to 16,853,346 pcycles for keypoint
+and 7,522,407 to 7,475,226 for detection, including import but excluding constant staging
+and output export. The changed keypoint graph produced bit-identical outputs to the prior
+simulator engine on all four outputs. The simulator's absolute Mercury outputs differ from the
+saved Frame outputs even on the prior engine, so this is a relative regression check, not a
+Frame accuracy result. The saved prior Frame keypoint heatmap matched the ONNX Runtime argmax
+for 20 of 21 joints; the remaining joint needs device validation with this engine.

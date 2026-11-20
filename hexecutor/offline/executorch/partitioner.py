@@ -17,6 +17,8 @@ from .backend import HexecutorBackend
 from .lowering import kind_name, select_nodes
 
 TAG = "hexecutor_tensor_f32"
+_KEEP_KINDS = ("prelu", "linear", "act", "bmm", "sdpa", "embedding", "index_select", "index", "rmsnorm", "norm",
+              "logsigmoid", "scatter_rows")
 
 
 class HexecutorPartitioner(Partitioner):
@@ -27,15 +29,30 @@ class HexecutorPartitioner(Partitioner):
     def ops_to_not_decompose(self, ep):
         # PReLU and linear would otherwise be rewritten by the core ATen decomposition
         # (where/mul, permute/addmm), which HXFG does not express. ExecuTorch requires every
-        # kept op to be delegated, so keep exactly the nodes that partition() will select,
-        # decided on this pre-decomposition graph.
-        selected = set(select_nodes(ep))
+        # kept op to be delegated, so keep exactly the nodes that partition() will select.
+        kept = self._kept_ops()
+        # Decide on the graph partition() will see: the core decomposition minus the kept ops.
+        # The raw export still spells ops as conv2d, group_norm, dropout, ...; judged there,
+        # they would refuse every node after them.
+        table = torch.export.default_decompositions()
+        for op in kept:
+            table.pop(op, None)
+        try:
+            decomposed = ep.run_decompositions(table)
+        except Exception:  # fall back to judging the raw export
+            decomposed = ep
+        chosen = {
+            (n.name, n.target) for n in select_nodes(decomposed)
+            if kind_name(n) in _KEEP_KINDS
+        }
 
         def keep(node):
-            return node in selected and kind_name(node) in (
-                "prelu", "linear", "act", "bmm", "sdpa", "embedding", "index_select", "index", "rmsnorm", "norm"
-            )
+            return (node.name, node.target) in chosen
 
+        return (kept, keep)
+
+    @staticmethod
+    def _kept_ops():
         # Non-core activations and custom norms would otherwise be rewritten into clamp/mul or var/mean sequences.
         kept = [torch.ops.aten.prelu.default, torch.ops.aten.linear.default,
                 torch.ops.aten.hardswish.default, torch.ops.aten.hardsigmoid.default,
@@ -44,7 +61,16 @@ class HexecutorPartitioner(Partitioner):
                 torch.ops.aten.scaled_dot_product_attention.default,
                 torch.ops.aten.embedding.default,
                 torch.ops.aten.index_select.default,
-                torch.ops.aten.index.Tensor]
+                torch.ops.aten.index.Tensor,
+                torch.ops.aten.select_scatter.default,  # decomposes into arange/eq/where otherwise
+                torch.ops.aten.slice_scatter.default,
+                torch.ops.aten.index_put.default,
+                torch.ops.aten.log_sigmoid.default]  # one output; decomposed into log1p/minimum otherwise
+        # Composite activations (rewritten into exp/log/where sequences if not kept whole).
+        for name in ("elu", "selu", "celu", "softplus", "mish", "sinh", "cosh", "sign"):
+            packet = getattr(torch.ops.aten, name, None)
+            if packet is not None and hasattr(packet, "default"):
+                kept.append(packet.default)
         for op in (
             getattr(torch.ops.aten, "rms_norm", None),
             getattr(torch.ops.aten, "instance_norm", None),
@@ -52,7 +78,7 @@ class HexecutorPartitioner(Partitioner):
         ):
             if op is not None and hasattr(op, "default"):
                 kept.append(op.default)
-        return (kept, keep)
+        return kept
 
     def partition(self, exported_program) -> PartitionResult:
         nodes = select_nodes(exported_program)
