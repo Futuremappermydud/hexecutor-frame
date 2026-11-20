@@ -27,6 +27,11 @@ Softmax (axis 1 only), InstanceNormalization, GroupNormalization (opset 18 or 21
 Reshape, Squeeze, Unsqueeze, Transpose (rank 4, batch first), Slice (unit steps), Split (channel
 axis) and grouped Conv (each group is a Slice, a dense Conv and a channel Concat chain).
 
+Operators the HXFG set lacks (ReduceL1/L2/SumSquare/LogSumExp, LogSoftmax, DepthToSpace,
+SpaceToDepth) are rewritten first by onnx_decompose.py. Also supported: Elu, Celu, Selu, Softplus,
+Mish, Softsign, Sinh, Cosh, Sign, Clip with any constant bounds, 1-D Conv/pools, MaxPool
+ceil_mode, positive-step Slice, and reshape/Transpose/reshape channel shuffle.
+
 Exporter hygiene: before lowering, every node whose inputs are all constants (Identity-wrapped
 initializers, Shape/Gather/Unsqueeze/Concat size chains, scalar arithmetic; see `FOLDABLE`) is
 evaluated with onnx.reference and replaced by an initializer, Shape of a statically shaped
@@ -49,6 +54,22 @@ the Reshape to `[1, L, D]`. A Transpose `[0, 2, 1]` of a conv-style `[1, C, L]` 
 embedding) is a logical reshape. Gather of a contiguous run on the sequence axis is a slice.
 Anything else on token or head tensors raises an error naming the node.
 
+LFM-style decode graphs (batch one, one token per run, static shapes): `MatMulNBits` (com.microsoft;
+4 or 8 bits, block size 32, default zero points, K and N multiples of 32, optional bias) becomes
+HX_LINEAR_Q with GGML-layout Q4_0/Q8_0 rows (scales stored as float16). `RotaryEmbedding` (opset 23 or
+com.microsoft) on a `[1, L, heads * head_dim]` token tensor becomes HX_ROPE; the lowering recovers theta
+from the constant cos/sin caches and rejects caches that are not the plain `theta ** (-2j / rot)` table,
+and positions must be constant consecutive values or (one token only) a runtime `[1, 1]` integer input.
+Two operators of the `hexecutor` domain carry persistent state: `ShortConv` (inputs x `[1, 1, C]`, weight
+`[C, 1, k]` or `[C, k]`, optional bias, optional gate; attributes `state`, `activation` in none/relu/silu)
+is HX_SHORTCONV over a `[k - 1, 1, C]` ring, and `KVCacheWrite` (inputs token rows `[1, L, C]` and an
+optional integer position; attributes `state`, `max_len`, `position`) appends into a `[1, max_len, C]`
+cache and returns the whole cache, which attention then reads. These tensors live in the persistent state
+region, which is not a graph input or output: the host owns it and keeps it between runs. The manifest
+reports `state_bytes`, `persistent` (offsets) and `state_names` (state id -> attribute `state`). Attention
+over a cache is `ScaledDotProductAttention` with an additive mask input (the FP32 path; the blocked FP16
+plan refuses a persistent operand).
+
 The manifest's `fp16_plan` entry lists what keeps the graph out of the DSP's blocked
 FP16 plan (see `fp16_blockers`); such a graph still lowers and runs on the FP32 path.
 
@@ -58,6 +79,7 @@ Requires numpy and onnx. Nothing here is used by the native host or engine.
 import argparse
 import collections
 import hashlib
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -68,6 +90,10 @@ try:
     from . import hxfg_writer as hx
 except ImportError:  # run as a script from hexecutor/offline
     import hxfg_writer as hx
+try:
+    from . import onnx_decompose
+except ImportError:
+    import onnx_decompose
 
 NONE = hx.NONE
 MATMUL = hx.MATMUL
@@ -82,17 +108,20 @@ OPERATION_LIMIT = 1024
 # One matrix of a runtime tensor: `rows` x `cols` physical elements of tensor `id` (h = rows,
 # c = cols). `trans` reads it transposed (logical [cols, rows]); `op` produced it, or None.
 Mat = collections.namedtuple("Mat", "id rows cols trans op")
+# Operators whose rank-3 operands and results are token tensors, however they are reached.
+STATE_OPS = frozenset({"MatMulNBits", "RotaryEmbedding", "ShortConv", "KVCacheWrite"})
 ELEMENTWISE = frozenset({
     "Add", "Sub", "Mul", "Div", "Relu", "Clip", "LeakyRelu", "PRelu", "Sigmoid", "Tanh",
     "HardSigmoid", "HardSwish", "Gelu", "Exp", "Sqrt", "Abs", "Neg", "Erf", "Identity",
-    "Dropout", "Cast", "Silu",
+    "Dropout", "Cast", "Silu", "Sign", "Elu", "Celu", "Selu", "Softplus", "Mish", "Softsign",
+    "Sinh", "Cosh",
 })
 REDUCES = frozenset({"ReduceMean", "ReduceSum", "ReduceMax", "ReduceMin"})
 # Operators that pass token status from one of their inputs to their outputs.
 TOKEN_LINKED = ELEMENTWISE | REDUCES | frozenset({
     "Concat", "Gather", "GatherElements", "GatherND", "ScatterND", "Reshape", "Squeeze", "Unsqueeze", "Flatten", "LayerNormalization",
     "RMSNormalization", "RMSNorm", "SimplifiedLayerNormalization", "Softmax", "Split", "Slice",
-})
+}) | STATE_OPS
 TOKEN_OPS = TOKEN_LINKED | frozenset({"MatMul", "Transpose", "Einsum", "ScaledDotProductAttention", "sdpa"})
 HEAD_OPS = frozenset({"MatMul", "Mul", "Div", "Softmax", "Transpose", "Identity", "Einsum", "ScaledDotProductAttention", "sdpa"})
 SPLIT_OPS = frozenset({"Transpose", "Reshape", "Identity"})
@@ -119,9 +148,17 @@ def is_causal_mask(const):
 
 def _narrow_int64(arr, name=""):
     if isinstance(arr, np.ndarray) and arr.dtype == np.int64:
-        if np.any(arr < -2147483648) or np.any(arr > 2147483647):
-            raise ValueError(f"int64 constant {name} out of int32 range: [{arr.min()}, {arr.max()}]")
-        return arr.astype(np.int32)
+        lo, hi = -2147483648, 2147483647
+        out = (arr < lo) | (arr > hi)
+        if np.any(out):
+            # Slice/Clip end sentinels (INT64_MAX / INT64_MIN, or anything >= 2^62 in
+            # magnitude) mean "unbounded"; clamping them is exact. Any other
+            # out-of-range value would silently change meaning, so reject it.
+            sentinel = np.abs(arr[out].astype(np.float64)) >= 2.0 ** 62
+            if not np.all(sentinel):
+                raise ValueError(
+                    f"int64 constant {name} out of int32 range: [{arr.min()}, {arr.max()}]")
+        return np.clip(arr, lo, hi).astype(np.int32)
     return arr
 
 
@@ -188,9 +225,54 @@ def _elem_types(graph):
     return types
 
 
+def _state_op_output_dims(node, dims):
+    """Static output shape of a MatMulNBits, RotaryEmbedding, ShortConv or KVCacheWrite node, or None
+    while an input shape is unknown. ONNX shape inference does not know these operators."""
+    a = {x.name: onnx.helper.get_attribute_value(x) for x in node.attribute}
+    x = dims.get(node.input[0]) if node.input else None
+    if x is None:
+        return None
+    if node.op_type == "MatMulNBits":
+        return list(x[:-1]) + [int(a["N"])] if "N" in a else None
+    if node.op_type in ("RotaryEmbedding", "ShortConv"):
+        return list(x)
+    if node.op_type == "KVCacheWrite":
+        return [1, int(a["max_len"]), x[-1]] if "max_len" in a and len(x) == 3 else None
+    if node.op_type in ("ScaledDotProductAttention", "sdpa"):  # reads a state operator's cache
+        v = dims.get(node.input[2]) if len(node.input) > 2 else None
+        return list(x[:-1]) + [v[-1]] if v else None
+    return None
+
+
+def _declare_state_op_shapes(model):
+    """Give the outputs of the state operators value_info, so that shape inference carries static
+    shapes through the standard operators that follow them. One operator per pass, in graph order:
+    inference past a node it does not know yields wrong shapes (an Add of a known and an unknown
+    operand), so only a node whose every predecessor is declared may be read."""
+    graph = model.graph
+    for _ in range(len(graph.node) + 1):
+        declared = {v.name for v in graph.value_info}
+        pending = [n for n in graph.node
+                   if n.op_type in STATE_OPS | {"ScaledDotProductAttention", "sdpa"}
+                   and n.output and n.output[0] and n.output[0] not in declared]
+        if not pending:
+            return
+        try:
+            dims = _static_dims(_infer_shapes(model))
+        except Exception:  # surfaced by the lowering proper
+            return
+        shape = _state_op_output_dims(pending[0], dims)
+        if shape is None:
+            return
+        graph.value_info.append(
+            onnx.helper.make_tensor_value_info(pending[0].output[0], onnx.TensorProto.FLOAT, shape))
+
+
 class Lowerer:
     def __init__(self, model, compact_input="auto"):
         self.model = model
+        onnx_decompose.decompose(model)
+        _declare_state_op_shapes(model)
         self.graph = model.graph
         inferred = _infer_shapes(model)
         self.init = {i.name: _narrow_int64(numpy_helper.to_array(i), i.name) for i in self.graph.initializer}
@@ -212,6 +294,8 @@ class Lowerer:
         self.source_ops = []
         self.inputs = [i.name for i in self.graph.input if i.name not in self.init]
         self.outputs = [o.name for o in self.graph.output]
+        self.persistent = {}  # tensor id -> state id (conv rings, KV caches)
+        self.state_names = {}  # state id -> name
         self.users = {}
         for n in self.nodes:
             for name in n.input:
@@ -756,7 +840,7 @@ class Lowerer:
                 op = node.op_type
                 last_axis = (op in ("LayerNormalization", "RMSNormalization", "RMSNorm", "SimplifiedLayerNormalization", "Softmax", "Split") and r3(node.input[0])
                              and int(self.attrs(node).get("axis", -1)) % 3 == 2)
-                seed = op == "MatMul" or last_axis or (op in REDUCES and r3(node.input[0])) or (op == "Gather" and r3(node.output[0]))
+                seed = op == "MatMul" or op in STATE_OPS or op in ("ScaledDotProductAttention", "sdpa") or last_axis or (op in REDUCES and r3(node.input[0])) or (op == "Gather" and r3(node.output[0]))
                 link = op in TOKEN_LINKED and any(n in self.token for n in names)
                 if seed or link:
                     for n in names:
@@ -784,7 +868,7 @@ class Lowerer:
             self.fail(node, "dilations must be between 1 and 8 on each axis")
         return d[0], d[1]
 
-    def spatial(self, node, a, x, out, k, dilated=False):
+    def spatial(self, node, a, x, out, k, dilated=False, ceil=False):
         """(stride, pad_top, pad_left) of a windowed operation; checks the output size.
         k is the kernel size; dilated=True is for convolutions, which may dilate the window."""
         ih, iw, _ = self.hwc(x)
@@ -808,9 +892,15 @@ class Lowerer:
             pads = [0, 0, 0, 0]
         else:
             pads = list(a.get("pads", [0, 0, 0, 0]))
-        if (ih + pads[0] + pads[2] - ke[0]) // s[0] + 1 != oh or (
-            iw + pads[1] + pads[3] - ke[1]
-        ) // s[1] + 1 != ow:
+        def extent(n, pad, e, stride, which):
+            span = n + pad - e
+            size = (-(-span // stride) if ceil else span // stride) + 1
+            if ceil and (size - 1) * stride >= n + pads[which]:  # last window must start inside
+                size -= 1
+            return size
+
+        if (extent(ih, pads[0] + pads[2], ke[0], s[0], 0) != oh
+                or extent(iw, pads[1] + pads[3], ke[1], s[1], 1) != ow):
             self.fail(node, "output size disagrees with the window geometry")
         if pads[0] >= ke[0] or pads[1] >= ke[1]:
             self.fail(node, "leading padding must be smaller than the kernel")
@@ -846,14 +936,18 @@ class Lowerer:
             self.tid(name)
         silu = self._find_silu()
         rmsnorms = self._find_rmsnorm_decomposed()
+        shuffles = self._find_channel_shuffle()
         for node in self.nodes:
-            if id(node) in silu["skip"] or id(node) in rmsnorms["skip"]:
+            if id(node) in silu["skip"] or id(node) in rmsnorms["skip"] or id(node) in shuffles["skip"]:
                 continue
             handler = getattr(self, "op_" + node.op_type, None)
-            if handler is None and id(node) not in rmsnorms["fused"]:
+            if handler is None and id(node) not in rmsnorms["fused"] and id(node) not in shuffles["emit"]:
                 self.fail(node, "unsupported operator")
-            self._check_operands(node)
-            if id(node) in silu["mul"]:
+            if id(node) not in shuffles["emit"]:
+                self._check_operands(node)
+            if id(node) in shuffles["emit"]:
+                self._emit_channel_shuffle(node, *shuffles["emit"][id(node)])
+            elif id(node) in silu["mul"]:
                 self._emit_act(node, silu["mul"][id(node)], hx.FN_SILU)
             elif id(node) in rmsnorms["fused"]:
                 self._emit_rmsnorm_fused(node, rmsnorms["fused"][id(node)])
@@ -1050,6 +1144,47 @@ class Lowerer:
                     break
         return {"skip": skip, "mul": mul}
 
+    def _find_channel_shuffle(self):
+        """Reshape [1, C, H, W] -> [1, g, C/g, H, W], Transpose [0, 2, 1, 3, 4], Reshape back to
+        [1, C, H, W] (ShuffleNet). Returns the nodes to skip and the final Reshape with (x, groups)."""
+        by_output = {n.output[0]: n for n in self.nodes}
+        skip, emit = set(), {}
+        for last in self.nodes:
+            if last.op_type != "Reshape":
+                continue
+            t = by_output.get(last.input[0])
+            if t is None or t.op_type != "Transpose":
+                continue
+            if [int(v) for v in self.attrs(t).get("perm", [])] != [0, 2, 1, 3, 4]:
+                continue
+            first = by_output.get(t.input[0])
+            if first is None or first.op_type != "Reshape":
+                continue
+            x, mid, out = first.input[0], self.dims.get(first.output[0]), self.dims.get(last.output[0])
+            src = self.dims.get(x)
+            if (src is None or mid is None or out is None or len(src) != 4 or len(mid) != 5
+                    or src[0] != 1 or list(out) != list(src)
+                    or [mid[0], mid[1] * mid[2], mid[3], mid[4]] != list(src)):
+                continue
+            if any(self.users.get(n, 0) != 1 or n in self.outputs
+                   for n in (first.output[0], t.output[0])):
+                continue
+            skip.update((id(first), id(t)))
+            emit[id(last)] = (x, int(mid[1]))
+        return {"skip": skip, "emit": emit}
+
+    def _emit_channel_shuffle(self, node, x, groups):
+        """The shuffle as an exact 1x1 convolution with a 0/1 permutation matrix."""
+        c = self.dims[x][1]
+        per = c // groups
+        w = np.zeros((c, c, 1, 1), np.float32)
+        for k in range(per):
+            for i in range(groups):
+                w[k * groups + i, i * per + k, 0, 0] = 1.0
+        op = self._new_layer(node, hx.CONV, x, node.output[0], w, np.zeros(c, np.float32),
+                             [1, 1, 1, 1, 0, 0])
+        op.foldable = False
+
     # ------------------------------------------------------------ layers
     def _new_layer(self, node, kind, x_name, out_name, weights, bias, p, dilation=(1, 1)):
         op = Op(kind, self.tid(x_name), NONE, self.tid(out_name), p, node)
@@ -1058,11 +1193,26 @@ class Lowerer:
         op.foldable = True
         return self.add(op)
 
+    @staticmethod
+    def _as2d(a):
+        """Attributes of a 1-D windowed operation as the 2-D form with H = 1."""
+        a = dict(a)
+        if len(a.get("kernel_shape", [0, 0])) == 1:
+            a["kernel_shape"] = [1, a["kernel_shape"][0]]
+            a["strides"] = [1, (a.get("strides") or [1])[0]]
+            a["dilations"] = [1, (a.get("dilations") or [1])[0]]
+            pads = a.get("pads") or [0, 0]
+            a["pads"] = [0, pads[0], 0, pads[1]]
+        return a
+
     def op_Conv(self, node):
         a = self.attrs(node)
         x, w = node.input[0], self.const(node.input[1])
+        if w is not None and w.ndim == 3:  # Conv1d: [1, C, L] is NCHW with H = 1
+            w = w.reshape(w.shape[0], w.shape[1], 1, w.shape[2])
+            a = self._as2d(a)
         if w is None or w.ndim != 4:
-            self.fail(node, "weights must be a constant 4-D tensor")
+            self.fail(node, "weights must be a constant 3-D or 4-D tensor")
         bias = (
             self.const(node.input[2])
             if len(node.input) > 2 and node.input[2]
@@ -1617,10 +1767,34 @@ class Lowerer:
         consts = [self.const(n) if n else None for n in node.input[1:3]] + [None, None]
         code = self._act_code(node, a, consts)
         if code is None:
-            self.fail(node, "only ReLU, Clip(0, 6) and Clip(0, inf) are supported")
+            return self._clip(node, a, consts)
         if not self._fuse(node, code):
             self.add(Op(hx.ACT, self.tid(node.input[0]), NONE, self.tid(node.output[0]),
                         [hx.FN_RELU if code == hx.ACT_RELU else hx.FN_RELU6], node))
+
+    def _clip(self, node, a, consts):
+        """Clip with arbitrary constant bounds: Max with the lower bound, then Min with the upper."""
+        lo = consts[0] if consts[0] is not None else a.get("min")
+        hi = consts[1] if consts[1] is not None else a.get("max")
+        if (len(node.input) > 1 and node.input[1] and consts[0] is None) or (
+                len(node.input) > 2 and node.input[2] and consts[1] is None):
+            self.fail(node, "Clip bounds must be constant")
+        x, out = node.input[0], node.output[0]
+        if self.const(x) is not None:
+            self.fail(node, "constant inputs are unsupported")
+        bounds = [(hx.BIN_MAX, lo), (hx.BIN_MIN, hi)]
+        bounds = [(op, float(np.asarray(v).reshape(()))) for op, v in bounds if v is not None]
+        bounds = [(op, v) for op, v in bounds if abs(v) != np.inf]
+        if not bounds:
+            self.alias[out] = self.canon(x)
+            return
+        c = self.hwc(out)[2]
+        src = self.tid(x)
+        for i, (opcode, value) in enumerate(bounds):
+            dst = self.tid(out) if i == len(bounds) - 1 else self.temp(out, self.hwc(out))
+            vec = np.full(c, value, np.float32)
+            self.add(Op(hx.BINARY, src, NONE, dst, [opcode, 1, self.pool.emit(_pad32(vec)), 0], node))
+            src = dst
 
     op_Relu = _relu_like
     op_Clip = _relu_like
@@ -1684,6 +1858,37 @@ class Lowerer:
 
     def op_Not(self, node):
         self._emit_act(node, node.input[0], hx.FN_NOT)
+
+    def op_Sign(self, node):
+        self._emit_act(node, node.input[0], hx.FN_SIGN)
+
+    def op_Elu(self, node):
+        self._emit_act(node, node.input[0], hx.FN_ELU, self.attrs(node).get("alpha", 1.0))
+
+    def op_Celu(self, node):
+        self._emit_act(node, node.input[0], hx.FN_CELU, self.attrs(node).get("alpha", 1.0))
+
+    def op_Selu(self, node):
+        a = self.attrs(node)
+        if abs(a.get("alpha", 1.67326319217681884765625) - 1.6732632) > 1e-6 or abs(
+                a.get("gamma", 1.05070102214813232421875) - 1.0507010) > 1e-6:
+            self.fail(node, "only the default Selu alpha and gamma are supported")
+        self._emit_act(node, node.input[0], hx.FN_SELU)
+
+    def op_Softplus(self, node):
+        self._emit_act(node, node.input[0], hx.FN_SOFTPLUS)
+
+    def op_Mish(self, node):
+        self._emit_act(node, node.input[0], hx.FN_MISH)
+
+    def op_Softsign(self, node):
+        self._emit_act(node, node.input[0], hx.FN_SOFTSIGN)
+
+    def op_Sinh(self, node):
+        self._emit_act(node, node.input[0], hx.FN_SINH)
+
+    def op_Cosh(self, node):
+        self._emit_act(node, node.input[0], hx.FN_COSH)
 
     def op_Round(self, node):
         self._emit_act(node, node.input[0], hx.FN_ROUND)
@@ -1924,6 +2129,186 @@ class Lowerer:
     op_RMSNorm = op_RMSNormalization
     op_SimplifiedLayerNormalization = op_RMSNormalization
 
+    # ------------------------------------------------------------ LFM decode: quantized linear, RoPE, state
+    @staticmethod
+    def _text(value):
+        return value.decode() if isinstance(value, bytes) else str(value)
+
+    def _state_tensor(self, node, name, shape):
+        """Register a persistent tensor for attribute `state` = name; returns its state id."""
+        state_id = zlib.crc32(name.encode()) | 0x80000000
+        if state_id in self.state_names:
+            self.fail(node, f"state '{name}' is already used" if self.state_names[state_id] == name
+                      else f"state '{name}' collides with '{self.state_names[state_id]}'")
+        self.state_names[state_id] = name
+        return state_id
+
+    def _token_dims(self, node, name, allow_rank2=True):
+        """(L, C) of a token operand [1, L, C], or [1, C] as one token."""
+        d = self.dims.get(name)
+        if d is None or d[0] != 1 or len(d) not in ((2, 3) if allow_rank2 else (3,)):
+            self.fail(node, f"{name} must be a batch-one [1, L, C] token tensor (got {d})")
+        return (d[1], d[2]) if len(d) == 3 else (1, d[1])
+
+    def op_MatMulNBits(self, node):
+        """com.microsoft MatMulNBits -> HX_LINEAR_Q (GGML Q4_0 / Q8_0 rows, float16 block scales)."""
+        a = self.attrs(node)
+        k, n, bits, block = int(a.get("K", 0)), int(a.get("N", 0)), int(a.get("bits", 4)), int(a.get("block_size", 0))
+        if bits not in (4, 8) or block != 32:
+            self.fail(node, "only bits 4 or 8 with block_size 32 map to Q4_0 / Q8_0")
+        if k % 32 or n % 32 or k <= 0 or n <= 0:
+            self.fail(node, "K and N must be multiples of 32")
+        length, kk = self._token_dims(node, node.input[0])
+        if kk != k:
+            self.fail(node, f"input width {kk} != K {k}")
+        nb, per_block = k // 32, 32 * bits // 8
+        w = self.const(node.input[1])
+        scales = self.const(node.input[2]) if len(node.input) > 2 else None
+        if w is None or scales is None:
+            self.fail(node, "weights and scales must be constants")
+        if w.dtype != np.uint8 or w.size != n * nb * per_block:
+            self.fail(node, f"B must be uint8 with {n * nb * per_block} elements, got {w.dtype} {w.shape}")
+        if scales.size != n * nb:
+            self.fail(node, f"scales must hold {n * nb} values")
+        zp = node.input[3] if len(node.input) > 3 else ""
+        if zp:
+            z = self.const(zp)
+            default = 0x88 if bits == 4 else 128
+            if z is None or z.dtype != np.uint8 or not np.all(z == default):
+                self.fail(node, "zero points must be absent or the default (8 for 4 bits, 128 for 8 bits)")
+        if len(node.input) > 4 and node.input[4]:
+            self.fail(node, "g_idx is unsupported")
+        bias = None
+        if len(node.input) > 5 and node.input[5]:
+            bias = self.const(node.input[5])
+            if bias is None or bias.size != n:
+                self.fail(node, "bias must be a constant of N values")
+        q = w.reshape(n, nb, per_block)
+        if bits == 8:
+            q = (q.astype(np.int16) - 128).astype(np.int8).view(np.uint8)  # offset binary -> int8 bytes
+        blob = np.concatenate(
+            [q, scales.astype(np.float16).reshape(n, nb, 1).view(np.uint8).reshape(n, nb, 2)], axis=2)
+        w_off = self.pool.emit(blob.reshape(-1), dtype="u1")
+        b_off = self.pool.emit(_pad32(np.asarray(bias, np.float32).reshape(-1))) if bias is not None else NONE
+        self.add(Op(hx.LINEAR_Q, self.tid(node.input[0]), NONE, self.tid(node.output[0]),
+                    [0 if bits == 4 else 1, w_off, b_off, k, n, 0], node))
+
+    def op_RotaryEmbedding(self, node):
+        """RotaryEmbedding (opset 23 or com.microsoft) on a token tensor -> HX_ROPE."""
+        a = self.attrs(node)
+        ms = node.domain == "com.microsoft"
+        names = list(node.input) + [""] * 4
+        x, pos_name, cos_name, sin_name = (names[0], names[1], names[2], names[3]) if ms else (
+            names[0], names[3], names[1], names[2])
+        length, width = self._token_dims(node, x, allow_rank2=False)
+        heads = int(a.get("num_heads", 0))
+        if heads <= 0 or width % heads:
+            self.fail(node, "num_heads must divide the hidden width of the token tensor")
+        head_dim = width // heads
+        rot = int(a.get("rotary_embedding_dim", 0)) or head_dim
+        if rot > head_dim or rot % 2 or rot < 2:
+            self.fail(node, f"rotary_embedding_dim {rot} must be even and at most the head size {head_dim}")
+        if float(a.get("scale", 1.0)) != 1.0:
+            self.fail(node, "scale other than 1 is unsupported")
+        cos, sin = self.const(cos_name), self.const(sin_name)
+        if cos is None or sin is None:
+            self.fail(node, "cos and sin caches must be constants")
+        theta = self._rope_theta(node, cos, sin, rot)
+        pos_id, start, per_row = NONE, 0, 0
+        if not pos_name:
+            if length > 1 and not ms:
+                self.fail(node, "position_ids are required for several tokens")
+            per_row = int(length > 1)
+        else:
+            pos = self.const(pos_name)
+            if pos is not None:
+                flat = np.asarray(pos).reshape(-1).astype(np.int64)
+                if flat.size != length or np.any(flat != flat[0] + np.arange(length)) or flat[0] < 0:
+                    self.fail(node, "constant position_ids must be consecutive from a non-negative start")
+                if flat[-1] >= cos.shape[0]:
+                    self.fail(node, "position beyond the cos/sin cache")
+                start, per_row = int(flat[0]), int(length > 1)
+            else:
+                pd = self.dims.get(pos_name)
+                if length != 1 or pd is None or int(np.prod(pd)) != 1 or self.get_dtype(pos_name) != hx.DTYPE_INT32:
+                    self.fail(node, "a runtime position must be one integer [1, 1] for one token")
+                pos_id = self.tid(pos_name)
+        mode = int(a.get("interleaved", 0))
+        self.add(Op(hx.ROPE, self.tid(x), pos_id, self.tid(node.output[0]),
+                    [head_dim, heads, start, mode, hx.f32_bits(theta), 0 if rot == head_dim else rot, per_row],
+                    node))
+
+    def _rope_theta(self, node, cos, sin, rot):
+        try:
+            return hx.rope_theta(cos, sin, rot)
+        except ValueError as error:
+            self.fail(node, str(error))
+
+    def op_ShortConv(self, node):
+        """hexecutor::ShortConv: causal depthwise convolution over a persistent ring of k - 1 tokens."""
+        a = self.attrs(node)
+        name = self._text(a.get("state", b""))
+        if not name:
+            self.fail(node, "attribute `state` (a name) is required")
+        length, c = self._token_dims(node, node.input[0])
+        if length != 1:
+            self.fail(node, "one token per run")
+        w = self.const(node.input[1]) if len(node.input) > 1 else None
+        if w is None or w.ndim not in (2, 3) or w.shape[0] != c or (w.ndim == 3 and w.shape[1] != 1):
+            self.fail(node, "weight must be a constant [C, 1, k] or [C, k]")
+        wck = w.reshape(c, -1).astype(np.float32)
+        taps = wck.shape[1]
+        if not 2 <= taps <= 15:
+            self.fail(node, "kernel size must be 2..15")
+        bias = None
+        if len(node.input) > 2 and node.input[2]:
+            bias = self.const(node.input[2])
+            if bias is None or bias.size != c:
+                self.fail(node, "bias must be a constant of C values")
+        gate = node.input[3] if len(node.input) > 3 and node.input[3] else None
+        if gate and self.dims.get(gate) != self.dims.get(node.input[0]):
+            self.fail(node, "gate must have the shape of x")
+        act = {"none": 0, "relu": 1, "silu": 3}.get(self._text(a.get("activation", b"none")))
+        if act is None:
+            self.fail(node, "activation must be none, relu or silu")
+        stride = (c + 31) & ~31
+        wk = np.zeros((taps, stride), np.float32)
+        wk[:, :c] = wck.T
+        state_id = self._state_tensor(node, name, None)
+        ring = self.temp(f"state:{name}", [taps - 1, 1, c], hx.DTYPE_FLOAT32)
+        self.persistent[ring] = state_id
+        self.add(Op(hx.SHORTCONV, self.tid(node.input[0]), ring, self.tid(node.output[0]),
+                    [taps, self.pool.emit(wk), self.pool.emit(_pad32(np.asarray(bias, np.float32).reshape(-1)))
+                     if bias is not None else NONE, act],
+                    node, z=self.tid(gate) if gate else NONE))
+
+    def op_KVCacheWrite(self, node):
+        """hexecutor::KVCacheWrite: append token rows to a persistent cache; the output is the cache."""
+        a = self.attrs(node)
+        name = self._text(a.get("state", b""))
+        if not name:
+            self.fail(node, "attribute `state` (a name) is required")
+        length, c = self._token_dims(node, node.input[0], allow_rank2=False)
+        max_len = int(a.get("max_len", 0))
+        out = node.output[0]
+        if self.dims.get(out) != [1, max_len, c] or length > max_len:
+            self.fail(node, f"max_len {max_len} must hold the {length} written rows and match the output")
+        pos_id, static = NONE, int(a.get("position", 0))
+        if len(node.input) > 1 and node.input[1]:
+            pos = self.const(node.input[1])
+            if pos is not None:
+                static = int(np.asarray(pos).reshape(-1)[0])
+            else:
+                pd = self.dims.get(node.input[1])
+                if pd is None or int(np.prod(pd)) != 1 or self.get_dtype(node.input[1]) != hx.DTYPE_INT32:
+                    self.fail(node, "a runtime position must be one integer")
+                pos_id = self.tid(node.input[1])
+        if pos_id == NONE and (static < 0 or static + length > max_len):
+            self.fail(node, "constant position outside the cache")
+        state_id = self._state_tensor(node, name, None)
+        self.persistent[self.tid(out)] = state_id
+        self.add(Op(hx.KV_WRITE, self.tid(node.input[0]), pos_id, self.tid(out), [static], node))
+
     def op_GroupNormalization(self, node):
         """GroupNormalization over a [1, C, H, W] input. Scale and bias have one value per group
         (opset 18) or per channel (opset 21); group values are repeated over their channels."""
@@ -1965,13 +2350,15 @@ class Lowerer:
     # ------------------------------------------------------------ pooling
     def _pool(self, node, kind):
         a = self.attrs(node)
-        if a.get("ceil_mode", 0):
-            self.fail(node, "ceil mode is unsupported")
+        ceil = bool(a.get("ceil_mode", 0))
+        if ceil and kind != hx.MAXPOOL:
+            self.fail(node, "ceil mode is supported for MaxPool only")
         if len(node.output) > 1 and any(node.output[1:]):
             self.fail(node, "pool indices are unsupported")
+        a = self._as2d(a)
         k = list(a["kernel_shape"])
         dil = self.dilation(node, a)
-        s, pt, pl = self.spatial(node, a, node.input[0], node.output[0], k, dilated=True)
+        s, pt, pl = self.spatial(node, a, node.input[0], node.output[0], k, dilated=True, ceil=ceil)
         p = [k[0], k[1], s[0], s[1], pt, pl]
         if kind == hx.AVGPOOL:
             p.append(int(a.get("count_include_pad", 0)))
@@ -2167,10 +2554,15 @@ class Lowerer:
         if dims_x is not None and len(dims_x) in (5, 6) and dims_x[0] == 1:
             if out not in self.dims and len(perm) == len(dims_x):
                 self.dims[out] = [dims_x[p] for p in perm]
-            src, dst = self.hwc(x), self.hwc(out)
-            if src == dst or (src[0] * src[1] == dst[0] * dst[1] and src[2] == dst[2]):
-                self.alias[out] = cx
-                return True
+            # An alias is exact only when the permutation keeps the order of every axis longer
+            # than one: the data then does not move.
+            moved = [p for p in perm if dims_x[p] != 1]
+            if moved != sorted(moved):
+                self.fail(node, f"a rank-{len(dims_x)} transpose with perm {perm} reorders "
+                                "data and is unsupported (a reshape / transpose / reshape "
+                                "channel shuffle on NCHW is recognised as a whole)")
+            self.alias[out] = cx
+            return True
         if dims_x is not None and len(dims_x) == 3:
             if perm == [1, 0, 2]:
                 self.fail(node, "sequence-first [L, 1, K] tensors are unsupported (torch's "
@@ -2327,8 +2719,8 @@ class Lowerer:
             self.fail(node, "starts and ends must have the same length")
         axes = const_input(3, list(range(len(starts))))
         steps = const_input(4, [1] * len(starts))
-        if len(axes) != len(starts) or len(steps) != len(starts) or any(s != 1 for s in steps):
-            self.fail(node, "only unit steps are supported")
+        if len(axes) != len(starts) or len(steps) != len(starts) or any(s < 1 for s in steps):
+            self.fail(node, "steps must be positive")
         if rank == 4:
             hwc_axis = {1: 2, 2: 0, 3: 1}
         elif rank == 3:
@@ -2338,7 +2730,8 @@ class Lowerer:
 
         sizes = list(self.hwc(data))
         offsets, out_shape, seen = [0, 0, 0], list(sizes), set()
-        for axis, start, end in zip(axes, starts, ends):
+        stride = [1, 1, 1]
+        for axis, start, end, step in zip(axes, starts, ends, steps):
             axis = axis % rank
             if axis in seen:
                 self.fail(node, "an axis appears twice")
@@ -2353,12 +2746,42 @@ class Lowerer:
             if hi <= lo:
                 self.fail(node, "empty slices are unsupported")
             offsets[hwc_axis[axis]], out_shape[hwc_axis[axis]] = lo, hi - lo
-        if out_shape != list(self.hwc(node.output[0])):
+            stride[hwc_axis[axis]] = step
+        final = [-(-n // st) for n, st in zip(out_shape, stride)]
+        if final != list(self.hwc(node.output[0])):
             self.fail(node, "output shape disagrees with the slice")
+        out = node.output[0]
+        strided = stride != [1, 1, 1]
         if offsets == [0, 0, 0] and out_shape == sizes:
-            self.alias[node.output[0]] = self.canon(data)
-            return
-        self.add(Op(hx.SLICE, self.tid(data), NONE, self.tid(node.output[0]), offsets, node))
+            if not strided:
+                self.alias[out] = self.canon(data)
+                return
+            cur_id = self.tid(data)
+        else:
+            cur_id = self.temp(out, out_shape) if strided else self.tid(out)
+            self.add(Op(hx.SLICE, self.tid(data), NONE, cur_id, offsets, node))
+            if not strided:
+                return
+        # Strides: a 1x1 depthwise convolution with stride (sh, sw) subsamples rows/columns; a
+        # 1x1 convolution with a 0/1 selection matrix subsamples channels. Both are exact.
+        c_in = out_shape[2]
+        if stride[0] > 1 or stride[1] > 1:
+            last = stride[2] == 1
+            mid = self.tid(out) if last else self.temp(out, [final[0], final[1], c_in])
+            op = Op(hx.DEPTHWISE, cur_id, NONE, mid, [1, 1, stride[0], stride[1], 0, 0], node)
+            op.weights, op.bias = np.ones((c_in, 1, 1, 1), np.float32), np.zeros(c_in, np.float32)
+            op.foldable = False
+            self.add(op)
+            cur_id = mid
+            if last:
+                return
+        sel = np.zeros((final[2], c_in, 1, 1), np.float32)
+        for j in range(final[2]):
+            sel[j, j * stride[2], 0, 0] = 1.0
+        op = Op(hx.CONV, cur_id, NONE, self.tid(out), [1, 1, 1, 1, 0, 0], node)
+        op.weights, op.bias = sel, np.zeros(final[2], np.float32)
+        op.foldable = False
+        self.add(op)
 
     def op_Split(self, node):
         """Split along the channel axis: one SLICE per output."""
@@ -3018,6 +3441,7 @@ class Lowerer:
             ops.extend(self._split_wide(op) if op.kind == hx.CONV and op.weights is not None
                        else [op])
         self.ops = ops
+        packed_weights = []  # (op, packed FP16 weights, tiles), emitted after every FP32 weight
         for op in self.ops:
             if op.weights is None:
                 continue
@@ -3033,7 +3457,13 @@ class Lowerer:
             if op.kind == hx.CONV and not getattr(op, "no_hmx", False):
                 packed, tiles = hx.pack_hmx_weights(wk)
                 if hx.hmx_fits(tiles, ostride):
-                    op.p[9], op.p[10] = self.pool.emit(packed, "<f2"), tiles
+                    packed_weights.append((op, packed, tiles))
+        # The blocked FP16 plan needs every packed weight; when FP32 plus packed weights would not
+        # fit the pool, keep the exact FP32 path (the plan blockers report it) rather than fail.
+        extra = sum(np.asarray(packed).size * 2 + 128 for _, packed, _ in packed_weights)
+        if len(self.pool.data) + extra <= CONSTANT_POOL_LIMIT:
+            for op, packed, tiles in packed_weights:
+                op.p[9], op.p[10] = self.pool.emit(packed, "<f2"), tiles
 
     def _compact_conv(self, n, name):
         w = self.init.get(n.input[1]) if n.op_type == "Conv" and len(n.input) > 1 else None
@@ -3091,7 +3521,7 @@ class Lowerer:
         if len(ops) > OPERATION_LIMIT:
             raise ValueError(f"{len(ops)} operations exceed the runtime limit of {OPERATION_LIMIT}; "
                              "fewer heads or a shorter sequence")
-        blockers = fp16_blockers(ops, input_ids, out_ids, hwc, stride)
+        blockers = fp16_blockers(ops, input_ids, out_ids, hwc, stride, self.persistent, self.dtypes)
         if len(self.pool.data) > CONSTANT_POOL_LIMIT:
             raise ValueError(
                 f"constant pool is {len(self.pool.data)} bytes (FP32 weights and packed FP16 "
@@ -3107,13 +3537,15 @@ class Lowerer:
                     "input_tensors": self.inputs,
                     "output_tensors": out_parts,
                     "fp16_plan": {"eligible": not blockers, "blockers": blockers},
+                    "state_names": {str(k): v for k, v in sorted(self.state_names.items())},
                 },
             },
             dtypes=self.dtypes,
+            persistent=self.persistent,
         )
 
 
-def fp16_blockers(ops, inputs, outputs, hwc, stride):
+def fp16_blockers(ops, inputs, outputs, hwc, stride, persistent=(), dtypes=None):
     """Reasons the DSP's blocked FP16 plan would reject this graph.
 
     Mirrors `supported()` in hexecutor/native/tensor/fp16.c. A graph with blockers still
@@ -3127,6 +3559,14 @@ def fp16_blockers(ops, inputs, outputs, hwc, stride):
             reasons.append(f"op {n}: op kind {kind} is not supported in blocked FP16 plan")
         if stride(x) == 3 and kind != hx.CONV:
             reasons.append(f"op {n}: compact RGB input feeds a non-convolution")
+        if kind not in (hx.SHORTCONV, hx.ROPE, hx.KV_WRITE):
+            refs = [op[1], op[2]] + ([op[3]] if kind in (hx.SDPA, hx.WHERE, hx.SCATTER_ND) else [])
+            if kind == hx.SDPA and op[5] != NONE:
+                refs.append(op[5])
+            if any(r in persistent for r in refs if r != NONE):
+                reasons.append(f"op {n}: reads persistent state (float32 rows), which the blocked FP16 plan cannot hold")
+        if kind in (hx.ROPE, hx.KV_WRITE) and op[2] != NONE and (dtypes or {}).get(op[2], 0) != hx.DTYPE_FLOAT32:
+            reasons.append(f"op {n}: integer position operand")
         if kind == hx.CONV:
             if not p[10]:
                 reasons.append(f"op {n}: convolution has no HMX packing (weights too large)")

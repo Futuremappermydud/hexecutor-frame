@@ -161,6 +161,18 @@ class LowerOnnxTests(unittest.TestCase):
                                   for i in range(len(manifest["output_parts"]))])
         np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
 
+    def test_narrow_int64_clamps_large_constants(self):
+        from hexecutor.offline.lower_onnx_float import _narrow_int64
+        int64_arr = np.array([-9223372036854775808, 0, 9223372036854775807], dtype=np.int64)
+        narrowed = _narrow_int64(int64_arr, "slice_ends")
+        self.assertEqual(narrowed.dtype, np.int32)
+        np.testing.assert_array_equal(narrowed, np.array([-2147483648, 0, 2147483647], dtype=np.int32))
+
+    def test_narrow_int64_rejects_non_sentinel_overflow(self):
+        from hexecutor.offline.lower_onnx_float import _narrow_int64
+        with self.assertRaises(ValueError):
+            _narrow_int64(np.array([5_000_000_000], dtype=np.int64), "vocab_id")
+
 
 if __name__ == "__main__":
     unittest.main()

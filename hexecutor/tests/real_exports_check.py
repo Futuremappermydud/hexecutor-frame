@@ -166,6 +166,8 @@ def _models():
 # ------------------------------------------------------------------ comparison
 def _hwc(o):
     """An ONNX batch-one output as the runner's layout: HWC for rank 4, [C] for rank 2."""
+    if o.ndim == 3:  # [1, C, L] is NCHW with H = 1: HWC is [L, C]
+        return o[0].transpose(1, 0)
     return o[0].transpose(1, 2, 0) if o.ndim == 4 else o[0]
 
 
@@ -230,7 +232,7 @@ def check(name, build, fold, work):
     plan = manifest["fp16_plan"]
     row["hxfg"] = len(_hxfg_op_kinds(d / "g"))
     row["fp16"] = "eligible" if plan["eligible"] else f"no ({len(plan['blockers'])} blockers)"
-    data = x[0].transpose(1, 2, 0) if x.ndim == 4 else x[0]
+    data = _hwc(x)
     (d / "in.f32").write_bytes(np.ascontiguousarray(data, np.float32).tobytes())
     try:
         subprocess.run([str(RUNNER), str(d / "g.hxfg"), str(d / "g.bin"), str(d / "in.f32"),
