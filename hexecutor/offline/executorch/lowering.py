@@ -2660,6 +2660,19 @@ def _sdpa_token_views(ep):
     return alias, skip, fast
 
 
+# Factor applied to attention scores before they are stored (see _emit_sdpa). A power of two in (0, 1];
+# 1.0 keeps the plain MATMUL/SOFTMAX pair. Set with set_attention_score_scale before lowering.
+ATTENTION_SCORE_SCALE = 1.0
+
+
+def set_attention_score_scale(scale):
+    global ATTENTION_SCORE_SCALE
+    mantissa, _ = np.frexp(scale)
+    if not 0 < scale <= 1 or mantissa != 0.5:
+        raise ValueError("attention score scale must be a power of two in (0, 1]")
+    ATTENTION_SCORE_SCALE = float(scale)
+
+
 def _emit_sdpa(b, node):
     q, k, v = node.args[0], node.args[1], node.args[2]
     mask = node.args[3] if len(node.args) > 3 and node.args[3] is not None else None
@@ -2694,8 +2707,14 @@ def _emit_sdpa(b, node):
         probs = b.temp(node.name + "_probs", (lq, lk))
         co = b.tid(out_node) if token else b.temp(node.name + "_o", (lq, dv))
         sc = float(scale) if scale is not None else 1.0 / float(np.sqrt(dk))
-        b.emit_to(hx.MATMUL, cq, ck, scores, [1, hx.f32_bits(sc), 1, 0])
-        b.emit_to(hx.SOFTMAX, scores, NONE, probs, [])
+        shrink = ATTENTION_SCORE_SCALE
+        # The scores tensor is FP16 on the blocked plan (max 65504); Depth Pro 2's first block reaches 2e6.
+        # Store Q.K^T * shrink (a power of two, so exact) and let the softmax multiply by 1/shrink in float.
+        b.emit_to(hx.MATMUL, cq, ck, scores, [1, hx.f32_bits(sc * shrink), 1, 0])
+        if shrink == 1.0:
+            b.emit_to(hx.SOFTMAX, scores, NONE, probs, [])
+        else:
+            b.emit_to(hx.ATTN_SOFTMAX, scores, NONE, probs, [2, 0, 0, hx.f32_bits(1.0 / shrink)])
         b.emit_to(hx.MATMUL, probs, cv, co, [0, 0, 1, 0])
         if not token:
             b.emit_to(hx.RESHAPE, co, NONE, to, [0])

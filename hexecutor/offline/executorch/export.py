@@ -40,7 +40,7 @@ def _ensure_flatc():
 _ensure_flatc()
 
 
-def export_program(model, example_inputs):
+def export_program(model, example_inputs, partitioner=None):
     """torch.export -> edge (with hexecutor partitioning) -> ExecuTorch program manager."""
     model = model.eval()
     if not isinstance(example_inputs, tuple):
@@ -64,7 +64,7 @@ def export_program(model, example_inputs):
         exported._graph_module = torch.fx.GraphModule(exported.graph_module, g)
     edge = to_edge_transform_and_lower(
         exported,
-        partitioner=[HexecutorPartitioner()],
+        partitioner=[partitioner or HexecutorPartitioner()],
         compile_config=EdgeCompileConfig(),
     )
     return edge.to_executorch(config=ExecutorchBackendConfig())

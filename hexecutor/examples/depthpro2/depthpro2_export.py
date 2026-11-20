@@ -4,8 +4,8 @@
 Run from the repository root with the ExecuTorch venv (plus timm >= 1.0.27):
 
     hexecutor/.work/executorch-venv/bin/python hexecutor/examples/depthpro2/depthpro2_export.py \
-        --src ML_DEPTH_PRO_2_CHECKOUT --weights DepthPro2-S/model.safetensors --size 256 \
-        --out hexecutor/.work/depthpro2/dp2s_256.pte [--hxfg-dir DIR] [--check]
+        --src ML_DEPTH_PRO_2_CHECKOUT --weights DepthPro2-S/model.safetensors --size 128 \
+        --out hexecutor/.work/depthpro2/dp2s_128.pte [--hxfg-dir DIR] [--check]
 
 The weights (apple/DepthPro2-S, Apple ML Research licence, research use only) are read from a
 local path and never written into the repository. Only `network/encoder.py` and
@@ -18,8 +18,8 @@ Export-time rewrites, each checked against the upstream modules by `--check`:
   token concat is between two runtime tensors;
 - RoPE is folded into the projections: rotate_half(W x) = (W^T M)^T x, so each head computes
   q = (W_q y) * cos + (W_q M y) * sin with full-size constant cos/sin (1/0 on prefix rows);
-- each block runs its 6 heads as single-head SDPAs (the HVX matmul path) and sums the per-head
-  output projections instead of concatenating heads;
+- each block runs its 6 heads as single-head SDPAs, concatenates them, and applies one
+  output projection;
 - cross-frame blocks (5, 7, 9, 11) keep their incoming class and register tokens, as upstream's
   cross_frame_attention does;
 - the MLP is split in two along its hidden width, and convolutions over the per-op HMX budget
@@ -28,13 +28,14 @@ Export-time rewrites, each checked against the upstream modules by `--check`:
 Inputs: patch tokens [1, N, 768] of raw RGB in [0, 1] ((c, ky, kx) order per 16 x 16 patch, row-major
 patches; the patch embedding is a linear with the ImageNet normalisation folded in, since HXFG
 convolutions stop at 15 x 15 kernels and stride 8), and prefix [1, 5, 384]. Output: inverse depth
-[1, 1, S, S], focal-normalised; metric depth = f_px / (S * inv). For the Frame's Arcturus V3
-passthrough cameras (2464 x 2464, fx ~ 1477 px) a centre crop resized to S has
-f_px = 1477 * S / crop.
+[1, 1, S, S], focal-normalised. Metric depth = f_px / (S * inv), using the focal length
+of the model input in pixels. With --arcturus-calibration and --camera, --image is sampled
+onto a centered square pinhole and --hxfg-dir also receives its intrinsics in pinhole.json.
 """
 
 import argparse
 import importlib.util
+import json
 import struct
 import subprocess
 import sys
@@ -56,6 +57,52 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 S_CONFIG = dict(backbone_preset="vit_small_patch16_dinov3", reassembled_blocks=(2, 5, 8, 11),
                 cross_frame_blocks=(5, 7, 9, 11), dims_reassemble=(48, 96, 192, 384), dim_decoder=64)
+
+
+def arcturus_pinhole(image, calibration, side, size):
+    """Sample an unrotated Arcturus V3 color capture onto an upright square pinhole."""
+    cameras = json.loads(calibration.read_text())["cameras"]
+    source = f"passthrough_{side}"
+    matches = [c for c in cameras if c["sourceCamera"] == source]
+    if len(matches) != 1:
+        raise ValueError(f"expected one calibration for {source}")
+    camera = matches[0]
+    if (camera["hardwareIdentifier"], camera["cameraModel"], camera["preRotateClockwiseByDeg"]) != (
+        "Arcturus Camera V3", "kb", 0
+    ):
+        raise ValueError(f"{source} must use unrotated Arcturus V3 Kannala–Brandt calibration")
+    width, height = camera["width"], camera["height"]
+    if image.size != (width, height):
+        raise ValueError(f"{source} capture must be {width} × {height}")
+
+    intrinsics = camera["intrinsics"]
+    focal_px = intrinsics["fx"] * size / width
+    center = (size - 1) / 2
+    axis = (np.arange(size, dtype=np.float64) - center) / focal_px
+    # The right sensor is mounted upside down. The calibration still uses its raw pixel axes.
+    if side == "right":
+        axis = -axis
+    x, y = np.meshgrid(axis, axis)
+    radius = np.hypot(x, y)
+    theta = np.arctan(radius)
+    t2 = theta * theta
+    k1, k2, k3, k4 = (intrinsics[f"k{i}"] for i in range(1, 5))
+    distorted = theta * (1 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4))))
+    scale = np.divide(distorted, radius, out=np.ones_like(radius), where=radius != 0)
+    u = intrinsics["cx"] + intrinsics["fx"] * x * scale
+    v = intrinsics["cy"] + intrinsics["fy"] * y * scale
+    if u.min() < 0 or u.max() >= width - 1 or v.min() < 0 or v.max() >= height - 1:
+        raise ValueError(f"pinhole view extends beyond the {source} capture")
+
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    col, row = u.astype(np.intp), v.astype(np.intp)
+    dx, dy = (u - col)[..., None], (v - row)[..., None]
+    top = (1 - dx) * rgb[row, col] + dx * rgb[row, col + 1]
+    bottom = (1 - dx) * rgb[row + 1, col] + dx * rgb[row + 1, col + 1]
+    sampled = (1 - dy) * top + dy * bottom
+    pinhole = {"source_camera": source, "focal_px": focal_px, "cx": center, "cy": center,
+               "width": size, "height": size}
+    return sampled.astype(np.float32) / 255, pinhole
 
 
 def load_module(path, name):
@@ -373,6 +420,48 @@ def segment_partitioner(model):
     return SegmentPartitioner()
 
 
+def write_strips(args, model, payloads, x, prefix, want):
+    """Per-delegate HXFG graphs for a strip export: body/ (inputs x, p; output h0) and strip<k>/ (input h0).
+    Reference files hold the PyTorch tensors in HWC order; want.f32 is the assembled inverse depth."""
+    assert len(payloads) == args.strips + 1, f"{len(payloads)} delegates for {args.strips} strips"
+    with torch.no_grad():
+        h, w = model.grid
+        # recompute the body output h0 exactly as forward does
+        feats = []
+        tok = torch.cat([prefix, model.patch_embed(x)], dim=1)
+        for i, blk in enumerate(model.blocks):
+            tok = blk(tok)
+            if i in model.taps:
+                feats.append(tok[:, model.npt:].transpose(1, 2).reshape(1, tok.shape[2], h, w))
+        decoded = model.decoder([layer(f) for layer, f in zip(model.reassemble, feats)])
+        h0 = model.head[0](decoded)
+        strips = [s(h0) for s in model.tail]
+
+    def hwc(t):
+        return np.ascontiguousarray(t[0].permute(1, 2, 0).numpy()).tobytes()
+
+    out = args.hxfg_dir
+    out.mkdir(parents=True, exist_ok=True)
+    by_inputs = {}
+    for payload in payloads:
+        parsed = blob.unpack(payload)
+        by_inputs.setdefault(len(parsed.inputs), []).append(parsed)
+    body = by_inputs[2][0]
+    parts = [("body", body, [h0])] + [(f"strip{k}", g, [strips[k]]) for k, g in enumerate(by_inputs[1])]
+    for name, parsed, refs in parts:
+        d = out / name
+        d.mkdir(exist_ok=True)
+        n_tensors, n_ops = struct.unpack_from("<II", parsed.image, 12)
+        print(f"{name}: ops {n_ops}, tensors {n_tensors}, constants {len(parsed.constants) / 2**20:.2f} MiB")
+        (d / "g.hxfg").write_bytes(parsed.image)
+        (d / "g.bin").write_bytes(parsed.constants)
+        for i, r in enumerate(refs):
+            (d / f"ref_{i}.f32").write_bytes(hwc(r))
+    (out / "x.f32").write_bytes(np.ascontiguousarray(x[0].numpy()).tobytes())
+    (out / "p.f32").write_bytes(np.ascontiguousarray(prefix[0].numpy()).tobytes())
+    (out / "want.f32").write_bytes(np.ascontiguousarray(want[0, 0].numpy()).tobytes())
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--src", type=Path, required=True, help="ml-depth-pro-2 checkout")
@@ -381,17 +470,40 @@ def main():
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--hxfg-dir", type=Path)
     ap.add_argument("--image", type=Path, help="optional RGB image for the example input")
+    ap.add_argument("--arcturus-calibration", type=Path, help="sensor-rig-calibration.json for a raw passthrough capture")
+    ap.add_argument("--camera", choices=("left", "right"), help="camera for the unrotated RGB capture")
+    ap.add_argument("--strips", type=int, default=0,
+                    help="split the head tail into this many row strips, each its own delegate/graph "
+                         "(needed above ~224 px, where one graph exceeds the 16 MiB HXFG cap); "
+                         "writes body/ and strip<k>/ under --hxfg-dir")
+    ap.add_argument("--score-scale", type=float, default=1 / 1024,
+                    help="power-of-two factor stored on attention scores so FP16 does not overflow "
+                         "(block 0 reaches 2e6); the softmax multiplies it back in float. 1 disables")
     ap.add_argument("--check", action="store_true")
     args = ap.parse_args()
+    from hexecutor.offline.executorch import lowering
+    lowering.set_attention_score_scale(args.score_scale)
     assert args.size % 32 == 0
+    if (args.arcturus_calibration and not (args.camera and args.image)) or (
+        args.camera and not args.arcturus_calibration
+    ):
+        ap.error("--arcturus-calibration, --camera and --image are required together for a passthrough capture")
 
     torch.manual_seed(0)
     ref = Reference(args.src, args.weights)
-    model = DepthPro2Frame(ref, args.size).eval()
+    model = DepthPro2Frame(ref, args.size, args.strips).eval()
+    pinhole = None
     if args.image:
         from PIL import Image
-        img = Image.open(args.image).convert("RGB").resize((args.size, args.size), Image.BILINEAR)
-        rgb = torch.from_numpy(np.asarray(img).copy()).permute(2, 0, 1).float()[None] / 255
+
+        with Image.open(args.image) as img:
+            if args.arcturus_calibration:
+                pixels, pinhole = arcturus_pinhole(img, args.arcturus_calibration, args.camera, args.size)
+                print(f"{pinhole['source_camera']} pinhole focal length: {pinhole['focal_px']:.6f} px")
+            else:
+                img = img.convert("RGB").resize((args.size, args.size), Image.BILINEAR)
+                pixels = np.asarray(img, dtype=np.float32) / 255
+        rgb = torch.from_numpy(pixels).permute(2, 0, 1)[None]
     else:
         rgb = torch.rand(1, 3, args.size, args.size)
     mean = torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
@@ -400,12 +512,15 @@ def main():
     prefix = model.prefix_tokens.clone()
     with torch.no_grad():
         want = model(x, prefix)
+        if args.strips:
+            want = torch.cat(want, dim=2)  # assembled rows, for comparison with the stock model
         if args.check:
             stock = ref((rgb - mean) / std)
             rel = ((want - stock).abs().max() / stock.abs().max()).item()
             print(f"rewrite vs upstream: max abs {(want - stock).abs().max().item():.3e} rel {rel:.3e}")
 
-    program = export_program(model, (x, prefix))
+    program = export_program(model, (x, prefix),
+                             segment_partitioner(model) if args.strips else None)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_bytes(program.buffer)
     plan = program.executorch_program.execution_plan[0]
@@ -413,6 +528,9 @@ def main():
                 for d in plan.delegates]
     ops = [op.name for op in plan.operators]
     print(f"wrote {args.out} ({len(program.buffer)} bytes); delegates {len(payloads)}; CPU operators {ops}")
+    if args.strips:
+        write_strips(args, model, payloads, x, prefix, want)
+        return
     parsed = blob.unpack(payloads[0])
     n_tensors, n_ops = struct.unpack_from("<II", parsed.image, 12)
     print(f"HXFG ops {n_ops}, tensors {n_tensors}, constants {len(parsed.constants) / 2**20:.2f} MiB")
@@ -427,6 +545,8 @@ def main():
 
     if args.hxfg_dir:
         files(args.hxfg_dir)
+        if pinhole is not None:
+            (args.hxfg_dir / "pinhole.json").write_text(json.dumps(pinhole, indent=2) + "\n")
     runner = ROOT / "build/bin/hexecutor_tensor_run"
     if args.check and runner.exists() and len(payloads) == 1:
         with tempfile.TemporaryDirectory() as root:

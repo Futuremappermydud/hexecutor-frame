@@ -1337,6 +1337,26 @@ int main() {
                 check(std::abs(row_sum - 1.0f) < 1e-4f);
             }
 
+        // Temperature p[3]: scores stored at 1/1024 and restored by the softmax equal the unscaled softmax
+        {
+            auto plain = op(HX_ATTN_SOFTMAX);
+            plain.p[0] = 2;
+            Fixture fp({shape(H, Lq, Lk), shape(H, Lq, Lk)}, plain, {0});
+            fp.input(0, logits);
+            auto want = fp.run();
+            auto hot = op(HX_ATTN_SOFTMAX);
+            hot.p[0] = 2;
+            const float t = 1024.0f;
+            std::memcpy(&hot.p[3], &t, sizeof t);
+            std::vector<float> shrunk(logits);
+            for (float &v : shrunk) v /= t;
+            Fixture ft({shape(H, Lq, Lk), shape(H, Lq, Lk)}, hot, {0});
+            ft.input(0, shrunk);
+            auto got_t = ft.run();
+            check(got_t.size() == want.size());
+            for (size_t i = 0; i < want.size(); i++) check(std::abs(got_t[i] - want[i]) < 1e-6f);
+        }
+
         // Additive mask with HX_ATTN_SOFTMAX
         auto asm_op = op(HX_ATTN_SOFTMAX, 2, 1);
         asm_op.p[0] = 2; // channel axis

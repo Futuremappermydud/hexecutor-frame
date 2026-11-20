@@ -316,6 +316,25 @@ class ExportTests(unittest.TestCase):
         np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
 
     @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
+    def test_attention_score_scale_matches_torch_on_cpu_reference(self):
+        torch.manual_seed(5)
+        model = SpatialAttention().eval()
+        x = torch.randn(1, 3, 4, 4)
+        with torch.no_grad():
+            want = model(x).numpy()
+        lowering.set_attention_score_scale(1 / 1024)
+        try:
+            parsed = blob.unpack(delegate_payloads(export_program(model, (x,)))[0][1])
+        finally:
+            lowering.set_attention_score_scale(1.0)
+        soft = [p for k, p in op_params(parsed) if k == lowering.hx.ATTN_SOFTMAX]
+        self.assertEqual([p[:4] for p in soft], [[2, 0, 0, lowering.hx.f32_bits(1024.0)]])
+        got = run_reference(parsed, x).reshape(4, 4, 32).transpose(2, 0, 1)[None]
+        np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
+        with self.assertRaises(ValueError):
+            lowering.set_attention_score_scale(0.3)
+
+    @unittest.skipUnless(RUNNER.exists(), "portable reference runner not built")
     def test_conv_softmax_matches_torch_on_cpu_reference(self):
         torch.manual_seed(3)
         model = ConvSoftmax().eval()

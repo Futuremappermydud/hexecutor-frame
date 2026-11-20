@@ -347,7 +347,21 @@ int hx_fp16_plan(const HxGraph *g, struct HxFp16Plan *plan, uint32_t *tables, ui
             if (o->kind != HX_CONV || plan->weights[i])
                 continue;
             uint32_t n = o->p[10] * (g->tensors[o->out].stride / 32u) * 2048u;
-            if (n > best_bytes && next + n <= limit) {
+            /* Keep room for the streamed copy of the largest convolution left non-resident. */
+            uint32_t reserve = HX_FP16_MIN_WORKSPACE;
+            for (uint32_t j = 0; j < ops; j++) {
+                const HxOp *q = &g->ops[j];
+                if (q->kind != HX_CONV || j == i || plan->weights[j])
+                    continue;
+                const uint32_t w = q->p[10] * (g->tensors[q->out].stride / 32u) * 2048u + 4096u +
+                                   (packed_conv(q, &g->tensors[q->x], &g->tensors[q->out])
+                                        ? q->p[10] * 2048u
+                                        : 0u);
+                if (w > reserve)
+                    reserve = w;
+            }
+            if (n > best_bytes && next + n <= limit &&
+                (limit + HX_FP16_MIN_WORKSPACE) - (next + n) >= reserve) {
                 best = i;
                 best_bytes = n;
             }
@@ -1355,6 +1369,25 @@ static inline HVX_Vector vf_sigmoid(HVX_Vector x) {
     const HVX_Vector z = Q6_Vsf_vmax_VsfVsf(splat(-30.0f), Q6_Vsf_vmin_VsfVsf(splat(30.0f), x));
     return vf_recip(vf_add(splat(1.0f), vf_exp(Q6_V_vxor_VV(z, Q6_V_vsplat_R(0x80000000)))));
 }
+/* erf by the scalar form's Abramowitz-Stegun 7.1.26 (|error| < 1.5e-7), in vector lanes. */
+static inline HVX_Vector vf_erf(HVX_Vector x) {
+    const HVX_Vector sign = Q6_V_vand_VV(x, Q6_V_vsplat_R(0x80000000u));
+    const HVX_Vector a = Q6_V_vand_VV(x, Q6_V_vsplat_R(0x7fffffffu));
+    const HVX_Vector t = vf_recip(vf_add(splat(1.0f), vf_mul(splat(0.3275911f), a)));
+    HVX_Vector poly = splat(1.061405429f);
+    poly = vf_add(vf_mul(poly, t), splat(-1.453152027f));
+    poly = vf_add(vf_mul(poly, t), splat(1.421413741f));
+    poly = vf_add(vf_mul(poly, t), splat(-0.284496736f));
+    poly = vf_add(vf_mul(poly, t), splat(0.254829592f));
+    poly = vf_mul(poly, t);
+    const HVX_Vector z = Q6_Vsf_vmax_VsfVsf(splat(-30.0f), Q6_V_vxor_VV(vf_mul(a, a), Q6_V_vsplat_R(0x80000000u)));
+    const HVX_Vector r = vf_sub(splat(1.0f), vf_mul(poly, vf_exp(z)));
+    return Q6_V_vor_VV(r, sign);
+}
+static inline HVX_Vector vf_gelu(HVX_Vector x) {
+    return vf_mul(vf_mul(splat(0.5f), x),
+                  vf_add(splat(1.0f), vf_erf(vf_mul(x, splat(0.70710678f)))));
+}
 /* Pair loop shared by the elementwise vector forms: for each 32-channel block and each of this
  * part's pixel pairs, fn(even floats, odd floats, ...) gives the two results; the pad odd pixel
  * of an odd-width row and the lanes beyond C are written zero. */
@@ -1419,7 +1452,8 @@ static int act_vector(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t p
         (fn == HX_ACT_RELU || fn == HX_ACT_RELU6 || fn == HX_ACT_ABS ||
          fn == HX_ACT_NEG || fn == HX_ACT_LEAKY || fn == HX_ACT_HARDSIGMOID ||
          fn == HX_ACT_HARDSWISH);
-    if (!(simple || silu || o->kind == HX_LOGISTIC) || !same_layout(a, b))
+    const int gelu = o->kind == HX_ACT && fn == HX_ACT_GELU;
+    if (!(simple || silu || gelu || o->kind == HX_LOGISTIC) || !same_layout(a, b))
         return 0;
     const HVX_Vector *in = (const HVX_Vector *)tensor_data(g, o->x);
     HVX_Vector *dst = (HVX_Vector *)tensor_data(g, o->out);
@@ -1429,6 +1463,9 @@ static int act_vector(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t p
         if (simple) {
             re = vf_simple_activation(e, fn, o->p[1], o->p[2]);
             ro = vf_simple_activation(d, fn, o->p[1], o->p[2]);
+        } else if (gelu) {
+            re = vf_gelu(e);
+            ro = vf_gelu(d);
         } else {
             re = vf_sigmoid(e);
             ro = vf_sigmoid(d);
@@ -1456,11 +1493,12 @@ static inline HVX_Vector vf_binary(uint32_t op, HVX_Vector l, HVX_Vector u) {
 static int binary_vector(const HxGraph *g, const HxOp *o, uint32_t part, uint32_t parts) {
     const HxTensor *a = &g->tensors[o->x], *b = &g->tensors[o->out];
     const uint32_t *p = o->p, op = p[0], stride = b->stride;
-    if (!same_layout(a, b) || a->c != b->c || p[1] > 1u)
+    if (!same_layout(a, b) || a->c != b->c || p[1] > 2u)
         return 0;
     if (op != HX_BIN_ADD && op != HX_BIN_SUB && op != HX_BIN_MUL && op != HX_BIN_MIN &&
         op != HX_BIN_MAX && !(op == HX_BIN_DIV && p[1] == 1u && !p[3]))
         return 0;
+    const int kfull = p[1] == 2u;
     const HxTensor *t = p[1] ? NULL : &g->tensors[o->y];
     int full = 0, scalar_y = 0;
     if (t) {
@@ -1477,7 +1515,9 @@ static int binary_vector(const HxGraph *g, const HxOp *o, uint32_t part, uint32_
     if (stride * 4u > slice)
         return 0;
     float *vec = (float *)(g->fp16->workspace + part * slice);
-    if (p[1]) {
+    if (kfull) {
+        /* constant laid out [pixel][stride] in float; read below per pixel pair */
+    } else if (p[1]) {
         const float *k = (const float *)(g->constants + p[2]);
         for (uint32_t c = 0; c < stride; c++)
             vec[c] = op == HX_BIN_DIV ? (k[c] == 0.0f ? 0.0f : 1.0f / k[c]) : k[c];
@@ -1498,7 +1538,14 @@ static int binary_vector(const HxGraph *g, const HxOp *o, uint32_t part, uint32_
         const HVX_Vector v = in[at_];
         const HVX_Vector le = float_words(v), lo = float_words(Q6_Vuw_vlsr_VuwR(v, 16));
         HVX_Vector ue, uo;
-        if (full) {
+        if (kfull) {
+            const uint32_t px = (i % ppr_) * 2u, row = i / ppr_;
+            const float *k0 = (const float *)(g->constants + p[2]) + (size_t)(row * b->w + px) * stride + kb * 32u;
+            HVX_UVector u0 = *(const HVX_UVector *)k0;
+            HVX_UVector u1 = px + 1u < b->w ? *(const HVX_UVector *)(k0 + stride) : Q6_V_vzero();
+            ue = u0;
+            uo = u1;
+        } else if (full) {
             const HVX_Vector w = yin[at_];
             ue = float_words(w);
             uo = float_words(Q6_Vuw_vlsr_VuwR(w, 16));
@@ -1593,6 +1640,10 @@ static int softmax_vector(const HxGraph *g, const HxOp *o, uint32_t part, uint32
     const uint32_t causal = o->kind == HX_ATTN_SOFTMAX && o->p[1];
     const uint32_t M = b->w > 1u ? b->w : (o->p[2] ? o->p[2] : b->h);
     const HVX_Vector ninf = splat(-1e30f), floor30 = splat(-30.0f);
+    float temp = 1.0f;
+    if (o->kind == HX_ATTN_SOFTMAX && o->p[3])
+        memcpy(&temp, &o->p[3], sizeof temp);
+    const HVX_Vector tvec = splat(temp);
     HVX_Vector *ee = (HVX_Vector *)(g->fp16->workspace + part * slice), *eo = ee + blocks;
     for (uint32_t i = lo; i < hi; i++) {
         const int odd = !(odd_pad && i % ppr == ppr - 1u);
@@ -1611,6 +1662,10 @@ static int softmax_vector(const HxGraph *g, const HxOp *o, uint32_t part, uint32
             const HVX_VectorPred qo = softmax_lanes(b->c, kb, qodd, causal);
             const HVX_Vector v = in[kb * plane + i];
             HVX_Vector ve = float_words(v), vo = float_words(Q6_Vuw_vlsr_VuwR(v, 16));
+            if (temp != 1.0f) { /* scores were stored scaled down to fit FP16; undo it in float */
+                ve = vf_mul(ve, tvec);
+                vo = vf_mul(vo, tvec);
+            }
             if (mask_t) {
                 if (mask_t->c == 1u) {
                     ve = vf_add(ve, splat(scalar_mask_e));
@@ -2558,6 +2613,9 @@ static void softmax_fp16_scalar(const HxGraph *g, const HxOp *o, uint32_t part, 
     const uint32_t pixels = b->h * b->w;
     const uint32_t lo = pixels * part / parts, hi = pixels * (part + 1u) / parts;
 
+    float temp = 1.0f;
+    if (o->kind == HX_ATTN_SOFTMAX && o->p[3])
+        memcpy(&temp, &o->p[3], sizeof temp);
     for (uint32_t i = lo; i < hi; i++) {
         uint32_t oy = i / b->w, ox = i % b->w;
         uint32_t px = oy * pw_b + ox;
@@ -2571,7 +2629,7 @@ static void softmax_fp16_scalar(const HxGraph *g, const HxOp *o, uint32_t part, 
         for (uint32_t c = 0; c < b->c; c++) {
             if (causal && c > q)
                 continue;
-            float v = scalar(x[at(a, px, c)]);
+            float v = scalar(x[at(a, px, c)]) * temp;
             if (mask_v)
                 v += scalar(mask_v[at(mask_t, m_px, mask_t->c == 1 ? 0 : c)]);
             if (v > peak)
@@ -2584,7 +2642,7 @@ static void softmax_fp16_scalar(const HxGraph *g, const HxOp *o, uint32_t part, 
             if (causal && c > q) {
                 out[at(b, px, c)] = 0;
             } else {
-                float v = scalar(x[at(a, px, c)]);
+                float v = scalar(x[at(a, px, c)]) * temp;
                 if (mask_v)
                     v += scalar(mask_v[at(mask_t, m_px, mask_t->c == 1 ? 0 : c)]);
                 sum += expf(v - peak);
@@ -2595,7 +2653,7 @@ static void softmax_fp16_scalar(const HxGraph *g, const HxOp *o, uint32_t part, 
             if (causal && c > q) {
                 out[at(b, px, c)] = 0;
             } else {
-                float v = scalar(x[at(a, px, c)]);
+                float v = scalar(x[at(a, px, c)]) * temp;
                 if (mask_v)
                     v += scalar(mask_v[at(mask_t, m_px, mask_t->c == 1 ? 0 : c)]);
                 out[at(b, px, c)] = half(expf(v - peak) * inv_sum);

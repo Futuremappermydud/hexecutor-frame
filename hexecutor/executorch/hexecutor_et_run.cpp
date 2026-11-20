@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // hexecutor_et_run: loads a .pte, runs its "forward" method through the
-// HexecutorBackend on seeded random float32 inputs, and prints output summaries.
+// HexecutorBackend on seeded random or file-backed float32 inputs, and prints output summaries.
 //
-//   hexecutor_et_run MODEL.pte [--seed N]
+//   hexecutor_et_run MODEL.pte [--seed N | --input INPUT_F32 ...]
 //
 // The backend's mode follows the environment (see README.md). For a Mac run,
 // export HEXECUTOR_ET_REFERENCE=1; no device variables are read in that mode.
@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -48,14 +49,19 @@ int fail(const char *what) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: hexecutor_et_run MODEL.pte [--seed N] [--iters N] [--warmup N]\n");
+        std::fprintf(stderr,
+                     "usage: hexecutor_et_run MODEL.pte [--seed N | --input INPUT_F32 ...] "
+                     "[--iters N] [--warmup N]\n");
         return 2;
     }
     uint32_t seed = 1;
     int iters = 1, warmup = 0;
+    std::vector<const char *> input_paths;
     for (int i = 2; i < argc; i++) {
         if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc)
             seed = uint32_t(std::strtoul(argv[++i], nullptr, 10));
+        else if (std::strcmp(argv[i], "--input") == 0 && i + 1 < argc)
+            input_paths.push_back(argv[++i]);
         else if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc)
             iters = std::max(1, std::atoi(argv[++i]));
         else if (std::strcmp(argv[i], "--warmup") == 0 && i + 1 < argc)
@@ -95,18 +101,12 @@ int main(int argc, char **argv) {
     MallocMemoryAllocator method_alloc;
     MallocMemoryAllocator temp_alloc;
     MemoryManager memory(&method_alloc, &planned, &temp_alloc);
-    const auto load_start = std::chrono::steady_clock::now();
-    auto method = program->load_method(method_name, &memory);
-    if (!method.ok())
-        return fail("cannot load method");
-    const double load_ms = std::chrono::duration<double, std::milli>(
-                               std::chrono::steady_clock::now() - load_start)
-                               .count();
-
-    // Inputs: seeded uniform [-1, 1). Buffers are sized once and never resized.
+    // Validate file-backed inputs before loading the method, which opens the DSP session.
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     const size_t n_in = meta->num_inputs();
+    if (!input_paths.empty() && input_paths.size() != n_in)
+        return fail("supply one --input file per model input in model order");
     std::vector<std::vector<float>> input_data;
     std::vector<executorch::extension::TensorPtr> input_tensors;
     input_data.reserve(n_in);
@@ -119,12 +119,32 @@ int main(int argc, char **argv) {
         size_t n = 1;
         for (SizesType s : sizes)
             n *= size_t(s);
-        input_data.emplace_back(n);
-        for (float &v : input_data.back())
-            v = dist(rng);
+        auto &data = input_data.emplace_back(n);
+        if (input_paths.empty()) {
+            for (float &v : data)
+                v = dist(rng);
+        } else {
+            std::ifstream file(input_paths[i], std::ios::binary | std::ios::ate);
+            const auto bytes = static_cast<std::streamsize>(data.size() * sizeof(float));
+            if (!file || file.tellg() != bytes || !file.seekg(0) ||
+                !file.read(reinterpret_cast<char *>(data.data()), bytes)) {
+                std::fprintf(stderr, "hexecutor_et_run: expected %lld bytes from input %zu (%s)\n",
+                             static_cast<long long>(bytes), i, input_paths[i]);
+                return 1;
+            }
+        }
         input_tensors.push_back(executorch::extension::from_blob(
-            input_data.back().data(), sizes, ScalarType::Float));
-        if (method->set_input(EValue(*input_tensors.back()), i) != executorch::runtime::Error::Ok)
+            data.data(), sizes, ScalarType::Float));
+    }
+    const auto load_start = std::chrono::steady_clock::now();
+    auto method = program->load_method(method_name, &memory);
+    if (!method.ok())
+        return fail("cannot load method");
+    const double load_ms = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - load_start)
+                               .count();
+    for (size_t i = 0; i < n_in; i++) {
+        if (method->set_input(EValue(*input_tensors[i]), i) != executorch::runtime::Error::Ok)
             return fail("set_input failed");
     }
 

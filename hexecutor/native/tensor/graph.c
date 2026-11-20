@@ -261,8 +261,10 @@ static int op_valid(const HxGraph *g, const HxOp *o) {
         used = 5;
         break;
     case HX_KV_WRITE:
-    case HX_ATTN_SOFTMAX:
         used = 3;
+        break;
+    case HX_ATTN_SOFTMAX:
+        used = 4;
         break;
     case HX_ADD:
     case HX_PRELU:
@@ -409,6 +411,11 @@ static int op_valid(const HxGraph *g, const HxOp *o) {
     case HX_ATTN_SOFTMAX: {
         if (!same(a, b))
             return 0;
+        if (p[3]) { /* temperature: finite, positive, channel axis only */
+            const float t = hx_float(p[3]);
+            if (!(t > 0.0f && t < 3.0e38f) || p[0] != 2u)
+                return 0;
+        }
         if (o->y != HXFG_NONE) {
             if (o->y >= g->header->tensors)
                 return 0;
@@ -2995,11 +3002,12 @@ void hx_execute_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t par
                     m_row = mask_data + (my * mask_t->w + mx) * mask_t->stride;
                 }
 
+                const float temp = p[3] ? hx_float(p[3]) : 1.0f;
                 float peak = -FLT_MAX, sum = 0.0f;
                 for (uint32_t c = 0; c < b->c; c++) {
                     if (causal && c > q)
                         continue;
-                    float v = src[c];
+                    float v = src[c] * temp;
                     if (m_row)
                         v += (mask_t->c == 1 ? m_row[0] : m_row[c]);
                     if (v > peak)
@@ -3012,7 +3020,7 @@ void hx_execute_op(const HxGraph *g, uint32_t index, uint32_t part, uint32_t par
                     if (causal && c > q) {
                         dst[c] = 0.0f;
                     } else {
-                        float v = src[c];
+                        float v = src[c] * temp;
                         if (m_row)
                             v += (mask_t->c == 1 ? m_row[0] : m_row[c]);
                         dst[c] = expf(v - peak);

@@ -145,6 +145,10 @@ static int check(uint32_t base, uint32_t kind, uint32_t h, uint32_t w, uint32_t 
         /* step bits: causal, additive mask, scalar-per-pixel mask. */
         o.p[0] = 2;
         o.p[1] = step & 1u;
+        if (step & 8u) { /* temperature 4: the scores are multiplied by it before the mask */
+            const float temperature = 4.0f;
+            memcpy(&o.p[3], &temperature, sizeof temperature);
+        }
         if (step & 2u) {
             o.y = 1;
             if (step & 4u) {
@@ -1032,6 +1036,8 @@ int main(void) {
     for (uint32_t mode = 1; mode <= 3; mode++)
         errors += check(base, HX_ATTN_SOFTMAX, 7, 9, 40, 40, 1, mode, 0);
     errors += check(base, HX_ATTN_SOFTMAX, 7, 9, 40, 40, 1, 7, 0);
+    errors += check(base, HX_ATTN_SOFTMAX, 7, 9, 40, 40, 1, 8, 0);
+    errors += check(base, HX_ATTN_SOFTMAX, 7, 9, 40, 40, 1, 11, 0);
     for (uint32_t axes = 1; axes <= 3; axes++)
         for (uint32_t red = 0; red < HX_RED_COUNT; red++)
             errors += check(base, HX_REDUCE, 7, 9, 40, 40, axes, 1, red);

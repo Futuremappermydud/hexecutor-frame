@@ -236,6 +236,8 @@ typedef struct {
  * p[0] axis: 0 H, 1 W, 2 C (default 2/channel axis, which is key axis for [B, H, Lq, Lk]).
  * p[1] causal mask flag (1: causal, masks out k > q; 0: none).
  * p[2] sequence length L for causal query indexing if w = 1 (0 selects default).
+ * p[3] (HX_ATTN_SOFTMAX, axis 2 only) float32 bits of a temperature: the scores are multiplied by it in float,
+ *       before the mask, so scores stored scaled down to fit FP16 can be restored (0 selects 1.0f).
  * SDPA (HX_SDPA, 27): Fused scaled dot-product attention: Out = Softmax(Q.K^T * scale + mask) * V.
  * x = Q [B, Lq, D], y = K [B, Lk, D], z = V [B, Lk, Dv], out = Out [B, Lq, Dv].
  * p[0] optional additive mask tensor ID (or HXFG_NONE).
