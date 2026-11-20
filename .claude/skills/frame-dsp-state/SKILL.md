@@ -32,7 +32,7 @@ Expected for the depth/hands engines: `size_mb` 128, `iova` 2684354560.
 | control `[1,0,1]`, callback 0/cleared, regions zero | idle, clean | OK to run |
 | `[1,1,1]`, callback set, regions non-zero | a host died without closing its session | stop; tell the user; recovery has been reboot |
 | `[2,0,8]` | firmware wake stuck (long wake / XRService FeatureNN contention) | stop; DSP work is blocked until reboot; new sessions fail after 5 s with `CDSP firmware is stuck at control (2,0,8)` |
-| no `/dev/cdsp_mem` | rebooted | user runs `sudo insmod` (or `runtime/scripts/setup_frame.sh --qnn`, which uses sudo; ask first) |
+| no `/dev/cdsp_mem` | rebooted | user runs `sudo insmod` (or `depth-runtime/scripts/setup_frame.sh --qnn`, which uses sudo; ask first) |
 
 The journal line `Timeout reached while waiting for the CPU to read the results` appears in clean sessions too; it
 is not the fault. Each wake logs `Received CDSP FLOPS benchmark function`; a stuck DSP logs no further wakes.
@@ -45,4 +45,4 @@ is not the fault. Each wake logs `Received CDSP FLOPS benchmark function`; a stu
 - Long holds are risky unless XRService controller FeatureNN is off the CDSP
   (`controllerTrackingOptions.configGlobal` `FeatureNN.enableForLogic=false` + `GripNet.enable=true`); keep sessions
   short regardless.
-- Record the before/after state in the handoff for every DSP run ("control `(1,0,1)` afterwards").
+- Record the before/after state in the topic guide or private run notes for every DSP run ("control `(1,0,1)` afterwards").

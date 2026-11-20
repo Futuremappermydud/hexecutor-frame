@@ -5,7 +5,7 @@ set -eu
 cd "$(dirname "$0")/../.."
 OUT=$PWD/hexecutor/native/build/ab/planes-20261105
 mkdir -p "$OUT"
-SDKV=$PWD/depth-model/.work/hexagon-sdk
+SDKV=$PWD/samples/depth-model/.work/hexagon-sdk
 docker run --rm --pull never --platform linux/amd64 -v "$SDKV:/sdkv:ro" -v "$PWD:/workspace" -w /workspace/hexecutor/native "${HEXECUTOR_TOOLCHAIN_IMAGE:-hexecutor-toolchain:local}" sh -c '/sdkv/6.6.0.0/tools/HEXAGON_Tools/19.0.07/Tools/bin/hexagon-clang -mv75 -mhmx -c qd_hmx_ops.S -o build/ops.o'
 python3 hexecutor/benchmarks/encode_hmx.py hexecutor/native/build/ops.o --source hexecutor/native/qd_hmx_ops.S --output hexecutor/native/qd_hmx_ops_encoded.S
 n=$1; extra=${2:-}

@@ -8,7 +8,7 @@ static uint32_t rd32(const uint8_t*p){return (uint32_t)p[0]|((uint32_t)p[1]<<8)|
 static uint8_t*file(const char*p,uint32_t*n){FILE*f=fopen(p,"rb");CHECK(f);CHECK(!fseek(f,0,SEEK_END));long z=ftell(f);CHECK(z>0);CHECK(!fseek(f,0,SEEK_SET));uint8_t*b=malloc((size_t)z);CHECK(b&&fread(b,1,(size_t)z,f)==(size_t)z);fclose(f);*n=(uint32_t)z;return b;}
 static int resolve(void*x,const Nprg2Program*p,uint32_t i,const Nprg2Command*c,Nprg2Capability*k){(void)x;(void)p;(void)i;(void)c;k->supported=1;k->may_fallback=0;k->scratch_bytes=0;k->concurrent_worker_scratch_bytes=0;return 1;}
 static void check_case(const char*model,const char*fixture){
- char qp[160],rp[160];CHECK(!strcmp(model,"primary")||!strcmp(model,"alternate"));snprintf(qp,sizeof qp,"hexecutor/native/build/resident-%s.qdrx",model);snprintf(rp,sizeof rp,"depth-model/deployment/programs/%s-v2.nprg",model);
+ char qp[160],rp[160];CHECK(!strcmp(model,"primary")||!strcmp(model,"alternate"));snprintf(qp,sizeof qp,"hexecutor/native/build/resident-%s.qdrx",model);snprintf(rp,sizeof rp,"samples/depth-model/deployment/programs/%s-v2.nprg",model);
  uint32_t qn,pn,fn;uint8_t*q=file(qp,&qn),*raw=file(rp,&pn),*fx=file(fixture,&fn),qsha[32],psha[32];
  nprg2_sha256(q,qn,qsha);nprg2_sha256(raw,pn,psha);Nprg2ExpectedHashes x={q+32,q+64,qsha,psha};
  Nprg2Pool pools[7]={0};for(uint32_t i=0;i<7;i++){pools[i].bytes=rd32(raw+144+4*i);pools[i].base=pools[i].bytes?malloc(pools[i].bytes):NULL;CHECK(!pools[i].bytes||pools[i].base);if(pools[i].bytes)memset(pools[i].base,0,pools[i].bytes);}

@@ -1,11 +1,11 @@
 #!/bin/sh
 # SPDX-License-Identifier: LGPL-3.0-or-later
-# usage (from depth-model/): slide_cmd_sim.sh [build-only]   one container, variant 32 (1x1 packed native path, conv_path 4)
+# usage (from samples/depth-model/): slide_cmd_sim.sh [build-only]   one container, variant 32 (1x1 packed native path, conv_path 4)
 # configs: old (-DNAT_1X1=0), new (default)
 SDKV=${SDKV:-/Users/owenelliott/Documents/projects/spatial-stuff/depth-model/.work/hexagon-sdk}
 MAXC=${MAXC:-12}
-docker run --rm --platform linux/amd64 -e BUILDONLY="$1" -e MAXC="$MAXC" -v "$SDKV:/repo/depth-model/.work/hexagon-sdk" -v "$PWD:/repo" -w /repo "${HEXECUTOR_TOOLCHAIN_IMAGE:-hexecutor-toolchain:local}" sh -lc '
-SDK=/repo/depth-model/.work/hexagon-sdk/6.6.0.0/tools/HEXAGON_Tools/19.0.07/Tools
+docker run --rm --platform linux/amd64 -e BUILDONLY="$1" -e MAXC="$MAXC" -v "$SDKV:/repo/samples/depth-model/.work/hexagon-sdk" -v "$PWD:/repo" -w /repo "${HEXECUTOR_TOOLCHAIN_IMAGE:-hexecutor-toolchain:local}" sh -lc '
+SDK=/repo/samples/depth-model/.work/hexagon-sdk/6.6.0.0/tools/HEXAGON_Tools/19.0.07/Tools
 N=frame/native_program
 build() {
   $SDK/bin/hexagon-clang -mv75 -mhvx -mhvx-length=128b -O2 -G0 -w -ffp-contract=off -fno-fast-math -fno-strict-aliasing \

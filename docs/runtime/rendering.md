@@ -26,4 +26,4 @@ The default, guarded, and learned depth paths have different validation boundari
 
 Investigate visual faults in this order: stale publication, incorrect pose/frame transform, depth convention, discontinuity handling, then GPU submission. Retain render-loop cadence and GPU contention measurements when changing the occlusion stage; the compositor shares the GPU with depth compute.
 
-Source: [OpenXR viewer](../../runtime/src/openxr_point_cloud.cpp), [overlay](../../runtime/src/overlay_renderer.cpp), [API layer](../../runtime/src/openxr_occlusion_layer.cpp), and [occlusion renderer](../../runtime/src/occlusion_renderer.cpp).
+Source: [OpenXR viewer](../../depth-runtime/src/openxr_point_cloud.cpp), [overlay](../../depth-runtime/src/overlay_renderer.cpp), [API layer](../../depth-runtime/src/openxr_occlusion_layer.cpp), and [occlusion renderer](../../depth-runtime/src/occlusion_renderer.cpp).

@@ -236,7 +236,7 @@ static void run_abs_case(Nprg2Program *p, Nprg2Bound *b, Nprg2Executor *e,
 
 static void run_primary(void) {
     const char *qpath = "hexecutor/native/build/resident-primary.qdrx";
-    const char *npath = "depth-model/deployment/programs/primary-v2.nprg";
+    const char *npath = "samples/depth-model/deployment/programs/primary-v2.nprg";
     uint32_t qn, nn;
     uint8_t *q = read_file(qpath, &qn), *raw = read_file(npath, &nn), qsha[32], nsha[32];
     nprg2_sha256(q, qn, qsha);
@@ -275,7 +275,7 @@ static void run_primary(void) {
 
 static void run_alternate(void) {
     const char *qpath = "hexecutor/native/build/resident-alternate.qdrx";
-    const char *npath = "depth-model/deployment/programs/alternate-v2.nprg";
+    const char *npath = "samples/depth-model/deployment/programs/alternate-v2.nprg";
     uint32_t qn, nn;
     uint8_t *q = read_file(qpath, &qn), *raw = read_file(npath, &nn), qsha[32], nsha[32];
     nprg2_sha256(q, qn, qsha);

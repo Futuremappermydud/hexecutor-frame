@@ -22,4 +22,4 @@ Compare metric bias, invalid/false-valid rates, edge leakage, temporal stability
 
 Changing support radius, exposure compensation, uniqueness thresholds, or refinement changes the estimator. Keep baseline controls and evaluate the same raw pixels; do not let automatic selection consume held-out evaluation data. GPU speed improvements also need headset/frame-pacing evidence, because the GPU is shared with the compositor.
 
-Source: [Vulkan matcher](../../runtime/src/vulkan_stereo_pipeline.cpp), [guarded matcher](../../runtime/src/vulkan_guarded_stereo_pipeline.cpp), [CPU/reference geometry](../../runtime/src/depth_pipeline.cpp), and [experiment implementation](../../runtime/include/stereo_matcher_experiment.hpp).
+Source: [Vulkan matcher](../../depth-runtime/src/vulkan_stereo_pipeline.cpp), [guarded matcher](../../depth-runtime/src/vulkan_guarded_stereo_pipeline.cpp), [CPU/reference geometry](../../depth-runtime/src/depth_pipeline.cpp), and [experiment implementation](../../depth-runtime/include/stereo_matcher_experiment.hpp).

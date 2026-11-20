@@ -145,7 +145,7 @@ int main(void) {
     CHECK(pool1[0]==0x5a && spill[4]==0x6b);
 
     puts("PASS prepared spill/fill variants=2; ordered pool spans, direction, fail-closed bounds");
-    run_image("hexecutor/native/build/resident-primary.qdrx","depth-model/deployment/programs/primary-v2.nprg",62u,26u);
-    run_image("hexecutor/native/build/resident-alternate.qdrx","depth-model/deployment/programs/alternate-v2.nprg",53u,20u);
+    run_image("hexecutor/native/build/resident-primary.qdrx","samples/depth-model/deployment/programs/primary-v2.nprg",62u,26u);
+    run_image("hexecutor/native/build/resident-alternate.qdrx","samples/depth-model/deployment/programs/alternate-v2.nprg",53u,20u);
     return 0;
 }

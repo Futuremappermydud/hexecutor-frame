@@ -15,8 +15,8 @@ import sys as _path_sys
 from pathlib import Path as _SourcePath
 for _source_root in _SourcePath(__file__).resolve().parents:
     if (_source_root / "hexecutor/api.py").is_file():
-        _path_sys.path[:0] = [str(_source_root), str(_source_root / "depth-model/python"),
-                             str(_source_root / "depth-model/tools"),
+        _path_sys.path[:0] = [str(_source_root), str(_source_root / "samples/depth-model/python"),
+                             str(_source_root / "samples/depth-model/tools"),
                              str(_source_root / "hexecutor/benchmarks")]
         break
 from hexecutor.paths import workspace as _workspace

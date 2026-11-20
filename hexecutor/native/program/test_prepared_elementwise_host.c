@@ -133,7 +133,7 @@ static void run_all_u16(const char *qpath,const char *npath,uint8_t opcode,uint8
 static void run_all_new(const char *model,uint8_t opcode,uint8_t variant,const char *name,uint32_t expect) {
     char qpath[256],npath[256],cpath[256];
     snprintf(qpath,sizeof qpath,"hexecutor/native/build/resident-%s.qdrx",model);
-    snprintf(npath,sizeof npath,"depth-model/deployment/programs/%s-v2.nprg",model);
+    snprintf(npath,sizeof npath,"samples/depth-model/deployment/programs/%s-v2.nprg",model);
     snprintf(cpath,sizeof cpath,"recovered/%s/constants/constant_pool_5.bin",model);
     uint32_t qn,nn,cn;uint8_t *q=read_file(qpath,&qn),*raw=read_file(npath,&nn),*consts=read_file(cpath,&cn);
     uint8_t qsha[32],nsha[32];nprg2_sha256(q,qn,qsha);nprg2_sha256(raw,nn,nsha);
@@ -206,17 +206,17 @@ static void run_all_new(const char *model,uint8_t opcode,uint8_t variant,const c
     free(scratch_raw);for(unsigned i=0;i<7;i++)free(pools[i].base);free(hot);nprg2_close(&p);free(q);free(raw);free(consts);
 }
 int main(void) {
-    run_model("hexecutor/native/build/resident-primary.qdrx","depth-model/deployment/programs/primary-v2.nprg","hexecutor/native/program/fixtures/primary-smoke-linearclip.epcpu",QDR_LINEARCLIP,68,"LinearClip");
-    run_model("hexecutor/native/build/resident-alternate.qdrx","depth-model/deployment/programs/alternate-v2.nprg","hexecutor/native/program/fixtures/alternate-smoke-linearclip.epcpu",QDR_LINEARCLIP,68,"LinearClip");
-    run_model("hexecutor/native/build/resident-primary.qdrx","depth-model/deployment/programs/primary-v2.nprg","hexecutor/native/program/fixtures/primary-smoke-requant.epcpu",QDR_REQUANT_U8,70,"requant u8");
-    run_model("hexecutor/native/build/resident-alternate.qdrx","depth-model/deployment/programs/alternate-v2.nprg","hexecutor/native/program/fixtures/alternate-smoke-requant.epcpu",QDR_REQUANT_U8,70,"requant u8");
+    run_model("hexecutor/native/build/resident-primary.qdrx","samples/depth-model/deployment/programs/primary-v2.nprg","hexecutor/native/program/fixtures/primary-smoke-linearclip.epcpu",QDR_LINEARCLIP,68,"LinearClip");
+    run_model("hexecutor/native/build/resident-alternate.qdrx","samples/depth-model/deployment/programs/alternate-v2.nprg","hexecutor/native/program/fixtures/alternate-smoke-linearclip.epcpu",QDR_LINEARCLIP,68,"LinearClip");
+    run_model("hexecutor/native/build/resident-primary.qdrx","samples/depth-model/deployment/programs/primary-v2.nprg","hexecutor/native/program/fixtures/primary-smoke-requant.epcpu",QDR_REQUANT_U8,70,"requant u8");
+    run_model("hexecutor/native/build/resident-alternate.qdrx","samples/depth-model/deployment/programs/alternate-v2.nprg","hexecutor/native/program/fixtures/alternate-smoke-requant.epcpu",QDR_REQUANT_U8,70,"requant u8");
     static const struct { uint8_t op,var;const char *name;uint32_t pn,an; } u16[]={
         {QDR_REQUANT_U16,71,"requant u16",54,64},{QDR_ADD1111_U16,59,"add1111 u16",60,60},
         {QDR_MUL_U16,74,"mul u16",50,50},{QDR_ADD_U16,14,"add u16",20,20},
         {QDR_ADDSUB_U16,60,"addsub u16",12,12},{QDR_MUL1111_U16,73,"mul1111 u16",10,10}};
     for(unsigned i=0;i<sizeof u16/sizeof u16[0];i++){
-        run_all_u16("hexecutor/native/build/resident-primary.qdrx","depth-model/deployment/programs/primary-v2.nprg",u16[i].op,u16[i].var,u16[i].name,u16[i].pn);
-        run_all_u16("hexecutor/native/build/resident-alternate.qdrx","depth-model/deployment/programs/alternate-v2.nprg",u16[i].op,u16[i].var,u16[i].name,u16[i].an);
+        run_all_u16("hexecutor/native/build/resident-primary.qdrx","samples/depth-model/deployment/programs/primary-v2.nprg",u16[i].op,u16[i].var,u16[i].name,u16[i].pn);
+        run_all_u16("hexecutor/native/build/resident-alternate.qdrx","samples/depth-model/deployment/programs/alternate-v2.nprg",u16[i].op,u16[i].var,u16[i].name,u16[i].an);
     }
     run_all_new("primary",QDR_SIGN,39,"sign",12);run_all_new("alternate",QDR_SIGN,39,"sign",12);
     run_all_new("primary",QDR_LINEARCLIP,67,"linearclip u16",30);run_all_new("alternate",QDR_LINEARCLIP,67,"linearclip u16",30);

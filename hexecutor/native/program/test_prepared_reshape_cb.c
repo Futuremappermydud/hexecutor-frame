@@ -223,7 +223,7 @@ int main(void) {
         for (unsigned i = 0; i < sizeof kPads / sizeof kPads[0]; i++) {
             char qpath[96], npath[96], fxpath[128];
             snprintf(qpath, sizeof qpath, "hexecutor/native/build/resident-%s.qdrx", models[m]);
-            snprintf(npath, sizeof npath, "depth-model/deployment/programs/%s-v2.nprg", models[m]);
+            snprintf(npath, sizeof npath, "samples/depth-model/deployment/programs/%s-v2.nprg", models[m]);
             snprintf(fxpath, sizeof fxpath,
                      "hexecutor/native/program/fixtures/%s-smoke-reshape-cb-pad%u.epcpu",
                      models[m], kPads[i]);

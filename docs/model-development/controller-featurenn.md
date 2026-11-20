@@ -1,10 +1,10 @@
 # XRService controller FeatureNN on Hexecutor
 
-XRService's controller tracker runs a stereo keypoint network, FeatureNN, on the CDSP. This page covers compiling the CPU fallback model that XRService ships for our tensor backend and serving the unmodified XRService binary through the [CDSP broker](../hexecutor/broker.md#xrservice-jobs).
+XRService's controller tracker runs a stereo keypoint network, FeatureNN, on the CDSP. This guide covers compiling the shipped CPU fallback model for the tensor backend and using the stock XRService adapter. [XRService bridge](../hexecutor/xrservice-broker-bridge.md#stereofeaturenn)
 
 ## Model
 
-The model ships with SteamVR at `/opt/steamvr/drivers/cv/resources/minControllerFeatureNNModel/K2V3/` (SHA-256 `1dca8b6127063debd866203967275b5efb3e8c923794ceb49d7dec8fd4af703c` on the 2026-11-03 install). It is Valve's: keep copies and every derived file under the ignored `controller-tracking/.work/`.
+The model ships with SteamVR at `/opt/steamvr/drivers/cv/resources/minControllerFeatureNNModel/K2V3/` (SHA-256 `1dca8b6127063debd866203967275b5efb3e8c923794ceb49d7dec8fd4af703c` on the 2026-11-03 install). It is Valve's: keep copies and every derived file under the ignored `samples/controller-tracking/.work/`.
 
 | Item | Value |
 | --- | --- |
@@ -18,10 +18,10 @@ The model ships with SteamVR at `/opt/steamvr/drivers/cv/resources/minController
 The host performs the input normalization and the reshape/split/exp head. The DSP graph runs from the normalized input to the Gemm output:
 
 ```sh
-python3 -m venv controller-tracking/.work/venv
-controller-tracking/.work/venv/bin/pip install numpy onnx onnxruntime
-controller-tracking/.work/venv/bin/python hexecutor/offline/lower_onnx.py \
-  controller-tracking/.work/model/featurenn_k2v3.onnx controller-tracking/.work/lowered/featurenn \
+python3 -m venv samples/controller-tracking/.work/venv
+samples/controller-tracking/.work/venv/bin/pip install numpy onnx onnxruntime
+samples/controller-tracking/.work/venv/bin/python hexecutor/offline/lower_onnx.py \
+  samples/controller-tracking/.work/model/featurenn_k2v3.onnx samples/controller-tracking/.work/lowered/featurenn \
   --input /Div_output_0 --output-tensor /head/fc/Gemm_output_0 --pad-input-channels 3
 ```
 
@@ -29,11 +29,11 @@ The result has 68 operations, a 3.9 MB arena and 18.4 MB of constants. The two i
 
 ## Built-in XRService adapter
 
-Register the result as `featurenn` and pass `--xrservice-featurenn featurenn` to `hexecutord`, or set `FRAME_FEATURENN` to the prefix when using `runtime/scripts/run_hexecutord.sh`. The adapter accepts the built-in binary's packed u8 crops over the stock `dsp_service` shared buffer, performs the normalization and output head layout described above, and runs inference as a tracking broker job. It does not patch or replace XRService. See [the broker guide](../hexecutor/broker.md#xrservice-jobs) for the handshake, launcher example, and remaining device-validation gates.
+Register the result as `featurenn` and pass `--xrservice-featurenn featurenn` to `hexecutord`, or set `FRAME_FEATURENN` to the prefix when using `hexecutor/packaging/run_hexecutord.sh`. The adapter accepts the built-in binary's packed u8 crops over the stock `dsp_service` shared buffer, performs the normalization and output head layout described above, and runs inference as a tracking broker job. It does not patch or replace XRService. See [the XRService bridge guide](../hexecutor/xrservice-broker-bridge.md#stereofeaturenn) for the handshake, launcher example, and remaining device-validation gates.
 
 ## Checks (2026-11-09)
 
-`controller-tracking/tools/check_featurenn.py` compares the lowered graph with onnxruntime on the quantized model. Inputs were uniform noise and natural greyscale crops; no controller crops were available.
+`samples/controller-tracking/tools/check_featurenn.py` compares the lowered graph with onnxruntime on the quantized model. Inputs were uniform noise and natural greyscale crops; no controller crops were available.
 
 | Comparison | Worst absolute difference, raw head |
 | --- | --- |
@@ -43,4 +43,4 @@ Register the result as `featurenn` and pass `--xrservice-featurenn featurenn` to
 
 The DSP kernels match the float lowering. The remaining gap is float versus u8 quantization. Whether it matters for tracking has to be measured on real controller crops. The simulator ran the FP16 plan at 2.79 M serial cycles: depthwise 2.06 M, convolution 0.54 M, add 0.11 M. Device time has not been measured.
 
-To repeat the simulator check, write the input and reference files and run `hexecutor/tests/test_tensor_model_sim.c` (link with `-lhexagon`) on `hexagon-sim -mv75`, using the SDK and toolchain image recorded in the [hand-tracking checkpoint](hand-tracking-progress.md).
+To repeat the simulator check, write the input and reference files and run `hexecutor/tests/test_tensor_model_sim.c` (link with `-lhexagon`) on `hexagon-sim -mv75`, using the SDK and toolchain image recorded in the [MediaPipe validation instructions](hand-tracking.md#validation-and-performance).

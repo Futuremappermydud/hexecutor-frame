@@ -1,6 +1,6 @@
 # System architecture
 
-Frame Spatial Runtime turns headset stereo images into metric observations and world-space geometry. Hexecutor provides native Hexagon execution for learned inference. The model directories own model contracts, reference tools, and future training work; raw model artifacts stay local.
+Hexecutor provides native Hexagon execution for learned inference. The Frame depth runtime uses it as part of a pipeline that turns headset stereo images into metric observations and world-space geometry. The model samples contain model contracts, reference tools, and training work. Raw model artifacts stay local.
 
 ```mermaid
 flowchart LR
@@ -20,16 +20,16 @@ flowchart LR
 
 | Component | Owns | Does not establish by itself |
 | --- | --- | --- |
-| `runtime/` | Camera acquisition, rectification, depth-to-metric conversion, poses, fusion, rendering, recording | A model's training provenance or a DSP kernel's numerical contract |
+| `depth-runtime/` | Camera acquisition, rectification, depth-to-metric conversion, poses, fusion, rendering, recording | A model's training provenance or a DSP kernel's numerical contract |
 | `hexecutor/` | C++ transport/host, private memory, native programs, kernels, clocks, scheduling, cleanup | Correct camera geometry or calibrated model confidence |
-| `depth-model/` | Model extraction/reference tools, simulator adapters, tensor contracts, training workspace | A general inference engine for arbitrary exported graphs |
-| `hand-tracking/` | Model workspace and compatibility research | A finished hand-tracking runtime |
+| `samples/depth-model/` | Model extraction/reference tools, simulator adapters, tensor contracts, training workspace | A general inference engine for arbitrary exported graphs |
+| `samples/hand-tracking/` | Model workspace and compatibility research | A finished hand-tracking runtime |
 | `tools/` | Artifact policy and repository checks | Distribution of weights or captures |
 
-The render loop must continue locating and presenting the headset while depth work runs in the background. `runtime/src/cloud_worker.cpp` owns the depth/fusion worker. `openxr_point_cloud.cpp` presents the scene; `main.cpp` is the diagnostic application's entry point. The occlusion layer has its own publication/consumer contract.
+The render loop must continue locating and presenting the headset while depth work runs in the background. `depth-runtime/src/cloud_worker.cpp` owns the depth/fusion worker. `openxr_point_cloud.cpp` presents the scene; `main.cpp` is the diagnostic application's entry point. The occlusion layer has its own publication/consumer contract.
 
 For learned depth, the C++ host carries socket messages and manages the DSP session. The retained runtime backends execute the graph on the DSP. The hybrid Python graph scheduler has been removed. CPU reference execution remains available for offline numerical comparison.
 
 Camera ownership and DSP ownership are separate constraints. Capture borrows compositor-managed buffers; it must not compete for the physical sensors. A custom DSP session temporarily shares firmware infrastructure and may pause the eye client. It must restore its memory, clocks, callbacks, and worker state before that client resumes.
 
-Source and model resources have explicit ownership. The reusable C++ host is under `hexecutor/host/cpp`, native DSP code under `hexecutor/native`, device support under `hexecutor/device`, and benchmarks/research/examples in their own directories. Depth-specific lowering and lane generation live with `depth-model`. Resource paths are supplied through the model package/configuration; there are no code/model symlink aliases. README/document links remain convenience navigation.
+The reusable C++ host is under `hexecutor/host/cpp`, native DSP code under `hexecutor/native`, and device support under `hexecutor/device`. Depth-specific lowering and lane generation live under `samples/depth-model`. Model packages and configuration supply resource paths explicitly. Component README links point to the canonical guides.

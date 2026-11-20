@@ -155,7 +155,7 @@ static void open_session(Session *s, const char *model) {
     s->model = model;
     snprintf(path, sizeof path, "hexecutor/native/build/resident-%s.qdrx", model);
     s->qdrx = read_file(path, &s->qdrx_bytes);
-    snprintf(path, sizeof path, "depth-model/deployment/programs/%s-v2.nprg", model);
+    snprintf(path, sizeof path, "samples/depth-model/deployment/programs/%s-v2.nprg", model);
     s->nprg = read_file(path, &s->nprg_bytes);
     snprintf(path, sizeof path, "recovered/%s/constants/constant_pool_5.bin", model);
     s->constants = read_file(path, &s->constants_bytes);

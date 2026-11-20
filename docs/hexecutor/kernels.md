@@ -38,6 +38,6 @@ Evidence: FrameNPU `docs/NATIVE_ARITHMETIC.md` (2026-11-16) on CDSP firmware `4f
 
 ## Adapter coverage
 
-`native_adapter`, `native_kernels`, `native_stride2`, `native_runtime/stride2`, and `native_u16` contain probes and adapters for particular provider layouts. Their results are shape-specific. See [kernel adapters](kernel-adapters.md) before expanding a resolver's accepted feature set.
+Kernel-specific probes establish layout, shape and numerical constraints for each adapter. [Adapter acceptance and source locations](kernel-adapters.md)
 
 Source: [reference handlers](../../hexecutor/native/program/prepared_reference.c), [HMX paths](../../hexecutor/native/program/prepared_hmx_conv.inc), [data movement](../../hexecutor/native/program/prepared_datamove.inc), and [blocked glue](../../hexecutor/native/kernels/blocked/).

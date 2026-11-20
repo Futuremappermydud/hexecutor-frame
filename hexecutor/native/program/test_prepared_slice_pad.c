@@ -237,7 +237,7 @@ int main(int argc, char **argv){
 
     if (argc == 1) {
         run_case("hexecutor/native/build/resident-alternate.qdrx",
-                 "depth-model/deployment/programs/alternate-v2.nprg",
+                 "samples/depth-model/deployment/programs/alternate-v2.nprg",
                  "hexecutor/native/program/fixtures/alternate-smoke-slice-pad-cmd68.ppcpu",
                  "hexecutor/native/program/fixtures/alternate-smoke-slice-pad-cmd69.ppcpu");
     } else if (argc == 5) {

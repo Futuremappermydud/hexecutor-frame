@@ -13,7 +13,7 @@ make -C hexecutor/native HEX_CC=clang-14 HEX_LD=ld.lld-14
 This builds basic callback targets. For the current measured primary recipe:
 
 ```sh
-sh depth-model/deployment/lanes/build_best.sh NAME
+sh samples/depth-model/deployment/lanes/build_best.sh NAME
 ```
 
 That script changes to the monorepo root, uses the prepared engine recipe, and expects separately provisioned program data, measured-cost inputs, and generated lane headers. Its recorded generator options include two worker lanes and `--active block`. Regenerate model-specific headers when the program or schedule policy changes; the last generated header is not a universal schedule.
@@ -22,7 +22,7 @@ Record source revision/dirty patch, compiler, flags, generated-header identity, 
 
 ## Kernel memory module
 
-The depth engine expects `/dev/cdsp_mem`, 128 MB, and the verified IOVA. `runtime/scripts/setup_frame.sh --qnn` checks the configured device package, loads the module when needed, and checks memory chunks. A kernel module must match the running kernel and its ABI; building it against an arbitrary source tree is insufficient.
+The depth engine expects `/dev/cdsp_mem`, 128 MB, and the verified IOVA. `depth-runtime/scripts/setup_frame.sh --qnn` checks the configured device package, loads the module when needed, and checks memory chunks. A kernel module must match the running kernel and its ABI; building it against an arbitrary source tree is insufficient.
 
 The language-model client has a different memory-size requirement. Loading its larger allocation is not interchangeable with satisfying the depth engine's exact module-size check.
 

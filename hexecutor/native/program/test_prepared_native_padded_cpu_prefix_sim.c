@@ -10,22 +10,22 @@
 #endif
 #if NCPF_CASE==1
 #define QDRX_PATH "hexecutor/native/build/resident-primary.qdrx"
-#define NPRG_PATH "depth-model/deployment/programs/primary-v2.nprg"
+#define NPRG_PATH "samples/depth-model/deployment/programs/primary-v2.nprg"
 #define NCPF_PATH "hexecutor/native/program/fixtures/primary-smoke-first12.ncpfx"
 #define CASE_NAME "primary CI12/logical9"
 #elif NCPF_CASE==2
 #define QDRX_PATH "hexecutor/native/build/resident-primary.qdrx"
-#define NPRG_PATH "depth-model/deployment/programs/primary-v2.nprg"
+#define NPRG_PATH "samples/depth-model/deployment/programs/primary-v2.nprg"
 #define NCPF_PATH "hexecutor/native/program/fixtures/primary-smoke-ci20.ncpfx"
 #define CASE_NAME "primary CI20/logical18"
 #elif NCPF_CASE==3
 #define QDRX_PATH "hexecutor/native/build/resident-alternate.qdrx"
-#define NPRG_PATH "depth-model/deployment/programs/alternate-v2.nprg"
+#define NPRG_PATH "samples/depth-model/deployment/programs/alternate-v2.nprg"
 #define NCPF_PATH "hexecutor/native/program/fixtures/alternate-smoke-first12.ncpfx"
 #define CASE_NAME "alternate CI12/logical9"
 #elif NCPF_CASE==4
 #define QDRX_PATH "hexecutor/native/build/resident-alternate.qdrx"
-#define NPRG_PATH "depth-model/deployment/programs/alternate-v2.nprg"
+#define NPRG_PATH "samples/depth-model/deployment/programs/alternate-v2.nprg"
 #define NCPF_PATH "hexecutor/native/program/fixtures/alternate-smoke-ci20.ncpfx"
 #define CASE_NAME "alternate CI20/logical18"
 #else

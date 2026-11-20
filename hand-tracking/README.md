@@ -1,1 +1,0 @@
-../docs/model-development/hand-tracking.md

@@ -1,189 +1,47 @@
-# Bridging XRService StereoFeatureNN and Gazenet to Hexecutor Broker
+# XRService broker integration
 
-This guide describes how XRService's controller tracking (**StereoFeatureNN**) and eye tracking (**Gazenet**) are bridged into our CDSP broker daemon (`hexecutord`), eliminating firmware contention, avoiding VTCM memory hazards, and allowing XRService to be patched transparently.
+Hexecutor has a stock DMA-mailbox adapter in `hexecutord` and a separate shared C ABI shim. Both submit to the tensor [broker](broker.md). Use the portable ABI tests to validate packing and dispatch. Worn-device correctness and firmware ownership still require verification for each stock workload.
 
----
+## Integration paths
 
-## 1. Background & Motivation
+- The in-daemon `xrservice::Adapter` connects to `dsp_service`, maps its shared DMA buffer, and passes supported work to the broker with a tracking deadline. One adapter coordinates subscribed stock jobs, stages the result before publishing completion, and yields to stock firmware for model setup or unsupported requests. [Mailbox adapter](../../hexecutor/host/cpp/xrservice_featurenn.cpp)
+- The shared shim exposes `broker_shim_dispatch_stereofeaturenn`, `broker_shim_dispatch_gazenet` and `broker_shim_dispatch_gazenet_vector`. It also exports a FeatureNN symbol for interposition where a caller uses that symbol. An installed library, successful `LD_PRELOAD` or portable test alone does not establish that live XRService dispatch passes through it. Check the actual loaded service and stock traffic before claiming that firmware is bypassed. [C header](../../hexecutor/include/hexecutor/xrservice_broker_shim.h), [shim implementation](../../hexecutor/host/cpp/xrservice_broker_shim.cpp)
 
-On the Steam Frame headset (Qualcomm SM8650), the CDSP (Compute DSP) is shared across multiple concurrent perception workloads:
-- Frame learned depth engine (QDRX prepared executor, ~9.7 ms per 30 Hz frame)
-- MediaPipe / Mercury hand tracking (palm detection + landmark tracking, 30–60 Hz)
-- XRService controller tracking (**StereoFeatureNN**, 60 Hz per controller)
-- Stock eye tracking (**Gazenet** image evaluation and vector evaluation)
+## StereoFeatureNN
 
-### Historical Contention Hazards
-Previously, custom inferences held separate exclusive `hexecutor::Session` instances while XRService dispatched its own tasks directly to the stock `dsp_service` daemon:
-1. **Firmware Stalling at `(2,0,8)`**: Waking or exiting the CDSP while an uncoordinated stock job was in-flight caused firmware completion queues to desynchronize, leaving the DSP stuck at control state `(2,0,8)` and requiring a full device reboot.
-2. **Firmware Thread-3 VTCM Hazard**: Disassembly showed that firmware hardware thread 3 independently polls DMA mailbox `0x1522000` and uses VTCM `0x31700000–~0x317d4600` for eye-tracking weights and scratch tables. When our session held VTCM pool 1, concurrent stock requests would corrupt both activations and model weights.
+`hexecutord --xrservice-featurenn GRAPH` (or `--xrservice-stereofeaturenn GRAPH`) serves job 8 from the unmodified built-in XRService. Its shared block starts at DMA offset `0x1522000`. Its words are state, active, and taken/job id at offsets 0, 4, and 8. The request header is at cached offset `0x80`, packed u8 eye planes at `0x100`, and results at `0x40080`. Each eye has a 0x450-byte `cdsp_featurenn_output_data`: four contiguous 69-float arrays (center, uncertainty, plus-x, plus-z). The adapter converts u8 planes to normalized three-channel float NHWC and writes uncertainty as `2·min(raw,10)`; XRService applies the final exponential.
 
-### The Broker Architecture
-The CDSP broker (`hexecutord`, C++17) acts as the **single process owning the CDSP lease**. All workloads submit jobs through local Unix domain socket IPC (`hexecutor::broker::Client`).
+Enable XRService's normal FeatureNN path (not the GripNet/CPU test setting) and run, using the actual lowered prefix:
 
-```
-                    ┌──────────────────────────┐
-                    │     XRService / OpenVR   │
-                    │  (Controller & Eye Track)│
-                    └────────────┬─────────────┘
-                                 │
-                 ┌───────────────┴───────────────┐
-                 │ (Option A: Direct Patch/Shim) │ (Option B: Passive DMA Mailbox)
-                 │  libxrservice_broker_shim.so  │  xrservice::Adapter in hexecutord
-                 │  (LD_PRELOAD / C ABI calls)   │  (maps dsp_service DMA buffer)
-                 └───────────────┬───────────────┘
-                                 │
-                   Unix Domain Socket IPC (/tmp/hexecutord.sock)
-                                 │
- ┌───────────────────────────────▼──────────────────────────────────────────────┐
- │                              hexecutord                                      │
- │  ┌────────────────────────────────────────────────────────────────────────┐  │
- │  │ Priority Scheduler (Class::tracking, EDF, co-scheduled tensor graphs)  │  │
- │  └────────────────────────────────────┬───────────────────────────────────┘  │
- │                                       │                                      │
- │  ┌────────────────────────────────────▼───────────────────────────────────┐  │
- │  │                     One Persistent hexecutor::Session                  │  │
- │  │        (Shared VTCM resident records, unified FP16 tensor engine)      │  │
- │  └────────────────────────────────────┬───────────────────────────────────┘  │
- └───────────────────────────────────────┼──────────────────────────────────────┘
-                                         ▼
-                                Qualcomm SM8650 CDSP
+```sh
+FRAME_STEREOFEATURENN=/home/steamos/hexecutor-broker/featurenn \
+    hexecutor/packaging/run_hexecutord.sh --long-wake 30
 ```
 
----
+`FRAME_FEATURENN` is also accepted as an environment variable alias. That launcher registers stereoFeatureNN alone; add `--graph landmark=...` explicitly if desired. Check total constant capacity for any added graph. The CPU ONNX model that ships with XRService is the numerical reference. Our lowered graph differs from its u8 result by up to about 0.07 on the raw head.
 
-## 2. Bridging Mechanisms
+## Gazenet
 
-Two complementary bridging mechanisms are supported:
+The stock `CDSPGazenet` library is used by the separate `eyetracking` process. Its control block starts at DMA offset `0x445000`. Job 2 loads weights and the first job 4 acquires the stock I/O buffer; both remain on stock firmware. Once that buffer exists, `--xrservice-gazenet GRAPH` serves job-4 evaluation. The graph contract is one 128×128 three-channel float NHWC input and exactly 64 output floats. The adapter converts the two planar stock float images at cached offset `0x100`, pads channel two with zero, and writes the stock result at `0x20100`.
 
-### A. Direct Patch / Preload Shim (`libxrservice_broker_shim.so`)
-The cleanest, production-ready path. Rather than having XRService touch the stock CDSP DMA buffer at all, XRService calls the broker directly over the Unix domain socket:
-- Can be activated via `LD_PRELOAD` without modifying XRService binaries on disk.
-- Or can be called directly by patched XRService code via standard C API functions in `xrservice_broker_shim.h`.
-- **Completely bypasses firmware thread 3 and DMA mailboxes**, eliminating the VTCM hazard and yield stalls.
+`--xrservice-gazenet-vector GRAPH` separately adapts the in-place float-vector request. Its input is exactly 4,800 floats at cached offset `0x440`; the graph may return one or several outputs containing 1–4,800 finite floats in total. The adapter writes them back to the same buffer, updates the float count, then clears the ready word at control offset `0x0c`. Other vector sizes are left to stock firmware.
 
-### B. In-Daemon Mailbox Adapter (`xrservice::Adapter`)
-Built into `hexecutord`, this adapter connects to `dsp_service`, maps the stock DMA buffer (`0x2000000` bytes), and watches the mailbox words at `0x1522000` (StereoFeatureNN) and `0x445000` (Gazenet). When active jobs arrive, the adapter translates buffers, runs inference through `broker::Client`, writes results back, and signals completion.
+**VTCM ownership gate.** Firmware hardware thread 3 runs the stock eye-tracking handler on its own, separately from our wake. It serves jobs 2/4 posted to the DMA block at `0x1522000`, and it uses VTCM `0x31700000–~0x317d4600`. Pool 1 owns that range while a session is open ([memory layout](memory-layout.md#stock-eye-tracking-thread-and-vtcm)). Once the eye client keeps running, any job 2/4 that reaches the firmware's thread 3 while the broker holds a wake corrupts both sides. The adapter's yield releases the session only for requests it sees in its own blocks. The firmware's handler matches Gazenet's layout but sits at the block this adapter calls FeatureNN, so the offsets above need on-device confirmation before the Gazenet adapter can be called safe. Two fixes would remove the hazard: keep pool 1 out of `0x31700000–0x31800000` in adapter mode, or prove that no job 2/4 can reach `0x1522000` during a wake.
 
----
+Either Gazenet option sets `Artifacts::keep_eye_running`, so opening the broker session does not pause the eye client. Use this only with the adapter: an ordinary custom session still pauses and restores eye tracking. The launcher equivalents are `FRAME_GAZENET` and `FRAME_GAZENET_VECTOR`, each containing an HXFG prefix. Multiple adapter environment variables may be set together, subject to the session's graph and constant-capacity limits.
 
-## 3. Workload Contracts & Data Formats
+`--long-wake` does not enable the CPU-setting tripwire in adapter mode, because stock CDSP activity is expected. `hexecutor/tests/test_xrservice_featurenn.cpp` checks the FeatureNN and Gazenet conversion/result ABIs without a device. No Gazenet model lowering, output equivalence, live camera evaluation, or firmware handoff has been validated yet. Controller/gaze tracking quality on real inputs and long worn sessions remain release gates, as does absence of `(2,0,8)`.
 
-### 1. StereoFeatureNN (Controller Keypoint Network)
-- **Model**: Lowered MobileNetV2 with split Gemm head (68 ops, FP16 resident weights).
-- **Input**:
-  - Two $128 \times 128$ u8 eye planes per controller (`views = 2` for 1 controller, `views = 4` for 2 controllers).
-  - Normalization: $x_{\text{norm}} = (x / 255.0 - 0.449) / 0.226$.
-  - Packed into compact 3-channel NHWC float format ($128 \times 128 \times 3 \times 4 = 196,608$ bytes per controller) with channel 2 padded with $0.0$.
-- **Graph Output**:
-  - 552 output floats (split across 352 and 200 channels on the lowered model; the shim/adapter joins them).
-- **Output Record Formatting**:
-  - Reshaped into $[2, 92, 3]$ per controller: 4 heads of 23 floats per eye (center, uncertainty, plus-x, plus-z).
-  - Uncertainty head applies $2.0 \cdot \min(\text{raw}, 10.0)$ (XRService applies final exponential).
-  - Written into standard $0\times450$-byte ($1,104$ bytes) record per eye ($2,208$ bytes per controller).
+## Packaging
 
-### 2. Gazenet Image Evaluation
-- **Input**:
-  - Two planar $128 \times 128$ float images (left + right eye).
-  - Converted to compact 3-channel NHWC with channel 2 zero-padded ($196,608$ bytes).
-- **Output**:
-  - Exactly 64 output floats copied into result buffer.
+`cmake --install build --prefix <dir>` installs these files from a root or standalone Hexecutor build.
 
-### 3. Gazenet Vector Evaluation
-- **Input**:
-  - Float vector of up to 4,800 floats (typically exactly 4,800 floats, $19,200$ bytes).
-- **Output**:
-  - In-place float vector with updated float count.
-
----
-
-## 4. Components & Implementations
-
-### C API & Shim Library
-- **Header**: [xrservice_broker_shim.h](file:///Users/owenelliott/orca/workspaces/frame-spatial-runtime/cowrie/hexecutor/include/hexecutor/xrservice_broker_shim.h)
-- **Source**: [xrservice_broker_shim.cpp](file:///Users/owenelliott/orca/workspaces/frame-spatial-runtime/cowrie/hexecutor/host/cpp/xrservice_broker_shim.cpp)
-- **C Functions Exported**:
-  ```c
-  void broker_shim_set_socket(const char *socket_path);
-  int broker_shim_is_connected(void);
-  int broker_shim_dispatch_stereofeaturenn(const void *input_u8, void *output_records,
-                                          uint32_t views, uint32_t width, uint32_t height);
-  int broker_shim_dispatch_gazenet(const float *input_planar_f32, float *output_64_f32);
-  int broker_shim_dispatch_gazenet_vector(const float *input_f32, uint32_t in_floats,
-                                         float *output_f32, uint32_t max_out_floats,
-                                         uint32_t *out_floats);
-  int dispatchStereoFeatureNNOnCDSP(const void *input_u8, void *output_records,
-                                    uint32_t views, uint32_t width, uint32_t height);
-  ```
-
-### Daemon CLI & Launcher Aliases
-- **`hexecutord` CLI**:
-  - `--xrservice-featurenn GRAPH` or `--xrservice-stereofeaturenn GRAPH` (alias)
-  - `--xrservice-gazenet GRAPH`
-  - `--xrservice-gazenet-vector GRAPH`
-- **`run_hexecutord.sh`**:
-  - `FRAME_STEREOFEATURENN` or `FRAME_FEATURENN` environment variables.
-  - `FRAME_GAZENET` and `FRAME_GAZENET_VECTOR` environment variables.
-
-### Packaging & Bundling Tool
-- **Script**: [install_hexecutord.sh](file:///Users/owenelliott/orca/workspaces/frame-spatial-runtime/cowrie/runtime/scripts/install_hexecutord.sh)
-- **CMake Install Rules**: `cmake --install build --prefix <dir>` installs:
   - `<prefix>/bin/hexecutord`
-  - `<prefix>/bin/run_hexecutord.sh`
   - `<prefix>/lib/libxrservice_broker_shim.so` (or `.dylib`)
   - `<prefix>/include/xrservice_broker_shim.h`
-  - `<prefix>/systemd/10-xrservice-broker.conf` (drop-in configuration)
 
----
+The manual installer also copies the launcher to `<prefix>/bin/run_hexecutord.sh` and generates `<prefix>/systemd/10-xrservice-broker.conf`. It reads the build directory from `BUILD_DIR`, which defaults to the repo's `build/`. [install_hexecutord.sh](../../hexecutor/packaging/install_hexecutord.sh)
 
-## 5. Deployment & Usage Instructions
+## Verification
 
-### Step 1: Start `hexecutord` with Registered Graphs
-```bash
-# Register hand models + StereoFeatureNN + Gazenet
-FRAME_STEREOFEATURENN=/home/steamos/hexecutor-broker/models/featurenn \
-FRAME_GAZENET=/home/steamos/hexecutor-broker/models/gazenet \
-    /home/steamos/hexecutor-broker/bin/run_hexecutord.sh --long-wake 30
-```
-
-### Step 2: Patch XRService via Systemd `LD_PRELOAD` Drop-in
-No binary modification to XRService is needed:
-```bash
-# 1. Install bundle to headset
-runtime/scripts/install_hexecutord.sh /home/steamos/hexecutor-broker
-
-# 2. Apply systemd drop-in override
-sudo mkdir -p /etc/systemd/system/xrservice.service.d
-sudo cp /home/steamos/hexecutor-broker/systemd/10-xrservice-broker.conf /etc/systemd/system/xrservice.service.d/
-
-# 3. Reload systemd and restart XRService
-sudo systemctl daemon-reload
-sudo systemctl restart xrservice
-```
-
-### Step 3: Verify Operation
-Check XRService and hexecutord logs:
-```bash
-journalctl -u xrservice -f
-journalctl -b | grep hexecutord
-```
-Stereo FeatureNN and Gazenet calls will dispatch through `hexecutord` with ~1.2 ms inference latency and zero firmware desynchronization.
-
----
-
-## 6. Test Suite & Verification
-
-The implementation is verified by two standalone test suites in CTest:
-
-1. **`test_xrservice_featurenn` ([test_xrservice_featurenn.cpp](file:///Users/owenelliott/orca/workspaces/frame-spatial-runtime/cowrie/hexecutor/tests/test_xrservice_featurenn.cpp))**:
-   - Tests raw ABI conversions (input normalization, head decoding, uncertainty clamping, vector handling).
-   - Tests end-to-end `xrservice::Adapter` against real Unix domain socket with mock broker server and simulated 32 MiB DMA memory.
-2. **`test_xrservice_broker_shim` ([test_xrservice_broker_shim.cpp](file:///Users/owenelliott/orca/workspaces/frame-spatial-runtime/cowrie/hexecutor/tests/test_xrservice_broker_shim.cpp))**:
-   - Tests the C ABI functions and `LD_PRELOAD` symbol interception against a real Unix domain socket broker server.
-   - Verifies 1-controller (2 views) and 2-controller (4 views) StereoFeatureNN dispatch, Gazenet image eval, and Gazenet vector eval.
-
-Run all tests via CTest:
-```bash
-cmake --build build --target test_xrservice_featurenn test_xrservice_broker_shim
-ctest --test-dir build --output-on-failure
-```
-Result: 19/19 tests passed.
+The portable mailbox and shim tests validate conversion, result layout and broker calls. Validate model equivalence on captured inputs, then confirm live dispatch and firmware cleanup under the exact target service configuration. For the historical Frame coverage see the validation guide. [Mailbox ABI tests](../../hexecutor/tests/test_xrservice_featurenn.cpp), [shim tests](../../hexecutor/tests/test_xrservice_broker_shim.cpp), [device evidence](validation.md#recorded-frame-results)

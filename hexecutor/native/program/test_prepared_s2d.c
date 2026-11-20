@@ -21,7 +21,7 @@ static void set_block(Nprg2Pool pools[7],uint32_t id,const uint8_t *bytes) {
     CHECK(off<=pools[pool].bytes&&2048u<=pools[pool].bytes-off); memcpy(pools[pool].base+off,bytes,2048);
 }
 static void run_model(const char *model) {
-    char npath[128],qpath[128]; snprintf(npath,sizeof npath,"depth-model/deployment/programs/%s-v2.nprg",model);
+    char npath[128],qpath[128]; snprintf(npath,sizeof npath,"samples/depth-model/deployment/programs/%s-v2.nprg",model);
     snprintf(qpath,sizeof qpath,"hexecutor/native/build/resident-%s.qdrx",model);
     uint32_t qn,nn; uint8_t *q=read_file(qpath,&qn),*raw=read_file(npath,&nn),qsha[32],nsha[32];
     nprg2_sha256(q,qn,qsha);nprg2_sha256(raw,nn,nsha);

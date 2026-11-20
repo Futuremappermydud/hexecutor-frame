@@ -3,7 +3,7 @@
 # Build extended code and its small bootstrap only. Never rebuild the loader.
 set -eu
 cd "$(dirname "$0")/../.."
-task_sdk_root="${HEXECUTOR_SDK_ROOT:-$PWD/depth-model/.work/hexagon-sdk/6.6.0.0}"
+task_sdk_root="${HEXECUTOR_SDK_ROOT:-$PWD/samples/depth-model/.work/hexagon-sdk/6.6.0.0}"
 docker run --rm --pull never --platform linux/amd64 -v "$task_sdk_root:/sdk:ro" -v "$PWD:/workspace" -w /workspace/hexecutor/native \
    -e QDS_VECTORIZE="${QDS_VECTORIZE:-1}" -e QDS_SCALAR_CACHE="${QDS_SCALAR_CACHE:-0}" \
    -e QDS_DYNAMIC_TCM="${QDS_DYNAMIC_TCM:-0}" -e QDS_FALLBACK_TCM="${QDS_FALLBACK_TCM:-0}" \
@@ -34,7 +34,7 @@ docker run --rm --pull never --platform linux/amd64 -v "$task_sdk_root:/sdk:ro" 
    -e QDS_EXTRA_CFLAGS="${QDS_EXTRA_CFLAGS:-}" \
    "${HEXECUTOR_TOOLCHAIN_IMAGE:-hexecutor-toolchain:local}" sh -eu -c '
 cc=/sdk/tools/HEXAGON_Tools/19.0.07/Tools/bin/hexagon-clang
-flags="-I/workspace/depth-model/deployment/generated -mv75 -mhvx -mhvx-length=128b -O2 -G0 -ffreestanding -fno-builtin -fno-vectorize -fno-slp-vectorize -ffp-contract=off -fno-strict-aliasing -Wall -Wextra -DQDO_SCALAR_CACHE=$QDS_SCALAR_CACHE"
+flags="-I/workspace/samples/depth-model/deployment/generated -mv75 -mhvx -mhvx-length=128b -O2 -G0 -ffreestanding -fno-builtin -fno-vectorize -fno-slp-vectorize -ffp-contract=off -fno-strict-aliasing -Wall -Wextra -DQDO_SCALAR_CACHE=$QDS_SCALAR_CACHE"
 case "$QDS_SCALAR_CACHE" in 0|7) ;; *) echo "QDS_SCALAR_CACHE must be 0 or 7" >&2; exit 1;; esac
 case "$QDS_PRESERVE_VTCM" in 0|1) ;; *) echo "QDS_PRESERVE_VTCM must be 0 or 1" >&2; exit 1;; esac
 case "$QDS_BLOCKED_GLUE" in 0|1) ;; *) echo "QDS_BLOCKED_GLUE must be 0 or 1" >&2; exit 1;; esac

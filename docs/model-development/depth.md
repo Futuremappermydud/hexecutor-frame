@@ -16,7 +16,7 @@ Keep the transform convention and state initialization explicit. The live native
 
 ## Tooling pipeline
 
-`depth-model/tools/` contains context extraction, graph/weight recovery, quantization checks, simulator execution, synthetic probes, and the memory-level reference. `depth-model/python/depth_model/lowering/resident_program.py` and `resident_image.py` lower the recovered program into audited execution representations; the prepared-program tools produce native tables.
+`samples/depth-model/tools/` contains context extraction, graph/weight recovery, quantization checks, simulator execution, synthetic probes, and the memory-level reference. `samples/depth-model/python/depth_model/lowering/resident_program.py` and `resident_image.py` lower the recovered program into audited execution representations; the prepared-program tools produce native tables.
 
 The reference reconstructs compiled/tiled arithmetic and layouts. It is not an untiled training network. Source recovery, compatible QNN context loading, exact compiled execution, camera integration, and model training are separate deliverables.
 
@@ -26,6 +26,6 @@ The original primary graph records 5,870 recovered operations and 5,336 tensor d
 
 The retained device bridge runs the prepared native paths. CPU reference tools remain useful for differential checks but are not a fallback in the live model pipeline. Model-specific headers, lane tables, contexts, constant pools, and manifest identities must be regenerated/provisioned as a matched package.
 
-For distillation/fine-tuning, put new training definitions and export/evaluation recipes in `depth-model/training/`. Establish preprocessing, eye order, projection, output units, state, and uncertainty semantics as part of the new model contract. Updating weights alone does not establish compatibility with an old compiled schedule.
+For distillation/fine-tuning, put new training definitions and export/evaluation recipes in `samples/depth-model/training/`. Establish preprocessing, eye order, projection, output units, state, and uncertainty semantics as part of the new model contract. Updating weights alone does not establish compatibility with an old compiled schedule.
 
 Read [CPU reference](cpu-reference.md), [model artifact policy](../../tools/model_artifact_policy.py), and [live integration](../runtime/model-depth.md). This workspace does not distribute legacy model assets or claim independent provenance for a replacement solely because its code has generic names.

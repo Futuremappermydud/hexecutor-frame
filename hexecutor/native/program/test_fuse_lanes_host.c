@@ -48,7 +48,7 @@ int main(int argc,char **argv){
     const char *model=argc>1?argv[1]:"primary";
     char path[256];uint32_t qn,nn;
     snprintf(path,256,"hexecutor/native/build/resident-%s.qdrx",model);uint8_t *q=rf(path,&qn);
-    snprintf(path,256,"depth-model/deployment/programs/%s-v2.nprg",model);uint8_t *n=rf(path,&nn);
+    snprintf(path,256,"samples/depth-model/deployment/programs/%s-v2.nprg",model);uint8_t *n=rf(path,&nn);
     Nprg2Pool pools[7];memset(pools,0,sizeof pools);
     for(int i=0;i<7;i++){pools[i].bytes=rd32(n+144+i*4);if(pools[i].bytes)pools[i].base=calloc(1,pools[i].bytes);}
     uint8_t qs[32],ns[32];nprg2_sha256(q,qn,qs);nprg2_sha256(n,nn,ns);

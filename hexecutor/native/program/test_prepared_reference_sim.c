@@ -269,7 +269,7 @@ static void env_open(Env *v, const char *model, uint8_t *const *inputs, const ui
     v->model = model;
     snprintf(path, sizeof path, "hexecutor/native/build/resident-%s.qdrx", model);
     v->q = read_file(path, &qn);
-    snprintf(path, sizeof path, "depth-model/deployment/programs/%s-v2.nprg", model);
+    snprintf(path, sizeof path, "samples/depth-model/deployment/programs/%s-v2.nprg", model);
     v->raw = read_file(path, &nn);
     uint8_t qsha[32], nsha[32];
     nprg2_sha256(v->q, qn, qsha);

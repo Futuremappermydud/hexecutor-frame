@@ -11,5 +11,5 @@ dependencies = ["numpy"]
 
 [tool.setuptools]
 packages = ["hexecutor", "hexecutor.offline", "hexecutor.program", "depth_model", "depth_model.lowering", "depth_model.reference"]
-package-dir = {depth_model = "depth-model/python/depth_model"}
+package-dir = {depth_model = "samples/depth-model/python/depth_model"}
 include-package-data = false

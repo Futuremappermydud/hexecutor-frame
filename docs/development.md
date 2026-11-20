@@ -26,14 +26,24 @@ python3 tools/model_artifact_policy.py --history
 
 Use `make check` for the portable C++ host and worker protocol, geometry/temporal checks, documentation links, and artifact policy. The protocol tests exercise v3/v4 replies, temporal inputs, and session reuse/close through an injected inference implementation.
 
+These commands build and test Hexecutor's native host targets from the monorepo root.
+
+```sh
+cmake -S hexecutor -B build-hexecutor
+cmake --build build-hexecutor --parallel
+ctest --test-dir build-hexecutor --output-on-failure
+```
+
+The standalone build includes the broker, shim, portable tests, and host tools. The root build also includes the depth worker and model sample targets. Use `-DFRAME_BUILD_TESTS=OFF` to skip the portable C++ tests in either build.
+
 `make check-model` additionally requires private local assets. It validates the program/image readers and compares both models' native host outputs with saved oracle hashes. Offline Python diagnostics remain under the model and executor development packages; they are not part of the application's live path.
 
 A Linux compile check covers the real device-transport branch; the macOS build covers portable APIs and protocol behavior. Neither proves headset inference or firmware restoration. Device validation must include repeated inference, idle close/reopen, worker exit, VTCM and clock restoration, and eye-client recovery with the provisioned pinned artifacts.
 
 ## Documentation and reproducibility
 
-Maintain the canonical guides under `docs/`. Component README links and `runtime/docs` are compatibility paths to that content. Three stable stereo protocol filenames remain because experiment manifests hash them; modifying those pages changes the source identity for new runs. Saved experiment bundles retain their own source snapshot and must not be relabeled as new evidence.
+Maintain the canonical guides under `docs/`. Component README links and `depth-runtime/docs` are compatibility paths to that content. Three stable stereo protocol filenames remain because experiment manifests hash them; modifying those pages changes the source identity for new runs. Saved experiment bundles retain their own source snapshot and must not be relabeled as new evidence.
 
-Document why an optimization works, its activation/coverage conditions, and what invalidates the result. Keep individual mutation counts and command-by-command probe histories in local reports. Repeated findings such as the AXI domain, L2 mode transitions, active-block footprint choice, and warm plan identity belong in the maintained guides.
+Update the guide for the relevant topic when implementation or evidence changes. Replace superseded status and keep dated measurements with their artifact identity, input, target and validation scope. Repeated findings such as the AXI domain, L2 mode transitions, active-block footprint choice, and warm plan identity belong in the maintained guides.
 
-The temporal-fusion report, its research-notes directory, and both preserved fusion handoffs are outside this rewrite. Keep their contents and paths unchanged while the author is working on them.
+Keep one-off experiments under the ignored `research/experiments/` directory and use `research_notes/` for scratch notes. Recover superseded tracked notes through Git history. Preserve the DepthPro2 handoff, the temporal-fusion report and working notes, and both fusion handoffs at their original paths.

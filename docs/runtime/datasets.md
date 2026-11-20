@@ -23,7 +23,7 @@ Controller marks store poses, timestamps, a class, and strokes. A controller's d
 
 ## Finalize, transfer, and replay
 
-From `runtime/` in the appropriate host/headset environment:
+From `depth-runtime/` in the appropriate host/headset environment:
 
 ```sh
 python3 scripts/room_dataset.py finalize SESSION
@@ -45,13 +45,13 @@ IR-to-RGB projection needs the session's measured stereo yaw, extrinsics, and ex
 
 Compositor loss and DSP cleanup failures are retained in session logs. The launcher blocks another NPU capture in a boot marked by failed cleanup. After reboot, restore ptrace/memory prerequisites before recording again.
 
-These dataset tools remain local work in progress: `runtime/scripts/room_dataset.py`, `model_offline_batch.py`, `pull_room_dataset.py`, and `ir_dot_lib.py`. They are separate from the committed executor restructuring.
+The dataset index, offline depth pass, transfer helper and IR refinement live under `depth-runtime/scripts/`. Keep capture metadata, model artifact identities and replay parameters with the dataset.
 
 ## Offline IR yaw normalization
 
-`runtime/tools/ir_yaw_normalization.py` scores saved motion-stereo matches using each right-image ray's spherical yaw sensitivity. It leaves feature matches and their support unchanged. The right rectifier's fixed roll is included; an image-wide pixels-per-degree scale is only correct for a restricted set of rays. Python here is offline analysis and is not part of the live depth path.
+`depth-runtime/tools/ir_yaw_normalization.py` scores saved motion-stereo matches using each right-image ray's spherical yaw sensitivity. It leaves feature matches and their support unchanged. The right rectifier's fixed roll is included; an image-wide pixels-per-degree scale is only correct for a restricted set of rays. Python here is offline analysis and is not part of the live depth path.
 
-From `runtime/`, using a Python environment with NumPy:
+From `depth-runtime/`, using a Python environment with NumPy:
 
 ```sh
 python3 tools/ir_yaw_normalization.py --samples /path/to/motion-stereo-samples.npy --out /path/to/yaw-results --correction-deg 0

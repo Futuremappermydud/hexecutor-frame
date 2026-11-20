@@ -40,4 +40,4 @@ These repeated, numerically checked GEMM measurements establish the clock effect
 
 The HMX PLL is at `0x32341000`; its clock-controller base is `0x32348000`. Startup follows bounded PLL/mux sequencing and restores prior state. Architectural timer measurements use 19.2 MHz; core upcycles and timer ticks must not be interpreted as the same unit. Later live depth probes confirmed the multiplier 51, rather than inferring it only from a build flag.
 
-Source: [AXI sequence](../../hexecutor/native/qd_axim.h), [HMX power/clock handling](../../hexecutor/native/qd_hmx_power.h), [AXI probe](../../hexecutor/benchmarks/axim_tune.c), and [live depth probe](../../depth-model/deployment/lanes/device_clkprobe.py).
+Source: [AXI sequence](../../hexecutor/native/qd_axim.h), [HMX power/clock handling](../../hexecutor/native/qd_hmx_power.h), [AXI probe](../../hexecutor/benchmarks/axim_tune.c), and [live depth probe](../../samples/depth-model/deployment/lanes/device_clkprobe.py).

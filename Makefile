@@ -10,7 +10,7 @@ build build-host: configure
 build-worker: configure
 	cmake --build $(BUILD_DIR) --parallel --target frame_depth_worker
 build-runtime: build-worker
-	$(MAKE) -C runtime
+	$(MAKE) -C depth-runtime
 build-dsp:
 	$(MAKE) -C hexecutor/native
 check: build-host

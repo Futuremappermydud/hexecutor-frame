@@ -9,10 +9,10 @@ set -eu
 cd "$(dirname "$0")/../../.."
 REPS=${1:-1}
 SDK_MOUNT=""
-if [ -n "${HEXAGON_SDK_HOST:-}" ]; then SDK_MOUNT="-v $HEXAGON_SDK_HOST:/repo/depth-model/.work/hexagon-sdk:ro"; fi
+if [ -n "${HEXAGON_SDK_HOST:-}" ]; then SDK_MOUNT="-v $HEXAGON_SDK_HOST:/repo/samples/depth-model/.work/hexagon-sdk:ro"; fi
 docker run --rm --platform linux/amd64 $SDK_MOUNT -e REPS="$REPS" \
   -v "$PWD:/repo" -w /repo "${HEXECUTOR_TOOLCHAIN_IMAGE:-hexecutor-toolchain:local}" sh -lc '
-    SDK=/repo/depth-model/.work/hexagon-sdk/6.6.0.0/tools/HEXAGON_Tools/19.0.07/Tools
+    SDK=/repo/samples/depth-model/.work/hexagon-sdk/6.6.0.0/tools/HEXAGON_Tools/19.0.07/Tools
     ELF=/tmp/nprg2-overhead.elf
     "$SDK/bin/hexagon-clang" -mv75 -mhvx -mhvx-length=128b -O2 -G0 -ffp-contract=off -fno-fast-math -fno-strict-aliasing \
       -Wall -Wextra -Werror -DBENCH_REAL -I"$SDK/target/hexagon/include" -Ihexecutor/native/program \

@@ -4,19 +4,17 @@
 
 `frame_nir_hand_viewer` consumes the local `FRNIR001` raw tracking-camera stream and draws the native NIR pipeline's 21 joints per hand in the same transparent OpenXR layer. A reader keeps the newest complete pair, inference runs on a worker, and results expire 500 ms after capture, including inference time. The viewer exits when the stream ends. Capture timestamps are converted from `CLOCK_MONOTONIC_RAW` for capture-time world locking.
 
-Build on Frame from `runtime/` with `make nir-hand-viewer NIR_ORT=/home/steamos/nirhands-viewer/ort OPENXR_INCLUDE=/path/to/openxr-sdk/include`. Then run `./scripts/run_nir_hand_viewer.sh --models /home/steamos/nirhands-viewer/models` in an SSH terminal with a TTY; the launcher asks for sudo credentials to run the read-only capture helper. `FRAME_NIR_CAPTURE` overrides its default path `/tmp/nirhands-live/stream_nir_pairs`. `--threads N` and `--seconds N` are available for bounded checks. Inference threads use available CPUs 2–7 when affinity can be set. Ctrl-C stops the viewer and closes the capture pipe.
+Build on Frame from `depth-runtime/` with `make nir-hand-viewer NIR_ORT=/home/steamos/nirhands-viewer/ort OPENXR_INCLUDE=/path/to/openxr-sdk/include`. Then run `./scripts/run_nir_hand_viewer.sh --models /home/steamos/nirhands-viewer/models` in an SSH terminal with a TTY; the launcher asks for sudo credentials to run the read-only capture helper. `FRAME_NIR_CAPTURE` overrides its default path `/tmp/nirhands-live/stream_nir_pairs`. `--threads N` and `--seconds N` are available for bounded checks. Inference threads use available CPUs 2–7 when affinity can be set. Ctrl-C stops the viewer and closes the capture pipe.
 
-This build still executes the NIR ONNX graphs on the CPU by default. The Frame's installed ONNX Runtime has no QNN execution provider, and the native QNN16 ONNX lowerer cannot yet handle the keypoint graph's `InstanceNormalization` and dynamic shape operators. NPU deployment requires a prepared graph plus a verified native runner; do not label this build as NPU inference.
+The default is native tracking with ONNX Runtime on the CPU. Pass `--qnn16-dir DIR` to run both networks on the CDSP with `nirhands_detector.{q16p,q16c}` and `nirhands_keypoints.{q16p,q16c}`. Supply matching `--loader`, `--engine`, `--bootstrap` and `--chunk-probe` files, and pass `--models` for model metadata and decoding. This mode reports inference errors to the caller. Both dense heatmap and skeleton programs have Frame evidence. [Model workflow and recorded results](../model-development/nir-hand-tracking.md)
 
-An explicit `--qnn16-dir DIR` mode loads `nirhands_detector.{q16p,q16c}` and `nirhands_keypoints.{q16p,q16c}` through Hexecutor, with required `--loader`, `--engine`, `--bootstrap`, and `--chunk-probe` paths. It has no CPU fallback. The ONNX-to-QNN NHWC input/output conversion has host layout verification. With the specialized QNN16 tile kernels (see [NIR hand tracking NPU handoff](../model-development/nirhands-npu-handoff-2026-11-13.md)), device latency on the Frame CDSP is 8.8 ms (8.81 ms, 15.8M cycles) for the detector and 14.3 ms (14.28 ms, 25.7M cycles per hand) for keypoints, bit-identical to the ISS. Full end-to-end device tracking validation requires deploying both validated Q16P programs with their matching runtime artifacts.
+## Color and Mercury viewer
 
 `frame_hand_viewer` is a small standalone OpenXR app on Frame. It draws up to two tracked hands as 3D geometry over alpha-blended passthrough. The default MediaPipe path draws 21 joints per hand; the Mercury mode draws 26. Right hands are blue, left hands orange. It needs no browser or OpenVR overlay.
 
 `--mercury-dir DIR` selects stereo Mercury tracking on the CDSP. The directory contains `mercury_detection.{q16p,q16c}` and `mercury_keypoint.{q16p,q16c}`; use the matching QNN16 engine with explicit `--engine`, `--bootstrap`, `--loader`, and `--chunk-probe` paths. Mercury uses both rectified luma images and the calibrated stereo baseline. Its 616→160 detector input uses an antialiased triangle reduction: point-sampled downscaling suppressed hand confidence on real Frame captures. The MediaPipe path remains the default.
 
 The app uses the existing compositor DMA-BUF discovery and Vulkan NV12 detiling. MediaPipe uses rectified left-camera RGB; Mercury uses rectified luma from both cameras. The native C++17 tracker runs on a separate worker; OpenXR continues its wait/begin/end frame loop while inference runs. Results older than 500 ms are cleared rather than displayed as current.
-
-**Skeleton models.** A model directory whose `manifest.json` has `"arch": "skeleton"` under `keypoints` is a `SkeletonHandNet` export: the network returns six outputs and the host runs forward kinematics and the palm fit (`nirhands/src/skeleton.cpp`). When `"tight_crop": true` is set (as in the latest 96 px `FutureMapper/skeleton_tight96_full_v1` model), the native tracker fits tight crops to previous hand joints. Both 128 px and 96 px inputs are supported. Tracking and display are unchanged. This is verified on the CPU (ONNX Runtime) path only; the skeleton program does not yet fit the DSP engine's scratch region, see [the integration handoff](../model-development/nirhands-skeleton-integration-handoff-2026-11-13.md).
 
 ## Joint geometry
 
@@ -28,7 +26,7 @@ Each hand's model-relative metric landmarks are translated so they project onto 
 
 The worker locates OpenXR VIEW space in LOCAL at the capture timestamp via `XR_KHR_convert_timespec_time` and transforms joints into world space using quaternion rotations (`rotate(q, v)`). Head motion during capture, inference, and display therefore does not drag or swim the hands. If the extension or pose is unavailable, joints fall back to head space and follow the display pose. The `[Hands]` log reports `world_locked` and `capture_to_publish_ms`.
 
-The renderer draws into one transparent per-eye projection layer at the runtime's recommended size, with depth testing. It keeps two frames in flight and does not wait on the CPU for the frame it just submitted. Precompiled SPIR-V shaders are loaded from `runtime/shaders/hand_joints.{vert,frag}.spv`.
+The renderer draws into one transparent per-eye projection layer at the runtime's recommended size, with depth testing. It keeps two frames in flight and does not wait on the CPU for the frame it just submitted. Precompiled SPIR-V shaders are loaded from `depth-runtime/shaders/hand_joints.{vert,frag}.spv`.
 
 The tracker drops a hand when its landmark bounds overlap a higher-presence hand by more than `Options::duplicate_iou` (0.5). This applies to existing tracks and to new detections. Without it, two tracks could converge on one hand and fill both slots, so the second hand was never detected again.
 
@@ -36,7 +34,7 @@ The tracker drops a hand when its landmark bounds overlap a higher-presence hand
 
 ### Using Make (on Frame)
 
-From `runtime/`:
+From `depth-runtime/`:
 
 ```sh
 # MediaPipe / Mercury hand viewer:
@@ -60,14 +58,14 @@ cmake -B build -DFRAME_BUILD_TESTS=ON
 cmake --build build --target frame_hand_viewer --parallel
 ```
 
-When `NIR_ORT` is set (or detected at `hand-tracking/.work/ort/...`), `frame_nir_hand_viewer` is also enabled:
+When `NIR_ORT` is set (or detected at `samples/hand-tracking/.work/ort/...`), `frame_nir_hand_viewer` is also enabled:
 
 ```sh
 cmake -B build -DFRAME_BUILD_TESTS=ON -DNIR_ORT=/home/steamos/nirhands-viewer/ort
 cmake --build build --target frame_nir_hand_viewer --parallel
 ```
 
-OpenXR headers are auto-detected from `hand-tracking/.work/openxr-sdk/include` or `$OPENXR_INCLUDE`. The OpenXR loader is supplied by SteamVR at `/opt/steamvr/bin/linuxarm64`.
+OpenXR headers are auto-detected from `samples/hand-tracking/.work/openxr-sdk/include` or `$OPENXR_INCLUDE`. The OpenXR loader is supplied by SteamVR at `/opt/steamvr/bin/linuxarm64`.
 
 ## Run
 
@@ -75,7 +73,7 @@ SteamVR must be awake and publishing compositor color buffers. Follow [camera pr
 
 ### Launching locally on Frame
 
-For MediaPipe / color camera viewer, run from `runtime/`:
+For MediaPipe / color camera viewer, run from `depth-runtime/`:
 
 ```sh
 ./scripts/run_hand_viewer.sh \
@@ -90,7 +88,7 @@ The launcher temporarily disables compositor camera downscaling and restores the
 
 The app starts an OpenXR session named **Frame Hand Joints** and appears in the headset. Put your hands in front of the headset to see the joints and bones on them. MediaPipe alignment depends on its monocular depth estimate. Tracking covers only the rectified left-camera field of view.
 
-For Mercury stereo tracking on the CDSP, run from `runtime/` with the QNN16 deployment paths:
+For Mercury stereo tracking on the CDSP, run from `depth-runtime/` with the QNN16 deployment paths:
 
 ```sh
 ./scripts/run_hand_viewer.sh --mercury-dir /absolute/path/to/qnn16-programs \
@@ -102,7 +100,7 @@ For Mercury stereo tracking on the CDSP, run from `runtime/` with the QNN16 depl
 
 Mercury's joint positions are in left rectified camera axes (+Y up, −Z forward). The viewer converts them to the rectifier's camera axes, then uses the existing camera-to-head and capture-time world transforms. Its depth comes from Mercury's stereo optimization, not the MediaPipe size fit. See [Mercury hand tracking](../model-development/mercury-hand-tracking.md) for model provenance and validation limits.
 
-For the stereo NIR tracking camera viewer, run from `runtime/` in an SSH terminal with a TTY:
+For the stereo NIR tracking camera viewer, run from `depth-runtime/` in an SSH terminal with a TTY:
 
 ```sh
 ./scripts/run_nir_hand_viewer.sh
@@ -112,7 +110,7 @@ For the stereo NIR tracking camera viewer, run from `runtime/` in an SSH termina
 
 ### Launching remotely over SSH
 
-[view_hands.sh](../../runtime/scripts/view_hands.sh) launches the installed viewer over SSH:
+[view_hands.sh](../../depth-runtime/scripts/view_hands.sh) launches the installed viewer over SSH:
 
 ```sh
 # Color / MediaPipe / Mercury viewer:

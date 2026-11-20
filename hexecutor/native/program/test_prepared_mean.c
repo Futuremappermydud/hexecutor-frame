@@ -171,11 +171,11 @@ static void run_mean_case(const char *qpath, const char *npath, const char *fxpa
 
 int main(void) {
     run_mean_case("hexecutor/native/build/resident-primary.qdrx",
-                  "depth-model/deployment/programs/primary-v2.nprg",
+                  "samples/depth-model/deployment/programs/primary-v2.nprg",
                   "hexecutor/native/program/fixtures/primary-smoke-mean.epcpu",
                   95u, "primary");
     run_mean_case("hexecutor/native/build/resident-alternate.qdrx",
-                  "depth-model/deployment/programs/alternate-v2.nprg",
+                  "samples/depth-model/deployment/programs/alternate-v2.nprg",
                   "hexecutor/native/program/fixtures/alternate-smoke-mean.epcpu",
                   86u, "alternate");
     return 0;

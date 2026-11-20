@@ -1,10 +1,8 @@
 # MediaPipe hand detection and tracking
 
-The current optimization candidate and exact resume instructions are recorded in the [2026-11-06 checkpoint](hand-tracking-progress.md). The latest mixed-precision scheduler is not yet device-validated; earlier measurements below describe their stated builds.
+MediaPipe runs color-camera palm detection and landmark tracking through the HXFG tensor backend. The OpenXR viewer and native replay share the tracker. For stereo alternatives see [Mercury](mercury-hand-tracking.md) and [NIR hands](nir-hand-tracking.md).
 
 The native C++ hand pipeline runs Google's Hand Landmarker float16/1 bundle through Hexecutor on the Frame CDSP. Palm detection and landmark inference use HMX/HVX; RGB cropping, decoding, weighted suppression, projection and ROI tracking run in C++. The two graphs share one device session. This is an RGB API and replay executable; the standalone [live viewer](../runtime/hand-tracking-viewer.md) also connects the compositor camera to this pipeline. The depth/render application does not consume hand results yet.
-
-The earlier private hand-model research is separate from this MediaPipe deployment. Its operator gaps do not describe the supported MediaPipe graphs below.
 
 ## Model and coordinate contract
 
@@ -19,16 +17,16 @@ Image landmarks use MediaPipe's 21-joint order: x/image-width, y/image-height, a
 
 ## Provision and build
 
-The download recipe pins the versioned bundle to SHA-256 `fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1`. Weights, converted images, schematics and validation tensors remain ignored local artifacts. Attribution is in [NOTICE](../../hand-tracking/NOTICE) and [the MediaPipe license](../../hand-tracking/LICENSE.mediapipe).
+The download recipe pins the versioned bundle to SHA-256 `fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1`. Weights, converted images, schematics and validation tensors remain ignored local artifacts. Attribution is in [NOTICE](../../samples/hand-tracking/NOTICE) and [the MediaPipe license](../../samples/hand-tracking/LICENSE.mediapipe).
 
 From the repository root:
 
 ```sh
-python3 -m venv hand-tracking/.work/venv
-hand-tracking/.work/venv/bin/pip install -r hand-tracking/tools/requirements.txt
-hand-tracking/.work/venv/bin/python hand-tracking/tools/prepare_mediapipe.py \
-  --assets hand-tracking/models/mediapipe \
-  --output hand-tracking/.work/deployment
+python3 -m venv samples/hand-tracking/.work/venv
+samples/hand-tracking/.work/venv/bin/pip install -r samples/hand-tracking/tools/requirements.txt
+samples/hand-tracking/.work/venv/bin/python samples/hand-tracking/tools/prepare_mediapipe.py \
+  --assets samples/hand-tracking/models/mediapipe \
+  --output samples/hand-tracking/.work/deployment
 make build-host
 ```
 
@@ -66,7 +64,7 @@ build/bin/frame_hand_tracker \
 
 `--precise` selects the DSP float32 comparison path. `--dump-inputs /absolute/path/to/ignored/work` records exact model inputs for offline comparisons. HMX is the default; there is no automatic CPU/Python fallback.
 
-For embedding, link `hand_tracking_host`, call `hand_tracking::load_models(directory)`, construct one `hexecutor::Session` with those programs, and pass it to `hand_tracking::Tracker`. `process(Image, timestamp_ns)` accepts RGB bytes with an explicit row stride. Explicitly call `Session::close()` to receive restoration errors. The API lives in [tracker.hpp](../../hand-tracking/include/hand_tracking/tracker.hpp).
+For embedding, link `hand_tracking_host`, call `hand_tracking::load_models(directory)`, construct one `hexecutor::Session` with those programs, and pass it to `hand_tracking::Tracker`. `process(Image, timestamp_ns)` accepts RGB bytes with an explicit row stride. Explicitly call `Session::close()` to receive restoration errors. The API lives in [tracker.hpp](../../samples/hand-tracking/include/hand_tracking/tracker.hpp).
 
 ## Validation and performance
 
@@ -78,11 +76,19 @@ HEXECUTOR_TOOLCHAIN_IMAGE=your-installed-toolchain-image \
   sh hexecutor/build-scripts/test_tensor_sim.sh
 ```
 
-[validate_mediapipe.py](../../hand-tracking/tools/validate_mediapipe.py) compares the native reference or device runner with LiteRT. It accepts explicit SDK artifacts and an optional SSH host/remote work directory, records their hashes and timings, and keeps tensors/reports in its `--work` directory. `--landmark-input` adds a real crop saved by the replay executable. The float32 comparison budget is 0.002 absolute. HMX budgets are 1% of network input extent for regressors/landmarks, 0.02 for probabilities, and 0.002 m for model-relative world coordinates. Palm logits are compared after sigmoid. These are arithmetic comparison budgets, not task-accuracy guarantees.
+[validate_mediapipe.py](../../samples/hand-tracking/tools/validate_mediapipe.py) compares the native reference or device runner with LiteRT. It accepts explicit SDK artifacts and an optional SSH host/remote work directory, records their hashes and timings, and keeps tensors/reports in its `--work` directory. `--landmark-input` adds a real crop saved by the replay executable. The float32 comparison budget is 0.002 absolute. HMX budgets are 1% of network input extent for regressors/landmarks, 0.02 for probabilities, and 0.002 m for model-relative world coordinates. Palm logits are compared after sigmoid. These are arithmetic comparison budgets, not task-accuracy guarantees.
 
 The 2026-11-06 development run validated zero, random, gradient, image and real-hand-crop inputs, then replayed Google's `right_hands.jpg` for twelve frames. Both hands stayed above 0.99 presence with stable IDs and one detector invocation. The image-space overlay aligned with both hands. Repeated runs and explicit closes passed the existing guard, VTCM fingerprint, mapping, clock-marker and callback cleanup checks. A SIGTERM during replay completed the current frame, closed the session, and allowed a fresh process to reopen and infer successfully; SIGINT uses the same orderly-exit path.
 
 The initial float DSP palm path took about 700 ms. HMX, compact RGB, VTCM activations/constants, vector packing and specialized depthwise loops reduced the first fully validated warm host runs to roughly 19 ms for palms and 13.5 ms for landmarks (DSP architectural-timer measurements: 18.57 ms and 12.98 ms). The twelve-frame two-hand replay measured about 37 ms per tracked frame before the final host guard-scan optimization; a short close/reopen replay subsequently measured 31–35 ms on its two warm frames. These are dated prototype observations, not sub-millisecond performance or a live camera benchmark. Keep cold setup, model execution, host overhead and full tracking latency separate.
+
+### Compacted FP16 measurements
+
+The 2026-11-06 compacted planar run on Frame measured 0.945–1.004 ms DSP for landmark and 2.21–2.26 ms for palm (host warm calls roughly 1.0–1.3 ms and 2.5–3.0 ms). Engine identity `d6b96ed223a6…`, four-worker bootstrap `b8ddcf62d8cb…`. Nine LiteRT cases passed. All 28 outputs matched the preceding silicon build bit for bit. Cold staging took about 23 ms. Use the same artifact hashes before comparing a new build.
+
+- Exact dead-channel compaction removed 4,976 landmark channels and reduced the weights from 5.45 to 3.88 MB. Ordering remaining weights by magnitude improved gradient-case handedness error to about 0.0191 against a 0.02 budget. Keep the rounding and accumulation order in accuracy comparisons.
+- Depthwise loops and row/block partitioning were the major warm-path gains. FP32 residual state cost 9.41 ms versus 6.13 ms in the paired trial with little numerical benefit. QF16 depthwise accumulation degraded palm scores and handedness. Use the existing scheduled HVX implementation as the baseline. [Kernel constraints](../hexecutor/kernels.md)
+- Before claiming live performance, repeat two-hand tracking, idle close/reopen, signal exit and eye-client recovery with the chosen engine and bootstrap. Compare deadline misses and wake latency as well as warm arithmetic. [Broker measurements](../hexecutor/broker.md), [Validation](../hexecutor/validation.md)
 
 ## QNN v75 compiler comparison
 
@@ -97,10 +103,8 @@ QAIRT 2.50, v75/SM8650, O3, 8 MiB VTCM and four HVX threads produced the followi
 
 Records include constants, shapes and aliased/in-place placement nodes; they are not logical layer counts or a latency measure. The compiler uses `F16Crouton_TCM`, packed FP16 weights, DMA/checkpoint scheduling, in-place slices/concats, and `conv_layer_fp16_s1_v73` / `s2_v73` kernels even when targeting v75. Standalone depthwise/add/PReLU/ReLU operators disappear into the convolution lowering. The disassembled FP16 leaf performs matrix bias/conversion before storing FP16 tiles, avoiding our repeated FP32 materialization and repacking.
 
-Qualcomm's published 0.533 ms detector / 0.707 ms landmark TFLite figures on SM8650 use older 256×256 BlazePalm/BlazeHand exports (2,944 palm anchors and a three-output landmark model). Those exports were also prepared locally for comparison. Their compiled operation families are similar, but their application contract differs from this bundle. The [Qualcomm model card](https://huggingface.co/qualcomm/MediaPipe-Hand-Detection/blob/main/README.md) supplies the published timings; local offline preparation/simulation does not reproduce a hardware latency measurement. A subsequent optimization pass added a blocked FP16/fused path, with a mixed-precision residual-state candidate now awaiting device validation. The [checkpoint](hand-tracking-progress.md) distinguishes measured builds, the remaining numerical failure and work still needed on transfer/compute overlap.
+Qualcomm's published 0.533 ms detector / 0.707 ms landmark TFLite figures on SM8650 use older 256×256 BlazePalm/BlazeHand exports (2,944 palm anchors and a three-output landmark model). Those exports were also prepared locally for comparison. Their compiled operation families are similar, but their application contract differs from this bundle. The [Qualcomm model card](https://huggingface.co/qualcomm/MediaPipe-Hand-Detection/blob/main/README.md) supplies the published timings; local offline preparation/simulation does not reproduce a hardware latency measurement.
 
-## Earlier private-model workspace
+## Replacement models
 
-The inspected private pose plan contains host tensor operations around two delegated graphs. A delegate executor alone cannot replace its host matrix multiplication, reshaping, slicing, concatenation, normalization and multi-view aggregation. Recorded compatibility research found 22 unmatched operation types and 253 instances for that plan; detection/surface/gesture families had different requirements. These findings apply to those artifacts, not the MediaPipe graphs above.
-
-Use `hand-tracking/training/` for replacement model definitions, export tools and evaluation. Preserve dataset/checkpoint provenance and explicit crop, joint-order, coordinate, unit, confidence and state contracts. Evaluate occlusion recovery, handedness, temporal behavior, metric accuracy and device latency together.
+Use `samples/hand-tracking/training/` for replacement model definitions, export tools and evaluation. Preserve dataset/checkpoint provenance and explicit crop, joint-order, coordinate, unit, confidence and state contracts. Evaluate occlusion recovery, handedness, temporal behavior, metric accuracy and device latency together.

@@ -184,27 +184,27 @@ static void run_addsub_flat_case(const char *qpath, const char *npath, const cha
 
 int main(void) {
     run_addsub_flat_case("hexecutor/native/build/resident-primary.qdrx",
-                         "depth-model/deployment/programs/primary-v2.nprg",
+                         "samples/depth-model/deployment/programs/primary-v2.nprg",
                          "hexecutor/native/program/fixtures/primary-smoke-addsub-flat-152.epcpu",
                          152u, "primary");
     run_addsub_flat_case("hexecutor/native/build/resident-primary.qdrx",
-                         "depth-model/deployment/programs/primary-v2.nprg",
+                         "samples/depth-model/deployment/programs/primary-v2.nprg",
                          "hexecutor/native/program/fixtures/primary-smoke-addsub-flat-180.epcpu",
                          180u, "primary");
     run_addsub_flat_case("hexecutor/native/build/resident-primary.qdrx",
-                         "depth-model/deployment/programs/primary-v2.nprg",
+                         "samples/depth-model/deployment/programs/primary-v2.nprg",
                          "hexecutor/native/program/fixtures/primary-smoke-addsub-flat-182.epcpu",
                          182u, "primary");
     run_addsub_flat_case("hexecutor/native/build/resident-alternate.qdrx",
-                         "depth-model/deployment/programs/alternate-v2.nprg",
+                         "samples/depth-model/deployment/programs/alternate-v2.nprg",
                          "hexecutor/native/program/fixtures/alternate-smoke-addsub-flat-100.epcpu",
                          100u, "alternate");
     run_addsub_flat_case("hexecutor/native/build/resident-alternate.qdrx",
-                         "depth-model/deployment/programs/alternate-v2.nprg",
+                         "samples/depth-model/deployment/programs/alternate-v2.nprg",
                          "hexecutor/native/program/fixtures/alternate-smoke-addsub-flat-128.epcpu",
                          128u, "alternate");
     run_addsub_flat_case("hexecutor/native/build/resident-alternate.qdrx",
-                         "depth-model/deployment/programs/alternate-v2.nprg",
+                         "samples/depth-model/deployment/programs/alternate-v2.nprg",
                          "hexecutor/native/program/fixtures/alternate-smoke-addsub-flat-130.epcpu",
                          130u, "alternate");
     return 0;

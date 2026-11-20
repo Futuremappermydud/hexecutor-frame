@@ -36,6 +36,6 @@ Tag observations also showed short-timescale yaw drift outside the history sprea
 
 Dataset processing associates a camera pose with the estimated exposure and rejects missing or excessively distant poses. The historical 8 ms exposure offset is configurable and is not a universal calibration. Compositor restart, camera sequence gaps, and uncertain clock alignment must remain visible in metadata.
 
-Source: [capture](../../runtime/src/dma_capture.cpp), [rectification](../../runtime/src/depth_pipeline.cpp), [calibration definitions](../../runtime/include/calibration.hpp).
+Source: [capture](../../depth-runtime/src/dma_capture.cpp), [rectification](../../depth-runtime/src/depth_pipeline.cpp), [calibration definitions](../../depth-runtime/include/calibration.hpp).
 
-Capture-clock development in `runtime/src/v4l2_capture_clock.cpp` remains local work in progress.
+The capture-clock helper maps V4L2 and raw monotonic timestamps into the runtime clock domain. Verify its calibration against measured exposure timing for the camera stream under test. [Capture-clock code](../../depth-runtime/src/v4l2_capture_clock.cpp)

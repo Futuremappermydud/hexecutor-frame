@@ -8,22 +8,22 @@ From the repository root, `make build-host` builds the C++ host, worker, and por
 
 ## Spatial application
 
-Work from `runtime/`. Its Makefile uses C++17, optimization, OpenMP, and the installed SteamVR/OpenXR headers and libraries. `glslc` builds the compute shaders. MNN is an optional historical Vulkan-AI dependency; the native Vulkan matcher does not require it.
+Work from `depth-runtime/`. Its Makefile uses C++17, optimization, OpenMP, and the installed SteamVR/OpenXR headers and libraries. `glslc` builds the compute shaders. MNN is an optional historical Vulkan-AI dependency; the native Vulkan matcher does not require it.
 
 ```sh
-cd runtime
+cd depth-runtime
 ./scripts/setup_frame.sh
 ./scripts/deploy_and_run.sh
 ```
 
-The deploy script synchronizes the monorepo source layout to `/home/steamos/frame-spatial-runtime`, honoring artifact exclusions, builds the native host/worker and application, then launches from its `runtime/` subdirectory. It does not provision private model packages. `FRAME_HOST` and `FRAME_REMOTE_DIR` override the remote target.
+The deploy script synchronizes the monorepo source layout to `/home/steamos/frame-spatial-runtime`, honoring artifact exclusions, builds the native host/worker and application, then launches from its `depth-runtime/` subdirectory. It does not provision private model packages. `FRAME_HOST` and `FRAME_REMOTE_DIR` override the remote target.
 
 To build directly on the headset:
 
 ```sh
 cd /home/steamos/frame-spatial-runtime
 make build-runtime
-cd runtime
+cd depth-runtime
 ./bin/frame_openxr_point_cloud
 ```
 
@@ -34,14 +34,14 @@ SteamVR must be awake and its camera buffers present. The setup script configure
 Provision the model package, matching DSP engine/bootstrap, generated program tables, separately. A fresh clone does not contain weights, model dumps, generated model headers, or capture fixtures.
 
 ```sh
-# From runtime/ on the development host, after installing the matching package:
+# From depth-runtime/ on the development host, after installing the matching package:
 ./scripts/setup_frame.sh --qnn
 ```
 
 On the headset:
 
 ```sh
-cd /home/steamos/frame-spatial-runtime/runtime
+cd /home/steamos/frame-spatial-runtime/depth-runtime
 OMP_NUM_THREADS=2 ./bin/frame_openxr_point_cloud --depth-model-qnn
 ```
 
@@ -51,6 +51,6 @@ OMP_NUM_THREADS=2 ./bin/frame_openxr_point_cloud --depth-model-qnn
 
 ## DSP development
 
-Start with [Hexecutor operations](hexecutor/operations.md), then its [memory map](hexecutor/memory-layout.md). `make -C hexecutor/native` builds the basic callback targets with a Hexagon-capable compiler; it is not the optimized prepared-engine recipe. `depth-model/deployment/lanes/build_best.sh` records that recipe and requires local generated headers and model resources.
+Start with [Hexecutor operations](hexecutor/operations.md), then its [memory map](hexecutor/memory-layout.md). `make -C hexecutor/native` builds the basic callback targets with a Hexagon-capable compiler; it is not the optimized prepared-engine recipe. `samples/depth-model/deployment/lanes/build_best.sh` records that recipe and requires local generated headers and model resources.
 
 For failures, first identify the failing boundary: camera access, GPU initialization, model package verification, DSP startup, inference, or cleanup. The runtime and executor guides explain their diagnostics. A recorded benchmark does not prove a newly installed package is healthy.

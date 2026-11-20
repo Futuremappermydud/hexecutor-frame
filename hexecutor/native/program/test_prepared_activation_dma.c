@@ -61,7 +61,7 @@ static int run_case(const char*qpath,const char*npath,const char*fpath,uint32_t 
     for(unsigned p=0;p<7;p++)free(pools[p].base);free(hot);nprg2_close(&program);free(q);free(raw);free(fx);free(qsha);free(nsha);return 0;
 }
 int main(void){
-    if(run_case("hexecutor/native/build/resident-primary.qdrx","depth-model/deployment/programs/primary-v2.nprg","hexecutor/native/program/fixtures/primary-smoke-activation-dma.ppcpu",5u,67u))return 1;
-    if(run_case("hexecutor/native/build/resident-alternate.qdrx","depth-model/deployment/programs/alternate-v2.nprg","hexecutor/native/program/fixtures/alternate-smoke-activation-dma.ppcpu",7u,58u))return 1;
+    if(run_case("hexecutor/native/build/resident-primary.qdrx","samples/depth-model/deployment/programs/primary-v2.nprg","hexecutor/native/program/fixtures/primary-smoke-activation-dma.ppcpu",5u,67u))return 1;
+    if(run_case("hexecutor/native/build/resident-alternate.qdrx","samples/depth-model/deployment/programs/alternate-v2.nprg","hexecutor/native/program/fixtures/alternate-smoke-activation-dma.ppcpu",7u,58u))return 1;
     return 0;
 }

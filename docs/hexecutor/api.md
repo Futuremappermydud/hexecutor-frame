@@ -24,6 +24,6 @@ The host ports the firmware hash/ELF checks, shared-descriptor handshake, exclus
 
 `hexecutor/broker.hpp` adds a [CDSP broker](broker.md) client and server: `hexecutord` owns one tensor session and clients submit jobs with `broker::Client::run`, which has the same shape as `Session::run`.
 
-The native worker is `build/bin/frame_depth_worker` (copied to `runtime/bin/` for the app). `FRAME_DEPTH_WORKER` overrides its executable. The existing protocol v3/v4 is retained; `--check-package` verifies provisioned package files without opening the DSP. The worker supports idle close/reopen and close-after-reply. The portable protocol tests inject an inference implementation rather than adding a fake backend to the production worker.
+The native worker is `build/bin/frame_depth_worker` (copied to `depth-runtime/bin/` for the app). `FRAME_DEPTH_WORKER` overrides its executable. The existing protocol v3/v4 is retained; `--check-package` verifies provisioned package files without opening the DSP. The worker supports idle close/reopen and close-after-reply. The portable protocol tests inject an inference implementation rather than adding a fake backend to the production worker.
 
 Build with `make build-host`; run the portable native checks with `make check`. The Linux transport is compile-checked separately from macOS's hardware-unavailable branch. These checks do not substitute for a real headset inference and restoration run.

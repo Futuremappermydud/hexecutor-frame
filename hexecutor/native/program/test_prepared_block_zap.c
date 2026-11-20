@@ -107,7 +107,7 @@ static void run_model(const char *qpath, const char *npath) {
     free(q); free(raw);
 }
 int main(void) {
-    run_model("hexecutor/native/build/resident-primary.qdrx", "depth-model/deployment/programs/primary-v2.nprg");
-    run_model("hexecutor/native/build/resident-alternate.qdrx", "depth-model/deployment/programs/alternate-v2.nprg");
+    run_model("hexecutor/native/build/resident-primary.qdrx", "samples/depth-model/deployment/programs/primary-v2.nprg");
+    run_model("hexecutor/native/build/resident-alternate.qdrx", "samples/depth-model/deployment/programs/alternate-v2.nprg");
     return 0;
 }

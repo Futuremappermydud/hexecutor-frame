@@ -61,11 +61,11 @@ static void run_model(const char *qpath,const char *npath,const char *add_fixtur
 int main(int argc,char **argv){
     SIM_ACQUIRE_HVX;SIM_SET_HVX_DOUBLE_MODE;
     if(argc==1){
-        run_model("hexecutor/native/build/resident-primary.qdrx","depth-model/deployment/programs/primary-v2.nprg",
+        run_model("hexecutor/native/build/resident-primary.qdrx","samples/depth-model/deployment/programs/primary-v2.nprg",
                   "hexecutor/native/program/fixtures/primary-smoke-add.epcpu",
                   "hexecutor/native/program/fixtures/primary-smoke-linearclip.epcpu",
                   "hexecutor/native/program/fixtures/primary-smoke-requant.epcpu");
-        run_model("hexecutor/native/build/resident-alternate.qdrx","depth-model/deployment/programs/alternate-v2.nprg",
+        run_model("hexecutor/native/build/resident-alternate.qdrx","samples/depth-model/deployment/programs/alternate-v2.nprg",
                   "hexecutor/native/program/fixtures/alternate-smoke-add.epcpu",
                   "hexecutor/native/program/fixtures/alternate-smoke-linearclip.epcpu",
                   "hexecutor/native/program/fixtures/alternate-smoke-requant.epcpu");

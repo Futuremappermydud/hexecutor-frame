@@ -4,26 +4,11 @@ This document describes the design, implementation, and verification of dynamic 
 
 ---
 
-## 1. Context and Problem Statement
+## Lease sizing
 
-Historically, the Frame CDSP kernel driver (`cdsp_mem.ko`) allocated a static memory lease at module load time via the `size_mb` module parameter (e.g. `insmod cdsp_mem.ko size_mb=128`).
-- **128 MiB** was the baseline contract for learned depth (`ModelDepthPipeline`) and MediaPipe/NIR hand tracking (`nirhands`).
-- **512 MiB** was tested for multi-graph tensor models and enlarged constant pools.
-- **Emerging workloads** such as Liquid AI's LFM3 family require significantly more CDSP memory:
-  - *LFM3-1.7B Text Decoder (Q4_0, Host-Assisted Embeddings)*: requires **848 MiB** minimum (~1024 MiB recommended lease, 64 JTLB slots).
-  - *LFM3-VL-2B Multimodal (Q4_0, Host-Assisted Embeddings)*: requires **982 MiB** minimum (~1280 MiB or 1536 MiB recommended lease, 80–96 JTLB slots).
-  - *LFM3-VL-2B All-on-DSP (Q4_0, Token Embeddings on CDSP)*: requires **1140 MiB** minimum (~1536 MiB recommended lease, 96 JTLB slots).
-  *(See budget reconciliation details below from [`docs/model-development/lfm3-dsp-plan.md`](../model-development/lfm3-dsp-plan.md)).*
+The ordinary depth and small tracking configurations use a 128 MiB baseline. Large tensor models may require a larger mutually compatible kernel lease and engine, bootstrap and probe. Size the window against actual arenas, constants, state and guard layout, using the exported manifest. [Recorded lease tests](#recorded-evidence-and-release-checks)
 
-A static lease presents a fundamental trade-off:
-- If pinned to 128 MiB, large models cannot run.
-- If permanently pinned to 1024–1536 MiB, lightweight tracking workloads permanently hold up to 1.5 GiB of headset system RAM, risking OS out-of-memory kills and starving graphics/compositor processes.
-
-Dynamic memory reservation solves this by scaling the allocation up to the workload's exact requirement when active, and shrinking it back down to baseline (128 MiB) when idle or transitioning back to lightweight tracking.
-
----
-
-## 2. Architecture Overview
+## Architecture Overview
 
 ```mermaid
 flowchart TD
@@ -56,11 +41,11 @@ flowchart TD
 
 ---
 
-## 3. Kernel Module Implementation (`cdsp_mem.c` & `cdsp_mem_core.c`)
+## Kernel Module Implementation (`cdsp_mem.c` & `cdsp_mem_core.c`)
 
 The kernel module lives at [`hexecutor/device/kmod/cdsp_mem.c`](../../hexecutor/device/kmod/cdsp_mem.c) and [`hexecutor/device/kmod/cdsp_mem_core.c`](../../hexecutor/device/kmod/cdsp_mem_core.c) with public ABI constants in [`hexecutor/include/hexecutor/cdsp_mem.h`](../../hexecutor/include/hexecutor/cdsp_mem.h).
 
-### 3.1 Constraints and Boundaries
+### Constraints and Boundaries
 - **Chunk granularity**: 2 MiB physically contiguous chunks (`CHUNK_ORDER 9`, `PAGE_SIZE << 9`).
 - **Base IOVA**: `0xa0000000`.
 - **Minimum size**: 128 MiB (64 chunks, 8 JTLB slots).
@@ -68,7 +53,7 @@ The kernel module lives at [`hexecutor/device/kmod/cdsp_mem.c`](../../hexecutor/
   $$\text{0xa0000000} + \text{0x60000000 (1.5 GiB)} = \text{0x100000000 (4 GiB)}$$
   1536 MiB spans the entire remaining 32-bit IOVA space. Any allocation $> 1536$ MiB overflows 32-bit addressability and is rejected.
 
-### 3.2 Dynamic Growth and Shrinking
+### Dynamic Growth and Shrinking
 Resizing is serialized under `cdsp_mem_lock` mutex:
 1. **Growth (`new_size_mb > size_mb`)**:
    - Always allowed, regardless of active mappings or pins.
@@ -89,12 +74,12 @@ Resizing is serialized under `cdsp_mem_lock` mutex:
    - Flushes SMMU context (`iommu_flush_iotlb_all(domain)`).
    - Downsizes chunk pointer arrays.
 
-### 3.3 Pin and Mapping Safety Rules
+### Pin and Mapping Safety Rules
 - **Live User VMA Tracking**: The driver tracks memory mappings using `struct vm_operations_struct` (`.open` and `.close`). When a process forks, splits VMAs, or unmaps regions, each VMA's extent (`vm_pgoff << PAGE_SHIFT + vm_end - vm_start`) is tracked in `cdsp_mem_core`. Chunks within any live mapping can never be freed while mapped.
 - **DSP-Window Pin (`CDSP_MEM_IOC_PIN` / `CDSP_MEM_IOC_UNPIN`)**: An ioctl tied to the open `struct file *`. A session pins the extent the DSP engine touches. If a host process crashes or exits abruptly, the driver's `.release` callback automatically releases all pins registered by that file descriptor.
 - **Concurrency**: `SET_SIZE`, `mmap`, `PIN`, and `UNPIN` are fully serialized under `cdsp_mem_lock` mutex. No sleeping memory allocations occur under a spinlock.
 
-### 3.4 Permissions and Capabilities
+### Permissions and Capabilities
 - `/dev/cdsp_mem` device permissions remain `0666` (openable and mappable by unprivileged processes as required by existing client binaries).
 - `CDSP_MEM_IOC_SET_SIZE` and the sysfs setter `/sys/module/cdsp_mem/parameters/size_mb` require `CAP_SYS_ADMIN` unless the module parameter `allow_user_resize=1` is passed (default: `0`).
 - `CDSP_MEM_IOC_GET_SIZE`, `CDSP_MEM_IOC_GET_INFO`, and `PIN`/`UNPIN` remain unprivileged.
@@ -105,18 +90,14 @@ Resizing is serialized under `cdsp_mem_lock` mutex:
 
 ---
 
-## 4. Host Workload Management (`WorkloadMemoryManager`)
+## Host Workload Management (`WorkloadMemoryManager`)
 
 Implemented in [`hexecutor/host/cpp/workload_memory.cpp`](../../hexecutor/host/cpp/workload_memory.cpp) and [`hexecutor/include/hexecutor/workload_memory.hpp`](../../hexecutor/include/hexecutor/workload_memory.hpp).
 
-### 4.1 Automatic Workload Sizing
-`calculate_workload_size_mb(programs, artifacts)` evaluates the active workload:
-- **Baseline Workloads**: Depth and hand tracking return `128 MiB`.
-- **Tensor & QNN16 Workloads**: Sums engine ELF + program images + arenas + constant pools + I/O buffers + 32 MiB scratch/stacks/canaries.
-- **Overrides**: Supports `Artifacts::cdsp_memory_mb` and `HEXECUTOR_CDSP_MEM_MB` environment variable.
-- **Alignment**: Aligns up to 16 MiB boundaries and clamps to `[128, 1536]` MiB.
+### Automatic Workload Sizing
+`calculate_workload_size_mb(programs, artifacts)` estimates the required lease from a 1 MiB engine reservation, the image and constant file sizes, declared I/O bytes and 32 MiB of shared overhead. It rounds the estimate to 16 MiB and uses at least the 128 MiB baseline. `Artifacts::cdsp_memory_mb` and `HEXECUTOR_CDSP_MEM_MB` can raise the requested size within the configured cap. The estimate does not replace the engine's window and layout checks. [Workload sizing](../../hexecutor/host/cpp/workload_memory.cpp)
 
-### 4.2 RAII Lease Pattern (`WorkloadLease`)
+### RAII Lease Pattern (`WorkloadLease`)
 ```cpp
 {
     // Acquiring lease automatically grows cdsp_mem if needed
@@ -127,49 +108,36 @@ Implemented in [`hexecutor/host/cpp/workload_memory.cpp`](../../hexecutor/host/c
 } // Destruction automatically shrinks cdsp_mem back to baseline (128 MiB) if nothing else pins
 ```
 
-### 4.3 Integration in `Session` (`executor.cpp`)
+### Integration in `Session` (`executor.cpp`)
 - `open()`: Calculates workload requirement, acquires `WorkloadLease`, queries actual driver lease size, opens `/dev/cdsp_mem`, takes the DSP-window pin via `CDSP_MEM_IOC_PIN(lease_mb)`, and calls `mmap(nullptr, mapped_bytes, ...)`.
-- Constants Region: When `mapped_bytes > 128 MiB`, `allocation_limit` for constants dynamically expands beyond 96 MiB up to `mapped_bytes - 32 MiB`.
+- Constants Region: For HXFG pools that exceed the standard allocation, and an engine window above 128 MiB, the high region begins at 128 MiB and ends at the smaller of the engine window minus 8 KiB and the format ceiling. Persistent state follows the constants.
 - Guards: Dynamic top-of-window canary guard placed at `mapped_bytes - 4096`.
 - `close()`: After `verify_exit(ran)` finishes and succeeds, calls `CDSP_MEM_IOC_UNPIN` and closes the device handle.
 - `release_memory()`: Unmaps memory (`munmap`) and releases `WorkloadLease`. If the driver returns `-EBUSY` (another process or mapping is holding the window), the host manager treats `-EBUSY` as 'stay large' without crashing.
 
-### 4.4 Idle-Close and Persistent-State Interplay
-- `hexecutord` supports `--idle-close-ms` to release the device during idle periods.
-- Persistent DSP state (KV cache for attention layers and causal 1D conv historical buffers) resides in the lease window.
-- If the lease were to shrink below the persistent state region, this state would be lost.
-- `WorkloadMemoryManager::set_persistent_state_pin(state_mb)` exposes a hook for persistent-state owners: while live, shrink requests below `state_mb` are refused, keeping the memory lease preserved across idle cycles.
+### Persistent state
 
----
+The broker keeps sessions with persistent graphs open through routine idle gaps. A forced release loses that state and requires explicit reset before subsequent use. The workload manager also exposes a persistent pin for callers that own such a lease. [Broker lifecycle](broker.md#persistent-state)
 
-## 5. Hexagon JTLB and Transport Adaptations
+## Hexagon JTLB and Transport Adaptations
 
-### 5.1 Dynamic JTLB Slot Placement (`qd_owned_memory.h`)
+### Dynamic JTLB Slot Placement (`qd_owned_memory.h`)
 Hexagon JTLB provides 128 entries (indices `0..127`). Firmware / QuRT OS entries occupy slots `0..11`.
 Each JTLB slot maps a 16 MiB page (`0x40` encoding).
 
-The starting entry index `QDO_FIRST` adapts based on `QDO_SLOTS`:
-$$\text{QDO\_FIRST} = \begin{cases} 64 & \text{if } \text{QDO\_SLOTS} \le 64 \\ 128 - \text{QDO\_SLOTS} & \text{if } \text{QDO\_SLOTS} > 64 \end{cases}$$
+The standard eight-slot build uses indices 64–71. Builds with more than eight slots search for free entries from 127 down to 16 and save their original values. Installation refuses a conflicting virtual mapping or insufficient free slots. Restore and verify all saved entries at exit. `QDO_SLOTS` is an engine/bootstrap build setting. [JTLB implementation](../../hexecutor/native/qd_owned_memory.h)
 
-| Window Size | JTLB Slots (16 MiB) | Slot Indices | Headroom / Firmware Conflict |
-| :--- | :---: | :---: | :--- |
-| **128 MiB** (shipped) | 8 | 64..71 | None (slots 12..63 and 72..127 free) |
-| **256 MiB** | 16 | 64..79 | None |
-| **512 MiB** (experimental) | 32 | 64..95 | None |
-| **1024 MiB** (LFM3 Text) | 64 | 64..127 | None |
-| **1536 MiB** (LFM3-VL) | 96 | 32..127 | None (entries 0..31 preserved for firmware) |
-
-### 5.2 Transport and Probe Updates (`frame_transport.cpp`)
+### Transport and Probe Updates (`frame_transport.cpp`)
 - `verify_chunk_map()` accepts windows up to 1536 MiB (`window_mb <= 1536`).
 - Nonce random bits masking updated for $> 512$ MiB (`~0x7fe00000u`) to clear 10 chunk-index bits, ensuring no hash collisions across all 768 chunks.
 
 ---
 
-## 6. Verification and Test Taxonomy
+## Verification
 
 The test suite separates mock-level tests, real-core logic tests, and device-staged test plans:
 
-### 6.1 Real-Core C Driver Tests (`test_cdsp_mem_core`)
+### Real-Core C Driver Tests (`test_cdsp_mem_core`)
 Target `test_cdsp_mem_core` compiles the pure C kernel core (`cdsp_mem_core.c`) directly on macOS using a fake kernel ops table without kernel headers:
 1. **Physical Allocation & Mapping**: Verifies 2 MiB chunk allocation, IOMMU mapping, and SMMU context invalidation.
 2. **Atomic Rollback on Injected Failure**: Systematically injects allocation and mapping failures at **every individual chunk index** from 64 to 127 (growing 128 to 256 MiB) and across sample indices up to 768 (1.5 GiB). Verifies 100% clean rollback with 0 leaked chunks or IOVA mappings.
@@ -178,7 +146,7 @@ Target `test_cdsp_mem_core` compiles the pure C kernel core (`cdsp_mem_core.c`) 
 5. **Multi-Threaded Concurrency**: 8 concurrent threads executing simultaneous resize, pin, unpin, and mapping calls under mutex serialization.
 6. **Teardown**: Full unmap and free of all chunks with zero memory leaks.
 
-### 6.2 Host Workload Manager Mock Tests (`test_dynamic_cdsp_mem`)
+### Host Workload Manager Mock Tests (`test_dynamic_cdsp_mem`)
 Target `test_dynamic_cdsp_mem` tests `WorkloadMemoryManager` and `WorkloadLease` using mock mode:
 1. **Step-wise Growth & Shrinking**: 128 to 1536 MiB and back.
 2. **Boundary Enforcement**: Rejection of $< 128$ MiB and $> 1536$ MiB.
@@ -187,10 +155,10 @@ Target `test_dynamic_cdsp_mem` tests `WorkloadMemoryManager` and `WorkloadLease`
 5. **EBUSY Handling**: Verification that driver -EBUSY is handled gracefully as 'stay large'.
 6. **Multi-Threaded Leases**: 8 concurrent threads acquiring and releasing leases.
 
-### 6.3 Python Offline Mock Suite (`test_cdsp_mem_dynamic.py`)
+### Python Offline Mock Suite (`test_cdsp_mem_dynamic.py`)
 Python unit tests with mocked sysfs and `/dev/cdsp_mem` paths validating sizing bounds and context manager lifecycle.
 
-### 6.4 Frame Device Staged Test Plan (`dynamic_mem_stage_test.sh`)
+### Frame Device Staged Test Plan (`dynamic_mem_stage_test.sh`)
 Located at [`hexecutor/device/kmod/dynamic_mem_stage_test.sh`](../../hexecutor/device/kmod/dynamic_mem_stage_test.sh). Designed to run directly on the Steam Frame headset (requires user watching for insmod and dmesg monitoring):
 - **Step 0**: Frame DSP state check (`depth_state.py`, control `[1,0,1]`).
 - **Step 1**: Insmod / check baseline 128 MiB reservation.
@@ -200,14 +168,8 @@ Located at [`hexecutor/device/kmod/dynamic_mem_stage_test.sh`](../../hexecutor/d
 
 ---
 
-## 7. Unverified Device Items (Frame Hardware Dependencies)
+## Recorded evidence and release checks
 
-The following items cannot be fully verified from the macOS host or simulator and require execution of the staged test plan on hardware:
-1. **JTLB Slots 96..127 and 32..63 Firmware Headroom**:
-   - *Status*: QuRT and Valve's `dsp_service` occupy slots 0..11. Slots 64..71 (128 MiB) and 64..95 (512 MiB) are proven clean. Slots 32..63 and 96..127 have not been read on physical device during concurrent XRService execution. `qd_owned_memory.h` verifies that target slots are clear before writing, but confirmation that no firmware threads map slots 32..63 remains unverified on hardware.
-2. **CDSP SMMU Aperture (0xa0000000..0x100000000)**:
-   - *Status*: The 512 MiB window (`0xa0000000..0xc0000000`) is verified. The upper 1 GiB (`0xc0000000..0x100000000`) must be confirmed free of conflicts with any peripheral or GPU SMMU mappings.
-3. **Physical DDR Contiguity for ~768 Order-9 Allocations**:
-   - *Status*: 768 contiguous 2 MiB allocations require 1.5 GiB of unfragmented RAM. On a booted headset with long uptime, memory compaction (`echo 1 > /proc/sys/vm/compact_memory`) may be required before `insmod` or large growth. Atomic rollback guarantees system stability on allocation failure, but allocation success rate at runtime under memory pressure is unverified on device.
-4. **DSP Execution with Constants $> 512$ MiB**:
-   - *Status*: Physical execution of models exceeding 512 MiB on the Hexagon NPU hardware.
+Read-only device probes covered 128–512 MiB in the 2026-11-17 session. A matched experimental 80-slot build ran a staged tensor workload with a 1,280 MiB lease on 2026-11-19. That run demonstrates a large-window data path for its firmware, engine and workload. Verify slot availability, the SMMU aperture and cleanup under the target firmware and concurrent clients. [Device evidence](validation.md#recorded-frame-results)
+
+The configured maximum still requires target-specific coverage. Validate allocation under realistic memory pressure, rollback after failed growth, and return to the baseline following process exit. Large windows require many independently contiguous 2 MiB chunks. A simulated allocation success does not establish that the target kernel can allocate those chunks during a long-running headset session.

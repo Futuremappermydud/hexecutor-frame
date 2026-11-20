@@ -34,4 +34,4 @@ Use paired alternating control/candidate runs, distinguish first-call setup from
 
 A schedule model is useful for prioritizing work, not a timing oracle. Active-block scheduling predicted the direction of a measured gain; the later split-merge design predicted a large gain but actually regressed. New synchronization and workspace structures need device timing even after numerical checks pass.
 
-Raw reports, engine binaries, captures, and source snapshots remain local under the ignored build/report locations. The former dated performance diary is recoverable in prior Git history and the external documentation recovery copy. The current recipe and analysis code are [here](../../depth-model/deployment/lanes/).
+Raw reports, engine binaries, captures, and source snapshots remain local under the ignored build/report locations. The former dated performance diary is recoverable in prior Git history and the external documentation recovery copy. The current recipe and analysis code are [here](../../samples/depth-model/deployment/lanes/).

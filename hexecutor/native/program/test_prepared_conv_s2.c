@@ -79,7 +79,7 @@ int main(void) {
     SIM_SET_HVX_DOUBLE_MODE;
 
     const char *qpath = "hexecutor/native/build/resident-primary.qdrx";
-    const char *npath = "depth-model/deployment/programs/primary-v2.nprg";
+    const char *npath = "samples/depth-model/deployment/programs/primary-v2.nprg";
 
     uint32_t qn, nn;
     uint8_t *q = read_file(qpath, &qn);

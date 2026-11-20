@@ -12,7 +12,7 @@ from urllib.parse import unquote
 
 ROOT=Path(__file__).resolve().parents[1]
 ENV=dict(os.environ)
-ENV['PYTHONPATH']=os.pathsep.join(map(str,(ROOT,ROOT/'depth-model/python',ROOT/'depth-model/tools',
+ENV['PYTHONPATH']=os.pathsep.join(map(str,(ROOT,ROOT/'samples/depth-model/python',ROOT/'samples/depth-model/tools',
                                          ROOT/'hexecutor/benchmarks',ROOT/'hexecutor/native/program')))+os.pathsep+ENV.get('PYTHONPATH','')
 def run(*args,cwd=ROOT):subprocess.run(list(map(str,args)),cwd=cwd,env=ENV,check=True)
 def source_files():
@@ -29,7 +29,7 @@ def check_docs():
     if failures:raise RuntimeError(f'Broken documentation links: {failures}')
     print(f'Documentation links checked: {count}',flush=True)
 def check_layout():
-    for name in ('depth-model/frame','hexecutor/models','hexecutor/recovered','hexecutor/tools','hexecutor/depth-model'):
+    for name in ('samples/depth-model/frame','hexecutor/models','hexecutor/recovered','hexecutor/tools','hexecutor/depth-model'):
         if (ROOT/name).is_symlink():raise RuntimeError('retired resource alias: '+name)
     count=0
     for p in source_files():
@@ -39,7 +39,7 @@ def check_layout():
         for node in ast.walk(tree):
             if isinstance(node,ast.ImportFrom) and (node.module or '').startswith('depth_model'):
                 raise RuntimeError('executor imports a model: '+str(p))
-    worker=(ROOT/'runtime/src/model_depth_pipeline.cpp').read_text()
+    worker=(ROOT/'depth-runtime/src/model_depth_pipeline.cpp').read_text()
     if 'FRAME_DEPTH_PYTHON' in worker or 'model_depth_bridge.py' in worker:raise RuntimeError('live path still launches Python')
     print(f'Layout, live native entry, and Python syntax checked ({count} files)',flush=True)
 def check_model():
@@ -78,8 +78,8 @@ def main():
     elif command=='check-model':check_model()
     elif command=='check':
         check_layout();check_docs();run(sys.executable,'-m','unittest','discover','-s','hexecutor/tests','-p','test_qnn_inspect.py');run(sys.executable,'-m','unittest','discover','-s','hexecutor/tests','-p','test_lower_onnx.py');run(sys.executable,'tools/test_model_artifact_policy.py');run(sys.executable,'tools/model_artifact_policy.py','--history')
-        run('c++','-O2','-std=c++17','-Iruntime/include','runtime/tools/test_model_depth_geometry.cpp','-o','build/test_geometry');run('build/test_geometry')
-        run('c++','-O2','-std=c++17','-Iruntime/include','runtime/tools/test_model_temporal.cpp','runtime/src/model_temporal.cpp','-o','build/test_temporal');run('build/test_temporal')
+        run('c++','-O2','-std=c++17','-Idepth-runtime/include','depth-runtime/tools/test_model_depth_geometry.cpp','-o','build/test_geometry');run('build/test_geometry')
+        run('c++','-O2','-std=c++17','-Idepth-runtime/include','depth-runtime/tools/test_model_temporal.cpp','depth-runtime/src/model_temporal.cpp','-o','build/test_temporal');run('build/test_temporal')
     elif command=='run':
         if len(sys.argv)<3:raise ValueError('provide a Python script path')
         run(sys.executable,*sys.argv[2:])

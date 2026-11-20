@@ -1,18 +1,14 @@
-# Mercury hand tracking on QNN run lists
+# Mercury stereo hand tracking
 
-Goal: the [hand viewer](../runtime/hand-tracking-viewer.md) runs Monado's Mercury pipeline on the stereo cameras, with both Mercury networks executed on the Frame CDSP by Hexecutor, following the run lists QNN's HTP compiler produces for V75. This replaces the monocular MediaPipe depth estimate with stereo 3D hands from Mercury's kinematic optimizer. The live path stays C++17 with no CPU, Python or ONNX Runtime fallback.
+The OpenXR hand viewer can run Monado's Mercury detector, keypoint model and native stereo tracker on the rectified compositor pair. The C++17 viewer selects the QNN16 run-list backend with `--mercury-dir`. A separate ExecuTorch example exports the two networks as HXFG for portable and DSP comparisons. These are distinct model and runner contracts. [Viewer and launch options](../runtime/hand-tracking-viewer.md), [ExecuTorch Mercury exporter](../../hexecutor/executorch/mercury/export_executorch.py)
 
-Decisions (2026-11-09, user): execute QNN's prepared FP16 run list natively, as depth's `prepared-qnn` does for its u8 graph; port the full Mercury pipeline; feed it the luma of the rectified compositor stereo pair through a pinhole model rather than raw fisheye.
+## Model and compiler inputs
 
-## Status, 2026-11-09, with viewer update 2026-11-11
-
-The source, compiler, and initial oracle steps were completed offline. The QNN16 engine and viewer have since run on Frame; see the viewer checkpoint below.
-
-1. **Sources.** Monado `3acbda6b7dacbe014749020e8543fded54ef076b` (`src/xrt/tracking/hand/mercury`, BSL-1.0) and the `monado/utilities/hand-tracking-models` files `grayscale_detection_160x160.onnx` (SHA-256 `1f1a039a…ed36`) and `grayscale_keypoint_jan18.onnx` (`40c0daa5…d1d5`), both matching their LFS pointers. All are under ignored `hand-tracking/.work/external/`. **The models repository has no license file**; establish the model license before distributing converted artifacts or shipping.
+1. **Sources.** Monado `3acbda6b7dacbe014749020e8543fded54ef076b` (`src/xrt/tracking/hand/mercury`, BSL-1.0) and the `monado/utilities/hand-tracking-models` files `grayscale_detection_160x160.onnx` (SHA-256 `1f1a039a…ed36`) and `grayscale_keypoint_jan18.onnx` (`40c0daa5…d1d5`), both matching their LFS pointers. All are under ignored `samples/hand-tracking/.work/external/`. **The models repository has no license file**; establish the model license before distributing converted artifacts or shipping.
 2. **QNN compilation.** `hexecutor/offline/compile_qnn.py` now accepts ONNX (`--input-dim` optional). Both nets compile for V75, SM8650, 8 MB VTCM, four HVX threads, O3, in a local `hexecutor-qairt-tools` image (Ubuntu 22.04, Python 3.10 with `libpython3.10`, QAIRT 2.50's pinned converter packages, clang 14). Detection lowers to 997 nodes and keypoint to 1,138.
-3. **Accuracy oracle.** `hand-tracking/tools/mercury_qnn_oracle.py` builds Mercury-normalized inputs from an image, runs ONNX Runtime and the x86 HTP simulator, and compares the two. On `right_hands.jpg`: detection max error 5e-4; keypoint heatmap max 0.0020 with all 21 argmaxes equal, depth heatmap 0.0040, `scalar_extras` 0.0099 of 14.5, curls 0.0033. The QNN FP16 graph is therefore an acceptable target. The context returns `heatmap_xy` as NHWC `[1,22,22,21]`.
-4. **Context decoding.** `depth-model/tools/htp_graph.py` now reads QAIRT 2.50 contexts: dictionaries after extra words, the `0xf, 0xfffc0003` I/O preamble with any input count, one checkpoint word when flags are 3, and `@BlockZap` block tables. The legacy depth context still decodes byte-identically. Detection: 1,005 ops, 868 tensors. Keypoint: 939 ops, 938 tensors.
-5. **Run lists.** The 2.50 trace hook (`depth-model/sim/qnn_trace_hook.cpp`) runs unchanged on these contexts. Detection executes 530 main and 179 vector-list entries; keypoint executes 516 and 138. Traces are under `hand-tracking/.work/qnn-v75/mercury-*/trace/`.
+3. **Accuracy oracle.** `samples/hand-tracking/tools/mercury_qnn_oracle.py` builds Mercury-normalized inputs from an image, runs ONNX Runtime and the x86 HTP simulator, and compares the two. On `right_hands.jpg`: detection max error 5e-4; keypoint heatmap max 0.0020 with all 21 argmaxes equal, depth heatmap 0.0040, `scalar_extras` 0.0099 of 14.5, curls 0.0033. The QNN FP16 graph is therefore an acceptable target. The context returns `heatmap_xy` as NHWC `[1,22,22,21]`.
+4. **Context decoding.** `samples/depth-model/tools/htp_graph.py` now reads QAIRT 2.50 contexts: dictionaries after extra words, the `0xf, 0xfffc0003` I/O preamble with any input count, one checkpoint word when flags are 3, and `@BlockZap` block tables. The legacy depth context still decodes byte-identically. Detection: 1,005 ops, 868 tensors. Keypoint: 939 ops, 938 tensors.
+5. **Run lists.** The 2.50 trace hook (`samples/depth-model/sim/qnn_trace_hook.cpp`) runs unchanged on these contexts. Detection executes 530 main and 179 vector-list entries; keypoint executes 516 and 138. Traces are under `samples/hand-tracking/.work/qnn-v75/mercury-*/trace/`.
 
 ## Kernel census
 
@@ -32,26 +28,21 @@ All activations are FP16 crouton in TCM. Weights are packed FP16 (`Xpe`/`Xwe`), 
 
 Depth's handlers are u8/u16, and the MediaPipe tensor engine does not consume QNN programs, so these FP16 variants have their own handlers in `hexecutor/native/qnn16/`; see [QNN FP16 handlers](#qnn-fp16-handlers).
 
-## Remaining work, in order
+## Viewer evidence and validation
 
-1. **Program lowering.** Done 2026-11-09; see [Q16P program and engine](#q16p-program-and-engine).
-2. **FP16 handlers.** Correctness handlers for every kernel are done and checked against the trace hook's per-op VTCM writes (`QD_WRITES`); see the next sections. Still needed: vector/matrix versions of the scalar handlers, asynchronous weight DMA, and Frame gating.
-3. **Engine and host.** A serial engine and `Backend::qnn16_f16` session run both networks on the Frame and match QNN: 3.4 ms for detection and 4.2 ms for keypoint with the [HVX tile leaves](#hvx-tile-leaves); see [remaining optimizations](#remaining-optimizations).
-4. **Mercury port.** Built on Frame and run against real stereo captures on 2026-11-11. Articulation and alignment need further validation.
-5. **Viewer.** The stereo capture, native per-frame inference, and 26-joint world-space renderer are integrated. Correct hand rotation and joint motion remain open.
-6. **Frame validation.** Per-model DSP timing, two-hand tracking, close/reopen, signal exit, and the [long-session exit](../hexecutor/operations.md#failure-handling) behavior. Wait for the user before any test they must watch.
+In a bounded worn-viewer run on 2026-11-11, `frame_hand_viewer --mercury-dir` tracked one hand and restored the DSP at exit. The wearer reported incorrect hand rotation and joint motion. A captured 616×616 frame exposed aliasing in the original 160×160 detector resize. The antialiased C++ reduction matched the offline resize to 0.00054 mean normalized input difference on that frame. After the fix the detector reached 0.997 confidence and ran keypoints. The keypoint adapter uses QNN output order: depth, extras, XY heatmap, curls.
 
-Viewer checkpoint, 2026-11-11: `frame_hand_viewer --mercury-dir` now captures both rectified compositor lumas, runs the two QNN16 programs in a native session, and draws 26 OpenXR-order joints through the calibrated camera/head transform. The Frame build succeeded. A bounded live run tracked one hand and restored the DSP at exit. The wearer reported incorrect hand rotation and joint motion, so tracking quality is not yet validated. A captured 616×616 frame exposed severe aliasing in the original 160×160 detector resize; the antialiased C++ reduction now matches the offline resize to 0.00054 mean normalized input difference on that frame. The live detector reached 0.997 confidence and ran keypoints after this fix. The keypoint adapter was also corrected to use QNN output order: depth, extras, XY heatmap, curls. Two-hand and long-session gates remain open.
+The separate [HXFG / ExecuTorch simulator evidence](#hxfg--executorch-simulator-evidence) covers paired engine comparisons. Tracker articulation, two-hand geometry, target-firmware accuracy and cleanup remain device checks.
 
 ## QNN FP16 handlers
 
-Work started 2026-11-09 in `hexecutor/native/qnn16/`. It is separate from the tensor engine and broker, which are owned by another session. As of 2026-11-09, every kernel in both censuses has a native handler that has been checked against the trace oracle. Only `qnn16_conv1x1` uses HMX. The others are portable scalar C, which builds for V75 and whose unit test passes on the Hexagon ISS. None has run on Frame.
+The trace-oracle fixtures check the QNN16 handlers' per-operation VTCM writes. The chosen shape determines tile, HMX or float/generic execution. The dates and timings below describe paired hardware runs.
 
 **Oracle.** `hexecutor/offline/qnn16_oracle.py` reads the decoded context and a trace-hook run (`QD_TRACE_LOG`, `QD_WRITES`).
 - **Run-list mapping.** In 2.50 FP16 graphs, list 1 holds the flags-4/6 operations. List 0 holds every other executable operation in serial order. The `InputSlicePad` stub (`0xebc680`) is the only executor-only entry, found by alignment. Every function offset maps to one kernel type.
 - **Replay.** Replaying the writes reproduces every simulator output exactly.
 - **Padded tensors.** `max_dimensions` is the whole padded extent, and `padding` locates `dimensions` inside it. For example, a `[10,66,32]` input with padding `[7,3]` has a 24×72 extent and 54 blocks. The oracle used to add the padding a second time, which misplaced every padded block. That bug is what made the 3×3 convolutions look wrong.
-- **Fixtures.** The tool exports per-operation fixtures under the ignored `hand-tracking/.work/qnn16-fixtures/`.
+- **Fixtures.** The tool exports per-operation fixtures under the ignored `samples/hand-tracking/.work/qnn16-fixtures/`.
 
 **Formats.** These were confirmed against the ONNX weights, so no repacking is needed:
 - An FP16 crouton block is an HMX activation tile: 16 pixel pairs × 32 channels × 2. Row `y`, column `x` and channel `c` are at half `((y·2 + x/2)·32 + c)·2 + x%2`.
@@ -99,17 +90,17 @@ Work started 2026-11-09 in `hexecutor/native/qnn16/`. It is separate from the te
 The lowering and engine below use these handlers. One correction found while wiring them in: `Xpe` packs `ceil(ci/2)` input-channel pairs per 32-output group, so when `ci` is not a multiple of 32 (keypoint's 42-input `lastKeypoints` FC slices, the 12-input t=3 layers) the group stride is not K × 2 KiB. Those ops use the scalar `qnn16_pointwise_f16` instead of the HMX leaf. The earlier ISS fixtures passed only because those inputs were zero in the trace.
 
 ```sh
-K=depth-model/sim/qairt_2_50_functions.json
+K=samples/depth-model/sim/qairt_2_50_functions.json
 for g in detection keypoint; do
-  C=hand-tracking/.work/qnn-v75/mercury-$g/context T=hand-tracking/.work/qnn-v75/mercury-$g/trace
+  C=samples/hand-tracking/.work/qnn-v75/mercury-$g/context T=samples/hand-tracking/.work/qnn-v75/mercury-$g/trace
   for t in cast conv3x3 depthwise format im2col moves relu sigmoid stride2; do
     python3.14 hexecutor/tests/test_qnn16_${t}_qd.py $C $T --known $K
   done
-  python3.14 hexecutor/tests/test_qnn16_io_qd.py $C $T --known $K --inputs hand-tracking/.work/mercury-oracle
+  python3.14 hexecutor/tests/test_qnn16_io_qd.py $C $T --known $K --inputs samples/hand-tracking/.work/mercury-oracle
   python3.14 hexecutor/offline/qnn16_oracle.py $C $T --known $K \
-    --conv1x1 hand-tracking/.work/qnn16-fixtures/$g-conv1x1.bin \
-    --conv1x1-clip hand-tracking/.work/qnn16-fixtures/$g-conv1x1clip.bin \
-    --conv1x1-small hand-tracking/.work/qnn16-fixtures/$g-conv1x1-small.bin
+    --conv1x1 samples/hand-tracking/.work/qnn16-fixtures/$g-conv1x1.bin \
+    --conv1x1-clip samples/hand-tracking/.work/qnn16-fixtures/$g-conv1x1clip.bin \
+    --conv1x1-small samples/hand-tracking/.work/qnn16-fixtures/$g-conv1x1-small.bin
 done
 HEXECUTOR_SDK_ROOT=... HEXECUTOR_TOOLCHAIN_IMAGE=depth-model-hmx-tools sh hexecutor/build-scripts/test_qnn16_sim.sh
 ```
@@ -118,12 +109,12 @@ The trace needs `QD_WRITES` in addition to `QD_TRACE_LOG`. Build the hook with c
 
 ## Q16P program and engine
 
-Status at 2026-11-09 08:50: the whole path works and matches QNN on silicon. All of it is uncommitted.
+The Q16P and Q16C artifacts carry the run list and constants for the native QNN16 session.
 
-- **Constants.** `hexecutor/offline/qnn16_lower.py --write-tensor-config`, then a simulator run with the trace hook's `QD_TENSOR_CONFIG`/`QD_TENSORS`, dumps every pool-2 input. Sizes come from `max_dimensions`: a `[256, 8]` `Xpe` is stored as `[256, 32]`, and sizing from `dimensions` silently truncated it. All 192 + 165 weight dumps equal the VTCM bytes their consumers read. Dumps are in `hand-tracking/.work/qnn-v75/mercury-*/consts/`.
-- **Lowering.** `hexecutor/offline/qnn16_program.py` writes `PREFIX.q16p` (format: `hexecutor/native/qnn16/program.h`), `PREFIX.q16c` (constants) and `PREFIX.q16.json`. It keeps QNN's own VTCM offsets and runs the traced entries serially in simulator order; weight DMA becomes a synchronous copy at issue time. Detection is 602 ops and keypoint 538. Programs are in `hand-tracking/.work/qnn16-programs/`.
+- **Constants.** `hexecutor/offline/qnn16_lower.py --write-tensor-config`, then a simulator run with the trace hook's `QD_TENSOR_CONFIG`/`QD_TENSORS`, dumps every pool-2 input. Sizes come from `max_dimensions`: a `[256, 8]` `Xpe` is stored as `[256, 32]`, and sizing from `dimensions` silently truncated it. All 192 + 165 weight dumps equal the VTCM bytes their consumers read. Dumps are in `samples/hand-tracking/.work/qnn-v75/mercury-*/consts/`.
+- **Lowering.** `hexecutor/offline/qnn16_program.py` writes `PREFIX.q16p` (format: `hexecutor/native/qnn16/program.h`), `PREFIX.q16c` (constants) and `PREFIX.q16.json`. It keeps QNN's own VTCM offsets and runs the traced entries serially in simulator order; weight DMA becomes a synchronous copy at issue time. Detection is 602 ops and keypoint 538. Programs are in `samples/hand-tracking/.work/qnn16-programs/`.
 - **Validation and interpreter.** `program.c` validates every range and op contract (host preflight and DSP). `exec.c` interprets ops. The 1×1 convolutions with whole K tiles run on HMX. Convolution-family ops and space-to-depth use the float path in `qnn16_f32.c`: gather to float32 scratch, prepare weights once with the scale folded in, compute and scatter, split by rows over four workers. Other ops use the FP16 handlers through logical scratch. `qnn16_half.h` holds the inline FP16 conversions, checked exhaustively against the compiler's on the host and ISS.
-- **Engine.** `hexecutor/native/qnn16/engine.c`, built by `hexecutor/build-scripts/build_qnn16.sh`, runs on the unchanged tensor bootstrap (same `HxSessionConfig`), with feature `HXQ16E01` and result magic `Q16R`. Its scratch is private DDR `[60 MiB, 64 MiB − 4 KiB)` in L1-cached page 3; the host keeps constants below 60 MiB. HVX bypasses L1, so the engine builds with `-fno-vectorize` and its `memcpy`/`memset` stay scalar in that range.
+- **Engine.** `hexecutor/native/qnn16/engine.c`, built by `hexecutor/build-scripts/build_qnn16.sh`, runs on the unchanged tensor bootstrap (same `HxSessionConfig`), with feature `HXQ16E01` and result magic `Q16R`. Its scratch is private DDR `[56 MiB, 64 MiB − 4 KiB)` in L1-cached page 3. The host keeps constants below the scratch boundary. HVX bypasses L1, so the engine builds with `-fno-vectorize` and its `memcpy`/`memset` stay scalar in that range.
 - **Host.** `Backend::qnn16_f16` and `load_qnn16_program()` in `hexecutor/host/cpp/executor.cpp`. `hexecutor_qnn16_run` runs several programs round-robin in one session and writes outputs and per-op cycles.
 
 **Checks.**
@@ -236,12 +227,12 @@ Housekeeping before committing:
 
 ## Mercury C++ port
 
-`hand-tracking/mercury/` is a C++17 port of Mercury's per-frame pipeline. `mercury::Tracker` (in [tracker.hpp](../../hand-tracking/mercury/include/mercury/tracker.hpp)) takes a rectified grayscale stereo pair, pinhole intrinsics for each view, and `left_in_right`. It returns two hands of 26 OpenXR-ordered joints, with poses and radii in left-camera axes (+X right, +Y up, −Z forward).
+`samples/hand-tracking/mercury/` is a C++17 port of Mercury's per-frame pipeline. `mercury::Tracker` (in [tracker.hpp](../../samples/hand-tracking/mercury/include/mercury/tracker.hpp)) takes a rectified grayscale stereo pair, pinhole intrinsics for each view, and `left_in_right`. It returns two hands of 26 OpenXR-ordered joints, with poses and radii in left-camera axes (+X right, +Y up, −Z forward).
 
 - **Networks.** The two networks sit behind `mercury::Networks`, which receives every detection or keypoint request of a frame stage as one batch, in the ONNX tensor layouts. The library has no CPU, ONNX Runtime or Python inference path. The DSP session from steps 1–3 implements this interface and converts QNN's NHWC `heatmap_xy`. Request fields after the tensors (view, hand, crop direction) are informational only.
-- **Vendored code.** `third_party/monado/` holds unmodified Monado files: `kine_lm`, hand-size refinement, `u_box_iou`, and the vector and Eigen interop headers. The exception is `hg_hand_size_opt`, whose `std::span` parameters became `const std::array&` for C++17. tinyceres is vendored too. `compat/` supplies the small subset of `xrt_defines.h`, `m_api`, logging and time those files include. `src/` ports `hg_sync.cpp`, `hg_model.cpp` and `hg_image_distorter.cpp` without OpenCV. It reproduces `cv::warpAffine`'s 1/32-pixel fixed-point bilinear letterbox except for detector reductions below 0.5×, which use an antialiased triangle filter, and retains Mercury's truncating nearest-neighbor stereographic crops. Attribution is in [NOTICE](../../hand-tracking/mercury/NOTICE).
+- **Vendored code.** `third_party/monado/` holds unmodified Monado files: `kine_lm`, hand-size refinement, `u_box_iou`, and the vector and Eigen interop headers. The exception is `hg_hand_size_opt`, whose `std::span` parameters became `const std::array&` for C++17. tinyceres is vendored too. `compat/` supplies the small subset of `xrt_defines.h`, `m_api`, logging and time those files include. `src/` ports `hg_sync.cpp`, `hg_model.cpp` and `hg_image_distorter.cpp` without OpenCV. It reproduces `cv::warpAffine`'s 1/32-pixel fixed-point bilinear letterbox except for detector reductions below 0.5×, which use an antialiased triangle filter, and retains Mercury's truncating nearest-neighbor stereographic crops. Attribution is in [NOTICE](../../samples/hand-tracking/mercury/NOTICE).
 - **Behavior.** Mercury's tuneable defaults, detection scheduling (alternating views, both while hand size is refined), IoU suppression, pose-predicted crops and inputs, reprojection and distance rejection, and the 10-frame display warm-up are kept. Monado's OpenCV image orientation, debug sinks, masks sink, `u_var` UI and worker pool are not ported; calls are synchronous.
-- **Eigen** 3.3+ headers are required. CMake uses an `Eigen3` package or `MERCURY_EIGEN_INCLUDE`, which defaults to the ignored `hand-tracking/.work/external/eigen`. Eigen 3.4.0 is from `https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz`, SHA-256 `8586084f71f9bde545ee7fa6d00288b264a2b7ac3607b974e54d13e7162c1c72` (MPL-2.0). Without Eigen, the Mercury targets are skipped with a status message. The Frame has no system Eigen, so the ignored Eigen tree was copied there for the 2026-11-11 viewer build.
+- **Eigen** 3.3+ headers are required. CMake uses an `Eigen3` package or `MERCURY_EIGEN_INCLUDE`, which defaults to the ignored `samples/hand-tracking/.work/external/eigen`. Eigen 3.4.0 is from `https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz`, SHA-256 `8586084f71f9bde545ee7fa6d00288b264a2b7ac3607b974e54d13e7162c1c72` (MPL-2.0). Without Eigen, the Mercury targets are skipped with a status message. The Frame has no system Eigen, so the ignored Eigen tree was copied there for the 2026-11-11 viewer build.
 
 ### Validation
 
@@ -258,7 +249,7 @@ Housekeeping before committing:
   Flipping the synthetic stereo extrinsic, or the right-hand mirroring, gives 560–850 mm errors, so the test catches those convention errors.
 - **Not asserted: per-joint 3D error.** Even ideal rays from a 6.4 cm baseline leave each joint's depth along its ray weakly determined, and Mercury's articulation priors fill it in. The mean joint error is 15–24 mm even for the self-consistent hand.
 
-`mercury_replay` runs PGM stereo pairs through the port. Its `--exchange` option starts the development-only `hand-tracking/tools/mercury_onnx_exchange.py`, which answers network requests with ONNX Runtime over a pipe. On a synthetic planar pair made from `right_hands.jpg` (50 px disparity at the runtime's rectified f = 380, baseline 63.9 mm), the real networks behaved as follows:
+`mercury_replay` runs PGM stereo pairs through the port. Its `--exchange` option starts the development-only `samples/hand-tracking/tools/mercury_onnx_exchange.py`, which answers network requests with ONNX Runtime over a pipe. On a synthetic planar pair made from `right_hands.jpg` (50 px disparity at the runtime's rectified f = 380, baseline 63.9 mm), the real networks behaved as follows:
 - they detected and tracked the right hand in both views, active from frame 9;
 - the palm stayed stable at 0.41 m;
 - the hand size pinned at Mercury's 0.12 m maximum, because a photographed hand is not hand-sized at that depth.
@@ -267,27 +258,58 @@ Accuracy needs real captures:
 
 ```sh
 build/bin/mercury_replay --focal 380 --cx 308 --cy 308 --baseline 0.0639016 \
-  --exchange "$PWD/hand-tracking/.work/venv/bin/python -I $PWD/hand-tracking/tools/mercury_onnx_exchange.py --models $PWD/hand-tracking/.work/external/hand-tracking-models" \
+  --exchange "$PWD/samples/hand-tracking/.work/venv/bin/python -I $PWD/samples/hand-tracking/tools/mercury_onnx_exchange.py --models $PWD/samples/hand-tracking/.work/external/hand-tracking-models" \
   left0.pgm right0.pgm left1.pgm right1.pgm
 ```
 
 ## Reproduce
 
 ```sh
-# Converter image: see the status section; compile each net.
+# Compile each net with the configured QAIRT toolchain.
 docker run --rm --platform linux/amd64 -v /absolute/qairt/2.50.0.260828:/sdk:ro -v "$PWD":/workspace -w /workspace \
   hexecutor-qairt-tools python hexecutor/offline/compile_qnn.py --sdk /sdk \
-  --model hand-tracking/.work/external/hand-tracking-models/grayscale_keypoint_jan18.onnx \
-  --output hand-tracking/.work/qnn-v75/mercury-keypoint --name mercury_keypoint
+  --model samples/hand-tracking/.work/external/hand-tracking-models/grayscale_keypoint_jan18.onnx \
+  --output samples/hand-tracking/.work/qnn-v75/mercury-keypoint --name mercury_keypoint
 
-hand-tracking/.work/venv/bin/python -I hand-tracking/tools/mercury_qnn_oracle.py --sdk /absolute/qairt/2.50.0.260828 \
-  --models hand-tracking/.work/external/hand-tracking-models \
-  --detection-context hand-tracking/.work/qnn-v75/mercury-detection/mercury_detection-v75.bin \
-  --keypoint-context hand-tracking/.work/qnn-v75/mercury-keypoint/mercury_keypoint-v75.bin \
-  --image hand-tracking/.work/right_hands.jpg --work hand-tracking/.work/mercury-oracle
+samples/hand-tracking/.work/venv/bin/python -I samples/hand-tracking/tools/mercury_qnn_oracle.py --sdk /absolute/qairt/2.50.0.260828 \
+  --models samples/hand-tracking/.work/external/hand-tracking-models \
+  --detection-context samples/hand-tracking/.work/qnn-v75/mercury-detection/mercury_detection-v75.bin \
+  --keypoint-context samples/hand-tracking/.work/qnn-v75/mercury-keypoint/mercury_keypoint-v75.bin \
+  --image samples/hand-tracking/.work/right_hands.jpg --work samples/hand-tracking/.work/mercury-oracle
 
-python3.14 depth-model/tools/htp_graph.py hand-tracking/.work/qnn-v75/mercury-keypoint/mercury_keypoint-v75.bin \
-  hand-tracking/.work/qnn-v75/mercury-keypoint/context --no-source-names
+python3.14 samples/depth-model/tools/htp_graph.py samples/hand-tracking/.work/qnn-v75/mercury-keypoint/mercury_keypoint-v75.bin \
+  samples/hand-tracking/.work/qnn-v75/mercury-keypoint/context --no-source-names
 ```
 
 `--graph-name` does not yet find 2.50's debug-name table, so use `--no-source-names`.
+
+## HXFG / ExecuTorch simulator evidence
+
+The 2026-11-20 comparison used two Mercury HXFG exports in `hexecutor/.work/mercury-et/`. The keypoint graph
+multiplies a `16x16x32` map by the scalar runtime input `useLastKeypoints`. The FP16
+binary vector path now broadcasts that scalar across every 32-channel block. `HX_ZEROINSERT`
+also copies blocked channel vectors onto the sparse output grid, preserving its zeros and odd-width
+pad columns. A second blocked gather packs 3x3 stride-one convolution windows with whole
+32-channel input blocks, including the pad-two border expansion at keypoint op 68. Unsupported
+shapes retain the generic im2col gather. Unsupported binary broadcasts and zero-insert layouts
+retain the scalar path. On
+the single-thread Hexagon ISS, the Mercury scalar multiply fell from 2,298,294 to 29,556
+pcycles, and its `10x10x63` to `21x21x63` zero insert from 3,575,466 to 57,615 pcycles.
+A pad-two `8x8x32` to `10x10x32` convolution fixture fell from 383,451 to 97,491
+pcycles with the same FP16 result.
+These pcycles count instructions rather than predicting Frame latency.
+
+Ordinary FP16 external input packing now splits rows across the four DSP workers. Mercury's
+one-channel image is represented with a 32-channel stride, so import has a large padded footprint.
+The Frame profile placed 6.58 million detection cycles outside operator timing, which includes
+import and export; the precise share due to import has not been measured on device. Parallel
+packing is a candidate for reducing that interval, pending a Frame measurement. The HXFG and
+`.pte` files do not need re-export for these engine changes.
+
+The serial whole-graph ISS harness measured 23,700,072 to 16,853,346 pcycles for keypoint
+and 7,522,407 to 7,475,226 for detection, including import but excluding constant staging
+and output export. The changed keypoint graph produced bit-identical outputs to the prior
+simulator engine on all four outputs. The simulator's absolute Mercury outputs differ from the
+saved Frame outputs even on the prior engine, so this is a relative regression check, not a
+Frame accuracy result. The saved prior Frame keypoint heatmap matched the ONNX Runtime argmax
+for 20 of 21 joints; the remaining joint needs device validation with this engine.

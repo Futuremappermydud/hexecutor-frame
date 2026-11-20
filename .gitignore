@@ -67,10 +67,10 @@ recovered/
 runs/
 
 # Exported model metadata and unpacked validation packages.
-/depth-model/metadata/
-/depth-model/portable/check/
+/samples/depth-model/metadata/
+/samples/depth-model/portable/check/
 # Address-named memory dumps from earlier captures.
-/depth-model/[0-9]*
+/samples/depth-model/[0-9]*
 
 # Captured arrays and generated model-specific C headers.
 *_actual_data.h
@@ -82,9 +82,9 @@ space_to_depth_cases.h
 /priv-experiments/
 
 # Host scratch products and caches.
-/runtime/artifacts/
-/runtime/bin/
-/runtime/scratch/
+/depth-runtime/artifacts/
+/depth-runtime/bin/
+/depth-runtime/scratch/
 *.log
 .DS_Store
 *.swp
@@ -92,4 +92,6 @@ space_to_depth_cases.h
 
 # Reverse engineering notes, excerpts, and investigative probes
 /re-archive/
+/research/
+/research_notes/
 build-*/

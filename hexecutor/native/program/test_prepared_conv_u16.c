@@ -310,7 +310,7 @@ int main(int argc, char **argv) {
 
     if (argc == 1) {
         run_model("hexecutor/native/build/resident-primary.qdrx",
-                  "depth-model/deployment/programs/primary-v2.nprg",
+                  "samples/depth-model/deployment/programs/primary-v2.nprg",
                   "hexecutor/native/program/fixtures/primary-smoke-conv-u16-3x3.epcpu",
                   "hexecutor/native/program/fixtures/primary-smoke-conv-u16-1x1.epcpu");
 #if defined(__hexagon__)

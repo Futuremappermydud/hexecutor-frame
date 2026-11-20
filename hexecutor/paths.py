@@ -23,7 +23,8 @@ class Workspace:
 
 def workspace():
     repo = Path(os.environ.get('FRAME_SOURCE_ROOT', Path(__file__).resolve().parent.parent)).resolve()
-    data = Path(os.environ.get('FRAME_DEPTH_DATA', repo / 'depth-model')).expanduser().resolve()
+    depth = repo / 'samples/depth-model'
+    data = Path(os.environ.get('FRAME_DEPTH_DATA', depth)).expanduser().resolve()
     return Workspace(repo, repo/'hexecutor/native', repo/'hexecutor/offline',
-                     repo/'hexecutor/benchmarks', data, repo/'depth-model/tools',
-                     repo/'depth-model/deployment', repo/'depth-model/python/depth_model/reference')
+                     repo/'hexecutor/benchmarks', data, depth/'tools',
+                     depth/'deployment', depth/'python/depth_model/reference')

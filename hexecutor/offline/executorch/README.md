@@ -65,7 +65,7 @@ hexecutor/.work/executorch-venv/bin/python -m unittest hexecutor.tests.test_exec
 | `_adaptive_avg_pool2d` to (1, 1) | MEAN | |
 | `relu`, `hardtanh(0, 6)`, `clamp(0, None)`, `clamp(0, 6)` | fused | Fused only into a single-user convolution, depthwise convolution or add that is not already activated. |
 
-### Added 2026-11-19 (diffusion UNet)
+### Spatial and attention operators
 
 | Operation | Lowering | Notes |
 | --- | --- | --- |
@@ -84,7 +84,7 @@ refused every node after them (so `silu`, `linear` and SDPA were decomposed and 
 
 Example: `hexecutor/examples/diffusion/unet2d_export.py` (diffusers `UNet2DModel`, fully delegated, 265 HXFG ops).
 
-### Added 2026-11-19 (operator coverage)
+### Arithmetic, comparisons and shape operators
 
 | Operation | Lowering | Notes |
 | --- | --- | --- |
@@ -103,7 +103,7 @@ Example: `hexecutor/examples/diffusion/unet2d_export.py` (diffusers `UNet2DModel
 | `full`, `full_like`, `scalar_tensor`, `arange`, and casts or views of them | folded | Emit nothing; the consumer reads the value. A constant is folded only when every user reads it at a constant argument (for example the operand of a binary, where, conv or linear); a constant that a CPU operation also reads stays on the CPU. |
 | `convolution` on rank 3 (`conv1d`), batch one | TRANSPOSE, CONV or DEPTHWISE, TRANSPOSE | Dense or depthwise, any stride, padding and dilation (no output padding). Lowered as a convolution with one row. No fused activation. |
 
-### Added 2026-11-19 (parity with the float ONNX lowering)
+### Indexed access and exporter patterns
 
 | Operation | Lowering | Notes |
 | --- | --- | --- |
@@ -203,7 +203,7 @@ versions or layouts, truncation and trailing bytes.
   `pack_hmx_weights`, `hmx_fits`). Layout and weight packing mirror
   `lower_tflite.py` and `lower_onnx.py`, which are unchanged.
 
-## LFM decode operators
+## Stateful decode operators
 
 `ops.py` registers `hexecutor::lfm_linear_q` (GGML Q4_0/Q8_0 rows, uint8 `[N, K/32, 18|34]` blocks),
 `lfm_rope`, `lfm_shortconv` and `lfm_kv_write`. They run eagerly (state in `ops.STATE`, cleared with

@@ -20,7 +20,7 @@ static uint8_t *read_file(const char *path, uint32_t *n) {
 static int run_model(const char *model) {
     char qpath[96],npath[96];
     snprintf(qpath,sizeof qpath,"hexecutor/native/build/resident-%s.qdrx",model);
-    snprintf(npath,sizeof npath,"depth-model/deployment/programs/%s-v2.nprg",model);
+    snprintf(npath,sizeof npath,"samples/depth-model/deployment/programs/%s-v2.nprg",model);
     uint32_t qn,nn; uint8_t *q=read_file(qpath,&qn),*raw=read_file(npath,&nn);
     CHECK(q && raw);
     Nprg2Pool pools[7]={0};

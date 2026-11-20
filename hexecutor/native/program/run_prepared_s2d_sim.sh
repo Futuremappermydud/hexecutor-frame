@@ -8,7 +8,7 @@ if [ ! -x .venv-cpu/bin/python ]; then
 fi
 .venv-cpu/bin/python hexecutor/native/program/capture_s2d_cpu_prefix.py --case smoke --model primary --model alternate
 docker run --rm --platform linux/amd64 -v "$PWD:/repo" -w /repo "${HEXECUTOR_TOOLCHAIN_IMAGE:-hexecutor-toolchain:local}" sh -lc '
-  SDK=/repo/depth-model/.work/hexagon-sdk/6.6.0.0/tools/HEXAGON_Tools/19.0.07/Tools
+  SDK=/repo/samples/depth-model/.work/hexagon-sdk/6.6.0.0/tools/HEXAGON_Tools/19.0.07/Tools
   ELF=/tmp/nprg2-prepared-s2d.elf
   "$SDK/bin/hexagon-clang" -mv75 -mhvx -mhvx-length=128b -O2 -G0 -Wall -Wextra -Werror \
     -I"$SDK/target/hexagon/include" -Ihexecutor/native/program -Ihexecutor/native \

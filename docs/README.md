@@ -1,50 +1,35 @@
-# Frame Spatial Runtime documentation
-
-This is the maintained handbook for the spatial application, Hexecutor DSP execution, and perception-model development. It describes the current source tree and carries forward durable engineering findings from the earlier investigation notes. Recorded timings are dated observations, not promises for a fresh installation.
+# Hexecutor documentation
 
 ## Start here
 
-- [System architecture](architecture.md): how capture, depth, reconstruction, rendering, and the DSP connect.
-- [Build and run](getting-started.md): host versus headset commands and local model prerequisites.
-- [Development and validation](development.md): where to change code and what evidence a change needs.
-
-## Spatial runtime
-
-| Guide | What it explains |
-| --- | --- |
-| [Runtime overview](runtime/README.md) | Processes, threads, backends, and source ownership |
-| [Cameras and calibration](runtime/cameras.md) | DMA-BUF capture, sensor identity, coordinate conventions, timing, and calibration drift |
-| [Stereo matching](runtime/stereo.md) | Vulkan and CPU matchers, confidence gates, and experimental alternatives |
-| [Learned depth integration](runtime/model-depth.md) | Model preprocessing, native bridge, state, and deployment selection |
-| [Reconstruction](runtime/reconstruction.md) | Point fusion, persistent depth, sparse TSDF, and mesh generation |
-| [Rendering and occlusion](runtime/rendering.md) | OpenVR diagnostics, OpenXR scenes, and the Vulkan API layer |
-| [Datasets and evaluation](runtime/datasets.md) | Capture sessions, replay, controller marks, IR refinement, and provenance |
+- [System architecture](architecture.md) maps the executor, Frame depth runtime and model samples.
+- [Build and run](getting-started.md) covers host and headset entry points.
+- [Development and validation](development.md) describes the portable checks and evidence required for changes.
+- [Training and artifacts](model-development/training-and-artifacts.md) covers local model data, provenance and repository policy.
 
 ## Hexecutor
 
-| Guide | What it explains |
+| Topic | Guides |
 | --- | --- |
-| [Generic tensor backend](hexecutor/tensor-backend.md) | Static tensor graphs, multi-model sessions, FP16 HMX and model-independent tooling |
-| [Native host API](hexecutor/api.md) | C++ tensors/programs, explicit packages, and worker lifecycle |
-| [Install the broker](hexecutor/install.md) | One-command Frame install, bundle contents, and release prerequisites |
-| [Executor architecture](hexecutor/README.md) | Host/DSP responsibilities, loader, transport, and execution modes |
-| [Memory layout](hexecutor/memory-layout.md) | Private DDR, VTCM, L2 leases, aliasing, and workspace limits |
-| [Dynamic CDSP memory](hexecutor/dynamic-memory.md) | Dynamic memory growth and shrinking from 128 MiB to 1.5 GiB based on workloads |
-| [CDSP broker (proposed)](hexecutor/broker.md) | One owner for the CDSP: scheduling depth, hands, controller and eye work |
-| [XRService broker bridge](hexecutor/xrservice-broker-bridge.md) | Bridging and patching XRService StereoFeatureNN and Gazenet via shim library |
-| [Clocks and bandwidth](hexecutor/clocks.md) | AXI and HMX clock findings, controlled measurements, and restoration |
-| [Kernels and arithmetic](hexecutor/kernels.md) | HVX/HMX, blocked layouts, exact conversion, and adapters |
-| [Scheduling and optimizations](hexecutor/scheduling.md) | Dependencies, lane scheduling, plan replay, DMA, and rejected changes |
-| [Formats and host API](hexecutor/formats.md) | QDRP, QDRX, NPRG v2, pool binding, and preflight |
-| [Build and operations](hexecutor/operations.md) | Toolchains, package identity, session lifecycle, and recovery |
-| [Performance interpretation](hexecutor/performance.md) | The pinned deployment versus the latest measured primary recipe |
-| [Kernel adapters](hexecutor/kernel-adapters.md) | Shape-specific support boundaries and fixture generation |
-| [Language-model example](hexecutor/language-model.md) | The Qwen DSP client and its shared infrastructure |
-| [Frame wake word investigation](hexecutor/frame-wake-word.md) | Verified mic and aDSP callback paths, LPASS memory limits, and the low power implementation route |
+| Architecture and integration | [Executor architecture](hexecutor/README.md), [C++ API](hexecutor/api.md), [program formats](hexecutor/formats.md), [HXFG tensor backend](hexecutor/tensor-backend.md), [ExecuTorch delegate](../hexecutor/executorch/README.md) |
+| Broker and deployment | [Broker lifecycle and scheduling](hexecutor/broker.md), [XRService integration](hexecutor/xrservice-broker-bridge.md), [broker installation](hexecutor/install.md), [Frame operations and recovery](hexecutor/operations.md) |
+| Memory and kernels | [Private DDR, VTCM and L2](hexecutor/memory-layout.md), [dynamic leases](hexecutor/dynamic-memory.md), [kernels and numerics](hexecutor/kernels.md), [adapter acceptance](hexecutor/kernel-adapters.md), [run-list scheduling](hexecutor/scheduling.md) |
+| Measurements | [Validation and device evidence](hexecutor/validation.md), [prepared-depth performance baselines](hexecutor/performance.md), [AXI/HMX clocks](hexecutor/clocks.md) |
 
-## Models and repository policy
+## Depth runtime
 
-- [Depth model](model-development/depth.md), [CPU reference](model-development/cpu-reference.md), and [hand tracking](model-development/hand-tracking.md), including its [optimization checkpoint](model-development/hand-tracking-progress.md) and the [Mercury QNN run-list plan](model-development/mercury-hand-tracking.md); [controller FeatureNN](model-development/controller-featurenn.md) on the tensor backend.
-- [Repository checks](development.md#practical-local-checks) and [model artifact policy](../tools/model_artifact_policy.py).
+| Topic | Guides |
+| --- | --- |
+| Capture and geometry | [Runtime overview](runtime/README.md), [camera ownership, calibration and timing](runtime/cameras.md), [stereo depth and confidence](runtime/stereo.md) |
+| Inference and fusion | [Learned depth integration](runtime/model-depth.md), [point fusion, persistent depth and TSDF](runtime/reconstruction.md), [datasets and replay](runtime/datasets.md) |
+| Headset presentation | [Rendering and occlusion](runtime/rendering.md), [OpenXR hand viewers](runtime/hand-tracking-viewer.md) |
 
-The temporal-fusion report and related working notes remain in their original locations and are outside this rewrite. Both fusion handoffs are also preserved unchanged. Superseded session diaries are available in Git history and the external documentation recovery copy; they are not the primary navigation system.
+## Model samples and experiments
+
+| Workload | Guides |
+| --- | --- |
+| Depth | [Depth model and tooling](model-development/depth.md), [CPU reference](model-development/cpu-reference.md), [DepthPro2 DSP handoff](model-development/depthpro2-dsp-handoff-2026-11-20.md) |
+| Hands | [MediaPipe RGB](model-development/hand-tracking.md), [Mercury stereo](model-development/mercury-hand-tracking.md), [stereo NIR](model-development/nir-hand-tracking.md) |
+| Controllers | [XRService FeatureNN](model-development/controller-featurenn.md) |
+
+Keep active working notes in the ignored root `research/` and `research_notes/` directories. The tracked [temporal-fusion report](../reports/Temporal%20depth%20fusion%20for%20Frame.md) and [executor fusion handoff](../hexecutor/frame/handoffs/HANDOFF_FUSION.md) are preserved project records.

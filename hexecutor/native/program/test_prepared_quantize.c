@@ -20,7 +20,7 @@ static int run_case(const char*model,uint32_t cmd,uint32_t seq,uint32_t src_off,
     char path[512];uint8_t*q=malloc(2u*1024u*1024u),*raw=malloc(512u*1024u),*source=malloc(128),*wanted=malloc(64),*pool1_before=malloc(POOL1_BYTES),*qsha=malloc(32),*nsha=malloc(32);
     CHECK(q&&raw&&source&&wanted&&pool1_before&&qsha&&nsha);
     snprintf(path,sizeof path,"hexecutor/native/build/resident-%s.qdrx",model);FILE*f=fopen(path,"rb");CHECK(f&&fread(q,1,2u*1024u*1024u,f)>256u);long qsize=ftell(f);CHECK(qsize>0&&qsize<=2L*1024L*1024L);fclose(f);
-    snprintf(path,sizeof path,"depth-model/deployment/programs/%s-v2.nprg",model);f=fopen(path,"rb");CHECK(f&&fread(raw,1,512u*1024u,f)>256u);long nsize=ftell(f);CHECK(nsize>0&&nsize<=512L*1024L);fclose(f);
+    snprintf(path,sizeof path,"samples/depth-model/deployment/programs/%s-v2.nprg",model);f=fopen(path,"rb");CHECK(f&&fread(raw,1,512u*1024u,f)>256u);long nsize=ftell(f);CHECK(nsize>0&&nsize<=512L*1024L);fclose(f);
     snprintf(path,sizeof path,"frame/native_quantize/fixtures/%s-smoke.f32",model);CHECK(read_exact(path,source,128));
     snprintf(path,sizeof path,"frame/native_quantize/fixtures/%s-smoke.u16",model);CHECK(read_exact(path,wanted,64));
     snprintf(path,sizeof path,"frame/native_quantize/fixtures/%s-smoke.pool1",model);CHECK(read_exact(path,pool1_before,POOL1_BYTES));

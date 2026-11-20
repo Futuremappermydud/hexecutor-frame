@@ -6,9 +6,9 @@
 set -eu
 cd "$(dirname "$0")/../../.."
 SDKARG=""
-if [ -n "${SDK_MOUNT:-}" ]; then SDKARG="-v $SDK_MOUNT:/repo/depth-model/.work/hexagon-sdk:ro"; fi
+if [ -n "${SDK_MOUNT:-}" ]; then SDKARG="-v $SDK_MOUNT:/repo/samples/depth-model/.work/hexagon-sdk:ro"; fi
 docker run --rm --platform linux/amd64 $SDKARG -e ARGS="$*" -v "$PWD:/repo" -w /repo "${HEXECUTOR_TOOLCHAIN_IMAGE:-hexecutor-toolchain:local}" sh -lc '
-  SDK=/repo/depth-model/.work/hexagon-sdk/6.6.0.0/tools/HEXAGON_Tools/19.0.07/Tools
+  SDK=/repo/samples/depth-model/.work/hexagon-sdk/6.6.0.0/tools/HEXAGON_Tools/19.0.07/Tools
   ELF=/tmp/nprg2-datamove.elf
   "$SDK/bin/hexagon-clang" -mv75 -mhvx -mhvx-length=128b -O2 -G0 -ffp-contract=off -fno-fast-math -fno-strict-aliasing \
     -Wall -Wextra -Werror -I"$SDK/target/hexagon/include" -Ihexecutor/native/program \

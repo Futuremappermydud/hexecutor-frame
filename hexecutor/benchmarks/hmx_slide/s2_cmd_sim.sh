@@ -1,10 +1,10 @@
 #!/bin/sh
 # SPDX-License-Identifier: LGPL-3.0-or-later
-# usage (from depth-model/): s2_cmd_sim.sh   one container: builds old (S2_FORCE_BCOPY=1) and new, runs variant 36 conv commands
+# usage (from samples/depth-model/): s2_cmd_sim.sh   one container: builds old (S2_FORCE_BCOPY=1) and new, runs variant 36 conv commands
 SDKV=${SDKV:-/Users/owenelliott/Documents/projects/spatial-stuff/depth-model/.work/hexagon-sdk}
 MAXC=${MAXC:-12}
-docker run --rm --platform linux/amd64 -e MAXC="$MAXC" -v "$SDKV:/repo/depth-model/.work/hexagon-sdk" -v "$PWD:/repo" -w /repo "${HEXECUTOR_TOOLCHAIN_IMAGE:-hexecutor-toolchain:local}" sh -lc '
-SDK=/repo/depth-model/.work/hexagon-sdk/6.6.0.0/tools/HEXAGON_Tools/19.0.07/Tools
+docker run --rm --platform linux/amd64 -e MAXC="$MAXC" -v "$SDKV:/repo/samples/depth-model/.work/hexagon-sdk" -v "$PWD:/repo" -w /repo "${HEXECUTOR_TOOLCHAIN_IMAGE:-hexecutor-toolchain:local}" sh -lc '
+SDK=/repo/samples/depth-model/.work/hexagon-sdk/6.6.0.0/tools/HEXAGON_Tools/19.0.07/Tools
 N=frame/native_program
 build() { # name flags
   $SDK/bin/hexagon-clang -mv75 -mhvx -mhvx-length=128b -O2 -G0 -w -ffp-contract=off -fno-fast-math -fno-strict-aliasing \

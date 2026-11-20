@@ -30,6 +30,6 @@ The C++ model adapter verifies pinned artifact hashes before acquiring the DSP a
 
 An idle session closes after `FRAME_DEPTH_IDLE_CLOSE_S` (default 15 seconds) and reopens for the next request. This avoids the historical resident idle exit around 36.9 seconds that could leave the service stuck. Capture can close after each reply, but repeated reopen/close behavior has its own recorded failure history. Do not convert a cleanup failure into an invisible retry loop.
 
-Source: [C++ pipeline](../../runtime/src/model_depth_pipeline.cpp), [native worker](../../runtime/tools/frame_depth_worker.cpp), and [temporal-state implementation](../../runtime/src/model_temporal.cpp). The separate temporal-fusion working documents are not maintained by this guide.
+Source: [C++ pipeline](../../depth-runtime/src/model_depth_pipeline.cpp), [native worker](../../depth-runtime/tools/frame_depth_worker.cpp), and [temporal-state implementation](../../depth-runtime/src/model_temporal.cpp). The separate temporal-fusion working documents are not maintained by this guide.
 
-The live worker and executor host are C++17. Offline Python compatibility tools remain under `depth-model/python/depth_model/`; they are not a production fallback. See [native API](../hexecutor/api.md).
+The live worker and executor host are C++17. Offline Python compatibility tools remain under `samples/depth-model/python/depth_model/`; they are not a production fallback. See [native API](../hexecutor/api.md).

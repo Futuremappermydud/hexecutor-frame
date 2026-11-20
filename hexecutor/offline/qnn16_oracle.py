@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Per-operation oracle for QAIRT 2.50 FP16 HTP contexts from the x86 simulator.
 
-Inputs are a context decoded by depth-model/tools/htp_graph.py (graph.json) and
-a trace directory written by depth-model/sim/qnn_trace_hook.cpp with
+Inputs are a context decoded by samples/depth-model/tools/htp_graph.py (graph.json) and
+a trace directory written by samples/depth-model/sim/qnn_trace_hook.cpp with
 QD_TRACE_LOG and QD_WRITES. The tool maps every executed run-list entry to its
 serialized operation, replays the VTCM writes in execution order and decodes
 any VTCM tensor before or after the operation that uses it. Native FP16

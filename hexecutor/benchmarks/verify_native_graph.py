@@ -14,8 +14,8 @@ import sys as _path_sys
 from pathlib import Path as _SourcePath
 for _source_root in _SourcePath(__file__).resolve().parents:
     if (_source_root / "hexecutor/api.py").is_file():
-        _path_sys.path[:0] = [str(_source_root), str(_source_root / "depth-model/python"),
-                             str(_source_root / "depth-model/tools"),
+        _path_sys.path[:0] = [str(_source_root), str(_source_root / "samples/depth-model/python"),
+                             str(_source_root / "samples/depth-model/tools"),
                              str(_source_root / "hexecutor/benchmarks")]
         break
 from hexecutor.paths import workspace as _workspace
@@ -43,7 +43,7 @@ def ensure_image(model):
     image = (PATHS.native / f'build/resident-{model}.qdrx')
     if not image.exists():
         import subprocess
-        subprocess.run([sys.executable, str((PATHS.repo / 'depth-model/python/depth_model/lowering/resident_image.py')), str((PATHS.model_data / 'recovered') / model),
+        subprocess.run([sys.executable, str((PATHS.repo / 'samples/depth-model/python/depth_model/lowering/resident_image.py')), str((PATHS.model_data / 'recovered') / model),
                         '--output', str(image)], check=True, stdout=subprocess.DEVNULL)
     return image
 

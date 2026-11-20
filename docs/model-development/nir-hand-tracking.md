@@ -1,0 +1,36 @@
+# Stereo NIR hand tracking
+
+The native NIR viewer consumes stereo tracking-camera frames, detects and updates hand tracks, and publishes 21 joints per hand to OpenXR. Use the ONNX Runtime CPU path as a reference or supply an explicit QNN16 program directory to run both networks on the CDSP. The runtime viewer guide covers capture permissions, calibration, build targets, launcher flags and visibility/cleanup. [OpenXR hand viewer](../runtime/hand-tracking-viewer.md)
+
+## Capture, replay and model contract
+
+- `stream_nir_pairs` uses the existing XRService tracking-camera buffers. `FRNIR001` carries raw stereo grayscale pairs and is required by the native viewer. The Python host viewer also accepts compressed `FRNIR002` JPEG pairs, and can record and replay them with timestamps and sequences. Capture and transport latency matter independently of inference. [Capture helper](../../samples/hand-tracking/tools/stream_nir_pairs.cpp), [host viewer](../../samples/hand-tracking/tools/nirhands_live.py)
+- Use the matching rig YAML or measured session calibration. Reject low-confidence or high-reprojection-error labels in profile/evaluation runs and compare configurations on the same recording. Keep Frametop recordings and derived results local under the dataset terms. Python tools support offline replay, peer-pipeline comparison, and per-user bone profiles from two-view labels. [Replay](../../samples/hand-tracking/tools/nirhands_replay.py), [Evaluation](../../samples/hand-tracking/tools/nirhands_take.py), [Profile builder](../../samples/hand-tracking/tools/nirhands_profile.py)
+- A model package contains `detector.onnx`, `keypoints.onnx` and `manifest.json`. A skeleton export supplies heatmaps, visibility, palm, angles and scale to the host decoder. Its manifest carries the 33-value mean profile and may enable tight crops from prior tracked joints. The viewer supports `--output skeleton|heatmap|combined` and `--heatmap-weight`. Tracking continues to use the skeleton when the display uses auxiliary heatmap or mixed angles. [Native pipeline](../../samples/hand-tracking/nirhands/src/pipeline.cpp), [Skeleton fit](../../samples/hand-tracking/nirhands/src/skeleton.cpp)
+- `nirhands_replay --qnn16-dir ... --check-cpu` compares decoded outputs with ORT on the same crops when built with `NIRHANDS_QNN16`. Compare track identity, metric joint error, jitter and capture-to-result timing separately. [Native replay](../../samples/hand-tracking/nirhands/tools/nirhands_replay.cpp)
+
+## QNN16 build and validation
+
+1. Export the detector and selected development checkpoint with `export_nirhands_onnx.py --project PROJECT --checkpoint CHECKPOINT --output DIR`. Compare decoded ONNX outputs with evaluation-mode PyTorch on nondegenerate crops. [Exporter](../../samples/hand-tracking/tools/export_nirhands_onnx.py)
+2. Compile the ONNX with the provisioned QAIRT toolchain for the v75 target. Record versions, hashes and input shapes. The recorded 96 px skeleton export uses `--input-dim crops=1,2,96,96 --input-dim second_valid=1`. Decode the context with `htp_graph.py --no-source-names`. [Compiler wrapper](../../hexecutor/offline/compile_qnn.py), [context decoder](../../samples/depth-model/tools/htp_graph.py)
+3. Capture the graph trace using the matching trace hook, generate tensor-log config with `qnn16_lower.py --write-tensor-config`, then capture the tensors. Per-model `trace.sh` helpers and their logs live in the local work directories. Pass the matching QAIRT function map to the lowerer and program builder. [Trace hook](../../samples/depth-model/sim/qnn_trace_hook.cpp), [lowerer](../../hexecutor/offline/qnn16_lower.py)
+4. Use `qnn16_program.py --tensors trace/tensors.bin` and pass `--context-binary` when the context cannot be resolved by hash. Assign staging with `qnn16_scratch.py IN.q16p OUT.q16p [CONSTANTS.q16c]`. Q16P inputs use NHWC. Keep the matching constants and model manifest with each program. [Program builder](../../hexecutor/offline/qnn16_program.py), [scratch planner](../../hexecutor/offline/qnn16_scratch.py)
+5. Run the ISS and compare its exported outputs against ORT independently. For a kernel change run `--fuzz KIND --all` for the affected op kinds, the scratch poison test where relevant, and both real-crop references. Record per-op cycles with `QNN16_SIM_CFLAGS=-DQ16_SIM_PER_OP`. [Simulator driver](../../hexecutor/build-scripts/test_qnn16_program_sim.sh), [scratch poison test](../../hexecutor/tests/test_qnn16_scratch_poison.py)
+6. Run each program alone on the Frame and compare outputs with the same ISS run. Then check two-hand native replay and a bounded headset session. Record DSP and wall latency separately, including wake rotations, and verify cleanup. [Device validation](../hexecutor/validation.md#coverage-to-establish-on-frame), [launch commands](../runtime/hand-tracking-viewer.md#run)
+
+### Reproducibility details
+
+- Files named `trace/crops.raw` in earlier tight96 work were zero-filled. The full_v2 real-crop comparison used `real/nhwc20.raw` and `real/nhwc50.raw` with fresh simulator outputs. Check hashes before comparing any old result. `--compare` checks the no-tile float reference and can flag local differences even when the final outputs agree.
+- When layouts change, inspect the Q16P scratch total and partial-tile write footprints. The widened QNN16 scratch range resolved the earlier 768-byte shortfall. The full_v2 program used 4,031,360 bytes. Preserve neighboring views when an HMX store spans a partial tile.
+- QAIRT 2.50 places some indirect constants and a fused tanh table in pool 2. The program builder can recover the scale head's table from the matching context when capture validation fails. Keep context and function-map versions paired. Some architectures still require a stride-2 convolution where the context would otherwise emit an unsupported MaxPool variant.
+
+## Recorded evidence and follow-up
+
+| Run | Result |
+| --- | --- |
+| Original detector and heatmap keypoints | About 8.8 ms per detector call and 14.3 ms per keypoint call on Frame in the 2026-11-13 tile-kernel comparison. |
+| `skeleton_tight96_full_v2` on two real crops, 2026-11-16 | Layout-aware L2 normalization and transpose reduced ISS cycles from 72.70M to 50.76M and device keypoints from 33.0 to 18.2 ms per hand. Outputs matched the paired ISS references bit for bit. |
+| Same recording, two-hand native replay | Combined output mode improved p50 from 72.3 to 41.5 ms and p90 from 122 to 76 ms. The optimized run's p99 was 129 ms, with roughly 50 ms wake-rotation stalls. ORT CPU replay measured p50 26 ms with three threads on cores that overlap the compositor. |
+| Auxiliary heatmap versus skeleton on the full_v2 recording | Against a two-view FAH-L reference for 298 hands, skeleton MPJPE / fingertip error was 15.2 / 26.0 mm and auxiliary heatmap error was 11.3 / 19.1 mm. These figures describe that recording and reference. |
+
+Verify worn tracking and perf with the exact optimized engine on a current deployment. The highest remaining ISS costs in the recorded full_v2 profile were CONV3X3 (11.2M cycles) and weight-staging COPY (6.9M). Reestablish the baseline before tuning them. For the alternative UmeTrack trunk, compare disparity and visibility outputs on a trained checkpoint and real crops before drawing accuracy conclusions.

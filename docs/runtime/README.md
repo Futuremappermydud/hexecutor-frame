@@ -14,6 +14,6 @@ The runtime acquires a calibrated stereo pair, computes depth off the render thr
 | `src/openxr_occlusion_layer.cpp`, `occlusion_renderer.cpp` | API-layer interception and occlusion rendering |
 | `scripts/room_dataset.py` and replay tools | Repeatable data collection and evaluation |
 
-All paths in this table are relative to `runtime/`. Read [cameras](cameras.md) before changing geometry, [model integration](model-depth.md) before changing the bridge, and [rendering](rendering.md) before changing coordinate or submission behavior. The [system overview](../architecture.md) explains the component boundaries.
+All paths in this table are relative to `depth-runtime/`. Read [cameras](cameras.md) before changing geometry, [model integration](model-depth.md) before changing the bridge, and [rendering](rendering.md) before changing coordinate or submission behavior. The [system overview](../architecture.md) explains the component boundaries.
 
 See [the OpenXR hand joint viewer](hand-tracking-viewer.md) for a simple in-headset camera/joint view, build instructions and session lifecycle.

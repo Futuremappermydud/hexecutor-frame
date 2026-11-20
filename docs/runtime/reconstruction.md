@@ -26,7 +26,7 @@ TSDF integration also retains its touched-leaf/work buffers. Surface extraction 
 
 `[Mesh]` logs separate `postprocess`, `speckles`, `filter` and `mesh` milliseconds. `[TSDF]` logs `postprocess`, `speckles`, `integrate` and `mesh`; the mesh time remains the most recent scheduled extraction/publication time. The model's `postprocess` covers CPU metric conversion and confidence expansion, including spherical-map construction on first use. `stereo` remains the backend's inference time.
 
-From `runtime/`, build and run the CPU-only checks and synthetic benchmark:
+From `depth-runtime/`, build and run the CPU-only checks and synthetic benchmark:
 
 ```sh
 make bin/test_depth_postprocess bin/test_meshing_pipeline bin/test_tsdf_volume bin/benchmark_depth_processing
@@ -59,4 +59,4 @@ The replay tools allow the same recorded observations to be integrated under dif
 
 This guide describes the implemented representations. It does not replace or modify the ongoing temporal-fusion report or its related notes.
 
-Source: [TSDF interface](../../runtime/include/tsdf_volume.hpp), [integration and meshing](../../runtime/src/tsdf_volume.cpp), [persistent depth](../../runtime/src/persistent_depth.cpp), and [worker](../../runtime/src/cloud_worker.cpp).
+Source: [TSDF interface](../../depth-runtime/include/tsdf_volume.hpp), [integration and meshing](../../depth-runtime/src/tsdf_volume.cpp), [persistent depth](../../depth-runtime/src/persistent_depth.cpp), and [worker](../../depth-runtime/src/cloud_worker.cpp).

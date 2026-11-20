@@ -218,7 +218,7 @@ static const uint32_t kAlternate[] = {109, 4666};
 
 int main(void) {
     char fixture[160];
-    for(unsigned i=0;i<sizeof kPrimary/sizeof kPrimary[0];i++) { snprintf(fixture,sizeof fixture,"hexecutor/native/program/fixtures/primary-smoke-sign-%lu.epcpu",(unsigned long)kPrimary[i]);run_sign_case("hexecutor/native/build/resident-primary.qdrx","depth-model/deployment/programs/primary-v2.nprg",fixture,kPrimary[i],"primary"); }
-    for(unsigned i=0;i<sizeof kAlternate/sizeof kAlternate[0];i++) { snprintf(fixture,sizeof fixture,"hexecutor/native/program/fixtures/alternate-smoke-sign-%lu.epcpu",(unsigned long)kAlternate[i]);run_sign_case("hexecutor/native/build/resident-alternate.qdrx","depth-model/deployment/programs/alternate-v2.nprg",fixture,kAlternate[i],"alternate"); }
+    for(unsigned i=0;i<sizeof kPrimary/sizeof kPrimary[0];i++) { snprintf(fixture,sizeof fixture,"hexecutor/native/program/fixtures/primary-smoke-sign-%lu.epcpu",(unsigned long)kPrimary[i]);run_sign_case("hexecutor/native/build/resident-primary.qdrx","samples/depth-model/deployment/programs/primary-v2.nprg",fixture,kPrimary[i],"primary"); }
+    for(unsigned i=0;i<sizeof kAlternate/sizeof kAlternate[0];i++) { snprintf(fixture,sizeof fixture,"hexecutor/native/program/fixtures/alternate-smoke-sign-%lu.epcpu",(unsigned long)kAlternate[i]);run_sign_case("hexecutor/native/build/resident-alternate.qdrx","samples/depth-model/deployment/programs/alternate-v2.nprg",fixture,kAlternate[i],"alternate"); }
     return 0;
 }

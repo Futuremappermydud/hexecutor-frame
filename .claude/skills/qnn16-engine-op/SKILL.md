@@ -6,15 +6,14 @@ description: Make a bit-identical speed change to a QNN16 engine op (hexecutor/n
 # Bit-identical QNN16 engine op change
 
 Engine sources: `hexecutor/native/qnn16/` (`exec.c` dispatch and tile hooks, `qnn16_tile_*.c` forms, `qnn16_f32.c`
-generic float path, `program.h` op kinds and parameters). These files and the build/test scripts are **untracked in
-git** in this worktree. Past examples with numbers: the 2026-11-13 23:10, 2026-11-14 00:20/23:15 and 2026-11-16
-10:30 sections of `docs/model-development/nirhands-skeleton-integration-handoff-2026-11-13.md`.
+generic float path, `program.h` op kinds and parameters). The workflow and measured cases are in
+`docs/model-development/nir-hand-tracking.md`.
 
 Environment (as for `qnn16-lower`): Docker running, and
 ```sh
-export HEXECUTOR_SDK_ROOT=~/Documents/projects/frame-spatial-runtime/depth-model/.work/hexagon-sdk/6.6.0.0
+export HEXECUTOR_SDK_ROOT=~/Documents/projects/frame-spatial-runtime/samples/depth-model/.work/hexagon-sdk/6.6.0.0
 export HEXECUTOR_TOOLCHAIN_IMAGE=depth-model-hmx-tools
-W=hand-tracking/.work/qnn-v75/nirhands-skeleton-full-v2     # current baseline program
+W=samples/hand-tracking/.work/qnn-v75/nirhands-skeleton-full-v2     # current baseline program
 ```
 
 ## 1. Baseline on this tree first
@@ -30,8 +29,7 @@ log). Per-kind totals are always printed (`kind N: ops pcycles`); kind numbers a
 `hexecutor/native/qnn16/program.h` (also listed in `hexecutor/offline/qnn16_scratch.py`), e.g. 1 COPY, 6 CONV3X3,
 19 CONCAT, 22 TRANSPOSE, 29 CONV3X3_S2, 42 L2NORM, 43 REDUCE_MEAN.
 
-Also save a copy of the engine sources before editing (e.g. `cp -R hexecutor/native/qnn16 <scratch>/qnn16-orig`):
-they are untracked, so git can't give them back.
+Record the baseline source revision and preserve any preexisting working edits that affect the engine build.
 
 ## 2. Change the op
 
@@ -72,7 +70,7 @@ building anything else. Deploy it **beside** the old engine, never over it (see 
 ## 5. Report
 
 pcycles before/after (same tree), per-kind deltas, fuzz kinds and layouts, crop bit-identity, engine md5s, DSP ms
-per call once measured on the Frame. Record it in the handoff (`frame-handoff-update`).
+per call once measured on the Frame. Record it in the topic guide or private experiment notes (`frame-handoff-update`).
 
 ## Gotchas
 

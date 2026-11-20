@@ -44,7 +44,7 @@ add_executable(hexecutor_blob_test test_blob.cpp)
 target_link_libraries(hexecutor_blob_test PRIVATE hexecutor_blob)
 
 # Existing hexecutor host sources, referenced by path. This list mirrors the
-# hexecutor_host target in the root CMakeLists.txt; keep the two in sync.
+# hexecutor_host target in hexecutor/CMakeLists.txt; keep the two in sync.
 set(HEXECUTOR_HOST_SOURCES
     ${HEXECUTOR_REPO_ROOT}/hexecutor/host/cpp/executor.cpp
     ${HEXECUTOR_REPO_ROOT}/hexecutor/host/cpp/workload_memory.cpp

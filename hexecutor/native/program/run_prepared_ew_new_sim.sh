@@ -14,7 +14,7 @@ N=hexecutor/native/program
 SEGDIR=${SEGDIR:-.work/ewnew}
 SDK_MOUNT=${SDK_MOUNT:-${HEXAGON_SDK_HOST:-}}
 SDKARG=""
-if [ -n "$SDK_MOUNT" ]; then SDKARG="-v $SDK_MOUNT:/repo/depth-model/.work/hexagon-sdk:ro"; fi
+if [ -n "$SDK_MOUNT" ]; then SDKARG="-v $SDK_MOUNT:/repo/samples/depth-model/.work/hexagon-sdk:ro"; fi
 mkdir -p "$SEGDIR"
 host="$SEGDIR/test_refsim_split"
 cc -O2 -std=c11 -ffp-contract=off -fno-fast-math -fno-strict-aliasing -Wall -Wextra -Werror -I$N \
@@ -31,7 +31,7 @@ for w in "primary 4584 4" "primary 4776 4" "primary 4805 1" "primary 4808 11" "p
 done
 docker run --rm --platform linux/amd64 $SDKARG ${DOCKER_EXTRA:-} -e SEGDIR="$SEGDIR" -e CFX="${CFLAGS_EXTRA:-}" -e SIMARGS="${SIMARGS:-fast ew cycles}" \
   -v "$PWD:/repo" -w /repo "${HEXECUTOR_TOOLCHAIN_IMAGE:-hexecutor-toolchain:local}" sh -lc '
-    SDK=/repo/depth-model/.work/hexagon-sdk/6.6.0.0/tools/HEXAGON_Tools/19.0.07/Tools
+    SDK=/repo/samples/depth-model/.work/hexagon-sdk/6.6.0.0/tools/HEXAGON_Tools/19.0.07/Tools
     CC="$SDK/bin/hexagon-clang -mv75 -mhvx -mhvx-length=128b -O2 -G0 -ffp-contract=off -fno-fast-math -fno-strict-aliasing -Wall -Wextra -Werror $CFX -I$SDK/target/hexagon/include"
     $CC hexecutor/native/kernels/blocked/linearclip_flat_u8_sim.c -o /tmp/lcflat.elf -lhexagon
     "$SDK/bin/hexagon-sim" -mv75 --quiet /tmp/lcflat.elf
