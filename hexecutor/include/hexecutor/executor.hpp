@@ -59,9 +59,32 @@ Program load_tensor_program(const std::filesystem::path &image,
 Program load_qnn16_program(const std::filesystem::path &image,
                            const std::filesystem::path &constants);
 Bytes read_file(const std::filesystem::path &path);
+// Bytes of persistent state (conv rings, KV caches) an HXFG image needs: the end of its furthest
+// persistent tensor, zero when it has none. Bounds-checks the image's tensor table; throws on a
+// malformed one. The state region is the host's to provide and keep between runs.
+size_t persistent_state_extent(const Bytes &image);
 std::string sha256(const Bytes &bytes);
 Bytes load_elf(const Bytes &elf, uint32_t base, size_t capacity);
 void verify_file(const std::filesystem::path &path, const std::string &expected);
+
+// CPU reference execution of a tensor_f32 program (validation and `HexecutorBackend` reference mode;
+// Session never falls back to it). Persistent tensors (conv rings, KV caches) live in a zero-initialised
+// state region that is kept between run() calls and cleared by reset_state(), exactly as the device
+// session keeps its state region.
+class TensorReference {
+  public:
+    explicit TensorReference(const Program &program);
+    ~TensorReference();
+    TensorReference(const TensorReference &) = delete;
+    TensorReference &operator=(const TensorReference &) = delete;
+    std::vector<Bytes> run(const std::vector<Buffer> &inputs);
+    void reset_state();
+    size_t state_bytes() const;
+
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 // QDRX retains its four-input/two-output ABI. The tensor backend supports
 // multiple graphs under one device lease, with graph-specific I/O contracts.

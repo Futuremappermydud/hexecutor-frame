@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -54,8 +55,14 @@ class Backend {
     virtual void idle() {}
     // Forced release for a stock firmware job; unlike idle(), cannot be pinned.
     virtual void release() { idle(); }
+    // Reset any persistent state held by the backend (e.g. KV caches or accumulators).
+    // Note: reset_state is server-global across all active streams and clients on this broker.
     virtual void reset_state() {}
     virtual size_t state_bytes() const { return 0; }
+    // Register an embedded tensor graph. Called on the executor thread, between jobs.
+    virtual GraphInfo register_graph(const Bytes &, const Bytes &) {
+        throw std::runtime_error("dynamic graph registration is unsupported");
+    }
 };
 
 // Portable scheduling core: earliest deadline first; ties go to the more urgent
@@ -78,6 +85,13 @@ class Scheduler {
     // Remove every queued job of a client (disconnect) or of one of its streams.
     std::vector<Job> drop(uint64_t client, std::optional<uint32_t> stream = std::nullopt);
     size_t size() const { return queue_.size(); }
+    // Jobs of one client still queued (not yet running).
+    size_t queued(uint64_t client) const {
+        size_t n = 0;
+        for (const auto &j : queue_)
+            n += j.client == client;
+        return n;
+    }
     void ran(size_t graph) { last_graph_ = graph; have_last_ = true; }
 
   private:
@@ -139,11 +153,14 @@ class Client {
         std::vector<size_t> input_bytes, output_bytes;
     };
     Stream open(const StreamSpec &);
+    std::string register_graph(const Bytes &image, const Bytes &constants);
     void close(const Stream &);
     uint64_t submit(const Stream &, const std::vector<Buffer> &inputs);
     Result wait(uint64_t ticket);
     // submit + wait; throws unless the result is ok. Drop-in for Session::run.
     std::vector<Bytes> run(const Stream &, const std::vector<Buffer> &inputs);
+    // Request that the broker server reset any persistent state in the backend.
+    // Note: reset_state is server-global across all active streams on the broker.
     void reset_state();
 
   private:

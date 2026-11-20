@@ -112,7 +112,21 @@ int main() {
         require(out_count == 10, "gazenet vector output count is 10");
         require(vec_out[0] == 100.0f && vec_out[9] == 109.0f, "gazenet vector output values match");
 
+        // 5. Test recovery after broker disconnect/restart (reset client and lazy stream reopen)
         server.stop();
+        // Dispatch while server stopped should fail and reset client
+        rc = broker_shim_dispatch_gazenet(gaze_in.data(), gaze_out.data());
+        require(rc != 0, "dispatch fails when server is stopped");
+
+        // Restart server
+        broker::Server server2(std::make_unique<FakeBackend>(), server_options);
+        server2.start();
+
+        // Shim should recover and lazily reconnect
+        rc = broker_shim_dispatch_gazenet(gaze_in.data(), gaze_out.data());
+        require(rc == 0, "broker shim recovers and reconnects after server restart");
+
+        server2.stop();
     } catch (const std::exception &e) {
         std::cerr << "test_xrservice_broker_shim: " << e.what() << '\n';
         return 1;

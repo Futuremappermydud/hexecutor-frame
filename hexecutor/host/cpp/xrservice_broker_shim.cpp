@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "hexecutor/xrservice_broker_shim.h"
 #include "hexecutor/broker.hpp"
+#include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -43,54 +44,96 @@ struct ShimState {
 
     ShimState() : socket_path(get_default_socket()) {}
 
+    using Clock = std::chrono::steady_clock;
+    // A graph that is not registered must not cost a broker round-trip per frame.
+    static constexpr std::chrono::seconds kOpenRetry{2};
+    Clock::time_point featurenn_retry{}, gazenet_retry{}, vector_retry{};
+    static bool open_allowed(Clock::time_point retry) { return Clock::now() >= retry; }
+
+    void reset_locked() {
+        featurenn_stream = {};
+        gazenet_stream = {};
+        vector_stream = {};
+        client.reset();
+    }
+
     bool ensure_connected_locked() {
         if (client)
             return true;
         try {
             client = std::make_unique<hexecutor::broker::Client>(socket_path);
+            return true;
+        } catch (const std::exception &) {
+            reset_locked();
+            return false;
+        }
+    }
 
-            // Open stereoFeatureNN stream if graph exists
+    bool ensure_featurenn_stream_locked() {
+        if (!ensure_connected_locked())
+            return false;
+        if (featurenn_stream.id)
+            return true;
+        if (!open_allowed(featurenn_retry))
+            return false;
+        try {
             hexecutor::broker::StreamSpec fn_spec;
             fn_spec.graph = "featurenn";
             fn_spec.cls = hexecutor::broker::Class::tracking;
             fn_spec.period_ms = 0;
             fn_spec.deadline_ms = 50;
             fn_spec.latest_only = false;
-            try {
-                featurenn_stream = client->open(fn_spec);
-            } catch (const std::exception &e) {
-                // FeatureNN graph might not be registered
-            }
+            featurenn_stream = client->open(fn_spec);
+            return featurenn_stream.id != 0;
+        } catch (const std::exception &) {
+            featurenn_stream = {};
+            featurenn_retry = Clock::now() + kOpenRetry;
+            return false;
+        }
+    }
 
-            // Open Gazenet image stream if graph exists
+    bool ensure_gazenet_stream_locked() {
+        if (!ensure_connected_locked())
+            return false;
+        if (gazenet_stream.id)
+            return true;
+        if (!open_allowed(gazenet_retry))
+            return false;
+        try {
             hexecutor::broker::StreamSpec gaze_spec;
             gaze_spec.graph = "gazenet";
             gaze_spec.cls = hexecutor::broker::Class::tracking;
             gaze_spec.period_ms = 0;
             gaze_spec.deadline_ms = 50;
             gaze_spec.latest_only = false;
-            try {
-                gazenet_stream = client->open(gaze_spec);
-            } catch (const std::exception &e) {
-                // Gazenet graph might not be registered
-            }
+            gazenet_stream = client->open(gaze_spec);
+            return gazenet_stream.id != 0;
+        } catch (const std::exception &) {
+            gazenet_stream = {};
+            gazenet_retry = Clock::now() + kOpenRetry;
+            return false;
+        }
+    }
 
-            // Open Gazenet vector stream if graph exists
+    bool ensure_vector_stream_locked() {
+        if (!ensure_connected_locked())
+            return false;
+        if (vector_stream.id)
+            return true;
+        if (!open_allowed(vector_retry))
+            return false;
+        try {
             hexecutor::broker::StreamSpec vec_spec;
             vec_spec.graph = "gazenet_vector";
             vec_spec.cls = hexecutor::broker::Class::tracking;
             vec_spec.period_ms = 0;
             vec_spec.deadline_ms = 50;
             vec_spec.latest_only = false;
-            try {
-                vector_stream = client->open(vec_spec);
-            } catch (const std::exception &e) {
-                // Vector graph might not be registered
-            }
-
-            return true;
-        } catch (const std::exception &e) {
-            client.reset();
+            vector_stream = client->open(vec_spec);
+            return vector_stream.id != 0;
+        } catch (const std::exception &) {
+            vector_stream = {};
+            vector_retry = Clock::now() + kOpenRetry;
             return false;
         }
     }
@@ -129,7 +172,7 @@ void broker_shim_set_socket(const char *socket_path) {
     std::lock_guard<std::mutex> lock(s.mutex);
     if (socket_path && *socket_path) {
         s.socket_path = socket_path;
-        s.client.reset();
+        s.reset_locked();
     }
 }
 
@@ -149,7 +192,7 @@ int broker_shim_dispatch_stereofeaturenn(const void *input_u8, void *output_reco
 
     auto &s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
-    if (!s.ensure_connected_locked() || !s.featurenn_stream.id)
+    if (!s.ensure_featurenn_stream_locked())
         return -2;
 
     try {
@@ -195,6 +238,7 @@ int broker_shim_dispatch_stereofeaturenn(const void *input_u8, void *output_reco
         return 0;
     } catch (const std::exception &e) {
         std::cerr << "[xrservice_broker_shim] FeatureNN dispatch failed: " << e.what() << '\n';
+        s.reset_locked();
         return -3;
     }
 }
@@ -205,7 +249,7 @@ int broker_shim_dispatch_gazenet(const float *input_planar_f32, float *output_64
 
     auto &s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
-    if (!s.ensure_connected_locked() || !s.gazenet_stream.id)
+    if (!s.ensure_gazenet_stream_locked())
         return -2;
 
     try {
@@ -225,6 +269,7 @@ int broker_shim_dispatch_gazenet(const float *input_planar_f32, float *output_64
         return 0;
     } catch (const std::exception &e) {
         std::cerr << "[xrservice_broker_shim] Gazenet dispatch failed: " << e.what() << '\n';
+        s.reset_locked();
         return -3;
     }
 }
@@ -237,7 +282,7 @@ int broker_shim_dispatch_gazenet_vector(const float *input_f32, uint32_t in_floa
 
     auto &s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
-    if (!s.ensure_connected_locked() || !s.vector_stream.id)
+    if (!s.ensure_vector_stream_locked())
         return -2;
 
     try {
@@ -252,6 +297,7 @@ int broker_shim_dispatch_gazenet_vector(const float *input_f32, uint32_t in_floa
         return 0;
     } catch (const std::exception &e) {
         std::cerr << "[xrservice_broker_shim] Gazenet vector dispatch failed: " << e.what() << '\n';
+        s.reset_locked();
         return -3;
     }
 }

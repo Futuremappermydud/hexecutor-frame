@@ -104,7 +104,8 @@ double Admission::utilization() const {
 namespace {
 constexpr uint32_t magic = 0x31425848; // "HXB1"
 constexpr size_t max_payload = 64u << 20, max_count = 16;
-enum Type : uint32_t { OPEN = 1, OPENED, ERROR, SUBMIT, RESULT, CLOSE, RESET, RESET_DONE };
+enum Type : uint32_t { OPEN = 1, OPENED, ERROR, SUBMIT, RESULT, CLOSE, RESET, RESET_DONE,
+                       REGISTER, REGISTERED };
 struct Header {
     uint32_t magic, type, stream, count;
     uint64_t ticket, value;
@@ -253,6 +254,17 @@ struct Server::Impl {
     bool stopping = false, started = false, release = false;
     Scheduler scheduler;
     Admission admission;
+    struct ResetRequest {
+        std::shared_ptr<Conn> conn;
+        uint64_t client, ticket;
+    };
+    std::vector<ResetRequest> pending_resets;
+    struct Registration {
+        std::shared_ptr<Conn> conn;
+        uint64_t ticket;
+        Bytes image, constants;
+    };
+    std::deque<Registration> registrations;
     std::map<uint64_t, std::shared_ptr<Conn>> conns;
     uint64_t next_conn = 1;
     std::vector<GraphStats> stats;
@@ -330,14 +342,16 @@ struct Server::Impl {
             if (cls > uint32_t(Class::bulk) || !(spec.deadline_ms > 0) || !(spec.period_ms >= 0))
                 return send_error(c, 0, f.h.ticket, "invalid stream specification");
             spec.cls = Class(cls);
-            auto g = std::find_if(graphs.begin(), graphs.end(),
-                                  [&](const GraphInfo &x) { return x.name == spec.graph; });
-            if (g == graphs.end())
-                return send_error(c, 0, f.h.ticket, "unknown graph " + spec.graph);
-            size_t graph = size_t(g - graphs.begin());
+            size_t graph;
             uint32_t sid;
+            Bytes sizes;
             {
                 std::lock_guard<std::mutex> lock(mutex);
+                auto g = std::find_if(graphs.begin(), graphs.end(),
+                                      [&](const GraphInfo &x) { return x.name == spec.graph; });
+                if (g == graphs.end())
+                    return send_error(c, 0, f.h.ticket, "unknown graph " + spec.graph);
+                graph = size_t(g - graphs.begin());
                 sid = c->next_stream++;
                 double cost = graph_cost(graph);
                 if (cost < 0)
@@ -346,19 +360,25 @@ struct Server::Impl {
                     return send_error(c, 0, f.h.ticket,
                                       "admission refused: utilization would exceed the limit");
                 c->streams[sid] = {spec, graph};
+                put(sizes, uint32_t(g->input_bytes.size()));
+                put(sizes, uint32_t(g->output_bytes.size()));
+                for (auto n : g->input_bytes)
+                    put(sizes, uint64_t(n));
+                for (auto n : g->output_bytes)
+                    put(sizes, uint64_t(n));
             }
-            Bytes sizes;
-            sizes.reserve(sizeof(uint32_t) * 2 +
-                          sizeof(uint64_t) * (g->input_bytes.size() + g->output_bytes.size()));
-            put(sizes, uint32_t(g->input_bytes.size()));
-            put(sizes, uint32_t(g->output_bytes.size()));
-            for (auto n : g->input_bytes)
-                put(sizes, uint64_t(n));
-            for (auto n : g->output_bytes)
-                put(sizes, uint64_t(n));
             std::lock_guard<std::mutex> lock(c->send);
             Buffer part = view(sizes);
             send_frame(c->fd, OPENED, sid, f.h.ticket, 0, &part, 1);
+        } else if (f.h.type == REGISTER) {
+            if (f.parts.size() != 2)
+                return send_error(c, 0, f.h.ticket, "REGISTER needs image and constants");
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                registrations.push_back({c, f.h.ticket, std::move(f.parts[0]),
+                                         std::move(f.parts[1])});
+            }
+            changed.notify_one();
         } else if (f.h.type == SUBMIT) {
             Job job;
             job.client = id;
@@ -416,18 +436,11 @@ struct Server::Impl {
             for (auto &j : dropped)
                 reply_status(j, Status::error, "stream closed");
         } else if (f.h.type == RESET) {
-            std::string err;
-            try {
-                backend->reset_state();
-            } catch (const std::exception &e) {
-                err = e.what();
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                pending_resets.push_back({c, id, f.h.ticket});
             }
-            std::lock_guard<std::mutex> lock(c->send);
-            if (!err.empty()) {
-                send_frame(c->fd, ERROR, 0, f.h.ticket, 0, {view(err)});
-            } else {
-                send_frame(c->fd, RESET_DONE, 0, f.h.ticket, 0, nullptr, 0);
-            }
+            changed.notify_one();
         } else
             throw std::runtime_error("unexpected frame type from client");
     }
@@ -443,6 +456,9 @@ struct Server::Impl {
             for (auto &[sid, _] : c->streams)
                 admission.release((id << 32) | sid);
             dropped = scheduler.drop(id);
+            registrations.erase(std::remove_if(registrations.begin(), registrations.end(),
+                                               [&](const Registration &r) { return r.conn == c; }),
+                                registrations.end());
             conns.erase(it);
         }
         {
@@ -504,6 +520,19 @@ struct Server::Impl {
             }
         }
     }
+    void reply_reset(const ResetRequest &r, const std::string &err) {
+        try {
+            std::lock_guard<std::mutex> lock(r.conn->send);
+            if (r.conn->dead)
+                return;
+            if (!err.empty())
+                send_frame(r.conn->fd, ERROR, 0, r.ticket, 0, {view(err)});
+            else
+                send_frame(r.conn->fd, RESET_DONE, 0, r.ticket, 0, nullptr, 0);
+        } catch (const std::exception &) {
+            // client went away; nothing to answer
+        }
+    }
     void exec_loop() {
         auto last_work = Clock::now();
         bool device_held = false;
@@ -513,6 +542,8 @@ struct Server::Impl {
         expired.reserve(4);
         for (;;) {
             std::optional<Job> job;
+            std::optional<ResetRequest> reset_req;
+            std::optional<Registration> registration;
             expired.clear();
             {
                 std::unique_lock<std::mutex> lock(mutex);
@@ -521,13 +552,28 @@ struct Server::Impl {
                 for (;;) {
                     if (stopping || release)
                         break;
+                    // A RESET runs after every job its client submitted earlier.
+                    for (auto it = pending_resets.begin(); it != pending_resets.end(); ++it) {
+                        if (scheduler.queued(it->client) == 0) {
+                            reset_req = std::move(*it);
+                            pending_resets.erase(it);
+                            break;
+                        }
+                    }
+                    if (reset_req)
+                        break;
+                    if (!registrations.empty()) {
+                        registration = std::move(registrations.front());
+                        registrations.pop_front();
+                        break;
+                    }
                     job = scheduler.next(Clock::now(), expired);
                     if (job || !expired.empty())
                         break;
                     if (device_held) {
                         if (changed.wait_until(lock, last_work + idle_after) ==
                                 std::cv_status::timeout &&
-                            scheduler.size() == 0)
+                            scheduler.size() == 0 && pending_resets.empty())
                             break;
                     } else
                         changed.wait(lock);
@@ -535,14 +581,58 @@ struct Server::Impl {
             }
             for (auto &e : expired)
                 reply_status(e, Status::expired);
-            if (stopping_now())
+            if (stopping_now()) {
+                if (reset_req)
+                    pending_resets.push_back(std::move(*reset_req));
+                std::vector<ResetRequest> orphans;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    orphans.swap(pending_resets);
+                }
+                for (auto &r : orphans)
+                    reply_reset(r, "broker stopping");
                 break;
+            }
             if (take_release()) {
                 try {
                     backend->release();
                 } catch (const std::exception &) {
                 }
                 device_held = false;
+                continue;
+            }
+            if (reset_req) {
+                std::string err;
+                try {
+                    backend->reset_state();
+                } catch (const std::exception &e) {
+                    err = e.what();
+                }
+                reply_reset(*reset_req, err);
+                continue;
+            }
+            if (registration) {
+                std::string error, name;
+                try {
+                    GraphInfo info = backend->register_graph(registration->image,
+                                                             registration->constants);
+                    name = info.name;
+                    std::lock_guard<std::mutex> lock(mutex);
+                    graphs.push_back(std::move(info));
+                    stats.emplace_back();
+                    stats.back().state_bytes = graphs.back().state_bytes;
+                } catch (const std::exception &e) {
+                    error = e.what();
+                }
+                try {
+                    std::lock_guard<std::mutex> lock(registration->conn->send);
+                    if (!registration->conn->dead)
+                        send_frame(registration->conn->fd, error.empty() ? REGISTERED : ERROR,
+                                   0, registration->ticket, 0,
+                                   {view(error.empty() ? name : error)});
+                } catch (const std::exception &) {
+                    registration->conn->dead = true;
+                }
                 continue;
             }
             if (!job) {
@@ -761,6 +851,28 @@ Client::Stream Client::open(const StreamSpec &spec) {
         for (uint32_t i = 0; i < nout; i++)
             s.output_bytes.push_back(size_t(take<uint64_t>(f->parts[0], at)));
         return s;
+    }
+}
+std::string Client::register_graph(const Bytes &image, const Bytes &constants) {
+    uint64_t request = next_ticket_++;
+    Buffer parts[2] = {view(image), view(constants)};
+    send_frame(fd_, REGISTER, 0, request, 0, parts, 2);
+    for (;;) {
+        auto f = read_frame(fd_);
+        if (!f)
+            throw std::runtime_error("broker closed the connection");
+        if (f->h.type == RESULT) {
+            pending_[f->h.ticket] = decode_result(*f);
+            continue;
+        }
+        if (f->h.ticket != request || f->parts.size() != 1)
+            throw std::runtime_error("unexpected broker registration reply");
+        std::string value(f->parts[0].begin(), f->parts[0].end());
+        if (f->h.type == ERROR)
+            throw std::runtime_error("broker: " + value);
+        if (f->h.type != REGISTERED)
+            throw std::runtime_error("malformed broker registration reply");
+        return value;
     }
 }
 void Client::close(const Stream &s) { send_frame(fd_, CLOSE, s.id, 0, 0, {}); }

@@ -5,7 +5,10 @@
 #include "qnn16/program.h"
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -122,10 +125,67 @@ Bytes load_elf(const Bytes &elf, uint32_t base, size_t capacity) {
     return code;
 }
 
+size_t persistent_state_extent(const Bytes &image) {
+    HxHeader h{};
+    require(image.size() >= sizeof h, "HXFG image shorter than its header");
+    std::memcpy(&h, image.data(), sizeof h);
+    require(uint64_t(h.tensor_offset) + uint64_t(h.tensors) * sizeof(HxTensor) <= image.size(),
+            "HXFG tensor table is outside the image");
+    uint64_t end = 0;
+    for (uint32_t i = 0; i < h.tensors; i++) {
+        HxTensor t;
+        std::memcpy(&t, image.data() + h.tensor_offset + size_t(i) * sizeof t, sizeof t);
+        if (t.flags & HX_TENSOR_PERSISTENT)
+            end = std::max<uint64_t>(end, uint64_t(t.offset) + hx_tensor_bytes(&t));
+    }
+    require(end <= (256u << 20), "persistent state region is too large");
+    return size_t(end);
+}
+
 namespace {
+/* Decode LINEAR_Q (one activation row) on the DSP is fastest with 32 rows interleaved: rewrite those weights in
+ * place into the grouped layout (same size) and the op's format to 2/3 in this session's copies. The files and
+ * their hashes are untouched (checked above); the session's own pool-change check compares against these copies. */
+static void group_linear_q(HxGraph &graph, Bytes &image, Bytes &constants) {
+    auto *ops = reinterpret_cast<HxOp *>(image.data() + graph.header->op_offset);
+    const auto qualifies = [&](const HxOp &o) {
+        const uint32_t k = o.p[3], n = o.p[4];
+        const auto &out = graph.tensors[o.out];
+        const size_t bytes = size_t(k / 32) * n * (o.p[0] ? 34 : 18);
+        return o.p[0] <= 1 && !(k & 63u) && !(n & 31u) && k <= 4096 && !(o.p[1] & 127u) && out.h == 1 &&
+               out.w == 1 && size_t(o.p[1]) + bytes <= constants.size();
+    };
+    /* Weights may be shared (tied): regroup a block only if every LINEAR_Q that reads it can take the result. */
+    std::map<uint32_t, std::vector<HxOp *>> users;
+    std::map<uint32_t, bool> ok;
+    for (uint32_t i = 0; i < graph.header->ops; i++)
+        if (ops[i].kind == HX_LINEAR_Q) {
+            auto &o = ops[i];
+            auto [it, fresh] = ok.emplace(o.p[1], true);
+            const auto &first = users[o.p[1]];
+            it->second = it->second && qualifies(o) &&
+                         (first.empty() || (first[0]->p[0] == o.p[0] && first[0]->p[3] == o.p[3] &&
+                                            first[0]->p[4] == o.p[4]));
+            users[o.p[1]].push_back(&o);
+        }
+    std::vector<uint8_t> scratch;
+    for (auto &[offset, list] : users) {
+        if (!ok[offset])
+            continue;
+        const HxOp &o = *list[0];
+        scratch.resize(size_t(o.p[3]) * 34);
+        hx_lq_group_layout(constants.data() + offset, o.p[0], o.p[3], o.p[4], scratch.data());
+        for (HxOp *u : list)
+            u->p[0] += 2;
+    }
+}
 HxGraph preflight_tensor(const Bytes &image, const Bytes &constants) {
     HxGraph graph{};
     uint32_t bad = HXFG_NONE;
+    /* Persistent tensors are checked against the state region, not the arena: bind a region of the
+     * right size first (preflight never touches it; a Session binds the real one afterwards). */
+    if (const size_t state = persistent_state_extent(image))
+        hx_graph_set_state(&graph, const_cast<uint8_t *>(image.data()), uint32_t(state));
     uint32_t error = hx_graph_open(&graph, image.data(), uint32_t(image.size()), constants.data(),
                                    uint32_t(constants.size()), nullptr, 0x1000000u, &bad);
     require(error == HX_OK, "tensor preflight failed: error " + std::to_string(error) + " at op " +
@@ -216,11 +276,13 @@ struct Session::Impl {
     uint8_t *memory = nullptr;
     WorkloadLease lease;
     size_t mapped_bytes = 128u << 20;
+    size_t engine_mapped_bytes = 128u << 20;
     int pin_fd = -1;
     std::array<uint32_t, 7> sizes{}, pools{};
     std::array<uint32_t, 4> inputs{}, input_bytes{};
     std::array<uint32_t, 2> outputs{}, output_bytes{};
     std::vector<std::pair<uint32_t, uint32_t>> guards;
+    bool high_constants = false;
     uint32_t cursor = 1 << 20, allocation_limit = (32u << 20) - 128, commands = 0;
     bool preserving = false, l2 = false, fourth = false, closed = false, initialized = false;
     static bool feature(const Bytes &b, const std::string &s) {
@@ -313,6 +375,10 @@ struct Session::Impl {
             require(feature(engine, "HXTENG01"), "tensor engine feature missing");
             require(fourth && feature(engine, "HXTPART4"),
                     "tensor engine and bootstrap must both use four workers");
+            const char *grouped = std::getenv("HEXECUTOR_LQ_GROUPED");
+            if (feature(engine, "HXLQG001") && !(grouped && std::string(grouped) == "0"))
+                for (size_t i = 0; i < graphs.size(); i++)
+                    group_linear_q(graphs[i], tensor_images[i], tensor_constants[i]);
             preserving = true;
             return;
         }
@@ -368,12 +434,27 @@ struct Session::Impl {
         int fd = ::open("/dev/cdsp_mem", O_RDWR | O_CLOEXEC);
         require(fd >= 0, "cannot open cdsp_mem");
         uint32_t pin_mb = static_cast<uint32_t>(lease_mb);
-        ::ioctl(fd, CDSP_MEM_IOC_PIN, &pin_mb);
+        if (::ioctl(fd, CDSP_MEM_IOC_PIN, &pin_mb) < 0) {
+            // Unpinned, another process could resize the window under the DSP.
+            int e = errno;
+            ::close(fd);
+            require(false, std::string("cdsp_mem pin failed: ") + std::strerror(e));
+        }
         pin_fd = fd;
         void *mapped = mmap(nullptr, mapped_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         require(mapped != MAP_FAILED, "cannot map cdsp_mem");
         memory = static_cast<uint8_t *>(mapped);
         std::copy(engine.begin(), engine.end(), memory);
+        size_t engine_window_mb = 128;
+        if (const char *env = std::getenv("HEXECUTOR_CHUNK_WINDOW_MB")) {
+            char *end = nullptr;
+            errno = 0;
+            unsigned long v = std::strtoul(env, &end, 10);
+            require(errno == 0 && end != env && *end == '\0' && v >= 128 && v <= 4095,
+                    "HEXECUTOR_CHUNK_WINDOW_MB must be an integer in [128, 4095]");
+            engine_window_mb = v;
+        }
+        engine_mapped_bytes = std::min(mapped_bytes, engine_window_mb << 20);
         if (program.backend == Backend::tensor_f32 || program.backend == Backend::qnn16_f16) {
             const bool q = program.backend == Backend::qnn16_f16;
             tensor_config.magic = HXFG_CONFIG_MAGIC;
@@ -399,10 +480,24 @@ struct Session::Impl {
             cursor = 32u << 20;
             /* The Q16P engine keeps its private, L1-cached scratch in
              * [56 MiB, 64 MiB - 4 KiB) of the same page (engine.c). */
-            /* Tensor graphs may use relative [32, 96) MiB for constants (or higher when cdsp_mem > 128 MiB);
+            /* Tensor graphs may use relative [32, 96) MiB for constants (or higher when the loaded engine maps > 128 MiB);
              * the Q16P engine keeps its scratch in [56, 64) MiB. */
-            allocation_limit = q ? (56u << 20) - 128 : (mapped_bytes > (128u << 20) ? (mapped_bytes - (32u << 20) - 4096) : (96u << 20) - 4096);
+            allocation_limit = q ? (56u << 20) - 128 : (96u << 20) - 4096; /* above 96 MiB: VTCM backup, L2, guards */
             max_allocation = q ? 32u << 20 : HXFG_MAX_CONSTANT_BYTES + 1u;
+            /* Pools that do not fit [32, 96) MiB go above the first 128 MiB, inside the engine's mapped
+             * window; the persistent state follows them there. */
+            if (!q && engine_mapped_bytes > (128u << 20)) {
+                uint64_t need = 0;
+                for (const auto &c : tensor_constants)
+                    need += ((c.size() + 127) & ~size_t(127)) + 512;
+                if (need > allocation_limit - cursor || std::getenv("HEXECUTOR_HIGH_CONSTANTS")) { /* the variable forces it, for tests */
+                    require(engine_mapped_bytes > size_t(HXFG_HIGH_CONSTANT_START) + 8192,
+                            "engine window too small for the high constant region");
+                    cursor = HXFG_HIGH_CONSTANT_START;
+                    allocation_limit = uint32_t(std::min<size_t>(engine_mapped_bytes - 8192, HXFG_HIGH_CONSTANT_END));
+                    high_constants = true;
+                }
+            }
             for (size_t i = 0; i < programs.size(); i++) {
                 auto &c = tensor_config.graph[i];
                 c.constant_bytes = uint32_t(tensor_constants[i].size());
@@ -411,21 +506,35 @@ struct Session::Impl {
                           memory + c.constants);
             }
             size_t max_state_bytes = 0;
+            /* Persistent tensors carry a name hash (reserved[1]); graphs that use the same name share one
+             * place, and each distinct name gets its own, so stages of one model never alias. Tensors
+             * without a name keep the offset the lowering gave them, below all named ones. */
             std::map<uint32_t, uint32_t> shared_state_offsets;
+            const auto align_state = [](size_t v) { return (v + 127) & ~size_t(127); };
             for (size_t i = 0; !q && i < programs.size(); i++) {
                 const auto *h = graphs[i].header;
                 for (uint32_t j = 0; j < h->tensors; j++) {
                     const auto &t = graphs[i].tensors[j];
-                    if (t.reserved[0] & HX_TENSOR_PERSISTENT) {
-                        uint32_t off = t.offset;
-                        if (t.reserved[1] != 0) {
-                            auto it = shared_state_offsets.find(t.reserved[1]);
-                            if (it != shared_state_offsets.end())
-                                off = it->second;
-                            else
-                                shared_state_offsets[t.reserved[1]] = off;
-                        }
-                        max_state_bytes = std::max(max_state_bytes, size_t(off + hx_tensor_bytes(&t)));
+                    if ((t.reserved[0] & HX_TENSOR_PERSISTENT) && t.reserved[1] == 0)
+                        max_state_bytes = std::max(max_state_bytes, size_t(t.offset + hx_tensor_bytes(&t)));
+                }
+            }
+            max_state_bytes = align_state(max_state_bytes);
+            std::map<uint32_t, size_t> shared_state_bytes;
+            for (size_t i = 0; !q && i < programs.size(); i++) {
+                const auto *h = graphs[i].header;
+                for (uint32_t j = 0; j < h->tensors; j++) {
+                    const auto &t = graphs[i].tensors[j];
+                    if (!(t.reserved[0] & HX_TENSOR_PERSISTENT) || t.reserved[1] == 0)
+                        continue;
+                    const size_t bytes = hx_tensor_bytes(&t);
+                    auto it = shared_state_offsets.find(t.reserved[1]);
+                    if (it == shared_state_offsets.end()) {
+                        shared_state_offsets[t.reserved[1]] = uint32_t(max_state_bytes);
+                        shared_state_bytes[t.reserved[1]] = bytes;
+                        max_state_bytes = align_state(max_state_bytes + bytes);
+                    } else {
+                        require(shared_state_bytes[t.reserved[1]] == bytes, "shared persistent state sizes differ");
                     }
                 }
             }
@@ -456,7 +565,7 @@ struct Session::Impl {
                 }
             }
             require(hx_session_config_valid(&tensor_config), "invalid tensor memory config");
-            guard_floor = cursor; /* canaries in [64, 96) MiB must not overwrite constants */
+            guard_floor = high_constants ? 0 : cursor; /* canaries in [64, 96) MiB must not overwrite constants */
             install_guards();
             auto *arena = transport->arena();
             std::memset(arena, 0, 32768);
@@ -506,7 +615,7 @@ struct Session::Impl {
                  {(80u << 20) - 4096, 4096},
                  {88u << 20, 4096},
                  {(64u << 20) - 4096, 4096},
-                 {uint32_t(mapped_bytes - 4096), 4096},
+                 {uint32_t(engine_mapped_bytes - 4096), 4096},
                  {(96u << 20) - 128, 128},
                  {104u << 20, 128}})
             if (g.first >= guard_floor)
@@ -668,7 +777,8 @@ struct Session::Impl {
             throw std::runtime_error("worker exit/stack check failed");
         }
         auto *a = transport->arena();
-        if (get<uint32_t>(a, 3072)) {
+        /* The JTLB mapper's state moved from 3072 to 28672 for windows above 128 MiB (qd_owned_memory.h). */
+        if (get<uint32_t>(a, engine_mapped_bytes > (128u << 20) ? 28672 : 3072)) {
             transport->retain("resident translations still active");
             throw std::runtime_error("resident JTLB still active");
         }

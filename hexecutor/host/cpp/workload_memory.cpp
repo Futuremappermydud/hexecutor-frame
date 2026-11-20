@@ -2,6 +2,7 @@
 #include "hexecutor/workload_memory.hpp"
 #include "hexecutor/cdsp_mem.h"
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -158,6 +159,9 @@ bool WorkloadMemoryManager::request_driver_resize(size_t target_mb) {
     }
 
 #ifdef __linux__
+    const bool is_shrink = target_mb < current_size_mb_;
+    const bool is_grow = target_mb > current_size_mb_;
+
     // Try ioctl on /dev/cdsp_mem
     int fd = ::open(CDSP_MEM_DEV_PATH, O_RDWR | O_CLOEXEC);
     if (fd >= 0) {
@@ -166,28 +170,44 @@ bool WorkloadMemoryManager::request_driver_resize(size_t target_mb) {
         int err = errno;
         ::close(fd);
         if (ret == 0) {
-            current_size_mb_ = target_mb;
+            size_t new_size = read_driver_size_mb();
+            if (is_grow && new_size < target_mb)
+                return false;
+            current_size_mb_ = new_size;
             return true;
         }
-        if (err == EBUSY) {
+        if (is_shrink && err == EBUSY) {
             // Driver refused shrink because another process or active mapping pins the window.
-            // Treat -EBUSY as 'stay large'.
+            // Treat -EBUSY on shrink as 'stay large'.
             current_size_mb_ = read_driver_size_mb();
             return true;
         }
+        // A module without the resize ioctl: fall back to the sysfs parameter.
+        // Anything else (EPERM, EBUSY on a grow, ...) is a real refusal.
+        if (err != ENOTTY && err != EINVAL && err != ENOSYS)
+            return false;
     }
 
     // Try sysfs parameter write
-    std::ofstream f(CDSP_MEM_SYSFS_SIZE);
-    if (f.is_open()) {
-        f << target_mb << std::endl;
-        if (f.good()) {
-            current_size_mb_ = target_mb;
+    int sfd = ::open(CDSP_MEM_SYSFS_SIZE, O_WRONLY | O_CLOEXEC);
+    if (sfd >= 0) {
+        std::string s = std::to_string(target_mb) + "\n";
+        ssize_t written = ::write(sfd, s.data(), s.size());
+        int err = errno;
+        ::close(sfd);
+        if (written == static_cast<ssize_t>(s.size())) {
+            size_t new_size = read_driver_size_mb();
+            if (is_grow && new_size < target_mb)
+                return false;
+            current_size_mb_ = new_size;
             return true;
         }
-        // If write failed, re-read size (e.g. -EBUSY) and stay large
-        current_size_mb_ = read_driver_size_mb();
-        return true;
+        if (is_shrink && err == EBUSY) {
+            // Re-read size and stay large on EBUSY shrink
+            current_size_mb_ = read_driver_size_mb();
+            return true;
+        }
+        return false;
     }
 #else
     // On non-Linux (e.g. macOS dev environment), fallback to tracked state

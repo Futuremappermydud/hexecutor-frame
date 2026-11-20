@@ -100,6 +100,11 @@ struct Fake : broker::Backend {
     std::vector<GraphInfo> graphs() const override {
         return {{"twice", {8}, {8}}, {"sum", {8}, {4}}};
     }
+    GraphInfo register_graph(const Bytes &image, const Bytes &constants) override {
+        if (image != Bytes{1, 2} || constants != Bytes{3})
+            throw std::runtime_error("bad graph payload");
+        return {"registered", {8}, {4}};
+    }
     std::vector<Bytes> run(size_t graph, const std::vector<Buffer> &in, double &dsp_ms) override {
         entered++;
         {
@@ -157,6 +162,14 @@ static void server_tests() {
     server.start();
     {
         Client c(sock);
+        require(c.register_graph({1, 2}, {3}) == "registered", "register graph");
+        StreamSpec registered_spec;
+        registered_spec.graph = "registered";
+        auto registered = c.open(registered_spec);
+        require(registered.input_bytes == std::vector<size_t>{8} &&
+                    registered.output_bytes == std::vector<size_t>{4},
+                "registered graph contract");
+        c.close(registered);
         // Admission: limit 0.5, so 30% + 30% is refused.
         StreamSpec rate;
         rate.graph = "sum";
@@ -234,7 +247,7 @@ static void server_tests() {
     // Idle release: the backend is told to let go of the device.
     wait_for([&] { return fake.idles.load() >= 1; }, "idle release");
     auto st = server.stats();
-    require(st.size() == 2 && st[0].runs >= 4 && st[1].runs >= 1, "graph stats");
+    require(st.size() == 3 && st[0].runs >= 4 && st[1].runs >= 1, "graph stats");
     server.stop();
     require(!std::filesystem::exists(sock), "socket removed");
     ::rmdir(dir);
@@ -306,12 +319,16 @@ struct StatefulFake : broker::Backend {
     float state_val = 0.0f;
     bool lost = false;
     size_t state_size = 1024;
+    std::thread::id run_thread_id;
+    std::thread::id reset_thread_id;
+    bool reject_reset = false;
 
     std::vector<GraphInfo> graphs() const override {
         return {{"accum", {4}, {4}, state_size}, {"scale", {4}, {4}, state_size}};
     }
     std::vector<Bytes> run(size_t graph, const std::vector<Buffer> &in, double &dsp_ms) override {
         std::lock_guard<std::mutex> l(m);
+        run_thread_id = std::this_thread::get_id();
         if (lost)
             throw std::runtime_error("persistent state was lost: session was released/failed; reset required");
         float arg = 0.0f;
@@ -328,6 +345,9 @@ struct StatefulFake : broker::Backend {
     }
     void reset_state() override {
         std::lock_guard<std::mutex> l(m);
+        reset_thread_id = std::this_thread::get_id();
+        if (reject_reset)
+            throw std::runtime_error("no active session to reset");
         state_val = 0.0f;
         lost = false;
     }
@@ -405,8 +425,20 @@ static void persistent_state_broker_test() {
 
         // Recover by resetting state
         c.reset_state();
+        require(fake.reset_thread_id == fake.run_thread_id, "reset_state executed on executor thread");
         auto r_recovered = c.run(accum, {{&x_new, 4}});
         require(first(r_recovered[0]) == 4.0f, "recovered after reset_state");
+
+        // Reject reset when no session / backend rejects
+        fake.reject_reset = true;
+        bool reject_as_expected = false;
+        try {
+            c.reset_state();
+        } catch (const std::exception &e) {
+            reject_as_expected = std::string(e.what()).find("no active session to reset") != std::string::npos;
+        }
+        require(reject_as_expected, "reset_state forwards backend error when rejected");
+        fake.reject_reset = false;
     }
 
     // 5. Check stats report state_bytes

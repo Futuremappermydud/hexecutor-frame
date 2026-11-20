@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <dirent.h>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <pthread.h>
@@ -20,6 +21,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <thread>
+#include <unistd.h>
 
 using namespace hexecutor;
 
@@ -38,6 +40,13 @@ class SessionBackend : public broker::Backend {
         : graphs_(std::move(graphs)), artifacts_(std::move(artifacts)) {
         for (auto &g : graphs_)
             programs_.push_back(g.program);
+    }
+    ~SessionBackend() override {
+        close_session("shutdown");
+        for (auto &path : graph_dirs_) {
+            std::error_code ignored;
+            std::filesystem::remove_all(path, ignored);
+        }
     }
     std::vector<broker::GraphInfo> graphs() const override {
         std::vector<broker::GraphInfo> out;
@@ -60,6 +69,53 @@ class SessionBackend : public broker::Backend {
     size_t state_bytes() const override {
         return session_ ? session_->state_bytes() : artifacts_.persistent_state_bytes;
     }
+    broker::GraphInfo register_graph(const Bytes &image, const Bytes &constants) override {
+        if (!failed_.empty())
+            throw std::runtime_error("device session failed earlier: " + failed_);
+        if (graphs_.size() >= 8)
+            throw std::runtime_error("at most eight graphs share one tensor session");
+        char dir[] = "/tmp/hexecutord-graph-XXXXXX";
+        if (!mkdtemp(dir))
+            throw std::runtime_error("cannot create private graph directory");
+        std::filesystem::path path(dir);
+        try {
+            auto write = [&](const char *name, const Bytes &bytes) {
+                std::ofstream out(path / name, std::ios::binary);
+                out.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+                if (!out)
+                    throw std::runtime_error("cannot write registered graph");
+            };
+            write("program.hxfg", image);
+            write("constants.bin", constants);
+            Program program = load_tensor_program(path / "program.hxfg", path / "constants.bin");
+            if (program.backend != hexecutor::Backend::tensor_f32)
+                throw std::runtime_error("registered graph is not tensor_f32");
+            std::string name = "app-" + std::to_string(graphs_.size());
+            if (std::any_of(graphs_.begin(), graphs_.end(), [&](const NamedProgram &g) {
+                    return g.name == name;
+                }))
+                throw std::runtime_error("registered graph name conflicts with a startup graph");
+            broker::GraphInfo info{name, {}, {}};
+            for (auto &t : program.inputs)
+                info.input_bytes.push_back(t.bytes());
+            for (auto &t : program.outputs)
+                info.output_bytes.push_back(t.bytes());
+            if (session_)
+                close_session("graph registration");
+            if (!failed_.empty())
+                throw std::runtime_error("cannot restore session for graph registration");
+            programs_.push_back(program);
+            graphs_.push_back({name, std::move(program)});
+            graph_dirs_.push_back(path);
+            return info;
+        } catch (...) {
+            std::error_code ignored;
+            std::filesystem::remove_all(path, ignored);
+            throw;
+        }
+    }
+    // Reset persistent backend state across all streams.
+    // With no open session there is nothing resident to clear; still acknowledge.
     void reset_state() override {
         if (session_)
             session_->reset_state();
@@ -106,6 +162,7 @@ class SessionBackend : public broker::Backend {
     }
 
   private:
+    std::vector<std::filesystem::path> graph_dirs_;
     void close_session(const char *reason) {
         if (!session_)
             return;
@@ -295,7 +352,7 @@ int main(int argc, char **argv) {
                 throw std::runtime_error("unknown option " + arg);
         }
         if (options.socket.empty() || artifacts.loader.empty() || artifacts.engine.empty() ||
-            artifacts.bootstrap.empty() || artifacts.chunk_probe.empty() || graphs.empty())
+            artifacts.bootstrap.empty() || artifacts.chunk_probe.empty())
             usage(2);
         if (graphs.size() > 8)
             throw std::runtime_error("at most eight graphs share one tensor session");
@@ -384,7 +441,8 @@ int main(int argc, char **argv) {
             watcher.join();
         }
         for (size_t i = 0; i < stats.size(); i++)
-            std::cerr << "[hexecutord] " << names[i] << ": runs " << stats[i].runs << " mean run "
+            std::cerr << "[hexecutord] " << (i < names.size() ? names[i] : "app-" + std::to_string(i))
+                      << ": runs " << stats[i].runs << " mean run "
                       << stats[i].mean_run_ms << " ms, dsp " << stats[i].mean_dsp_ms << " ms\n";
         return 0;
     } catch (const std::exception &e) {
