@@ -160,9 +160,19 @@ static int cdsp_mem_param_set_size_mb(const char *val, const struct kernel_param
 		return ret;
 
 	mutex_lock(&cdsp_mem_lock);
-	ret = cdsp_mem_core_resize(&core, n);
-	if (ret == 0)
-		size_mb = core.size_mb;
+	if (!core.ops) {
+		/* Before init (insmod parameter): same limits cdsp_mem_init enforces. */
+		if (n < CDSP_MEM_MIN_SIZE_MB || n > CDSP_MEM_MAX_SIZE_MB || n % 2)
+			ret = -EINVAL;
+		else {
+			size_mb = n;
+			ret = 0;
+		}
+	} else {
+		ret = cdsp_mem_core_resize(&core, n);
+		if (ret == 0)
+			size_mb = core.size_mb;
+	}
 	mutex_unlock(&cdsp_mem_lock);
 	return ret;
 }
@@ -171,7 +181,7 @@ static int cdsp_mem_param_get_size_mb(char *buffer, const struct kernel_param *k
 {
 	unsigned int cur;
 	mutex_lock(&cdsp_mem_lock);
-	cur = core.size_mb;
+	cur = core.ops ? core.size_mb : size_mb;
 	mutex_unlock(&cdsp_mem_lock);
 	return sysfs_emit(buffer, "%u\n", cur);
 }
@@ -188,14 +198,16 @@ static void cdsp_mem_vma_open(struct vm_area_struct *vma)
 	unsigned long off = vma->vm_pgoff << PAGE_SHIFT;
 
 	mutex_lock(&cdsp_mem_lock);
-	cdsp_mem_core_map_add(&core, vma, off, size);
+	if (cdsp_mem_core_map_add(&core, vma, off, size) != 0) {
+		core.untracked_mappings++;
+	}
 	mutex_unlock(&cdsp_mem_lock);
 }
 
 static void cdsp_mem_vma_close(struct vm_area_struct *vma)
 {
 	mutex_lock(&cdsp_mem_lock);
-	cdsp_mem_core_map_remove(&core, vma);
+	cdsp_mem_core_map_close(&core, vma);
 	mutex_unlock(&cdsp_mem_lock);
 }
 
@@ -216,6 +228,12 @@ static int cdsp_mem_mmap(struct file *file, struct vm_area_struct *vma)
 		return -EINVAL;
 	}
 
+	ret = cdsp_mem_core_map_add(&core, vma, off, size);
+	if (ret) {
+		mutex_unlock(&cdsp_mem_lock);
+		return ret;
+	}
+
 	vma->vm_ops = &cdsp_mem_vm_ops;
 	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 	for (done = 0; done < size; done += CHUNK_BYTES) {
@@ -232,8 +250,8 @@ static int cdsp_mem_mmap(struct file *file, struct vm_area_struct *vma)
 			break;
 	}
 
-	if (ret == 0) {
-		cdsp_mem_core_map_add(&core, vma, off, size);
+	if (ret != 0) {
+		cdsp_mem_core_map_remove(&core, vma);
 	}
 	mutex_unlock(&cdsp_mem_lock);
 	return ret;

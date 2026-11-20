@@ -216,6 +216,20 @@ int main() {
         cdsp_mem_core_map_remove(&core, vma1);
         check(cdsp_mem_core_get_pinned_extent_mb(&core) == 128, "Pinned extent drops to 128 MiB baseline");
         check(cdsp_mem_core_resize(&core, 128) == 0, "Shrink to 128 MiB baseline now succeeds");
+
+        // Untracked VMA protection test (e.g. alloc failure during vma_open)
+        check(cdsp_mem_core_resize(&core, 512) == 0, "Grow to 512 MiB for untracked VMA test");
+        core.untracked_mappings = 1;
+        check(cdsp_mem_core_get_pinned_extent_mb(&core) == 512, "Untracked mapping forces pinned extent to full size");
+        check(cdsp_mem_core_resize(&core, 256) == -EBUSY, "Shrink must be refused with -EBUSY while untracked VMA exists");
+        // A failed-mmap cleanup removes an owner that was never tracked: must not release the count.
+        cdsp_mem_core_map_remove(&core, reinterpret_cast<void *>(0x9999));
+        check(core.untracked_mappings == 1, "map_remove of an unknown owner leaves the untracked count");
+        check(cdsp_mem_core_resize(&core, 256) == -EBUSY, "Shrink still refused after unrelated remove");
+        // VMA close for an unknown owner is the untracked VMA going away.
+        cdsp_mem_core_map_close(&core, reinterpret_cast<void *>(0x9999));
+        check(core.untracked_mappings == 0, "Untracked mappings decremented on VMA close");
+        check(cdsp_mem_core_resize(&core, 128) == 0, "Shrink succeeds after untracked VMA is cleared");
     }
     std::cout << "  ✓ Live mapping extent tracking and -EBUSY rules passed" << std::endl;
 

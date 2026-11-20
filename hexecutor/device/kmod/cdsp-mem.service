@@ -1,0 +1,12 @@
+[Unit]
+Description=Load cdsp_mem (CDSP DDR window, dynamic resize)
+After=local-fs.target
+ConditionPathExists=!/dev/cdsp_mem
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/insmod /var/lib/hexecutor/cdsp_mem.ko size_mb=128 allow_user_resize=1
+
+[Install]
+WantedBy=multi-user.target

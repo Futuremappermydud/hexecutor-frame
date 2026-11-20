@@ -35,6 +35,7 @@ int cdsp_mem_core_init(struct cdsp_mem_core *core, uint32_t initial_size_mb,
     core->ops_ctx = ops_ctx;
     core->pins = NULL;
     core->mappings = NULL;
+    core->untracked_mappings = 0;
 
     core->chunks = (void **)ops->alloc_meta(ops_ctx, nchunks * sizeof(void *));
     if (!core->chunks)
@@ -110,6 +111,7 @@ void cdsp_mem_core_destroy(struct cdsp_mem_core *core)
         map = next;
     }
     core->mappings = NULL;
+    core->untracked_mappings = 0;
 
     core->nchunks = 0;
     core->size_mb = 0;
@@ -120,6 +122,11 @@ uint32_t cdsp_mem_core_get_pinned_extent_mb(const struct cdsp_mem_core *core)
     uint32_t max_mb = CDSP_MEM_MIN_SIZE_MB;
     if (!core)
         return max_mb;
+
+    /* If any user VMAs could not be tracked (e.g. alloc failure during vma_open),
+     * refuse shrinking by treating the entire reservation as pinned. */
+    if (core->untracked_mappings > 0)
+        return core->size_mb;
 
     /* Check all live pins */
     for (struct cdsp_mem_pin *p = core->pins; p != NULL; p = p->next) {
@@ -320,6 +327,22 @@ int cdsp_mem_core_map_remove(struct cdsp_mem_core *core, void *owner)
         }
         curr = &(*curr)->next;
     }
+    return 0;
+}
+
+/* VMA close: a tracked mapping is removed; a close for an unknown owner is a VMA
+ * whose map_add failed in vma_open, so it releases one untracked count. */
+int cdsp_mem_core_map_close(struct cdsp_mem_core *core, void *owner)
+{
+    if (!core || !owner)
+        return 0;
+
+    for (struct cdsp_mem_mapping *m = core->mappings; m != NULL; m = m->next) {
+        if (m->owner == owner)
+            return cdsp_mem_core_map_remove(core, owner);
+    }
+    if (core->untracked_mappings > 0)
+        core->untracked_mappings--;
     return 0;
 }
 

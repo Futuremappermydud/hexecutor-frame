@@ -2,9 +2,13 @@
 #ifndef CDSP_MEM_CORE_H
 #define CDSP_MEM_CORE_H
 
+#ifdef __KERNEL__
+#include <linux/types.h>
+#else
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -83,6 +87,7 @@ struct cdsp_mem_core {
     void **chunks;
     struct cdsp_mem_pin *pins;
     struct cdsp_mem_mapping *mappings;
+    uint32_t untracked_mappings;
 };
 
 /* Initialize core manager with initial reservation (e.g. 128 MiB baseline) */
@@ -112,6 +117,8 @@ int cdsp_mem_core_map_add(struct cdsp_mem_core *core, void *owner, uint64_t offs
 
 /* Deregister a live user mapping (e.g. VMA on close/munmap). */
 int cdsp_mem_core_map_remove(struct cdsp_mem_core *core, void *owner);
+/* VMA close: removes a tracked mapping, or releases one untracked count. */
+int cdsp_mem_core_map_close(struct cdsp_mem_core *core, void *owner);
 
 /* Compute the highest active pinned or mapped extent in MiB.
  * Always at least CDSP_MEM_MIN_SIZE_MB (128).
