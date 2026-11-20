@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # Usage: bench_prepared_overhead_sim.sh [reps]
 # Executor control-loop overhead on both real schedules in the V75 simulator
 # (pcycles): stubbed handlers (trivial, tensor-decoding) and the real scalar

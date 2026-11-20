@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include <stdio.h>
 #include <hexagon_standalone.h>
 #include "../native/qd_pack_hvx.h"

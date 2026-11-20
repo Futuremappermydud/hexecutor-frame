@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Qwen3-0.6B decode with all Transformer arithmetic on the Frame CDSP.
 
 The ARM process owns GGUF parsing, tensor transfer, KV storage and token

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Preflight-only host link stubs. Numerical behavior is tested on Hexagon. */
 #include "../kernels/blocked/add_u8.h"
 #include "../kernels/blocked/linearclip_u8_u16.h"

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Host harness for Q16P programs: validates an image and runs operations with
  * the portable 1x1 reference in place of HMX. Used by test_qnn16_program.py
  * through ctypes; VTCM, exchange and scratch are caller-owned buffers. */

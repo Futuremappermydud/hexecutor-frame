@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Exact dense ports of qd_graph.c's CPU-backend kernels; see prepared_reference.h.
  * Each kernel keeps the reference's statement order, rounding and checks. In a
  * dry pass, xfer only proves bounds, salloc only measures, and the arithmetic

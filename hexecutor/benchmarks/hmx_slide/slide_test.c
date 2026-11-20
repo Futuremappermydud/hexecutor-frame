@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Randomised check of qd_hmx_slide3_n vs a scalar model (silicon cvt.ub). */
 #include <stdint.h>
 #include <stdio.h>

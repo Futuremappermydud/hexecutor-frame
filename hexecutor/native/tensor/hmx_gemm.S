@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* V75 fp16 GEMM. Tiles are [16 row pairs][32 columns][2 rows].
  * A [M/32,K/32,1024 halves], B [N/32,K/32,1024 halves], C [M/32,N/32,...].
  * A deep load can cover at most 32 K tiles (1024 channels). Split larger

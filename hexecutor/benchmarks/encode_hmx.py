@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Emit fixed HMX code for open LLVM from a relocation-free SDK ELF object.
 
 The native .S remains the editable source. This rejects text relocations,

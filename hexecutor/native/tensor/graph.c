@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "graph.h"
 #include <stddef.h>
 #include <string.h>

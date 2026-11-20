@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Reference-kernel schedule test for the host and the V75 simulator.
  *
  *   test_prepared_reference_sim [primary|alternate|both] [prefix|full]

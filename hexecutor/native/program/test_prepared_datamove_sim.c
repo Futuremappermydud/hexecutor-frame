@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Focused check of the data-movement fast paths in prepared_datamove.inc and
  * prepared_vcopy.h against the generic reference kernels, for the host and
  * the V75 simulator.

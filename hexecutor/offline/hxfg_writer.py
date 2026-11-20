@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Shared HXFG v1 serialization for the offline lowerings.
 
 The source-format front ends (TFLite, ONNX) build a list of operations over

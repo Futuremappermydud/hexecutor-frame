@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Offline, fail-closed lowering of a static QLinear ONNX graph to float HXFG v1.
 
 Supports the operator-level quantized form written by onnxruntime's static

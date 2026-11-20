@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # usage (from depth-model/): s2_cmd_sim.sh   one container: builds old (S2_FORCE_BCOPY=1) and new, runs variant 36 conv commands
 SDKV=${SDKV:-/Users/owenelliott/Documents/projects/spatial-stuff/depth-model/.work/hexagon-sdk}
 MAXC=${MAXC:-12}

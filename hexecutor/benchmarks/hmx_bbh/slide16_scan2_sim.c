@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Find Rs/Rt low bits with consecutive true x taps in the engine u16 crouton. */
 #include <stdint.h>
 #include <stdio.h>

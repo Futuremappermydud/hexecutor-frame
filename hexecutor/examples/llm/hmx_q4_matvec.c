@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Q4_0 GGUF matrix-vector multiply on Frame HMX.
  * The ARM host supplies quantized rows and one FP16 vector. All dequantization,
  * matrix arithmetic and result conversion happen on the CDSP.

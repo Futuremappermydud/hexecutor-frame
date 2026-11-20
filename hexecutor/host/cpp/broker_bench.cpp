@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Round-robin benchmark client for hexecutord: one stream per named graph,
 // fixed inputs, N rounds. Reports client-observed latency next to the broker's
 // own queue/run/DSP times, so IPC overhead and graph-switch costs can be read

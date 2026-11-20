@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Validate one native 1x1 command in its live resident graph prefix.
 
 Only the target command may dispatch natively. Its active u8 output permits

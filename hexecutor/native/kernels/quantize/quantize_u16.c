@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "quantize_u16.h"
 #include <math.h>
 #include <stdint.h>

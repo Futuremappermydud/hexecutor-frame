@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Versioned, bounded matrix packets shared by the local and Frame transports."""
 import struct
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Compare one compressed HMX Q4 tile matrix against an offline CPU reference."""
 import argparse
 import json

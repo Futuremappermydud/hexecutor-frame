@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef QD_BLOCKED_LINEARCLIP_U8_U16_H
 #define QD_BLOCKED_LINEARCLIP_U8_U16_H
 #include <stdint.h>

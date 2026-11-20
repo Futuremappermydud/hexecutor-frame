@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Shared static helpers of the HVX tile leaves (qnn16_tile*.c): crouton block
  * maps, masked stores, direct-tensor addressing, exact FP16/float32 word
  * conversions and the qf32 SiLU core. Include from tile sources only. */

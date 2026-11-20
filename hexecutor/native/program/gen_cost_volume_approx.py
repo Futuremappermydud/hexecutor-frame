@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Generate primary-graph cost-volume dead-command bitmaps for steps 2, 4, and 8."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

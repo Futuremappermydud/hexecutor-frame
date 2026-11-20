@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Replay Mercury's stride-2 path against QD writes.
 
 ConvLayer_SpaceToDepth_stride2 must match bit for bit. ConvLayer.fp16.s2

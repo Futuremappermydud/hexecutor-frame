@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Finish a published DSP exit packet after an interrupted persistent session."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

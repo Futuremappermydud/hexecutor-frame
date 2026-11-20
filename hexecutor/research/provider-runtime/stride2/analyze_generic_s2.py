@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Compare the raw V69 S2 leaf against canonical and basis-recovered int64 maps."""
 from __future__ import annotations
 

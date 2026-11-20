@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 set -eu
 cd "$(dirname "$0")/."
 cc -std=c11 -O2 -Wall -Wextra -Werror -DQD_DIRECT_ALLOW_MOCK_BASE=1 \

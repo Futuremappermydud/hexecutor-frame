@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Q16P engine: runs lowered QNN FP16 run lists (program.h) on the shared
  * guarded tensor bootstrap and transport. Worker stacks, mappings, the VTCM
  * snapshot and restoration remain bootstrap-owned.

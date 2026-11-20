@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Extracted QAIRT 2.50 stride1 setter; simulator-only ABI probe. */
 .text
 .p2align 6

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "prepared_s2d.h"
 #include "../kernels/layout/space_to_depth_u8_direct.h"
 #include <stdio.h>

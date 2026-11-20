@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Poison test for the staging blocks qnn16_scratch.py assigns.
 
 Runs a Q16P program twice on the host interpreter. The second pass fills the

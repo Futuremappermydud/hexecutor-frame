@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Generate Qwen3-0.6B's static NeoX RoPE coefficients for 257 positions."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

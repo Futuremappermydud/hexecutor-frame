@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Bounded callback launch proof. No firmware code changes. Optional vector
  * mode temporarily leases the firmware HT3 vector configuration on parked HT5.
  * The stock FLOPS dispatch starts 0..2. Only after all three reach this callback

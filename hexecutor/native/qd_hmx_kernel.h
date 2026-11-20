@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef QD_HMX_KERNEL_H
 #define QD_HMX_KERNEL_H
 extern void qd_hmx_wide(void *,void *,void *,void *,uint32_t);

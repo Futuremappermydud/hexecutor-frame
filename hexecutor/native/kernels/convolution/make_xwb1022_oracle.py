@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Capture sequence-1022 Xwb/FI after the CPU QDRX prefix and build a C oracle header."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

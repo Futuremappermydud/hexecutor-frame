@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Inventory upper VTCM during an exclusive callback, before granting any use.
  * Mode 0 is read-only. Mode 1 saves the complete range, checks unique page
  * sentinels, and restores/verifies EVERY byte before publishing exit.

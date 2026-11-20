@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """HXET v1 delegate blob: the payload stored in a .pte for the hexecutor backend.
 
 All integers are little-endian with no padding:

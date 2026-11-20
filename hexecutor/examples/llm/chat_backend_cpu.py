@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Line-oriented chat worker for the Gamescope GTK client: LFM3-1.7B on the
 Frame CPU through llama.cpp's llama-server (same protocol as chat_backend.py).
 

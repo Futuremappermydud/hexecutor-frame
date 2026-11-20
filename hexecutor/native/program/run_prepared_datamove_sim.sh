@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # Usage: run_prepared_datamove_sim.sh [cycles]
 # Builds test_prepared_datamove_sim.c for V75 (HVX 128B) and runs it in
 # hexagon-sim. SDK_MOUNT (optional): host path of .work/hexagon-sdk.

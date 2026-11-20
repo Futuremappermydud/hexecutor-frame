@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Build and validate a compact, model-bound NPRG table from a QDRX image."""
 from __future__ import annotations
 

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # usage (from depth-model/): slide_cmd_sim.sh [build-only]   one container, variant 32 (1x1 packed native path, conv_path 4)
 # configs: old (-DNAT_1X1=0), new (default)
 SDKV=${SDKV:-/Users/owenelliott/Documents/projects/spatial-stuff/depth-model/.work/hexagon-sdk}

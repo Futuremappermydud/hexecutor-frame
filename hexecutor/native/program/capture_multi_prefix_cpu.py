@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Capture multi-command CPU reference prefixes for prepared runtime validation."""
 from __future__ import annotations
 

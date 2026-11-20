@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Whole-graph native executor (qd_graph.c) over a QDRX image.
 
 Python only loads the image and constants, owns the pools and, for the DSP

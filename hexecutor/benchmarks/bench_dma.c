@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* DDR -> VTCM bandwidth on the Frame CDSP: HVX loads vs. user DMA.
  * Same command/result layout as bench_hvx.c (run with bench/run_dma.py). */
 #include <stdint.h>

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Print weight-stream timing for one decode token (FRAME_QWEN_TRACE)."""
 import os
 import numpy as np

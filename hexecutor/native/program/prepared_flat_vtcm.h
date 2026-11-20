@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef NPRG2_PREPARED_FLAT_VTCM_H
 #define NPRG2_PREPARED_FLAT_VTCM_H
 

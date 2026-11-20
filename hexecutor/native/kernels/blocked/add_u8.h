@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef QD_BLOCKED_ADD_U8_H
 #define QD_BLOCKED_ADD_U8_H
 #include "linearclip_u8_u16.h"

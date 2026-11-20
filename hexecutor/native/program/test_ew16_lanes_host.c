@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Host exactness proof for the 32-bit lane forms in blocked_glue/elementwise_u16.h
  * against the int64 reference formulas of prepared_reference.c (copied here
  * verbatim). Parameters that occur in the two schedules are checked over the

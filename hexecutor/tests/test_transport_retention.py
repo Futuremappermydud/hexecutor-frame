@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """A failed memory restore must retain state even after workers are released."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

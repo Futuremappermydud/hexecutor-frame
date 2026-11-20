@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef QD_HMX_POWER_H
 #define QD_HMX_POWER_H
 /* HMX power/clock sequences already validated by the standalone Frame GEMM.

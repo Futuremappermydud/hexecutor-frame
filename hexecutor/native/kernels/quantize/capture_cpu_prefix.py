@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Capture the first production Quantize@FH.Ff as a guarded CPU-prefix fixture."""
 from __future__ import annotations
 

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Does HMX activation load (:deep:cm and :deep) honour an unaligned start?
  * Identity weights; compare load(a+off) vs load(aligned copy of a[off..]). */
 #include <stdint.h>

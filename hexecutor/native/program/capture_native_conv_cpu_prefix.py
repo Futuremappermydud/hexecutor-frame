@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Capture exact NativeGraph CPU-prefix pool state around prepared convs.
 
 Fixtures are independent of the prepared native handler. They contain every

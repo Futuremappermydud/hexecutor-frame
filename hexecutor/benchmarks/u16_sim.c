@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* ISA-simulator check of the payload's u16 HVX convolution and fused epilogue
  * against the exact int64 reference requantization (htp_emu conv_requant). */
 #include <stdint.h>

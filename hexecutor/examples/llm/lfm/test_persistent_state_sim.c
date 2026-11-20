@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Hexagon simulator test for persistent state across decode steps.
  * Compares against independent NumPy reference in test_persistent_golden.h.
  */

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Export a PyTorch module to an ExecuTorch .pte with hexecutor-delegated partitions.
 
 Usage (from the repository root, with the pinned venv):

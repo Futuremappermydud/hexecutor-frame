@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Hardware gate for the already simulator-validated, aligned SDK leaf.
  * Default uses the first 512 KB of verified VTCM scratch. Optional upper
  * placement saves/restores its complete 512 KB range during the exclusive

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Per-family comparison table of prepared-reference A/B reports (bench/ab.sh).
 
     python3 frame/bench/ab_table.py DIR NAME...

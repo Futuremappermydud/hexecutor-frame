@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* HVX tile form (qnn16_tile.h): pointwise convolution fused with SiLU (Q16_PW_SWISH) on one pixel.
  *
  * The fully connected layers of a network arrive as 1x1 convolutions on a [1,1,1,C] tile tensor. Xpe holds, per

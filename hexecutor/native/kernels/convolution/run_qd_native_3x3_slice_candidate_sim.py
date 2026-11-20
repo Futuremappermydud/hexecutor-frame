@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Simulator proof for removing only the output slice modulo CO-block check."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

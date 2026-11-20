@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Does cvt.ub=acc(sel) ever wrap instead of saturate? A sweep of x through bias:
  * one input lane * weight 0 (acc 0) so x = bias; store :cm so out[p*32+n]. */
 #include <stdint.h>

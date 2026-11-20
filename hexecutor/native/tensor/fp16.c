@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "fp16.h"
 #include "hmx.h"
 #include "fp16_hvx.h"

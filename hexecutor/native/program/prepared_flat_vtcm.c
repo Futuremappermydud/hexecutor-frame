@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "prepared_flat_vtcm.h"
 
 #include <limits.h>

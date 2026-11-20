@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Frame bench for prepared InputSlice/Im2col against NativeGraph CPU prefixes."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

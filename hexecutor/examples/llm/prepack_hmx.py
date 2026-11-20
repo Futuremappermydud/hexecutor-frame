@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """One-time GGUF Q4_0 -> FP16 HMX tile conversion; never used during chat."""
 import argparse
 import json

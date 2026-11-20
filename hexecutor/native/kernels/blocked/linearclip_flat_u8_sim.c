@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* V75 simulator test of qd_linearclip_flat_u8 (HVX) against the reference
  * expression of prepared_reference.c k_linearclip, written independently in
  * int64: clip(((((x*m)+128)>>8)+32)>>6, 0, 255). Every input byte, many

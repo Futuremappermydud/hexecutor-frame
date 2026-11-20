@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "space_to_depth_u8_direct.h"
 #include "space_to_depth_cases.h"
 #include <stdio.h>

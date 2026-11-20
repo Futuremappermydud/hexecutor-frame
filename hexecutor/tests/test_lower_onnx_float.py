@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Float ONNX -> HXFG lowering, BatchNorm folding and rejection paths (synthetic models only).
 
 Skips when the offline `onnx` package is absent. The numeric tests also need onnxruntime

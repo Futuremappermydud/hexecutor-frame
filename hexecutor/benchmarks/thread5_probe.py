@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Focused HT5 callback/vector proof, with fifth-thread-aware retention."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

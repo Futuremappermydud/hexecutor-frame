@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Compare Q16 Welford, instance normalization and Swish against a captured QNN graph and VTCM trace.
 
 Usage: python test_qnn16_welford_qd.py DECODED_DIR TRACE_DIR

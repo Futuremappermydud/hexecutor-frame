@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Capture CPU-prefix pool state for the Alternate InputSlicePad ops (cmd 68 & 69)."""
 from __future__ import annotations
 

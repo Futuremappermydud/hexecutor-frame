@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """AOT tests for the ExecuTorch hexecutor delegate (offline tooling only).
 
 Run from the repository root with the pinned venv:

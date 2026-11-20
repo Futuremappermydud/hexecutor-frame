@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* PW1X1 (packed Xpe weights) on the HMX 1x1 leaf, qnn16_tile_pw_hmx.c.
  *
  * The leaf (qnn16_conv1x1_wt, qnn16_hmx.S) accumulates the kg activation

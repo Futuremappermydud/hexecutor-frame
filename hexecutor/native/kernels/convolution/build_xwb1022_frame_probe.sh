@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # Builds only the isolated probe ELF. Never rebuilds or replaces qd_loader.elf.
 set -eu
 cd "$(dirname "$0")/../../../.."

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Cross-check HTP graph Xwb shape/padding with recovered Xwb element offsets."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

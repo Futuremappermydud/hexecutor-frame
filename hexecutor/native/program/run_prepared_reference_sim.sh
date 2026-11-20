@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # Usage: run_prepared_reference_sim.sh [primary|alternate|both] [prefix|full|segments] [segments per model] [fast] [cycles]
 # prefix takes a few minutes. full runs each whole schedule in one simulator
 # process and takes hours. segments splits each schedule on the host (default

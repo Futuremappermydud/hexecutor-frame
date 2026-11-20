@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # usage (any cwd): run.sh src.c [arg,arg ...]  one container; args per run comma-separated
 cd "$(dirname "$0")/../../.."
 SDKV=/Users/owenelliott/Documents/projects/spatial-stuff/depth-model/.work/hexagon-sdk

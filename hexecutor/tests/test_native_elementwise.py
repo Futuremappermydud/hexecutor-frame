@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Exhaust every u8 input pair for each recovered add/requant parameter set."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

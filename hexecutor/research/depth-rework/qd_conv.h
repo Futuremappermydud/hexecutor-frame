@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef QD_CONV_H
 #define QD_CONV_H
 #include <stdint.h>

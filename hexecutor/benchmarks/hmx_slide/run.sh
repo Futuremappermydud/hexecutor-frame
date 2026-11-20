@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # usage: run.sh src.c args...
 cd "$(dirname "$0")/../../.."
 src=$1; shift

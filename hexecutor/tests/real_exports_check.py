@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Real PyTorch exports through the float ONNX lowerer, compared on the reference runner.
 
 Standalone report; the unit tests do not run it (it needs torch, which the onnx test

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Read-only check that the CDSP resolves each 2 MB chunk of the private
 cdsp_mem window to the same memory the host sees.
 

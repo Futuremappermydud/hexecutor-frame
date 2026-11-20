@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Synchronous QNN FP16 VTCM transfer helpers.
  *
  * The run-list engine supplies exact byte counts from decoded tensor

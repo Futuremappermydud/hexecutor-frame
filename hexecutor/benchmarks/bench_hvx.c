@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Microbenchmarks for the Frame CDSP worker callback (runs behind qd_loader).
  * Command at arena+0 (uncached view); per-thread results at arena+2048. */
 #include <stdint.h>

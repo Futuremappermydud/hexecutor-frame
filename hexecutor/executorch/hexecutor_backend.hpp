@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #pragma once
 // Public entry points for the HexecutorBackend delegate. The backend also
 // self-registers from a static initializer; callers that link this archive

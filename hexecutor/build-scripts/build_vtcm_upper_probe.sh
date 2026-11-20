@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # Build only the reversible upper-VTCM probe; never replace the loader.
 set -eu
 cd "$(dirname "$0")/../.."

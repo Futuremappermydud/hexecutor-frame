@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Extract every recovered u8 add/requant epilogue for the HVX oracle."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

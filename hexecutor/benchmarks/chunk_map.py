@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Read-only: which host 2 MB chunk does each DSP IOVA chunk resolve to?"""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

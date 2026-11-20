@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # Build extended code and its small bootstrap only. Never rebuild the loader.
 set -eu
 cd "$(dirname "$0")/../.."

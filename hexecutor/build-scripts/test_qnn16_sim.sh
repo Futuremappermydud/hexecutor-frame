@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # Hexagon simulator checks of the QNN FP16 run-list handlers (hexecutor/native/qnn16)
 # against fixtures from hexecutor/offline/qnn16_oracle.py. Fixtures are local,
 # ignored artifacts: pass their directory as QNN16_FIXTURES (default

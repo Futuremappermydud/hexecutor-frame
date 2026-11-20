@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef HEXECUTOR_TENSOR_DEPTHWISE_HVX_H
 #define HEXECUTOR_TENSOR_DEPTHWISE_HVX_H
 /* Keep each channel block's filter in vector registers across the pixel

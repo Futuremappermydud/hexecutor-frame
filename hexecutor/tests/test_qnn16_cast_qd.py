@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Check native float32/FP16 casts against local Mercury QD writes."""
 import argparse
 import ctypes as C

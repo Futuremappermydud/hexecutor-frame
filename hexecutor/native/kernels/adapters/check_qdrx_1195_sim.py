@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Independent int64 oracle for the adapter's actual command-1195 fixture."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Independent integer and staged-output oracle for the zero-copy 1195 SDK run."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

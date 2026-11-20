@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Integer forms of the reference's float conversions (k_dequantize,
  * k_quantize), bit-equal to their double formulas; test_exact_math.c checks
  * them exhaustively/randomly against those formulas. */

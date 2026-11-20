@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Calibrate direct u8 HMX conversion against the recovered two-stage epilogue."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

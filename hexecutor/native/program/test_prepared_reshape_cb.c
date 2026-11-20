@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "prepared_reshape_cb.h"
 
 #if defined(__hexagon__)

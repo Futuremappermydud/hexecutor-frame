@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Call extended code on a private L2-TCM stack; preserve Valve's stack and
  * callee-saved registers exactly. r16 survives the entire C call by the ABI. */
     .text

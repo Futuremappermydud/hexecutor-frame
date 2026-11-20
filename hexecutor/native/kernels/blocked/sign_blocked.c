@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "sign_blocked.h"
 #include <hexagon_types.h>
 #include <hvx_hexagon_protos.h>

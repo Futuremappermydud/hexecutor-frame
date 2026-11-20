@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef QD_HMX_LAYOUT_H
 #define QD_HMX_LAYOUT_H
 /* Logical 32-pixel tiles use the high-byte lanes of a 64x32 integer HMX tile.

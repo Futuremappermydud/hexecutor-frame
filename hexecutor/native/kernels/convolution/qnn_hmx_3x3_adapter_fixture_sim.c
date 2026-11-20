@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Device-shaped staging/leaf/drain/scatter path for actual CPU-prefix fixtures. */
 #include <stdint.h>
 #include <stdio.h>

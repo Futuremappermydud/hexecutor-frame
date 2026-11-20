@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Hexagon simulator check of QNN FP16 run-list handlers against fixtures
  * exported by hexecutor/offline/qnn16_oracle.py from QAIRT's x86 HTP simulator.
  * Usage: hexagon-sim -mv75 test_qnn16_conv.elf -- FIXTURE...

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Report exact differences; this calibration is not a passing backend gate."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

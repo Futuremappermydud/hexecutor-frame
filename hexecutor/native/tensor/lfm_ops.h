@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef HEXECUTOR_TENSOR_LFM_OPS_H
 #define HEXECUTOR_TENSOR_LFM_OPS_H
 #include <stdint.h>

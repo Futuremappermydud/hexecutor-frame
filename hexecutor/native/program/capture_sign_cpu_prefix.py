@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Capture each Sign command's physical CPU pool prefix and changed pool-1 pages."""
 from __future__ import annotations
 

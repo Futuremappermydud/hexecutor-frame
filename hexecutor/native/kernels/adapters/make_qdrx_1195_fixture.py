@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Make a deterministic input fixture with command 1195's exact raw Xpb/FI."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

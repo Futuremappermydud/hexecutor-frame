@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Regression: K=1152 in the hand landmark model exceeds one deep load. */
 #include <stdint.h>
 #include <stdio.h>

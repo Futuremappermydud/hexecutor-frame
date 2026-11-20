@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Bounded, allocation-free QDRX reader. No libc, host pointers in the wire
  * format, physical addresses, power changes, or memory-pool writes. */
 #include "qd_resident.h"

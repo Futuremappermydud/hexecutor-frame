@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Float32 execution forms of the QNN FP16 convolution-family leaves.
  *
  * The engine gathers each operand once into float32 NHWC scratch, prepares

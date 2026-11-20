@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* A freestanding callback for Valve's existing CDSP worker dispatcher.
  * Called by hardware threads 0..2 after their built-in FLOPS benchmark.
  * Only writes the dedicated 0xb12100 scratch region through its uncached alias.

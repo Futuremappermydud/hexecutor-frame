@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Preserve borrowed context 3: 32 vectors and four predicates (0/1 byte masks).
  * Caller must hold the parked firmware manager's context for the whole lease.
  * R0 returns saved SSR from enter; leave takes (save_area, saved_ssr). */

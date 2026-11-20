@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef QD_OWNED_MEMORY_H
 #define QD_OWNED_MEMORY_H
 /* Private DDR allocated by cdsp_mem, never firmware/service memory. The host

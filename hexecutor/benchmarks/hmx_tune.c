@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Serialized worker-0 GEMM tuning. All tensors remain in VTCM during timing.
  * Wait for workers 1/2 to leave the stock benchmark before using their VTCM.
  */

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef QD_BLOCKED_ELEMENTWISE_U16_H
 #define QD_BLOCKED_ELEMENTWISE_U16_H
 /* Exact HVX elementwise kernels over QNN u16 crouton ("CH", 8x4x32, 2 KiB)

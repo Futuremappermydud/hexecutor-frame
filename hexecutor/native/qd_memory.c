@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Native accessors for the recovered blocked tensors. No precomputed address
  * arrays: walk contiguous channel runs and derive each 2 KB block directly. */
 #include <stdint.h>

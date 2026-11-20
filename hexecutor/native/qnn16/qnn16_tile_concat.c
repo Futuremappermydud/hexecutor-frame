@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* HVX tile form (qnn16_tile.h): concatenation along H of tile tensors.
  *
  * Output row y is row r of one input; with the same width, channels and column parity on both sides the row's

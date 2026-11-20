@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Check native convolution geometry and quantify conversion differences."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

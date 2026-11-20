@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Capture Reshape.hw@CB*2 CPU-prefix fixtures for each CPU model.
 
 By default captures the first command; --all-pads captures the first command

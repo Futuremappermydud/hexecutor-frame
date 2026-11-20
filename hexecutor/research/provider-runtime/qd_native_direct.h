@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef QD_NATIVE_DIRECT_H
 #define QD_NATIVE_DIRECT_H
 

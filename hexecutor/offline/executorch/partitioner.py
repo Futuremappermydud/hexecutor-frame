@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Partitioner that tags the edge-dialect nodes the HXFG tensor_f32 backend can run.
 
 The support rules live in lowering.py (`select_nodes`), so the partitioner and

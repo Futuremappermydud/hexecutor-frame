@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #define QDG_DSP 1
 #include "qd_glue_hvx.h"
 #include "qd_pack_hvx.h"

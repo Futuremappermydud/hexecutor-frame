@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // CDSP broker phase 1: scheduler, admission, Unix-socket server and client.
 #include "hexecutor/broker.hpp"
 #include <algorithm>

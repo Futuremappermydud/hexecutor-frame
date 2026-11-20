@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Inspect direct bindings and operands on Frame without issuing a convolution."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

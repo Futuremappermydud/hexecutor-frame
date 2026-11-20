@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "elementwise_u16.h"
 #include <hexagon_types.h>
 #include <hvx_hexagon_protos.h>

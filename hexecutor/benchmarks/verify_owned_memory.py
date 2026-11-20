@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Prove host/DSP access to every 4 KB page of a private 128 MB allocation."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

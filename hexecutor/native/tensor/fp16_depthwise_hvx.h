@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef HEXECUTOR_TENSOR_FP16_DEPTHWISE_HVX_H
 #define HEXECUTOR_TENSOR_FP16_DEPTHWISE_HVX_H
 /* One output row of one channel block. Lane 0 reads column ix + kx and lane 1

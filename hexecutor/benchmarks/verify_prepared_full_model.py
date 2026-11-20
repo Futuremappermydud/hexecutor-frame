@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Run every prepared command of one model on Frame and check both outputs.
 
 Each case runs once from zeroed mutable pools and then again without any pool

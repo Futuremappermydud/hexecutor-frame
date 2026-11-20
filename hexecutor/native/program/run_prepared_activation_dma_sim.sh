@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 set -eu
 cd "$(dirname "$0")/../../.."
 .venv-cpu/bin/python hexecutor/native/program/capture_activation_dma_cpu_prefix.py --case smoke --out hexecutor/native/program/fixtures

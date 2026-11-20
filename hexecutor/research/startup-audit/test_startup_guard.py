@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Host-only truth table for the proposed QDS callback-start guard.
 
 Run with: python3 frame/startup_audit/test_startup_guard.py

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Run axim_tune.elf once: HVX DDR read bandwidth with the Q6 AXI master at XO,
 raised (750 MHz, or 1000 MHz for axim_tune_1000.elf) and restored.
 

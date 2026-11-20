@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Reject unprepared graph starts without mapping DDR or borrowing VTCM."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

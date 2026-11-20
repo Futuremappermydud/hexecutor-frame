@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Capture actual CPU-prefix sequence 874 (CI128/CO64 stride-1 Xwb)."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

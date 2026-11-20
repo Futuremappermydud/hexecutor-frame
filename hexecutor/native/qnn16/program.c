@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Q16P structural validation, shared by the host preflight and the DSP. */
 #include "program.h"
 #include <stddef.h>

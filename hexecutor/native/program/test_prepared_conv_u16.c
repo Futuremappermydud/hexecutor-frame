@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "prepared_conv_u16.h"
 
 #if defined(__hexagon__)

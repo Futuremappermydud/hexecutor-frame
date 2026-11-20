@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """A/B/A native integer HMX timing with final-head differences against exact v6."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

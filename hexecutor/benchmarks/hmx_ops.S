@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Called by worker 0 only, with SSR.XE2 set. No QuRT/HAP dependency.
  * HMX words were assembled/disassembled with Qualcomm Clang 19.0.07,
  * -mv75 -mhmx. Encoding them explicitly also permits open LLVM assemblers

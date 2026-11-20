@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Shared power sequence copied from the hardware-validated bring-up. */
 #pragma once
 #include <stdint.h>

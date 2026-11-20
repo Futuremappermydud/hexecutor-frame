@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef QD_LAYOUT_AUDIT_SPACE_TO_DEPTH_U8_DIRECT_H
 #define QD_LAYOUT_AUDIT_SPACE_TO_DEPTH_U8_DIRECT_H
 

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef QNN16_HALF_H
 #define QNN16_HALF_H
 #include <stdint.h>

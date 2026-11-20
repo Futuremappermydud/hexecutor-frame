@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Export sequence 247's exact pool1 block offsets for the SDK scatter sim."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

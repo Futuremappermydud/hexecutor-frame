@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Inventory exact 3x3 CI32/CO32 CB*2 Xwb graph footprints."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

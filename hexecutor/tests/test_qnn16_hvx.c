@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "qnn16_hvx.h"
 #include <assert.h>
 #include <math.h>

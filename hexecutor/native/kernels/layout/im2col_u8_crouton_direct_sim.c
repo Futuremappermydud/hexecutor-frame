@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "im2col_u8_crouton_direct.h"
 #include <stdio.h>
 #include <stdlib.h>

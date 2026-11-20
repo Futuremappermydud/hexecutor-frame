@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Extract the exact local QAIRT aligned bbb 3x3 leaf as Hexagon words."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

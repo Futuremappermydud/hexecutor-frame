@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Offline byte census for one serialized QDRX schedule.
 
 Usage: python3 frame/vtcm_lease/census_schedule.py [path/to/image.qdrx]

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Contiguous acc sweep: acc[p][n] = x0 + 2048*t + 64*n + p, one (pre, m) per run.
  * Output per case: C[2048] only (p*32+n). argv: cases pre m x0 out */
 #include <stdint.h>

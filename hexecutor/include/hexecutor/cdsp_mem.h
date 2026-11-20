@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef HEXECUTOR_CDSP_MEM_H
 #define HEXECUTOR_CDSP_MEM_H
 

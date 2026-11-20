@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Compare fused u8 convolution with independent int64 accumulation/rounding."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

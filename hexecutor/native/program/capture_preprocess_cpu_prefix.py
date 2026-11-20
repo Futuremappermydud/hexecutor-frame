@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Capture CPU-prefix oracle states for the exact early InputSlice and Im2col ops."""
 from __future__ import annotations
 

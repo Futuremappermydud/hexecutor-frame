@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Offline QNN TFLite/ONNX conversion and HTP preparation with explicit SDK/target.
 
 Run in a Linux QAIRT development environment with its tested dependencies and

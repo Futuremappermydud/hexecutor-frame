@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Integer HMX arithmetic/layout probe, for Qualcomm's ISA simulator only. */
 #include <stdint.h>
 #include <stdio.h>

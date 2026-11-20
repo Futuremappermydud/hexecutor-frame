@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef QD_LINEARCLIP_FLAT_U8_H
 #define QD_LINEARCLIP_FLAT_U8_H
 /* Flat (dense, direct) u8 -> u8 LinearClip, the LINEARCLIP/69 profile of

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Reuse the exact validated convolution implementation. The surrounding graph
  * engine supplies resident inputs and a private staging arena; no host traffic
  * or service wake occurs between graph operations. */

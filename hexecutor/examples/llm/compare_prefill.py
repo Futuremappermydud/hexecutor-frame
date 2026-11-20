@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Compare one large prompt batch to equivalent smaller causal batches."""
 import numpy as np
 from tokenizers import Tokenizer

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Compare a host dump variant with simulator and Model on all baseline cases."""
 import json
 import sys

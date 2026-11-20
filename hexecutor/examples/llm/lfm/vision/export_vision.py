@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Export LFM3-VL vision encoder and multimodal projector to ONNX float.
 
 Static shape, batch 1, fixed tile size 32x32 (smallest supported tile:

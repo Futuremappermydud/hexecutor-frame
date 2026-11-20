@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 'QDRX v1 ABI. Changing any registry requires a new ABI fingerprint.\n\nThe generated C registry is checked against this file in the test suite.\nNames are development metadata; only integer IDs go into the upload image.'
 
 VARIANTS = (

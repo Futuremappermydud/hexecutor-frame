@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Hardware L2 size sweep. One requested SYSCFG.L2CFG value per callback.
  * Thread 0 runs on the firmware DDR stack, saves all 1 MiB TCM to uncached
  * arena, accesses only private DDR while cache is on, then disables cache and

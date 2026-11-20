@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Convolution-to-HVX lowering; graph storage and requantization stay on ARM."""
 
 from hexecutor.paths import workspace

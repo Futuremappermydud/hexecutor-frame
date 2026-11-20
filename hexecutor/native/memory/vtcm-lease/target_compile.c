@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Hexagon-only compile smoke test for the target HVX implementation. */
 #include "../../qd_vtcm_lease.h"
 

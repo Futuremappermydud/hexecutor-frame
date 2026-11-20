@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # One-command A/B of prepared-reference engine variants on the Frame.
 #
 #   sh hexecutor/benchmarks/ab.sh [-q|-p] [-n] [-r REPEAT] [-t TAG] VARIANT...

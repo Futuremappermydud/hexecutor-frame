@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Isolate generic aligned spatial leaf setup with a 1x1 identity convolution. */
 #include <stdint.h>
 #include <stdio.h>

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Which Rs/Rt low bits give stride-2 tap walks on :cm loads? Prints tap maps by
  * pixel value (b y x). Tile slide: output of the first cvt only (pixels x1.. of block). */
 #include <stdint.h>

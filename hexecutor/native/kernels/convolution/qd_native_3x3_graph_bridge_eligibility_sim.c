@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Call the actual graph bridge on QDRX-generated tensor/command metadata.
  * Native ownership is deliberately false: supported cases must reach the
  * bridge's hard ownership error before staging; unsupported cases must defer. */

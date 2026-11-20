@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "prepared_mul_flat.h"
 #include <stdio.h>
 #include <stdlib.h>

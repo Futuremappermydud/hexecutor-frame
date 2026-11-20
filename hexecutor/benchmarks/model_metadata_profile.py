@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Decode the Model vendor's 352-byte NNETPerfInfo records (Oct 30 firmware).
 
 Metadata offsets were recovered from libhexagon_skel.so's

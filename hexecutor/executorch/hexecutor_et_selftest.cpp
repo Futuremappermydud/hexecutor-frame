@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // hexecutor_et_selftest: drives the HexecutorBackend directly, without a .pte.
 //
 //   HEXECUTOR_ET_REFERENCE=1 hexecutor_et_selftest PROGRAM.hxfg CONSTANTS.bin \

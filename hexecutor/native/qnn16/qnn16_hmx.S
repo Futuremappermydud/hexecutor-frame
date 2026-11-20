@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* HMX leaves for QNN FP16 run-list handlers (see qnn16.h). V75. */
     .text
 

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Validate the original aligned QNN leaf's descriptor ABI without its runtime. */
 #include <stdint.h>
 #include <stdio.h>

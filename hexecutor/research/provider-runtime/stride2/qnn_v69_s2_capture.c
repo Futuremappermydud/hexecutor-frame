@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Offline capture of the legacy 4-tensor S2 worker from pinned V69. */
 #include <stdint.h>
 #include <stdio.h>

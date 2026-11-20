@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Build one raw-S2 one-hot fixture for the corrected V69 generic leaf harness."""
 from __future__ import annotations
 

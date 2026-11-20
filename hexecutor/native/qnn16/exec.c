@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Q16P interpreter: one validated operation at a time, serially.
  *
  * Matrix 1x1 convolutions run through the injected HMX leaf on QNN's own

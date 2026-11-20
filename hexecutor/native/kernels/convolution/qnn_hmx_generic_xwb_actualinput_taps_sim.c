@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Verify captured real CB activations with one-hot 3x3 Xwb taps. */
 #include <stdint.h>
 #include <stdio.h>

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "../native/tensor/graph.h"
 #include "../native/tensor/fp16.h"
 #include <stdint.h>

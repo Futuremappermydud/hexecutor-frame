@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Local QAIRT 2.50 hmx_v73_convbbb_stride1_aligned; simulator-only ABI probe. */
 .text
 .p2align 6

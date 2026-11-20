@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 set -eu
 cd "$(dirname "$0")/../../.."
 if [ ! -x .venv-cpu/bin/python ]; then

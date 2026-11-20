@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Check Mercury's external I/O and housekeeping leaves against a QD trace.
 
 Covers *InputSlicePad and *InputSlice (model inputs to VTCM), *OutputSlice

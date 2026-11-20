@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef QD_GRAPH_NATIVE_COMPACT_H
 #define QD_GRAPH_NATIVE_COMPACT_H
 /* Experimental A-only staging: isolate input-page scatter/span from W/Fi/Y.

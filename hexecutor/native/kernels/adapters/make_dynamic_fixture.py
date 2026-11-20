@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Make command 2380 fixture from a real NativeGraph CPU prefix snapshot."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Probe HVX integer/qfloat instructions used by the Q4 decode kernel.
  * Inputs at arena+0x4000 (4 vectors), outputs at arena+0x5000 (16 vectors). */
 #include <stdint.h>

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Compare grouped moments against a captured graph, VTCM writes and tensor dump.
 
 Usage: python test_qnn16_group_moments_qd.py DECODED_DIR TRACE_DIR

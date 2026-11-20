@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* One-shot Frame probe for the simulator-proven generic V75 Xwb 3x3 leaf.
  * This does not call the loader and is not a performance benchmark. */
 #include <stdint.h>

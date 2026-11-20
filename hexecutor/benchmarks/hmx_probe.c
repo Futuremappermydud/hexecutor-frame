@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Stage-1 HMX probe: privileged register reads only, no writes to hardware.
  * Results at arena+2048 (uncached): per worker 16 words. */
 #include <stdint.h>

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # Builds the Q16P engine (hexecutor/native/qnn16) for the shared tensor
 # bootstrap. The SDK path and installed image are explicit. Run
 # build_tensor.sh first: the session uses its bootstrap and chunk probe.

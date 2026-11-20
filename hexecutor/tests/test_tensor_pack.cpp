@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Host check of the im2col operand layout used by the DSP's blocked-FP16 dense convolutions.
 // The matrix product is emulated from the documented operand layouts; the real matrix unit is
 // exercised only by the simulator and device tests.

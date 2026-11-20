@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Scalar reference forms of the QNN FP16 non-matrix leaves.
  *
  * These helpers use logical contiguous NHWC buffers. They are intended as

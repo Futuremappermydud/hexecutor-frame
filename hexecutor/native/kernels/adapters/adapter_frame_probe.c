@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Isolated Frame probe for the adapter + QNN 1x1 leaf. Worker 0 only. */
 #include <stdint.h>
 #include <hexagon_types.h>

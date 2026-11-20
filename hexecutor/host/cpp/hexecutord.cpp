@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // hexecutord: the CDSP broker daemon (docs/hexecutor/broker.md, phase 1).
 // One process owns the device session; clients submit tensor-graph jobs over a
 // Unix socket. The optional stock-job adapter also uses this socket; it keeps

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Hexagon simulator test for LFM decode building blocks and regression check.
  *
  * Runs:

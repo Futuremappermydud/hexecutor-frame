@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Packets for the persistent HVX convolution payload (qd_conv.h)."""
 
 from hexecutor.paths import workspace

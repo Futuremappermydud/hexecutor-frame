@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Probe one padded input tile against the local aligned QNN 3x3 leaf.
  * This is intentionally an ABI experiment, not a claimed supported fixture. */
 #include <stdint.h>

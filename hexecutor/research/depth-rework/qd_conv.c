@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Persistent HVX convolution payload. Entered through qd_loader on each of the
  * three Valve workers; serves commands until QDC_OP_EXIT or an idle timeout.
  * QD_HOST_TEST compiles one-command dispatch with a scalar vrmpy substitute. */

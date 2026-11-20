@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* End-to-end simulator staging/call/download path shared with Frame payload. */
 #include <stdint.h>
 #include <hexagon_standalone.h>

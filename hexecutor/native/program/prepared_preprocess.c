@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "prepared_preprocess.h"
 #if defined(QDS_PREPARED_QUANTIZE) && QDS_PREPARED_QUANTIZE
 #include "prepared_quantize.h"

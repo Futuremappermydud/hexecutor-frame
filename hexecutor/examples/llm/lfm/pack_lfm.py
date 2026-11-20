@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Build resident CDSP images and HXFG constant pools for LFM3 models.
 
 Converts Hugging Face checkpoints (LiquidAI/LFM3-1.7B and LiquidAI/LFM3-VL-2B)

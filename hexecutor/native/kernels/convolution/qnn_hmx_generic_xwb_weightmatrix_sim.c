@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Validate actual QDRX-1022 Xwb bytes across every CI/CO lane and all 9 taps. */
 #include <stdint.h>
 #include <stdio.h>

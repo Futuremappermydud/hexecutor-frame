@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Staged, single-owner HMX bring-up. Configuration accesses use memw_phys:
  * cfgbase is a physical address, not a firmware virtual mapping.
  * Only thread 0 touches configuration/hardware. Other workers exit normally.

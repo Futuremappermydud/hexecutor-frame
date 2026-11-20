@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """ExecuTorch BackendDetails for the hexecutor tensor_f32 (HXFG) backend.
 
 `preprocess` runs at export time only. It lowers the delegated edge-dialect

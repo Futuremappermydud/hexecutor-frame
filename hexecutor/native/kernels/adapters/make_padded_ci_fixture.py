@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Capture a QDRX low-CI command and zero-expand its Xpb filter to CI32."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

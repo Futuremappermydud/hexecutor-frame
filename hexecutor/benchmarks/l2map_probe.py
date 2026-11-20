@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Run the read-only L2 map probe (build/qd_l2map_probe.elf): stack pointers,
 TLB entries and L2-TCM occupancy at callback entry."""
 

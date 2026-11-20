@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Run with ASan/UBSan against generated QDRX images. Mutations have a fresh
  * checksum so they exercise structural bounds rather than only CRC rejection.
  * This is a host-only fuzz driver, never a DSP payload. */

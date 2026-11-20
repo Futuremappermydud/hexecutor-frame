@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "graph.h"
 static int span(uint32_t at, uint64_t n, uint32_t bytes) { return at <= bytes && n <= bytes - at; }
 static int overlap(uint32_t a, uint32_t an, uint32_t b, uint32_t bn) {

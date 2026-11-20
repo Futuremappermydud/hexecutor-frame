@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Exact-output acceptance for the native whole-graph executor (qd_graph.c).
 
 Runs the 25 recorded simulator probes, the smoke case and the seed-1234 random

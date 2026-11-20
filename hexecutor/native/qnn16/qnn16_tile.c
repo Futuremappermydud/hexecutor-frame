@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* HVX depthwise and space-to-depth leaves on FP16 crouton tiles (qnn16_tile.h). */
 #include "qnn16_tile_priv.h"
 

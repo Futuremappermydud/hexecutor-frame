@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Inspect QAIRT's compiler schematic as data, without executing its Python.
 
 QAIRT 2.50 emits Python-like dictionaries plus expansion loops. Only literal

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 set -eu
 cd "$(dirname "$0")/../../../.."
 .venv-cpu/bin/python hexecutor/native/kernels/convolution/generate_native3_bridge_cases.py

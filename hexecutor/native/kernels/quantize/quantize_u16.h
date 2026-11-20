@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef NATIVE_QUANTIZE_U16_H
 #define NATIVE_QUANTIZE_U16_H
 #include <stddef.h>

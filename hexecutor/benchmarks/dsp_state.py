@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 import socket, struct, array, mmap, hashlib
 s=socket.socket(socket.AF_UNIX); s.settimeout(2); s.connect(b"\0dsp_service"); s.sendall(struct.pack("<I",4))
 p,anc,_,_=s.recvmsg(64,socket.CMSG_SPACE(16)); fds=[]

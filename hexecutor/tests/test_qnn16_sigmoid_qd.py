@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Build and run the scalar QNN16 sigmoid adapter against a QD_WRITES sample.
 
 The fixture stays in a temporary directory; no captured model arrays are

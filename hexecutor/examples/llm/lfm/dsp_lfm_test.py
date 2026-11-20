@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Deterministic numpy reference and fixture generator for tiny synthetic LFM model.
 
 Architecture:

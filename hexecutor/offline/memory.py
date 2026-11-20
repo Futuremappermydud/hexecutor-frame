@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Native host tensor/packet primitives shared by execution backends."""
 import ctypes
 import subprocess

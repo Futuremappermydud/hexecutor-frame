@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Capture CPU-prefix pools and command output for alternate flat multiply."""
 from __future__ import annotations
 

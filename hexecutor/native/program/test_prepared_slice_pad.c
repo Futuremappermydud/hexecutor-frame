@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "prepared_slice_pad.h"
 
 #ifdef __hexagon__

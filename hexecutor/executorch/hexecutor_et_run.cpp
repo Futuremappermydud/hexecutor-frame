@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // hexecutor_et_run: loads a .pte, runs its "forward" method through the
 // HexecutorBackend on seeded random float32 inputs, and prints output summaries.
 //

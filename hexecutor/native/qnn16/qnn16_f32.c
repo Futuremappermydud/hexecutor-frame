@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Float32 execution forms of the convolution-family leaves (qnn16_f32.h). */
 #include "qnn16_f32.h"
 #include <math.h>

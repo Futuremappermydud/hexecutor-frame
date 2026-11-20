@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Release a resident session whose workers exited but whose service control
 stayed at (2,0,8).
 

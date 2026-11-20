@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Probe distinct CI/CO Xwb lanes, both weight signs, each spatial tap. */
 #include <stdint.h>
 #include <stdio.h>

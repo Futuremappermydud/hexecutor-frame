@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Simulator-only map of qd_hmx_finish's mxmem2 read footprint. */
 #include <stdint.h>
 #include <stdio.h>

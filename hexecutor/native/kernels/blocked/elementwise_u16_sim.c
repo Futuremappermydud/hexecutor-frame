@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* V75 simulator test of blocked_glue/elementwise_u16.c against an independent
  * int64 oracle (the reference formulas of prepared_reference.c, copied) that
  * also reads/writes the CH layout element by element (so the block/row/pair/

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Qualcomm assembler, -mv75 -mhmx. All inputs and outputs reside in VTCM.
  * r0=A, r1=B, r2=Fi, r3=C, r4=number of 32-channel depth tiles. */
     .text

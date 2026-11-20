@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* HVX tile form (qnn16_tile.h): softmax over channels. */
 #include "qnn16_tile_priv.h"
 

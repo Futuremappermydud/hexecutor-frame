@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Offline ISA simulation of the actual HVX im2col + integer HMX convolution. */
 #include <stdint.h>
 #include <stdio.h>

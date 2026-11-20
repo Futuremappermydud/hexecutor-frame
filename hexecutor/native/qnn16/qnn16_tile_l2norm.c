@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* HVX tile form (qnn16_tile.h): L2NORM over axis 1 (H) of [b,h,w,c] tiles. */
 #include "qnn16_tile_priv.h"
 #include <math.h>

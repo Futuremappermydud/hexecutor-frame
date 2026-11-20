@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Capture actual runtime packed weights/FI at QDRX command 2380 using CPU graph."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

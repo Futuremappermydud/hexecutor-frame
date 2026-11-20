@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Replay full Xpe 3x3 convolutions against Mercury QD writes."""
 import argparse
 import ctypes as C

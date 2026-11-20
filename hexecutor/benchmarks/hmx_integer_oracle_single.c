@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Calibrate integer HMX against model arithmetic in Qualcomm's ISA simulator.
  * Input: case count followed by {convert,u8 A[64,32],s8 packed B[32,32],Fi[64]}.
  * Output: one native u8 [64,32] tile per case. No physical device access. */

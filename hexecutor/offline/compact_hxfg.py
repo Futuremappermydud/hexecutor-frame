@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Remove channels that cannot affect any output from a lowered HXFG graph.
 
 Pruned models keep their full channel width in the file. A channel is removable

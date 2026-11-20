@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "input_slice_pad_direct.h"
 #include <stdio.h>
 #include <stdlib.h>

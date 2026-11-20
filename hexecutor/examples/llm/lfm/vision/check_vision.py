@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Check LFM3-VL vision encoder and multimodal projector coverage and numerical accuracy.
 
 Workflow:

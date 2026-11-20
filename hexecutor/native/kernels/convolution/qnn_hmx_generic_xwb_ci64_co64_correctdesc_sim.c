@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Generic V75 CI64/CO64 Xwb descriptor proof with exact physical-layout oracle. */
 #include <stdint.h>
 #include <stdio.h>

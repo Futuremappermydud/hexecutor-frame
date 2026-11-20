@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Two conversions per native :cm tile: what survives the first cvt?
  * Bank 1 hi=floor(x/256)+128 clipped; bank 0 lo = x mod 256 (sel bit 1). */
 #include <stdint.h>

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Real 6/33 commands through the executor with the simulated HMX hooks: for each
  * distinct shape of the variant, the HVX fast conv (no hmx) vs the HMX slide path,
  * hash of the command's output blocks only, path taken and conv phase cycles.

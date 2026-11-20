@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Executor control-loop overhead on the real schedules, handlers stubbed.
  *
  *   bench_prepared_overhead <qdrx> <nprg> [reps]    (several pairs may follow)

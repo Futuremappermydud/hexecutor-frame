@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 import sys,re
 sys.path.insert(0,'/tmp/frame-i-merge/depth-model/frame/native_program')
 import compact_v2 as pp

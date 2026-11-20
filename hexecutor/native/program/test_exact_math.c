@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Host check: prepared_exact_math.h against the reference double formulas.
  *   cc -O2 -ffp-contract=off -fno-fast-math test_exact_math.c -lm -o t && ./t */
 #include "prepared_exact_math.h"

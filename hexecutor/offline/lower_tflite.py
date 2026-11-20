@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Offline, fail-closed lowering of a static float TFLite graph to HXFG v1.
 
 Requires numpy and the generated `tflite` Python schema package. No TFLite,

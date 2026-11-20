@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Portable broker tests: scheduling order, admission, and client/server over a
 // real Unix socket with an injected backend (no device).
 #include "hexecutor/broker.hpp"

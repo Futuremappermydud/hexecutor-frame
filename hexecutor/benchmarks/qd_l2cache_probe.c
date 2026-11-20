@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Bounded L2 cache carve-out probe. Run with all three callback workers idle.
  * Thread 0 uses its firmware DDR stack. The full 1 MiB of L2-TCM is saved
  * through the uncached arena before changing SYSCFG, then restored afterwards.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 import json,os,subprocess,hashlib,sys
 X,R=sys.argv[1],os.getcwd()
 V=json.load(open('.work/model-qnn-meta-20261030/full-validation.json'))['models']['primary']['runs']

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Independently lower one actual S2 Xwb case and verify the CPU-prefix output."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

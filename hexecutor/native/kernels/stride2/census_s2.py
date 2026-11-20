@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Census actual QDRX stride-2 Xwb commands for the native S2 experiment."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

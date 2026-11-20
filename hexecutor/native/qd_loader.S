@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Fixed 4 KB trampoline registered as the worker callback. It invalidates the
  * rewritable payload region in the data and instruction caches, then tail-jumps
  * to it, so new payloads can reuse one address without stale instructions.

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "add_u8.h"
 #include <hexagon_types.h>
 #include <stdint.h>

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Edge-dialect ExecuTorch graph -> HXFG v1 lowering for the hexecutor backend.
 
 Shared by the partitioner (which asks `kind_of` / `select_nodes`) and the

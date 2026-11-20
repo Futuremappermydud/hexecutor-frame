@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Native handlers for QAIRT 2.50 FP16 HTP run lists (Mercury hand tracking).
  *
  * Operands keep QNN's VTCM formats, so no repacking happens at run time:

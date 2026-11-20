@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* One-hot center tap probes for the aligned generic spatial leaf. */
 #include <stdint.h>
 #include <stdio.h>

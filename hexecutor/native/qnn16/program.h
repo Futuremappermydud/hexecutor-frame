@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Q16P v1: a QAIRT 2.50 FP16 HTP graph lowered to a serial handler program.
  *
  * Offline lowering (hexecutor/offline/qnn16_program.py) records QNN's own

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Qwen3-0.6B on the Frame CDSP: whole tokens per DSP command (qwen_dsp.c).
 
 The model image (pack_dsp.py) stays resident in the cdsp_mem buffer, so a

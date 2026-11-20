@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Bounded V75 generic HMX one-hot probe using a recovered CB*2.Xwb graph shape. */
 #include <stdint.h>
 #include <stdio.h>

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Negative-path proof: unsupported geometry, bad block address and workspace
  * alias all reject before the VTCM workspace is written. */
 #include <stdint.h>

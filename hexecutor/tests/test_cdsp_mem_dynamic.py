@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Test dynamic CDSP memory manager and reservation range."""
 
 import unittest

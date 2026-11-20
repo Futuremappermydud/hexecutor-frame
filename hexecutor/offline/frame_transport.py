@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Bounded Frame CDSP transport using the existing Valve worker callback.
 
 Uses the established FLOPS wake-up path, so eye inference is paused for the

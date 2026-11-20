@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Host exhaustive check of the fused conv-epilogue lane arithmetic (prepared_reference.c, rq_emit_fx and
  * fuse_scalar) against the epilogue commands' own integer formulas (prepared_reference.c k_requant_u8 / k_add_u8
  * generic int64 form):

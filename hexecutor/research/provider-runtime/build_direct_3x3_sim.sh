@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 set -eu
 cd "$(dirname "$0")/../../native"
 FIXTURE=${1:-/src/kernels/convolution/xwb_ci64_qdrx247_cpu_prefix_fixture.bin}

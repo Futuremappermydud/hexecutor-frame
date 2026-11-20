@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Hexagon simulator run of a whole Q16P program with the HMX 1x1 leaf.
  * Usage: hexagon-sim -mv75 test_qnn16_program.elf -- [--compare] PROGRAM.q16p CONSTANTS.q16c OUT_DIR IN0.f32 [IN1.f32 ...]
  * Writes OUT_DIR/out<N>.f32 per graph output and prints pcycles per

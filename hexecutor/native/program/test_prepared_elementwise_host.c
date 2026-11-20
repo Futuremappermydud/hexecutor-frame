@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* ASan/UBSan read-only preflight proof for real LinearClip and requant NPRG metadata.
  * Numeric HVX execution remains covered by test_prepared_elementwise.c. */
 #include "prepared_elementwise.h"

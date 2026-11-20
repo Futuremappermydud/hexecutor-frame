@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Read-only L2 configuration probe (2026-11-01).
  * Thread 0 reads SYSCFG, CCR, SSR, CFGBASE and the core configuration table
  * (memw_phys at cfgbase<<5, as the standalone runtime's __rdcfg does). It

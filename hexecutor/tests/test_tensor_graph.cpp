@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #include "tensor/graph.h"
 #include "hexecutor/executor.hpp"
 #include <algorithm>

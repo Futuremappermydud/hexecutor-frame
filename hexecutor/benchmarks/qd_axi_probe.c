@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include <stdint.h>
 #include "../native/qd_protocol.h"
 #include "../native/qd_conv.h"

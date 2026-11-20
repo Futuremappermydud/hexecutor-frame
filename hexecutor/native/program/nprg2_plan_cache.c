@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "nprg2_plan_cache.h"
 #include <string.h>
 

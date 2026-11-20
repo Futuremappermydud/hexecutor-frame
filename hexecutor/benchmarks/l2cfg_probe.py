@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Run the read-only L2 configuration probe (build/qd_l2cfg_probe.elf) and print
 SYSCFG/CCR/SSR/CFGBASE and the core configuration table."""
 

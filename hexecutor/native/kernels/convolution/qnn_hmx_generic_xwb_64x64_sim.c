@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Generic V75 spatial leaf CI=CO=64, two depth pages per crouton. */
 #include <stdint.h>
 #include <stdio.h>

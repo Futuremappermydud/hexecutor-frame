@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // HexecutorBackend: an ExecuTorch BackendInterface that runs a delegate blob
 // (format v1, see blob.hpp) on the hexecutor tensor_f32 backend.
 //

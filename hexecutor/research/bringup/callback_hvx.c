@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include <hexagon_types.h>
 #include <hvx_hexagon_protos.h>
 typedef unsigned u32;

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Lower a decoded QAIRT FP16 graph and captured run lists to a qnn16 package.
 
 Offline development only. Prefer `--tensor-dumps`, captured by the simulator trace

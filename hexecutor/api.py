@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Offline program/buffer development API; the live host API is C++."""
 from dataclasses import dataclass
 from pathlib import Path

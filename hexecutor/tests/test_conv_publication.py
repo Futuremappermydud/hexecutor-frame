@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Regression tests for publishing commands to live polling workers."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

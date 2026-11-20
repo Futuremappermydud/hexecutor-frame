@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Portable float reference for Q16_CONV1X1, for host tests only: the DSP
  * engine uses the HMX leaf. Kept apart from exec.c because Hexagon clang
  * cannot lower this _Float16 code. */

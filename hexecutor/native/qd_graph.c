@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Native ARM executor for QDRX images; see qd_graph.h. Each kernel mirrors the
  * like-named function of tools/htp_emu.py (and fast_depth.py for convolution),
  * including NumPy's broadcasting, padding and float rounding. Anything outside

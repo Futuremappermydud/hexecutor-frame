@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #include "depth_model/deployment.hpp"
 #include "hexecutor/executor.hpp"
 #include <cstring>

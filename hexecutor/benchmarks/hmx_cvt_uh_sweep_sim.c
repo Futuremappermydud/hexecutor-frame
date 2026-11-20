@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* cvt.uh:2x1 bias-only sweep: A=0 so acc=0, x = bias. Output u16 [pixel][channel] (v6 layout).
  * argv: cases e m x0 step out */
 #include <stdint.h>

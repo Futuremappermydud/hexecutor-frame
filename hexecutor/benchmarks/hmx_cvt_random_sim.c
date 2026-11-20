@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Native integer HMX conversion characterisation (V75 ISS).
  * A: one crouton block (64 px x 32 ch u8, byte p*32+k), :deep:cm load.
  * B: weight.b block, byte ((k/4)*32+n)*4+k%4.  Fi: 32 scale words, 32 bias.

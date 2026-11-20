@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Offline ABI probe for QAIRT's pure integer stride1 cfg builder. */
 #include <stdint.h>
 #include <stdio.h>

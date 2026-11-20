@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Replay small QNN16 data moves against ignored Mercury QD traces."""
 import argparse
 import ctypes as C

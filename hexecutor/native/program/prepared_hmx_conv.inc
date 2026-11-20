@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Exact HMX u8 convolution for the fast conv path (included by
  * prepared_reference.c after near_compute; see EXECUTOR.md "HMX conv").
  *

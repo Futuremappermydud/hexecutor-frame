@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Offline census of actual compiled QDRX 1x1 HMX command descriptors."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

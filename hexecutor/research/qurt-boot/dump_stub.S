@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
     .section .text_hook, "ax"
     .globl hook
 hook:

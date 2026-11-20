@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Offline, fail-closed lowering of a static float32 ONNX graph to HXFG v1.
 
 This is the front end for ordinary (non-QLinear) ONNX exports, for example PyTorch

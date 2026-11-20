@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Exercise the bounded 3x3 adapter with actual QDRX CPU-prefix fixtures."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Capture sparse CPU-prefix fixtures for every prepared stride-2 S2D profile."""
 from __future__ import annotations
 

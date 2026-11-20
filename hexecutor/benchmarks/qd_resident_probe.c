@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Decoder-only one-shot probe. Uses the established arena and loader. It does
  * not map the graph pools, touch VTCM/HMX, or execute a graph kernel. */
 #include "../native/qd_protocol.h"

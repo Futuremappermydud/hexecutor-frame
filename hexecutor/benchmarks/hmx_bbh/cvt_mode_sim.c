@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* What does cvt.ub=acc(Rs) do with Rs low bits and bits 12/13, on native 8-bit
  * crouton accumulators (QNN hmx_v75_convbbh1x1_stride1)? */
 #include <stdint.h>

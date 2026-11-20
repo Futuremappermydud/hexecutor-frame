@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Actual CPU-prefix sequence 3527, CI256/CO128 Xwb 3x3 stride-1 HMX simulation. */
 #include <stdint.h>
 #include <stdio.h>

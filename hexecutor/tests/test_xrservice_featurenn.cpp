@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #include "hexecutor/xrservice_featurenn.hpp"
 #include "hexecutor/broker.hpp"
 #include <algorithm>

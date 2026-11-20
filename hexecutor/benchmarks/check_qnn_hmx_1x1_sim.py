@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Check the original native leaf against independent int64 matrix arithmetic."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # Build only the isolated adapter Frame probe. Do not replace default payloads.
 set -eu
 cd "$(dirname "$0")/../../../.."

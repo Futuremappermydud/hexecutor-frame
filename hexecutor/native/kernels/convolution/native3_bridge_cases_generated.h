@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Generated from primary QDRX; do not hand-edit. */
 static const uint32_t k_bridge_sequences[5]={247,874,3589,3527,5019};
 static const uint32_t k_bridge_pool1_bytes=8388608u;

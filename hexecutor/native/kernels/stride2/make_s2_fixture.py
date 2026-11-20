@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Capture a CPU-prefix S2 X/W/FI and complete post-command Y page grid."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Qualcomm assembler: -mv75 -mhmx. Arguments follow the Hexagon ABI. */
     .text
     .globl hmx_tune_init

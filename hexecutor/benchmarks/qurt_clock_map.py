@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Extract the Turing clock map from a QuRT CDSP image (CDSP.HT.3.0 layout).
 
 Accepts a complete ELF (cdsp.mbn) or a split image directory (cdsp.mbn header

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Compare direct arena collection with the established dense -> blocked write,
  * including canaries, holes, shuffled pools, slices, partial rows and flattening.
  * cc -O1 -g -fsanitize=address,undefined -ffp-contract=off -fno-strict-aliasing

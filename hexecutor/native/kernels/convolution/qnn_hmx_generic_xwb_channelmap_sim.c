@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Generic spatial leaf 32x32 channel-index proof for Xwb. */
 #include <stdint.h>
 #include <stdio.h>

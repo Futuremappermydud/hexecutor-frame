@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 exec(open('sim.py').read().split("if __name__")[0])
 import numpy as np
 DT={'uint8':1,'int8':1,'uint16':2,'int16':2,'int32':4,'uint32':4,'float32':4,'float16':2}

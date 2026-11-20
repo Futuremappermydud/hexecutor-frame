@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Search all Rt low bits for the 3x3 u16 walk: x, x+1, x+2, then next row. */
 #include <stdint.h>
 #include <stdio.h>

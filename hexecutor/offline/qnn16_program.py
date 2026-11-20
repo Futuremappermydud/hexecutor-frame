@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Lower a decoded QAIRT 2.50 FP16 context to a Q16P program and constant pool.
 
 Inputs, all local and ignored:

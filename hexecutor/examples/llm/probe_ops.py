@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Validate the NPU's non-matmul Qwen3 operators against NumPy."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

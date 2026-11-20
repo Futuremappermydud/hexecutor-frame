@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* CI64/CO32 input-depth probe with hypothesized 6-tap/3-tap B packing. */
 #include <stdint.h>
 #include <stdio.h>

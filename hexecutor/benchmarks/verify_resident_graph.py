@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Run the actual graph on DSP; compare hashes or a prefix's pools with native C."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

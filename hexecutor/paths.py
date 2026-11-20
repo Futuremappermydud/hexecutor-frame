@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Explicit source/build/model locations shared by development tools.
 
 Runtime backends receive artifact paths directly. Model paths here are only

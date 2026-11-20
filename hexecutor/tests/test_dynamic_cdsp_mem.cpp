@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #include "hexecutor/cdsp_mem.h"
 #include "hexecutor/executor.hpp"
 #include "hexecutor/workload_memory.hpp"

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef QD_PROTOCOL_H
 #define QD_PROTOCOL_H
 #include <stdint.h>

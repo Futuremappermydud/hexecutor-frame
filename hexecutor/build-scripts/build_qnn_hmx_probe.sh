@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # Only the new probe; never build/replace the callback loader or default engine.
 set -eu
 cd "$(dirname "$0")/../.."

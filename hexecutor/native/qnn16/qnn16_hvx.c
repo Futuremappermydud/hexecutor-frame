@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Portable scalar semantics for QNN FP16 vector/data-movement leaves.
  * Buffers are logical NHWC, as decoded from the QAIRT graph/trace oracle.
  */

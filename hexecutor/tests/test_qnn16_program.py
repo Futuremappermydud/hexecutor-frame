@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Run a lowered Q16P program on the host and compare it with QNN.
 
 The portable interpreter (hexecutor/native/qnn16/exec.c) executes the

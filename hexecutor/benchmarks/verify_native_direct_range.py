@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Validate a CPU-seeded, native-only VTCM command range on Frame.
 
 This proves one direct convolution at a time. Boundary pool transfers are

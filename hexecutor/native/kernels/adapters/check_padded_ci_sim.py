@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Independent integer oracle and CPU-prefix comparison for padded-CI leaf."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Consumes the tiny binary fixture emitted by test_qnn16_sigmoid_qd.py. */
 #include "qnn16_hvx.h"
 #include <math.h>

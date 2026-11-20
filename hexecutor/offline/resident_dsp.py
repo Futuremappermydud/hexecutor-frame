@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Experimental whole-graph DSP backend over private cdsp_mem DDR.
 
 The module must already be loaded at 128 MB / IOVA 0xa0000000. The transport

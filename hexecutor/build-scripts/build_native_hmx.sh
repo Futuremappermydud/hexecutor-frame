@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # Separate experimental payload. Never rebuild the loader or replace v5.
 set -eu
 cd "$(dirname "$0")/../.."

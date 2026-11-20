@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Generate independent NumPy golden reference data for persistent state decode simulator test.
 
 Simulates 5 autoregressive decode steps with:

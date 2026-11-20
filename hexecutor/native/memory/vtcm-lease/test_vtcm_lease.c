@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Offline contract test: cc -std=c11 -O2 -Wall -Wextra -Werror -o test_vtcm_lease test_vtcm_lease.c && ./test_vtcm_lease */
 #include <stdio.h>
 #include <stdlib.h>

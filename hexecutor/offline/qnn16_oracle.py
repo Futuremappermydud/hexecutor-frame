@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Per-operation oracle for QAIRT 2.50 FP16 HTP contexts from the x86 simulator.
 
 Inputs are a context decoded by depth-model/tools/htp_graph.py (graph.json) and

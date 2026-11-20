@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Gamescope window for the Frame chat backends: Qwen3-0.6B on the CDSP
 (default) or LFM3-1.7B on the CPU (FRAME_CHAT_BACKEND=cpu)."""
 

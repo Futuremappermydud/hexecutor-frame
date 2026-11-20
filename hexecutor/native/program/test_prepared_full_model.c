@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Host lockstep test: the prepared executor against qd_graph's CPU backend over
  * every command of an actual model schedule.
  *

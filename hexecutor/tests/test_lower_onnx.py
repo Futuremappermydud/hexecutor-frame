@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """QLinear ONNX -> HXFG lowering on a tiny synthetic model (no real weights).
 
 Skips when the offline `onnx` package is absent. When the portable reference

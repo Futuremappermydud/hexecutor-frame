@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # NSP NoC clock check: read-only GCC and Turing clock dumps, DMA bandwidth at the
 # current clock, then again with cdsp_nocclk mhz=300 (restored on rmmod).
 # Run from the frame directory with SteamVR idle; needs sudo for the module.

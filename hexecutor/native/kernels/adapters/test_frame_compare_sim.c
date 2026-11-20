@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* ISA check for the restoration comparison, without touching Frame hardware. */
 #include <stdio.h>
 #include "adapter_frame_probe.c"

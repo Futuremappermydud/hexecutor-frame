@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Prepare HMX Q4_0 tiles offline; no model arithmetic runs on the host at inference time."""
 import argparse
 import json

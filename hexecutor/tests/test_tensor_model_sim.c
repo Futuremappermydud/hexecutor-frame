@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Whole-graph FP16 check on the instruction simulator. Runs one model serially
  * and compares output bits with a saved reference (normally a Frame report),
  * so a backend change that should not alter numerics can be checked off-device.

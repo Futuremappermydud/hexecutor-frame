@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 import struct,sys
 def build(hook,out):
     d=bytearray(open('p_base.mbn','rb').read())

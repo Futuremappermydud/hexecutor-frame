@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Full-output V75 generic HMX one-hot oracle using a recovered CB*2.Xwb graph shape. */
 #include <stdint.h>
 #include <stdio.h>

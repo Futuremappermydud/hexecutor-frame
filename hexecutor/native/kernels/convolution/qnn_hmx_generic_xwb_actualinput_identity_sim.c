@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Generic V75 spatial leaf with CPU-prefix Xwb/FI/input snapshot for QDRX 1022. */
 #include <stdint.h>
 #include <stdio.h>

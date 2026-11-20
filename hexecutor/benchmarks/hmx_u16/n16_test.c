@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Focused sim harness for the u16 native HMX conv (hmx_native16): builds
  * synthetic blocked u16 tensors in VTCM, calls hmx_native16 directly and
  * prints, per config, the path taken, a hash of the conv's OUTPUT blocks

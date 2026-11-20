@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef QD_PACK_HVX_H
 #define QD_PACK_HVX_H
 #include <stdint.h>

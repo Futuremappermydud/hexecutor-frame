@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 exec(open(__import__('os').path.join(__import__('os').path.dirname(__file__) if '__file__' in globals() else '.','rl.py')).read())
 import json
 r=json.load(open('/tmp/frame-i-merge/depth-model/frame/build/ab/claim_20261102i/claim_primary.json'))

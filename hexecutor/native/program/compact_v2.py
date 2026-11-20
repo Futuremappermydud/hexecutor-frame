@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """NPRG v2: deduplicated immutable geometry plus delta-coded block spans."""
 from __future__ import annotations
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Locate the first difference between batched and serial CDSP inference."""
 import numpy as np
 from tokenizers import Tokenizer

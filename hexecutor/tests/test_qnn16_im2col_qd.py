@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Replay Mercury's native FP32-to-FP16 im2col against ignored QD writes."""
 import argparse
 import ctypes as C

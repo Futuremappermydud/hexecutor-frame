@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Compare native ForceFormat moves with local QAIRT QD_WRITES traces.
 
 Only the temporary compiled helper and ignored local traces contain model data.

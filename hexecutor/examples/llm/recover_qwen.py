@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Finish a persistent qwen_dsp session whose host died before sending EXIT.
 
 Requires: dsp_service control (2,0,8), (2,0,1) or (1,1,1), the qd_loader

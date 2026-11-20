@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Decode HMX non-deep activation windows: tagged blocks, one-hot weights.
  * Block b pixel (y,x) channel 0 = b*64+y*8+x (+1 so 0 = "zero/none" marker? no: use +0 and channel1=1 marker). */
 #include <stdint.h>

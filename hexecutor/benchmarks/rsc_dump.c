@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Read-only dump of QDSP6SS RSCC sequencer registers and program memory,
  * into arena+0x10000 (worker 0 only). */
 #include <stdint.h>

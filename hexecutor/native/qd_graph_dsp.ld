@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 ENTRY(resident_entry)
 PHDRS { code PT_LOAD FLAGS(7); }
 SECTIONS {

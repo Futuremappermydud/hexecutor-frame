@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Independent convolution/layout gate for native 64-pixel integer HMX. */
 #define QDC_NATIVE_BUILD 1
 #include <stdint.h>

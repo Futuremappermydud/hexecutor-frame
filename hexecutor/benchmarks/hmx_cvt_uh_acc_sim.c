@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* cvt.uh:2x1 with real accumulators. Mode 0: one-hot A byte i (value 1) with
  * B[k][n] = 1 for k==n%32 ... records C for each i. Mode 1: random A, B, bias,
  * scale (e, m). Record: fi[64], A[2048], B[1024], C[2048]. argv: mode cases out */

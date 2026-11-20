@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Read-only probe #2 for the L2 work (2026-11-01): per-thread stack pointer,
  * all 128 TLB entries (tlbr), and the number of non-zero words in each 16 KB
  * slice of the 1 MB L2-TCM at callback entry. Writes only to the arena. */

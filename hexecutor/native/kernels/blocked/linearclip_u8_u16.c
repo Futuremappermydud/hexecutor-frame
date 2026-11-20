@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "linearclip_u8_u16.h"
 #include <limits.h>
 #include <stddef.h>

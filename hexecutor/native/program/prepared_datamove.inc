@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Exact fast paths for the data-movement reference kernels (SpaceToDepth,
  * ResizeNear, Transpose, Slice, SlicePad, Gather). Included by
  * prepared_reference.c after its blocked-layout helpers; not a standalone unit.

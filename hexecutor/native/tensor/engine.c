@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Generic tensor engine on the shared guarded bootstrap/transport. Worker
  * stacks, mapping, VTCM snapshot and restoration remain bootstrap-owned. */
 #include "graph.h"

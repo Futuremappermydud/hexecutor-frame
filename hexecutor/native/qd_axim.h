@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef QD_AXIM_H
 #define QD_AXIM_H
 /* Same 750 MHz AXI-master clock sequence validated by axim_tune and Qwen.

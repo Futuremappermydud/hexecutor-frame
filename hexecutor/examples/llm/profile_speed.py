@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Time a single NPU token without a CPU or GPU inference fallback."""
 import argparse
 from collections import defaultdict

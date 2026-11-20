@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Dynamic CDSP memory reservation manager for Frame workloads."""
 
 import fcntl

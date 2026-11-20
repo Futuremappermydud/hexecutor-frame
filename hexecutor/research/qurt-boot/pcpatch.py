@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """pcpatch.py in.mbn out.mbn ADDR   -- ADDR is VA or PA; writes `jump self` (0x5800c000) there"""
 import struct,sys
 d=bytearray(open(sys.argv[1],'rb').read()); a=int(sys.argv[3],0)

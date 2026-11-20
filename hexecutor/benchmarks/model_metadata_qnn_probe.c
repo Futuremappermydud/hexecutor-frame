@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Isolated client for the Model vendor's signed libhexagon RPC interface.
  * Recovered against libhexagon.so SHA 9750f275... (Oct 30, 2026).
  * Uses the preserved DSP-side ET12 wrapper to avoid the raw-context route's

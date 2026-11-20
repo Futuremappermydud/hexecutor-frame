@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Run bounded one-hot HMX spatial tap probes for setter-derived tuple."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Check a prepared InputSlicePad range against captured CPU-prefix pools."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

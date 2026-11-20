@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Worker-0 test of the Q6 AXI-master clock (turing_cc+0x254) at 750 MHz.
  * Valve's firmware leaves the RCG on XO and the Turing core PLLs off. QuRT's
  * table (CDSP.HT.3.0-00794) reaches 750 MHz as core2 PLL 1500 MHz main output,

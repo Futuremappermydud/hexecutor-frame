@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Run preserved Model DSP programs through the signed vendor runtime over ADB.
 
 Only stages files under /data/local/tmp/qd-qnn-20261030. Does not change vendor

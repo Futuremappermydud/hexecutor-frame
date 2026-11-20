@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Bounded 750/1000/750 MHz AXI tests; DDR-controller clock stays unchanged."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

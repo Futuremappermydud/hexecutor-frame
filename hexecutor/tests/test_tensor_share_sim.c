@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Several FP16 graphs in one VTCM arena on the instruction simulator.
  * Runs an alternating sequence twice: with standalone plans, re-staging every
  * time the graph changes (the engine's single-resident behaviour), and with

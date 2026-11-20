@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Tap map of QNN's 16-bit slide activation load (hmx_v75_convhbh_stride1_aligned):
  * activation.ub=mxmem(Rs,Rt)[:above] + weight.b=mxmem(w,r):dilate, cvt.uh:2x1.
  * A block: u16 crouton [row y][pair pp][k*4+2j+{0,1}]: value in the high byte.

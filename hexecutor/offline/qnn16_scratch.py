@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Give the staged HMX convolutions of a Q16P program VTCM scratch blocks.
 
 Q16_CONV3X3 and Q16_CONV3X3_S2 run on HMX by staging shifted copies of their

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "prepared_native.h"
 #include <hexagon_standalone.h>
 #include <stdio.h>

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Exact HVX fast paths, part 2: DepthToSpace (blocked u16 -> flat), SlicePad
  * (blocked u8 channel slice), Gather (flat rows), and the blocked u16 ->
  * flat f32 dequantize driver. Included by prepared_reference.c right after

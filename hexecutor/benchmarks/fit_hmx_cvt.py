@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 import sys, numpy as np
 raw=open(sys.argv[1],'rb').read(); R=256+2048+1024+2048; n=len(raw)//R
 fi=np.zeros((n,64),np.int64); A=np.zeros((n,64,32),np.int64); W=np.zeros((n,32,32),np.int64); C=np.zeros((n,64,32),np.int64)

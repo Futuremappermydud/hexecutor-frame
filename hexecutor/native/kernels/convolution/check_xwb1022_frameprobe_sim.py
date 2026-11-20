@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Build/run the shared Frame staging path on Hexagon simulator and oracle-check it."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

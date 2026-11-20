@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Bare-metal Frame callback. No QNN, QuRT, libc or HMX dependency.
  * QD_HOST_TEST compiles the same dispatcher with a scalar vector substitute
  * for local protocol/arithmetic tests; it does not emulate HVX hardware. */

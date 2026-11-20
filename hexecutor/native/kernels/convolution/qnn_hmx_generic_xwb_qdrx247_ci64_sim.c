@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Real CPU-prefix Xwb/FI fixture for QDRX sequence 247 (CI64/CO64). */
 #include <stdint.h>
 #include <stdio.h>

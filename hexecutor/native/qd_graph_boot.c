@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* The unchanged loader enters this small trampoline. Extended code, pools and
  * heap all live in private cdsp_mem, never outside owned mappings. Every worker
  * returns here before the JTLB is restored and EXIT is published. */

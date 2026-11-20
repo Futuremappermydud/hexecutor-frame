@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # usage (from depth-model/): hexecutor/benchmarks/hmx_u16/run.sh "label:-DN16_PT=0 -DN16_DIRECT_OUT=0" "label2:-D..." ...
 # One container, one build + run per variant. Prints per-config hash/cycles.
 cd "$(dirname "$0")/../../.."

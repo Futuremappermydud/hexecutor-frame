@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Sweep L2 cache fields 0..5 on Frame; one restored callback per size."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

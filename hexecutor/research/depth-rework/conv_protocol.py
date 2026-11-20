@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Packets for the persistent HVX convolution payload (qd_conv.h)."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

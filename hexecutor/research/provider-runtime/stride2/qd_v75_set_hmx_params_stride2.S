@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* QAIRT provider exact code: _Z22set_hmx_params_stride2P10hmx_paramsmmmmmm; provider sha256=4282ff5880c0b0b609da31769a65a101f9a2beb6b536554cbb14753370c2ab1a */
 /* source va=0x2f3ce0, size=0x3a8, code sha256=0192df20ec40869d2ccbc67b88c5d196ae0de8cfc79646dd07367f193b7a25ef */
 .text

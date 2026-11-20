@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Generate fp16_depthwise.S: hand-scheduled interior depthwise row loops.
 
 A hardware thread issues one packet every three cycles, so packets are the cost.

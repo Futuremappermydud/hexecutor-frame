@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Local packet tests. These backends do not claim DSP/HVX execution."""
 
 from hexecutor.paths import workspace

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Q16P v2 persistent DDR arena: bounds, execution and scratch isolation. */
 #include "program.h"
 #include <assert.h>

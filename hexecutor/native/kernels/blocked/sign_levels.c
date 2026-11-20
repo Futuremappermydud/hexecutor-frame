@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "sign_levels.h"
 #include <math.h>
 #if defined(__hexagon__)

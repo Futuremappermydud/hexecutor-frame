@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # Runs a whole lowered Q16P program on the Hexagon simulator with the HMX
 # leaf and the HVX tile leaves (hexecutor/tests/test_qnn16_program_sim.c).
 # Usage: test_qnn16_program_sim.sh [--compare] [--stop N] [--fuzz KIND [--all]] PREFIX OUT_DIR INPUT.f32...

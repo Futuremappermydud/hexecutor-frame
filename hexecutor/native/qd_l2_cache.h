@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef QD_L2_CACHE_H
 #define QD_L2_CACHE_H
 /* Frame V75, L2CFG=5: the whole 1 MiB L2 array becomes cache and no L2-TCM

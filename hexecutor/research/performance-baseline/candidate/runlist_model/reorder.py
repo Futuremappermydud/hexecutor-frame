@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 exec(open('dag.py').read())
 import heapq
 WIN=int(__import__('os').environ.get('WIN','48'))

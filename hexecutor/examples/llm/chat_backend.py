@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Line-oriented NPU chat worker for the Gamescope GTK client."""
 import json
 import sys

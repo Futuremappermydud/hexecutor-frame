@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* ISA-simulator check: scatter-free hmx_prepare_fast must produce byte-identical
  * activation tiles to the original scatter hmx_prepare, for several geometries. */
 #include <stdint.h>

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Inventory/preserve upper VTCM under the existing exclusive callback lease.
 
 Default is read-only. --write-restore requires a validated read-only snapshot

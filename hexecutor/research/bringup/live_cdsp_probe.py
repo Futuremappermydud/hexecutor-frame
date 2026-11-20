@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Run stock FLOPS, optionally a new worker callback, without restarting DSPs.
 
 Requires the stock Oct 6 firmware. Eye tracker is stopped briefly because the

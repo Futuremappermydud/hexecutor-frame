@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* HVX forms of the depthwise and space-to-depth leaves that work directly on
  * QNN's FP16 crouton tiles in VTCM (no logical scratch, no float32 staging).
  *

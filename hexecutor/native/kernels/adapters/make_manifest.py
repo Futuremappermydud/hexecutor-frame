@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Write a reproducibility manifest for the isolated adapter evidence."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

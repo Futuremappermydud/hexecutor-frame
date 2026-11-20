@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Check the graph bridge's narrow metadata gates against five real QDRX ops."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

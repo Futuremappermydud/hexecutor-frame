@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # The SDK path and installed image are explicit; no model-resource aliases.
 set -eu
 cd "$(dirname "$0")/../.."

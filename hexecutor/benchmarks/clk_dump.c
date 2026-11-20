@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Read-only dump of the Turing clock controllers feeding the CDSP's memory path,
  * into arena+0x10000 (worker 0 only). Offsets come from QuRT's clock tables
  * (CDSP.HT.3.0, see bench/qurt_clock_map.py): turing_cc at 0x32008000, the

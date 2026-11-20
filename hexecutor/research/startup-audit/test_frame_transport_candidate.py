@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Host mocks for the candidate FrameTransport lifecycle; no device access."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Calibrate HMX's native crouton load/store, with identity weights. */
 #include <stdint.h>
 #include <stdio.h>

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #include "detail.hpp"
 #include <iostream>
 // Runs the read-only chunk-map probe once. Usage: hexecutor_chunk_probe LOADER PROBE_ELF

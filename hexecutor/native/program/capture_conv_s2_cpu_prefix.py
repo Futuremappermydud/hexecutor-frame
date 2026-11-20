@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Capture real NativeGraph CPU state immediately around Stride-2 conv ops (Variant 36)."""
 from __future__ import annotations
 

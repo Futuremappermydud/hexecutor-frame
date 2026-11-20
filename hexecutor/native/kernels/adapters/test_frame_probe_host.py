@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Exercise the real probe callbacks with a fake transport; no device access."""
 import contextlib
 import io

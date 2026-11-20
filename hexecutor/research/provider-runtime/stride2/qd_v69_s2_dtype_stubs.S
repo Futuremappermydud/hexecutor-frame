@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 .text
 .p2align 4
 .globl qd_v69_s2_dtype_in

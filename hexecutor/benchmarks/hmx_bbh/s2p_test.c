@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Randomised check of qd_hmx_slide2p_n and the realigning merge against a scalar
  * model using the engine's stride-2 tap table (S2_TAPS, s2_ktab). */
 #include <stdint.h>

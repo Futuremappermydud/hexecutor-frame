@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 set -eu
 cd "$(dirname "$0")/../../native"
 FIXTURE=${1:-/src/kernels/adapters/fixture-qdrx-1195.bin}

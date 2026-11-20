@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 set -eu
 cd "$(dirname "$0")/../../.."
 python3 hexecutor/research/provider-runtime/make_direct_3x3_scatter_map.py

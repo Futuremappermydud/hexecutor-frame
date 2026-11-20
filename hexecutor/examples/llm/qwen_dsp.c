@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Whole-token Qwen3-0.6B forward pass on the Frame CDSP (HVX, 3 workers).
  *
  * Weights, RoPE table and KV cache live in the cdsp_mem buffer (VA = CDSP

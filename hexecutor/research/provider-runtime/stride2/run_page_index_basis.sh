@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 set -eu
 cd "$(dirname "$0")/../../../.."
 for spec in 0,1,0,4,12 1,1,1,4,12 2,2,3,4,12 0,1,0,12,4 1,1,1,12,4 2,2,3,12,4 0,1,0,4,7 0,1,0,4,8; do

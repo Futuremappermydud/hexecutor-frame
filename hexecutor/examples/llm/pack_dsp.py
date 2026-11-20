@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Build the resident CDSP image for qwen_dsp.c from the Q4_0 GGUF.
 
 Only re-arranges bytes (plus a constant RoPE table); the Q4_0 codes and

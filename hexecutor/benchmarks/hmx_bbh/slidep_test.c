@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Randomised check of qd_hmx_slide3p_n and qd_hmx_nativep_n plus the HVX merge
  * against the simulator-rounding reference clip((q*M+8192)>>14). */
 #include <stdint.h>

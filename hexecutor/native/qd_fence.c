@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* ARM-side ordering for the persistent DSP protocol: the arena mapping is
  * not ordered against the DSP without explicit barriers. */
 void qd_fence(void) {

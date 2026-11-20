@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Actual QDRX5019 CI32/CO2 tail proof with pre/post physical padded Y oracle. */
 #include <stdint.h>
 #include <stdio.h>

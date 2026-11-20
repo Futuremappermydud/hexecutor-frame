@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 set -eu
 [ "$#" -eq 1 ] || { echo "usage: $0 WORK_DIRECTORY" >&2; exit 2; }
 BIN=$(cd "$1" && pwd)/bin

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #pragma once
 // Parser for the HexecutorBackend delegate blob (format v1, little-endian).
 // Dependency-free so it can be tested without ExecuTorch.

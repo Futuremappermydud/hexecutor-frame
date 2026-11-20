@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* DSP unit test: llm/qwen_dsp.c's HVX per-element phases against their scalar
  * references, on synthetic data in L2-TCM (worker 0 only). Results at
  * arena+0x10000; decode them with bench/run_qwen_ops_test.py. */

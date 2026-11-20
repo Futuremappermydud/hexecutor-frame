@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Local QAIRT leaf hmx_v73_convbbb1x1_stride1, original 0x385640, 936 bytes.
  * Fast aligned path only; all other branches must be excluded by caller. */
     .text

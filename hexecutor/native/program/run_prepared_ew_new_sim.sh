@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # Focused V75 simulator tests for the SIGN/39, LINEARCLIP/67 and LINEARCLIP/69 elementwise handlers.
 #   1. hexecutor/blocked_glue/linearclip_flat_u8_sim.c: the flat u8 kernel against the independent int64 expression.
 #   2. Windows of the real schedules around those commands: the host reference runs the schedule up to the

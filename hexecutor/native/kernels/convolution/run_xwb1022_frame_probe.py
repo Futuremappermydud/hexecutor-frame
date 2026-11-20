@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """One-shot Frame runner; device invocation is intentionally separate from host validation."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

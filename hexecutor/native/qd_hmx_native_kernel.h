@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef QD_HMX_NATIVE_KERNEL_H
 #define QD_HMX_NATIVE_KERNEL_H
 #include <stddef.h>

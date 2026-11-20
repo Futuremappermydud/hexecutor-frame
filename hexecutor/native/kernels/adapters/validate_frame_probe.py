@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Host-only preflight for Frame probe packet and arena/pool ranges."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

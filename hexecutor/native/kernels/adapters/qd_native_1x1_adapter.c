@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #include "qd_native_1x1_adapter.h"
 #include <string.h>
 

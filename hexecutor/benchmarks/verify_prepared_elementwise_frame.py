@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Validate prepared elementwise execution using real CPU-prefix state."""
 
 # Direct CLI entry points use the same explicit package roots as the root task runner.

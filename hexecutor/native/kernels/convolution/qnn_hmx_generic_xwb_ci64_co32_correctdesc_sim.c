@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Generic V75 CI64/CO32 Xwb depth-block and spatial-tap proof. */
 #include <stdint.h>
 #include <stdio.h>

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Host proxy for command decode/handler resolution cost; see README scope."""
 from __future__ import annotations
 

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # usage: planes_build.sh NAME "extra cflags (+ separated)"   -> hexecutor/native/build/ab/planes-20261105/{eng,boot}-NAME.elf in the MAIN tree
 set -eu
 cd "$(dirname "$0")/../.."

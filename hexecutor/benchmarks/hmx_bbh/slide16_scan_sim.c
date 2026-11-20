@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Scan Rs/Rt low bits of the 16-bit activation load: which taps read what. */
 #include <stdint.h>
 #include <stdio.h>

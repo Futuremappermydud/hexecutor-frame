@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Measure the experimental native graph; report numerical differences explicitly.
 
 Finite, repeatable output and clean memory recovery do not establish numerical

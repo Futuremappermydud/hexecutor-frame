@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 #ifndef QD_SIGN_LEVELS_H
 #define QD_SIGN_LEVELS_H
 #include <stddef.h>

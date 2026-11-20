@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Gate and time the aligned SDK leaf on Frame against saved ISA fixtures.
 
 Does not load cdsp_mem or change installed executors. Upper placements require

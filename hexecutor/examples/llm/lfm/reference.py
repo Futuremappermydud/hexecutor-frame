@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """CPU reference forward pass for LFM3 models.
 
 Reads 'Packed layout v1' binary images (.dspbin, FP16 or Q4_0), dequantizes

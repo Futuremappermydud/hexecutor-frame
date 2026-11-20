@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Parser and layout tests. Needs no ExecuTorch.
 #include "blob.hpp"
 
