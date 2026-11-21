@@ -382,6 +382,29 @@ def decode(path, output, graph_name=None, legacy_names=True):
                     if length % 4:
                         raise DecodeError('unaligned framework vector')
                     node['framework_vector'] = r.words(length // 4)
+            if modern and fmt == 0x80000000 and node['type_name'] in ('@Spill', '@Fill'):
+                # QAIRT 2.50 writes a length-prefixed list of DMA groups even
+                # though its dictionary entry does not set the vector flag.
+                length = r.word()
+                if length < 16 or length % 4 or length != end - r.pos:
+                    raise DecodeError('invalid spill/fill vector length')
+                first_word, group_count = r.words(2)
+                groups = []
+                for _ in range(group_count):
+                    transfer_count, spill_offset = r.words(2)
+                    if not transfer_count or transfer_count > (end - r.pos) // 8:
+                        raise DecodeError('invalid spill/fill transfer count')
+                    transfers = [r.words(2) for _ in range(transfer_count)]
+                    groups.append(dict(offset=spill_offset, transfers=transfers))
+                if not groups or r.pos != end:
+                    raise DecodeError('invalid spill/fill groups')
+                node['spill_groups'] = groups
+                node['spill_dma_queue'] = first_word
+                # The existing framework-vector consumers represent one group.
+                # Keep their contract for a single group and fail closed for more.
+                if group_count == 1:
+                    node['framework_vector'] = [first_word, group_count, transfer_count,
+                                                spill_offset, *(w for pair in transfers for w in pair)]
             node['inputs'] = r.words(ni)
             node['outputs'] = [tensors.tensor(r, seq) for _ in range(no)]
             if modern and node['type_name'] == '@BlockZap' and r.pos != end:

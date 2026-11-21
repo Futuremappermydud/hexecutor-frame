@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Offline QNN TFLite/ONNX conversion and HTP preparation with explicit SDK/target.
+"""Offline QNN TFLite/ONNX/DLC conversion and HTP preparation with explicit SDK/target.
 
 Run in a Linux QAIRT development environment with its tested dependencies and
 clang++ installed. This tool never starts a device session. Generated source,
@@ -24,6 +24,9 @@ def main():
     p.add_argument("--model", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--name", required=True)
+    p.add_argument("--graph-name", help="DLC only: graph name reported by qairt-dlc-info")
+    p.add_argument("--context-only", action="store_true",
+                   help="skip optrace schematic generation and inspection")
     p.add_argument("--arch", default="v75")
     p.add_argument("--soc-model", type=int, default=57, help="QNN SM8650 is 57")
     p.add_argument("--vtcm-mb", type=int, default=8)
@@ -74,49 +77,62 @@ def main():
     tools = sdk / "bin" / target
     cpp, weights = out / (args.name + ".cpp"), out / (args.name + ".bin")
     suffix = model.suffix.lower()
-    if suffix not in (".tflite", ".onnx"):
-        p.error("model must be .tflite or .onnx")
+    if suffix not in (".tflite", ".onnx", ".dlc"):
+        p.error("model must be .tflite, .onnx, or .dlc")
     if args.input_dim and suffix != ".onnx":
         p.error("--input-dim applies to ONNX models only")
-    converter = [
-        sys.executable,
-        tools / ("qnn-onnx-converter" if suffix == ".onnx" else "qnn-tflite-converter"),
-        "--input_network",
-        model,
-        "--output_path",
-        cpp,
-    ]
-    for spec in args.input_dim:
-        name, sep, dims = spec.partition("=")
-        if not sep or not re.fullmatch(r"\d+(,\d+)*", dims):
-            p.error(f"invalid --input-dim {spec!r}")
-        converter += ["--input_dim", name, dims]
-    if args.copyright_file:
-        # QAIRT requires a .txt extension even for plain-text NOTICE files.
-        notice = out / "copyright.txt"
-        notice.write_text(args.copyright_file.read_text())
-        converter += ["--copyright_file", notice]
-    converter += args.converter_arg
-    run(converter, "convert.log")
-    run(
-        [
+    graph_name = args.name
+    if suffix == ".dlc":
+        if not args.graph_name:
+            p.error("--graph-name is required for DLC models")
+        if args.converter_arg or args.copyright_file:
+            p.error("converter options do not apply to preconverted DLC models")
+        graph_name = args.graph_name
+        model_args = ["--model", sdk / "lib" / target / "libQnnModelDlc.so",
+                      "--dlc_path", model]
+    else:
+        if args.graph_name:
+            p.error("--graph-name applies to DLC models only")
+        converter = [
             sys.executable,
-            tools / "qnn-model-lib-generator",
-            "-c",
+            tools / ("qnn-onnx-converter" if suffix == ".onnx" else "qnn-tflite-converter"),
+            "--input_network",
+            model,
+            "--output_path",
             cpp,
-            "-b",
-            weights,
-            "-t",
-            target,
-            "-o",
-            out / "lib",
-        ],
-        "library.log",
-    )
+        ]
+        for spec in args.input_dim:
+            name, sep, dims = spec.partition("=")
+            if not sep or not re.fullmatch(r"\d+(,\d+)*", dims):
+                p.error(f"invalid --input-dim {spec!r}")
+            converter += ["--input_dim", name, dims]
+        if args.copyright_file:
+            # QAIRT requires a .txt extension even for plain-text NOTICE files.
+            notice = out / "copyright.txt"
+            notice.write_text(args.copyright_file.read_text())
+            converter += ["--copyright_file", notice]
+        converter += args.converter_arg
+        run(converter, "convert.log")
+        run(
+            [
+                sys.executable,
+                tools / "qnn-model-lib-generator",
+                "-c",
+                cpp,
+                "-b",
+                weights,
+                "-t",
+                target,
+                "-o",
+                out / "lib",
+            ],
+            "library.log",
+        )
+        model_args = ["--model", out / "lib" / target / ("lib" + args.name + ".so")]
     backend = {
         "graphs": [
             {
-                "graph_names": [args.name],
+                "graph_names": [graph_name],
                 "O": args.optimization,
                 "vtcm_mb": args.vtcm_mb,
                 "hvx_threads": args.hvx_threads,
@@ -141,29 +157,36 @@ def main():
         }
     }
     (out / "extensions.json").write_text(json.dumps(ext, indent=2) + "\n")
+    optrace_args = [] if args.context_only else [
+        "--profiling_level", "detailed", "--profiling_option", "optrace",
+    ]
+    binary_name = args.name + "-" + args.arch
     run(
         [
             tools / "qnn-context-binary-generator",
-            "--model",
-            out / "lib" / target / ("lib" + args.name + ".so"),
+            *model_args,
             "--backend",
             sdk / "lib" / target / "libQnnHtp.so",
             "--config_file",
             out / "extensions.json",
             "--binary_file",
-            args.name + "-" + args.arch,
+            binary_name,
             "--output_dir",
             out,
-            "--profiling_level",
-            "detailed",
-            "--profiling_option",
-            "optrace",
+            *optrace_args,
             "--log_level",
             "info",
         ],
         "prepare.log",
     )
-    report = inspect(out / (args.name + "_schematic.bin"))
+    context = out / (binary_name + ".bin")
+    if not context.is_file() or not context.stat().st_size:
+        raise RuntimeError(f"QAIRT did not produce {context}; see {out / 'prepare.log'}")
+    report = {"context_binary": str(context)}
+    if not args.context_only:
+        # QAIRT replaces punctuation in graph names when naming schematic files.
+        schematic_name = re.sub(r"[^a-zA-Z0-9_]", "_", graph_name)
+        report.update(inspect(out / (schematic_name + "_schematic.bin")))
     report.update(
         {
             "source_model": str(model),
@@ -181,9 +204,11 @@ def main():
             file.read_bytes()
         ).hexdigest()
     (out / "compiled-summary.json").write_text(json.dumps(report, indent=2) + "\n")
-    print(
-        f'{args.name}: {report["after_nodes"]} lowered nodes; {out / "compiled-summary.json"}'
-    )
+    summary = out / "compiled-summary.json"
+    if args.context_only:
+        print(f"{args.name}: {context}; {summary}")
+    else:
+        print(f'{args.name}: {report["after_nodes"]} lowered nodes; {summary}')
 
 
 if __name__ == "__main__":

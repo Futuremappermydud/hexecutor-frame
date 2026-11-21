@@ -11,6 +11,7 @@
 //
 // Environment:
 //   QD_TRACE_LOG  text log: "seq list idx fn_offset thread nblocks"
+//   QD_WORKER_CHECKPOINTS  add worker wait/done addresses to the text log
 //   QD_WRITES     binary write log (records below); omit to log only
 //   QD_CALLS      text log of exported HVX kernel calls made by each op:
 //                 "seq name rdi rsi rdx rcx r8 r9 | stack0..3 | xmm0..3 (low 64 bits)"
@@ -45,6 +46,7 @@ uint8_t *vtcm_base;
 uint64_t vtcm_size;
 std::vector<uint8_t> shadow;
 FILE *trace_log, *writes;
+bool worker_checkpoints;
 uintptr_t lib_base;
 uint32_t seq;
 std::map<ExecEntry *, uint32_t> lists;
@@ -56,6 +58,7 @@ void init_locked() {
     static bool done;
     if (done) return;
     done = true;
+    worker_checkpoints = getenv("QD_WORKER_CHECKPOINTS") != nullptr;
     if (const char *p = getenv("QD_TRACE_LOG")) trace_log = fopen(p, "w");
     if (const char *p = getenv("QD_WRITES")) writes = fopen(p, "wb");
     if (const char *p = getenv("QD_TENSOR_CONFIG")) {
@@ -149,6 +152,9 @@ void wrap_list(ExecEntry *list, unsigned count) {
     unsigned n = 0;
     for (unsigned i = 0; i < count; ++i) {
         if (list[i].fn == trampoline) continue;
+        if (trace_log && worker_checkpoints && id == 1)
+            fprintf(trace_log, "# worker-checkpoints %u %#lx %#lx\n", i,
+                    (unsigned long)(uintptr_t)list[i].wait, (unsigned long)(uintptr_t)list[i].done);
         Wrapped *w = new Wrapped{MAGIC, list[i].fn, list[i].op, id, i};
         list[i].op = w;
         list[i].fn = trampoline;
