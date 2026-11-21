@@ -323,7 +323,10 @@ struct Adapter::Impl {
             warm_one(vector_stream, gazenet_vector_floats * sizeof(float), false);
     }
     bool stock_busy() {
-        return load(featurenn, 4) || load(gazenet, 4) || load(gazenet, 0xc);
+        const bool gaze_enabled = !options.gazenet_graph.empty() ||
+                                  !options.gazenet_vector_graph.empty();
+        return load(featurenn, 4) ||
+               (gaze_enabled && (load(gazenet, 4) || load(gazenet, 0xc)));
     }
     void warm_up() {
         auto deadline = Clock::now() + std::chrono::seconds(5);
@@ -336,14 +339,18 @@ struct Adapter::Impl {
         warm_graphs();
     }
     void run() {
+        const bool gaze_enabled = !options.gazenet_graph.empty() ||
+                                  !options.gazenet_vector_graph.empty();
         bool owned = false, failed = false, gaze_owned = false, gaze_failed = false;
         bool yielded = false, reacquire = false, grab_pending = false, vector_failed = false;
-        bool gaze_grabbed = load(gazenet, 8) == gazenet_job && !load(gazenet, 4);
+        bool gaze_grabbed = gaze_enabled && load(gazenet, 8) == gazenet_job && !load(gazenet, 4);
         while (!stopping) {
             uint32_t f_state = load(featurenn, 0), f_active = load(featurenn, 4);
             uint32_t f_taken = load(featurenn, 8);
-            uint32_t g_state = load(gazenet, 0), g_active = load(gazenet, 4);
-            uint32_t g_taken = load(gazenet, 8), g_ready = load(gazenet, 0xc);
+            uint32_t g_state = gaze_enabled ? load(gazenet, 0) : 0;
+            uint32_t g_active = gaze_enabled ? load(gazenet, 4) : 0;
+            uint32_t g_taken = gaze_enabled ? load(gazenet, 8) : 0;
+            uint32_t g_ready = gaze_enabled ? load(gazenet, 0xc) : 0;
             if (owned && !f_active) {
                 store(featurenn, 8, 0);
                 store(featurenn, 0, 1);

@@ -34,9 +34,10 @@ target_include_directories(hexecutor_chunk_probe PRIVATE host/cpp)
 target_link_libraries(hexecutor_chunk_probe PRIVATE hexecutor_host)
 set_target_properties(hexecutor_chunk_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
-add_library(xrservice_broker_shim SHARED host/cpp/xrservice_broker_shim.cpp)
+add_library(xrservice_broker_shim SHARED host/cpp/xrservice_broker_shim.cpp
+    host/cpp/xrservice_inline_hook.cpp)
 target_include_directories(xrservice_broker_shim PUBLIC include)
-target_link_libraries(xrservice_broker_shim PRIVATE hexecutor_host)
+target_link_libraries(xrservice_broker_shim PRIVATE hexecutor_host ${CMAKE_DL_LIBS})
 set_target_properties(xrservice_broker_shim PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

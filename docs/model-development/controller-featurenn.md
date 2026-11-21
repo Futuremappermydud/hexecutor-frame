@@ -27,9 +27,9 @@ samples/controller-tracking/.work/venv/bin/python hexecutor/offline/lower_onnx.p
 
 The result has 68 operations, a 3.9 MB arena and 18.4 MB of constants. The two input channels are zero-padded to three so the compact RGB input path applies. The 552-wide Gemm is split into outputs of 352 and 200 channels, and the host joins them. Two layers get plain ReLU because their quantized range is not 6: the first convolution (0–62.1) and the final 1×1 (0–3.54). The u8 model saturates the latter at 3.54 and the float graph does not.
 
-## Built-in XRService adapter
+## XRService broker bridge
 
-Register the result as `featurenn` and pass `--xrservice-featurenn featurenn` to `hexecutord`, or set `FRAME_FEATURENN` to the prefix when using `hexecutor/packaging/run_hexecutord.sh`. The adapter accepts the built-in binary's packed u8 crops over the stock `dsp_service` shared buffer, performs the normalization and output head layout described above, and runs inference as a tracking broker job. It does not patch or replace XRService. See [the XRService bridge guide](../hexecutor/xrservice-broker-bridge.md#stereofeaturenn) for the handshake, launcher example, and remaining device-validation gates.
+Register the result as `featurenn`, or set `FRAME_FEATURENN` to the prefix when using `hexecutor/packaging/run_hexecutord.sh`. The stock XRService binary takes CDSP ownership before posting its FeatureNN mailbox job, so the in-daemon mailbox adapter cannot redirect that call. The version-pinned in-process hook intercepts the dispatch before ownership and submits the packed u8 crops to the broker. See [the XRService bridge guide](../hexecutor/xrservice-broker-bridge.md#stereofeaturenn) for the tested scope and remaining device-validation gates.
 
 ## Checks (2026-11-09)
 

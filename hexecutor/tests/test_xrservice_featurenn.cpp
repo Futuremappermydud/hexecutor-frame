@@ -206,6 +206,27 @@ static void test_adapter_bridge() {
     server.stop();
 }
 
+static void test_featurenn_only_ignores_gazenet_block() {
+    std::string socket_path = "/tmp/test_featurenn_only_" + std::to_string(::getpid()) + ".sock";
+    ::unlink(socket_path.c_str());
+    broker::ServerOptions server_options;
+    server_options.socket = socket_path;
+    broker::Server server(std::make_unique<FakeAdapterBackend>(), server_options);
+    server.start();
+    std::vector<uint8_t> dma(dma_bytes, 0);
+    put<uint64_t>(dma, 0xa90000, 0x1614df651d03f542ULL);
+    put<uint64_t>(dma, 0xa90008, 9ULL);
+    put<uint32_t>(dma, gazenet_control_offset + 4, 0xbeef1234);
+    put<uint32_t>(dma, gazenet_control_offset + 0xc, 0xbeef5678);
+    AdapterOptions opts;
+    opts.featurenn_graph = "featurenn";
+    Adapter adapter(socket_path, opts, [] {}, dma.data(), dma.size());
+    adapter.start();
+    adapter.stop();
+    server.stop();
+    ::unlink(socket_path.c_str());
+}
+
 int main() {
     try {
         std::vector<uint8_t> shared(featurenn_output_offset + 4 * featurenn_output_record_bytes);
@@ -332,6 +353,7 @@ int main() {
         require(threw, "oversize Gazenet vector rejected");
 
         test_adapter_bridge();
+        test_featurenn_only_ignores_gazenet_block();
     } catch (const std::exception &e) {
         std::cerr << "test_xrservice_featurenn: " << e.what() << '\n';
         return 1;

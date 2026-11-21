@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Start the CDSP broker (hexecutord) on Frame with the hand graphs registered as
 # "palm" and "landmark", plus any extra --graph NAME=IMAGE,CONSTANTS arguments.
-# FRAME_FEATURENN (or FRAME_STEREOFEATURENN), FRAME_GAZENET and FRAME_GAZENET_VECTOR
-# instead register the corresponding stock-protocol adapter graphs from HXFG prefixes (without
-# .hxfg/.bin). Add hand graphs explicitly if desired; constant capacity is limited.
+# FRAME_FEATURENN (or FRAME_STEREOFEATURENN) registers a graph for the
+# in-process XRService hook. FRAME_GAZENET and FRAME_GAZENET_VECTOR register
+# stock-protocol adapter graphs. Values are HXFG prefixes (without .hxfg/.bin).
+# Add hand graphs explicitly if desired; constant capacity is limited.
 # Clients: frame_hand_viewer --broker SOCKET, frame_hand_tracker --broker SOCKET.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,7 +41,6 @@ if [[ -n "$FEATURENN" || -n "$GAZENET" || -n "$GAZENET_VECTOR" ]]; then
         [[ -f "$FEATURENN.hxfg" && -f "$FEATURENN.bin" ]] ||
             { echo "cannot find stereoFeatureNN graph at $FEATURENN" >&2; exit 1; }
         GRAPHS+=(--graph "featurenn=$FEATURENN.hxfg,$FEATURENN.bin")
-        ADAPTER+=(--xrservice-featurenn featurenn)
     fi
     if [[ -n "$GAZENET" ]]; then
         [[ -f "$GAZENET.hxfg" && -f "$GAZENET.bin" ]] ||
