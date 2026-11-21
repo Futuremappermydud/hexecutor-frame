@@ -698,7 +698,7 @@ uint32_t hx_graph_open(HxGraph *g, const void *image, uint32_t image_bytes, cons
     if (h->magic != HXFG_MAGIC || h->version != HXFG_VERSION || h->bytes != image_bytes ||
         !h->tensors || h->tensors > HXFG_MAX_TENSORS || !h->ops || h->ops > HXFG_MAX_OPS ||
         !h->inputs || h->inputs > HXFG_MAX_IO || !h->outputs || h->outputs > HXFG_MAX_IO ||
-        !h->arena_bytes || h->arena_bytes > 0x1000000u || h->arena_bytes > arena_bytes ||
+        !h->arena_bytes || h->arena_bytes > HXFG_MAX_ARENA_BYTES || h->arena_bytes > arena_bytes ||
         h->constant_bytes != constant_bytes || !constants || !constant_bytes ||
         constant_bytes > HXFG_MAX_CONSTANT_BYTES)
         return HX_HEADER;

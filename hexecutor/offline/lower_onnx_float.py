@@ -1603,7 +1603,7 @@ class Lowerer:
             stride = (c + 31) & ~31
             if len(self.dims[out]) == 4:
                 hwc_arr = c_arr[0].transpose(1, 2, 0)
-            elif len(self.dims[out]) == 3:
+            elif len(self.dims[out]) == 3 and not self._is_token(out):
                 hwc_arr = c_arr[0].transpose(1, 0).reshape(1, w, c)
             else:
                 hwc_arr = c_arr.reshape(h, w, c)

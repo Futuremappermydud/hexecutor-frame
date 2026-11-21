@@ -292,6 +292,14 @@ class FloatOnnxTests(unittest.TestCase):
         self.check_numeric(m, (1, 4, 3, 3))
 
     @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
+    def test_full_size_positional_embedding_add(self):
+        b = Builder(seed=29)
+        projected = b.node("MatMul", ["x", b.const(b.rand(4, 8))])
+        out = b.node("Add", [projected, b.const(b.rand(1, 3, 8))])
+        m = b.model([("x", [1, 3, 4])], [(out, [1, 3, 8])])
+        self.check_numeric(m, (1, 3, 4))
+
+    @unittest.skipUnless(onnxruntime and RUNNER.exists(), "needs onnxruntime and the runner")
     def test_where_select_matches_onnxruntime(self):
         b = Builder(seed=25)
         cond = b.node("Greater", ["x", b.const(np.zeros((1, 4, 2, 2), np.float32))])

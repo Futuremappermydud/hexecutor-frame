@@ -10,8 +10,17 @@ extern "C" {
  * private arena/constants. No model names, firmware addresses, pointers or embedded weights. */
 #define HXFG_MAGIC 0x47465848u
 #define HXFG_VERSION 1u
+/* Build-time overridable (host and simulator builds only; the DSP engine keeps these defaults): define
+ * HXFG_MAX_TENSORS, HXFG_MAX_OPS or HXFG_MAX_ARENA_BYTES before including this header to accept larger images. */
+#ifndef HXFG_MAX_TENSORS
 #define HXFG_MAX_TENSORS 1024u
+#endif
+#ifndef HXFG_MAX_OPS
 #define HXFG_MAX_OPS 1024u
+#endif
+#ifndef HXFG_MAX_ARENA_BYTES
+#define HXFG_MAX_ARENA_BYTES 0x1000000u
+#endif
 #define HXFG_MAX_IO 16u
 #define HXFG_MAX_GRAPHS 8u
 #define HXFG_CONFIG_MAGIC 0x53465848u
