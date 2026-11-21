@@ -22,6 +22,8 @@ import torch
 from executorch.exir import EdgeCompileConfig, ExecutorchBackendConfig, to_edge_transform_and_lower
 
 from .partitioner import HexecutorPartitioner
+from .decompositions import custom_table, uses_custom_ops
+from .volume import has_high_rank, has_nhwc_linear, has_oversized_conv, rewrite_volumes
 
 
 def _ensure_flatc():
@@ -47,6 +49,14 @@ def export_program(model, example_inputs, partitioner=None):
         example_inputs = (example_inputs,)
     with torch.no_grad():
         exported = torch.export.export(model, example_inputs)
+    if (has_high_rank(exported) or has_nhwc_linear(exported) or has_oversized_conv(exported)
+            or uses_custom_ops(exported)):
+        # Rank-5 cost volumes are re-traced as rank-4 depth-row layouts (volume.py); vector norms and
+        # im2col are decomposed into operations HXFG has (decompositions.py).
+        table = torch.export.default_decompositions()
+        for op in HexecutorPartitioner._kept_ops():
+            table.pop(op, None)
+        exported = rewrite_volumes(exported, example_inputs, custom_table(table), force=uses_custom_ops(exported))
     # Fold identity repeat([1]) nodes before edge lowering so the partitioner
     # sees through them (InstanceNorm2d decomposes to batch_norm_legit with
     # repeat on weight/bias).

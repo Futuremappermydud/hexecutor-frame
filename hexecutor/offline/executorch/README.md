@@ -83,6 +83,7 @@ partitioner instead of `Unsupported`. `ops_to_not_decompose` now decides on a co
 refused every node after them (so `silu`, `linear` and SDPA were decomposed and fell to the CPU).
 
 Example: `hexecutor/examples/diffusion/unet2d_export.py` (diffusers `UNet2DModel`, fully delegated, 265 HXFG ops).
+Example: `hexecutor/examples/fastfoundationstereo/ffs_export.py` (C-Fast-FoundationStereo at 128 x 192, fully delegated, 4344 HXFG ops; see its README).
 
 ### Arithmetic, comparisons and shape operators
 
@@ -138,13 +139,57 @@ splits the graph wherever an unsupported operation sits between delegated ones.
 itself follows a delegated one, because delegating both would create a
 partition cycle.
 
+### Cost volumes, 3D convolutions and other rewrites (`volume.py`, `decompositions.py`)
+
+`export_program` re-traces the decomposed program through `volume.rewrite_volumes` when it holds a rank-5
+tensor, a channels-last `linear` or layer norm, a dense convolution over the HMX budget, or an operation in
+`decompositions.CUSTOM`. The rewrite runs eagerly once (it creates the new constants and checks the result against
+the original program, `rtol` 1e-4), then exports again, so the delegate sees ordinary rank-4 ATen. Constant
+subgraphs (`arange`, `eye`, `sin`/`cos` tables, casts, clamps of constants) are folded into buffers, and dead
+nodes, unused `getitem` outputs and views undone by the next view are removed. Anything the rewrite has no form for
+raises `VolumeRewriteError` with the node and shape.
+
+| Operation | Rewritten as | Notes |
+| --- | --- | --- |
+| rank-5 value `[1, C, D, H, W]` | the depth-row layout `[1, C, D, H*W]` | Pointwise operations, batch norm, `cat` along C or D, broadcasts, `unsqueeze`/`expand`/`view` from and to `[1, C, ...]` maps, `squeeze` of C=1 (a transposition) and the `permute` pair used by per-pixel depth attention are covered. H*W is at most 4096. |
+| `convolution` 3D (dense, strided, dilated, grouped, depthwise) | per spatial tap (ky, kx): `index_select` over the H*W columns (zero column for padding), then a `(kd, 1)` convolution; the taps are summed. The output pixels run in column chunks of about `MAX_TEMP_BYTES` (6 MiB) of gathered tap, each reading only its own column range plus one zero column, and the chunks are joined by a balanced tree of two-input concatenations | `(kd, 1, 1)` kernels are one 2D convolution. Strides, padding and dilation in H and W are the gather index; in D they are the 2D convolution's. |
+| `convolution` 3D transposed (4x4x4 stride 2, 3x3x3 stride 2 with output padding, ...) | the same gather over the output pixels (zero for positions between inserted zeros) plus a transposed `(kd, 1)` convolution | Dilated transposed convolutions are not rewritten. |
+| convolution kernel above 15 rows (a `kd` = 17 depth convolution) | taps split into groups of at most 15, each read from the padded input and summed | HXFG kernels are at most 15 x 15. |
+| dense 2D convolution over the HMX scratch budget | input-channel chunks (summed) and output-channel chunks (concatenated) | Applies to transposed convolutions too (`conv_chunks`). |
+| `index.Tensor` with separable constant (D, H, W) indices | `index_select` over D and one over the pixel columns | The interpolation weights are ordinary broadcasts. |
+| `index_select` of a rank-5 value along D, H or W with a constant index | `index_select` over the depth rows, or over the pixel columns with the H or W index expanded | |
+| `upsample_trilinear3d` | three separable linear interpolations (W, then H, then D), each two `index_select`s and a weighted sum (`decompositions.py`) | Upstream's decomposition gathers all eight corners at the full output size at once; this keeps one axis live. |
+| `[1, G, Cg, D, H, W]` views with `linalg_vector_norm`/`sum` over Cg (group-wise correlation) | 1x1 convolutions with block-ones weights (sum, replicate) | |
+| channels-last `[1, H, W, C]` blocks (`permute`, layer norm, `linear`, GELU, per-channel scale, `permute` back) | token matrices `[1, H*W, C]`; the NCHW pair is one HWC copy | `linear` over `[B, L, C]` with B above one runs as `[B*L, C]`. |
+| `linalg_vector_norm` (order 1 or 2), `F.normalize` | `sqrt(sum(x*x))`, `sum(abs(x))` | `decompositions.py` |
+| `im2col`, `F.unfold`, batch one | a convolution with one-hot taps (`torch.eye`) | |
+| `adaptive_max_pool2d` to 1x1 | `amax` over the spatial dims | |
+| `select.int` | `narrow` and `squeeze` (slice and reshape) | |
+| `grid_sampler_2d`, batch one, bilinear, zeros or border padding, either `align_corners` | four `index` pixel gathers with zero-outside weights | The 4096-element NCHW flatten limit applies to the `[1, C, H*W]` result. The per-pixel batch of upstream stereo lookups (B*H*W one-row images) is not batch one; `examples/fastfoundationstereo` rewrites it as gathers along the depth axis. |
+| transposed 2D convolution (4x4 stride 2, ...) | ZEROINSERT and a dense convolution | Already lowered; now covered by `test_transposed_2d_convolution`. |
+
+Lowering additions (`lowering.py`): `index_select` along the rows of `[1, C, H, W]` with a constant index is a pixel
+gather over the flattened (h, w) list (the earlier row form read one channel vector per pixel and returned wrong
+rows); a reshape between batch-one rank-4 tensors that keeps dim 1 is a pixel-order HWC copy, whatever its size;
+`alias` has a kind before the edge conversion; the key transpose of a bmm with a batch above one and rank-3 views
+between attention tensors keep the `[B, L, C]` layout (`_spread_multihead`); equal-shape adds with a batch above one.
+
+Memory: HXFG runs operations in program order, and ExecuTorch emits every independent gather ahead of the operations that read them. `lowering._demand_order` re-schedules a graph by a depth-first walk from its outputs (each operation just before its first consumer) and keeps the result only when its estimated live peak is lower; graphs with persistent state, KV writes, RoPE, short convs, SDPA or scatter keep the emitted order. For the C-Fast stereo model at 224 x 288 this took the planned arena from 338 MiB to 133 MiB, and the column chunks to 83 MiB (see `examples/fastfoundationstereo/README.md`).
+
+Native limits that the rewritten graphs hit (set in `hexecutor/native/tensor/graph.h`/`graph.c`, not changed here):
+`HXFG_MAX_TENSORS` and `HXFG_MAX_OPS` are 1024, the arena is at most 16 MB, and a tensor dimension is at most
+4096. A stereo cost-volume model lowers to thousands of operations and hundreds of MB of activations, so it passes
+the AOT lowering and the numeric comparison on a host build with larger limits but not the standard preflight (the limits are compile-time settings now: see `graph.h`). The H*W of a rank-5 value is at most 4096; there is no zero-padded copy of a whole volume, so a volume of exactly 4096 pixels is accepted. Larger images need the pixel axis tiled (not implemented).
+
 ## Not supported (stay on the CPU)
 
 Broadcasts that stretch both operands, other pooling kinds, and every other operator not in the table. Also dynamic shapes, batch greater than one,
 and float results other than the bool/int intermediates above. Integer arithmetic, `dim=None` reductions, reductions and argmax/topk on a non-channel axis, and
 `keepdim=False` max/min. Transposed or grouped conv1d, and conv1d with output padding. Concatenation of constants, and reshapes that mix spatial and
-channel order. Convolutions or linear layers whose packed weights exceed the per-op HMX budget
-(`hxfg_writer.hmx_fits`) are rejected rather than split.
+channel order. Linear layers whose packed weights exceed the per-op HMX budget (`hxfg_writer.hmx_fits`) are rejected
+rather than split; dense 2D convolutions over the budget are split by `volume.py` when exported through
+`export_program`. Cumulative sums (`cumsum`) and per-pixel-batched `grid_sample` on runtime tensors have no form;
+`cumsum` of constants (positional tables) is folded into a buffer whenever the rewrite runs.
 
 ## Layout contract
 

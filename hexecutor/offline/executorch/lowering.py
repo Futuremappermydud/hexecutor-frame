@@ -65,6 +65,7 @@ KINDS = {
     "clone.default": "reshape",
     "_clone_dim_order.default": "reshape",
     "alias_copy.default": "reshape",
+    "alias.default": "reshape",  # the pre-edge spelling the partitioner judges before the edge conversion
     # Casts of a constant (ExecuTorch wraps scalar operands in a rank-0 tensor plus a dim-order copy)
     # fold into their consumer; a cast of a runtime tensor is kind "cast" (kind_of tells them apart).
     "_to_copy.default": "constcast",
@@ -619,8 +620,8 @@ def _binary_plan(node, ep, data=False):
     if len(sa) != len(sb):
         raise Unsupported("operands of different rank")
 
-    def fits(small, big):  # every dim of small is big's or one; batch is one
-        return len(small) == len(big) and small[0] == 1 and all(
+    def fits(small, big):  # every dim of small is big's or one; batch is one (or the shapes are equal)
+        return len(small) == len(big) and (small[0] == 1 or small == big) and all(
             s in (1, o) for s, o in zip(small, big)
         )
 
@@ -878,6 +879,13 @@ def token_view(node):
         if isinstance(src, torch.fx.Node) and (token_view(src) or ("",))[0] == "unflat":
             return "unflat_tail", src.args[0]
     return None
+
+
+def _channel_preserving(ishape, oshape):
+    """A reshape between batch-one rank-4 tensors that keeps dim 1 (channels): a copy of the HWC pixel
+    sequence, exact because both sides read the pixels row-major and the channel vector is unchanged."""
+    return (len(ishape) == 4 and len(oshape) == 4 and ishape[0] == 1 and oshape[0] == 1
+            and ishape[1] == oshape[1] and ishape[2] * ishape[3] == oshape[2] * oshape[3])
 
 
 def _rowmajor_reshape(node):
@@ -1940,7 +1948,8 @@ def check(kind, node, ep):
         hwc_of(out, node.name)
         # A spatial source is flattened in NCHW order into a temporary of N channels.
         if (src[:2] != [1, 1] and src[0] * src[1] * src[2] > MAX_CHANNELS
-                and src != hwc_of(out, node.name) and not _rowmajor_reshape(node)):
+                and src != hwc_of(out, node.name) and not _rowmajor_reshape(node)
+                and not _channel_preserving(ishape, out)):
             raise Unsupported("reshape flattens more elements than the channel limit")
     elif kind == "transpose":
         x = args[0]
@@ -1948,7 +1957,14 @@ def check(kind, node, ep):
         hwc_of(ishape, x.name)
         hwc_of(out, node.name)
         if len(ishape) in (2, 3):
-            _token_transpose_p(node, False, False)  # rank 2 / batch-one rank 3: a swap of two token axes
+            try:
+                _token_transpose_p(node, False, False)  # rank 2 / batch-one rank 3: a swap of two token axes
+            except Unsupported:
+                # An attention tensor [B, L, C] with a batch above one (the key transpose of a bmm).
+                if not (len(ishape) == 3 and node.users
+                        and all(kind_name(u) == "bmm" for u in node.users)):
+                    raise
+                _token_transpose_p(node, True, True)
         elif _transpose_p(node) is None:
             raise Unsupported("permute must be rank 4, batch-one, with perm (0, a, b, c)")
         if tuple(ishape[i] for i in _perm(node)) != out:
@@ -2386,7 +2402,8 @@ def _emit_reshape(b, node, x):
     dst = hwc_of(static_shape(node), node.name)
     src_rm = len(static_shape(x)) <= 3 or b.canon(x) in b.multihead_names
     dst_rm = len(static_shape(node)) <= 3 or b.canon(node) in b.multihead_names
-    if src == dst or (src[:2] == [1, 1] and dst[:2] == [1, 1]) or (src_rm and dst_rm):
+    if (src == dst or (src[:2] == [1, 1] and dst[:2] == [1, 1]) or (src_rm and dst_rm)
+            or _channel_preserving(static_shape(x), static_shape(node))):
         b.emit(hx.RESHAPE, b.tid(x), NONE, node, [0])
         return
     n = src[0] * src[1] * src[2]
@@ -2895,6 +2912,17 @@ def _emit_index_select(b, ep, node, x_arg, dim_arg, idx_arg):
         x_const = None
     xshape = static_shape(x_arg)
     dim_arg = dim_arg + len(xshape) if dim_arg < 0 else dim_arg
+    if len(xshape) == 4 and dim_arg == 2 and idx_const is not None and x_const is None:
+        # Rows of a [1, C, H, W] map. HX_GATHER's row form reads one channel vector per output pixel, so the
+        # rows go through a pixel gather over the flattened (h, w) list: pixel (r, x) reads (index[r], x).
+        w_pix = int(xshape[3])
+        rows = idx_const.reshape(-1).astype(np.int64)
+        flat = (rows[:, None] * w_pix + np.arange(w_pix)[None, :]).reshape(-1).astype(np.int32)
+        off = b.pool.emit(flat, "<i4")
+        b.emit(hx.GATHER, b.tid(x_arg), NONE, node,
+               [2, 0, int(xshape[2]) * w_pix, 0, 0, 0, 0, 0, off, flat.size])
+        b.record(node, op_name(node.target))
+        return
     if len(xshape) == 4:
         if dim_arg == 1:
             hwc_axis = 2
@@ -2974,7 +3002,14 @@ def _concat_axis(rank, dim, multihead=False):
     return {1: 2, 2: 0, 3: 1}[dim]
 
 
-def _spread_multihead(ep, names):
+def b_canon(node, aliases):
+    name = node.name
+    while aliases and name in aliases:
+        name = aliases[name]
+    return name
+
+
+def _spread_multihead(ep, names, aliases=None):
     """Extend the attention (multi-head) layout through rank-3 elementwise operations between two attention
     tensors (the score scale, the mask add, the softmax): those keep [B, L, K] rather than the token layout
     [B * L, 1, K], so they must agree with the bmm that reads or writes them. Only unary-like operations
@@ -2992,6 +3027,21 @@ def _spread_multihead(ep, names):
                            for a in node.args[1:])):
                 continue
             a, c = x.name, node.name
+            if (a in names) != (c in names):
+                names.add(a if c in names else c)
+                changed = True
+        # Attention tensors keep [B, L, C] through a rank-3 view or a swap of L and C (the key transpose of a
+        # bmm with a batch above one): rank-3 to rank-3 with a batch above one on either side.
+        for node in ep.graph.nodes:
+            if node.op != "call_function" or kind_name(node) not in ("reshape", "transpose"):
+                continue
+            x = node.args[0]
+            if not isinstance(x, torch.fx.Node) or x.op != "call_function" or _is_constant(ep, x):
+                continue
+            sx, sn = static_shape(x), static_shape(node)
+            if len(sx) != 3 or len(sn) != 3 or (sx[0] == 1 and sn[0] == 1):
+                continue
+            a, c = b_canon(x, aliases), b_canon(node, aliases)
             if (a in names) != (c in names):
                 names.add(a if c in names else c)
                 changed = True
@@ -3032,6 +3082,79 @@ def _by_component(ops):
     return [op for key in order for op in groups[key]]
 
 
+def _op_inputs(op):
+    """Tensor ids an op reads (x, y, z; a convolution's z is a dilation code)."""
+    z = NONE if op[0] in (hx.CONV, hx.DEPTHWISE, hx.MAXPOOL, hx.AVGPOOL) else op[3]
+    ids = [op[1], op[2], z]
+    if op[0] == hx.SDPA and len(op) > 5 and op[5] != NONE:
+        ids.append(op[5])
+    return [t for t in ids if t != NONE]
+
+
+def _live_peak(ops, size, outputs):
+    """Peak of the summed sizes of live tensors when `ops` run in order (inputs live from the start, a tensor
+    dies after its last reader; graph outputs live to the end). An estimate of the planner's arena."""
+    last = {}
+    for j, op in enumerate(ops):
+        for t in _op_inputs(op):
+            last[t] = j
+    for t in outputs:
+        last[t] = len(ops)
+    live, cur, peak = {}, 0, 0
+    produced = {op[4] for op in ops}
+    for t in {t for op in ops for t in _op_inputs(op)} - produced:
+        live[t] = size(t)  # graph inputs
+        cur += live[t]
+    peak = cur
+    for j, op in enumerate(ops):
+        if op[4] not in live:
+            live[op[4]] = size(op[4])
+            cur += live[op[4]]
+        peak = max(peak, cur)
+        for t in [t for t in live if last.get(t, -1) <= j and t != op[4]]:
+            cur -= live.pop(t)
+        if last.get(op[4], -1) <= j:
+            cur -= live.pop(op[4], 0)
+    return peak
+
+
+def _demand_order(ops, outputs, size, persistent=False):
+    """Run each operation just before its first consumer instead of in the order ExecuTorch emitted it.
+
+    A tap gather that only one convolution reads would otherwise sit materialised for the whole run of
+    gathers ahead of it (sixteen 16 MB tensors for one 4x4x4 transposed convolution). Operations are emitted
+    by a depth-first walk from the graph outputs, inputs in operand order. The new order is used only when
+    its estimated live peak is lower; graphs with persistent state, in-place scatter or operations that name
+    tensors in p[] keep their order."""
+    if persistent or any(op[0] in (hx.ROPE, hx.SHORTCONV, hx.KV_WRITE, hx.SDPA, hx.SCATTER_ND) for op in ops):
+        return ops
+    producer = {}
+    for i, op in enumerate(ops):
+        if op[4] in producer:
+            return ops  # a tensor written twice: order matters
+        producer[op[4]] = i
+    done, order = set(), []
+    roots = [producer[t] for t in outputs if t in producer] + list(range(len(ops)))
+    for root in roots:
+        if root in done:
+            continue
+        stack = [(root, iter(_op_inputs(ops[root])))]
+        done.add(root)
+        while stack:
+            i, it = stack[-1]
+            for t in it:
+                j = producer.get(t)
+                if j is not None and j not in done:
+                    done.add(j)
+                    stack.append((j, iter(_op_inputs(ops[j]))))
+                    break
+            else:
+                order.append(i)
+                stack.pop()
+    new = [ops[i] for i in order]
+    return new if _live_peak(new, size, outputs) < _live_peak(ops, size, outputs) else ops
+
+
 def lower_program(ep, destination):
     """Lower a delegated edge-dialect partition.
 
@@ -3053,7 +3176,7 @@ def lower_program(ep, destination):
                 for a in node.all_input_nodes:
                     b.multihead_names.add(b.canon(a))
                 b.multihead_names.add(b.canon(node))
-    _spread_multihead(ep, b.multihead_names)
+    _spread_multihead(ep, b.multihead_names, b.alias)
 
     graph_inputs = [
         n for n in ep.graph.nodes if n.op == "placeholder" and not _is_constant(ep, n)
@@ -3481,6 +3604,7 @@ def lower_program(ep, destination):
     }
     manifest["extra"] = {"state_names": {str(k): v for k, v in sorted(b.state_names.items())}}
     b.ops = _by_component(b.ops)
+    b.ops = _demand_order(b.ops, out_ids, lambda i: hwc(i)[0] * hwc(i)[1] * stride(i) * 4, bool(b.persistent))
     result = hx.write(b.ops, input_ids, out_ids, hwc, stride, b.pool, Path(destination), manifest,
                       dtypes=b.dtypes.get, persistent=b.persistent)
     image = Path(destination).with_suffix(".hxfg").read_bytes()
