@@ -79,7 +79,7 @@ clean:
 
 # Standalone live camera/hand inspector. Build from depth-runtime/; private model and
 # matching DSP paths are supplied at launch, never copied into the executable.
-HAND_NATIVE_BUILD ?= ../build
+HAND_NATIVE_BUILD ?= ../build-hand-viewer
 .PHONY: hand-viewer-host hand-viewer
 hand-viewer-host:
 	cmake -S .. -B $(HAND_NATIVE_BUILD) -DCMAKE_BUILD_TYPE=Release

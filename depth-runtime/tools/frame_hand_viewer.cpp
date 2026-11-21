@@ -50,7 +50,7 @@ Options parse(int argc,char** argv) {
         else if (arg=="--seconds") result.seconds=number(value(),86400);
         else if (arg=="--max-frames") result.max_frames=number(value(),1000000);
         else if (arg=="--precise") result.artifacts.tensor_hmx=false;
-        else if (arg=="--help") {
+        else if (arg=="--help" || arg=="-h") {
             std::cout << "frame_hand_viewer --models DIR --loader ELF --engine ELF --bootstrap ELF --chunk-probe ELF\n"
                          "frame_hand_viewer --mercury-dir DIR --loader ELF --engine ELF --bootstrap ELF --chunk-probe ELF\n"
                          "frame_hand_viewer --broker SOCKET   (hexecutord with graphs palm and landmark)\n"

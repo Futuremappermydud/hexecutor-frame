@@ -2,25 +2,6 @@
 # Frame's compositor must keep the native-size IMX616 buffers producing frames.
 # This is a launch prerequisite; the viewer itself uses only OpenXR and Vulkan.
 set -euo pipefail
-vrcmd=/opt/steamvr/bin/linuxarm64/vrcmd
-policy=camera.autoLowerPassthroughResolution
-previous=$("$vrcmd" --settings-int "$policy")
-previous=${previous##*=}
-if [[ ! "$previous" =~ ^[0-9]+$ ]]; then
-    echo 'Cannot read compositor camera resolution policy' >&2
-    exit 1
-fi
-restore() { "$vrcmd" --set-settings-int "$policy" "$previous" >/dev/null; }
-trap restore EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-"$vrcmd" --set-settings-int "$policy" 0 >/dev/null
-current=$("$vrcmd" --settings-int "$policy")
-if [[ "${current##*=}" != 0 ]]; then
-    echo 'Cannot keep compositor camera buffers at native resolution' >&2
-    exit 1
-fi
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNTIME_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 APP_ROOT="$(cd "$RUNTIME_DIR/.." && pwd)"
@@ -93,4 +74,45 @@ if ! has_arg "--chunk-probe" "$@" && [[ -n "$DEFAULT_CHUNK_PROBE" ]]; then
 fi
 
 cd "$RUNTIME_DIR"
-OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}" exec ./bin/frame_hand_viewer "${extra_args[@]}" "$@"
+if has_arg --help "$@" || has_arg -h "$@"; then
+    exec ./bin/frame_hand_viewer "$@"
+fi
+if [[ $(sysctl -n kernel.yama.ptrace_scope) != 0 ]]; then
+    echo 'Hand capture needs kernel.yama.ptrace_scope=0; run scripts/setup_frame.sh from the Mac after boot.' >&2
+    exit 1
+fi
+
+vrcmd=/opt/steamvr/bin/linuxarm64/vrcmd
+policy=camera.autoLowerPassthroughResolution
+previous=$("$vrcmd" --settings-int "$policy")
+previous=${previous##*=}
+if [[ ! "$previous" =~ ^[0-9]+$ ]]; then
+    echo 'Cannot read compositor camera resolution policy' >&2
+    exit 1
+fi
+restore() { "$vrcmd" --set-settings-int "$policy" "$previous" >/dev/null; }
+trap restore EXIT
+viewer_pid=
+stop_requested=0
+stop_viewer() {
+    stop_requested=1
+    if [[ -n "$viewer_pid" ]]; then kill -TERM "$viewer_pid" 2>/dev/null || true; fi
+}
+trap stop_viewer INT TERM
+"$vrcmd" --set-settings-int "$policy" 0 >/dev/null
+current=$("$vrcmd" --settings-int "$policy")
+if [[ "${current##*=}" != 0 ]]; then
+    echo 'Cannot keep compositor camera buffers at native resolution' >&2
+    exit 1
+fi
+
+if (( stop_requested )); then exit 130; fi
+OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}" ./bin/frame_hand_viewer ${extra_args[@]+"${extra_args[@]}"} "$@" &
+viewer_pid=$!
+if (( stop_requested )); then stop_viewer; fi
+while :; do
+    status=0
+    wait "$viewer_pid" || status=$?
+    if ! kill -0 "$viewer_pid" 2>/dev/null; then break; fi
+done
+exit "$status"

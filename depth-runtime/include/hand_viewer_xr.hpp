@@ -2,6 +2,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 struct HandSkeleton {
@@ -17,6 +18,8 @@ struct HandScene {
     // true: joints are in the OpenXR LOCAL space (world-locked at capture
     // time). false: joints are in head/VIEW space and follow the display pose.
     bool local_space = true;
+    std::array<std::string, 3> hud{};
+    std::array<uint8_t, 3> hud_color{110, 215, 255};
 };
 
 struct HeadPose {
@@ -30,12 +33,14 @@ class HandViewerXr {
 public:
     HandViewerXr();
     ~HandViewerXr();
-    void initialize();
+    void initialize(const char* app_name = "Frame Hand Joints");
     bool pollEvents();
     bool active() const;
+    bool capturePoseSupported() const;
+    uint64_t referenceSpaceChanges() const;
     // Headset (VIEW) pose in LOCAL at a CLOCK_MONOTONIC time. Safe to call from
     // a worker thread while the render loop runs. False when unavailable.
-    bool headPoseAt(uint64_t monotonic_ns, HeadPose& pose) const;
+    bool headPoseAt(uint64_t monotonic_ns, HeadPose& pose, bool require_tracked = false) const;
     void render(const HandScene& scene);
 private:
     struct Impl;

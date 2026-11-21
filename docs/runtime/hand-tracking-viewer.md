@@ -47,6 +47,8 @@ make nir-hand-viewer NIR_ORT=/home/steamos/nirhands-viewer/ort OPENXR_INCLUDE=/p
 make nir-hand-viewer-host
 ```
 
+The color viewer requires Eigen 3.3 or newer for Mercury. If CMake cannot find an installed Eigen package, pass `MERCURY_EIGEN_INCLUDE=/path/to/eigen` to Make or `-DMERCURY_EIGEN_INCLUDE=/path/to/eigen` to CMake.
+
 `make hand-viewer-host` builds `libhand_tracking_host.a`, `libmercury_executor_networks.a`, `libmercury_hand_tracking.a`, and `libhexecutor_host.a`. `make nir-hand-viewer-host` builds `libhexecutor_host.a`. Hand shaders are compiled with `glslc` if available, or fall back to precompiled `.spv` shaders if `glslc` is absent.
 
 ### Using CMake
@@ -54,22 +56,22 @@ make nir-hand-viewer-host
 From repository root:
 
 ```sh
-cmake -B build -DFRAME_BUILD_TESTS=ON
-cmake --build build --target frame_hand_viewer --parallel
+cmake -S depth-runtime -B build-runtime -DOPENXR_INCLUDE=/path/to/openxr-sdk/include
+cmake --build build-runtime --target frame_hand_viewer --parallel
 ```
 
 When `NIR_ORT` is set (or detected at `samples/hand-tracking/.work/ort/...`), `frame_nir_hand_viewer` is also enabled:
 
 ```sh
-cmake -B build -DFRAME_BUILD_TESTS=ON -DNIR_ORT=/home/steamos/nirhands-viewer/ort
-cmake --build build --target frame_nir_hand_viewer --parallel
+cmake -S depth-runtime -B build-runtime -DOPENXR_INCLUDE=/path/to/openxr-sdk/include -DNIR_ORT=/home/steamos/nirhands-viewer/ort
+cmake --build build-runtime --target frame_nir_hand_viewer --parallel
 ```
 
 OpenXR headers are auto-detected from `samples/hand-tracking/.work/openxr-sdk/include` or `$OPENXR_INCLUDE`. The OpenXR loader is supplied by SteamVR at `/opt/steamvr/bin/linuxarm64`.
 
 ## Run
 
-SteamVR must be awake and publishing compositor color buffers. Follow [camera prerequisites](cameras.md) and the [hand model/session prerequisites](../model-development/hand-tracking.md). Do not open claimed physical sensor devices.
+SteamVR must be awake and publishing compositor color buffers. After a Frame reboot, run `scripts/setup_frame.sh` from the Mac to prepare compositor camera access. Follow [camera prerequisites](cameras.md) and the [hand model/session prerequisites](../model-development/hand-tracking.md). Do not open claimed physical sensor devices.
 
 ### Launching locally on Frame
 
@@ -120,7 +122,7 @@ For the stereo NIR tracking camera viewer, run from `depth-runtime/` in an SSH t
 ./scripts/view_hands.sh --nir
 ```
 
-The `--nir` flag switches the remote target to `run_nir_hand_viewer.sh` and automatically directs `FRAME_REMOTE_DIR` to `/home/steamos/nirhands-npu` (or `/home/steamos/frame-spatial-runtime`). Set `FRAME_HOST` (default `frame`) as needed. Ctrl-C requests an orderly stop through the SSH terminal. SIGTERM also drains current inference and explicitly closes the DSP session.
+The `--nir` flag switches the remote target to `run_nir_hand_viewer.sh` and automatically directs `FRAME_REMOTE_DIR` to `/home/steamos/nirhands-npu` (or `/home/steamos/frame-spatial-runtime`). The color launcher prefers the current `depth-runtime/` installation and can use older installed layouts. Set `FRAME_HOST` (default `frame`) or `FRAME_REMOTE_DIR` as needed. Ctrl-C requests an orderly stop through the SSH terminal. SIGTERM also drains current inference and explicitly closes the DSP session.
 
 `--fps N` caps capture/tracking at 1–60 Hz (default 60), independently of OpenXR cadence; unchanged camera frames are skipped. `--precise` selects DSP float32 comparison arithmetic. `--seconds N` bounds process lifetime and `--max-frames N` bounds processed camera frames for validation.
 

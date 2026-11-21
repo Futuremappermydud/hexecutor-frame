@@ -14,6 +14,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -41,7 +42,7 @@ std::vector<uint32_t> spirv(const std::string& name) {
         file.seekg(0); file.read(reinterpret_cast<char*>(code.data()), std::streamsize(size));
         if (file) return code;
     }
-    throw std::runtime_error("missing shader "+name+" (run make hand-viewer from depth-runtime/)");
+    throw std::runtime_error("missing shader "+name+" (build the viewer from depth-runtime/)");
 }
 
 struct Vertex { float position[3]; float normal[3]; uint32_t rgba; };
@@ -83,6 +84,36 @@ std::vector<Vec3> unitSphere() {
 constexpr size_t kSphereVertices=size_t(kSphereSlices)*(kSphereStacks-1)*2*3;
 constexpr size_t kCylinderVertices=size_t(kCylinderSides)*6;
 constexpr size_t kVerticesPerHand=26*kSphereVertices+25*kCylinderVertices;
+constexpr size_t kHudColumns=44, kHudLines=3;
+constexpr size_t kHudVertices=12+kHudLines*kHudColumns*5*7*6;
+
+std::array<uint8_t, 5> hudGlyph(char ch) {
+    // 5x7 ASCII columns, as used by the diagnostic OpenVR HUD.
+    constexpr std::array<uint8_t, 5> letters[]{
+        {0x7C,0x12,0x11,0x12,0x7C}, {0x7F,0x49,0x49,0x49,0x36}, {0x3E,0x41,0x41,0x41,0x22},
+        {0x7F,0x41,0x41,0x22,0x1C}, {0x7F,0x49,0x49,0x49,0x41}, {0x7F,0x09,0x09,0x09,0x01},
+        {0x3E,0x41,0x49,0x49,0x7A}, {0x7F,0x08,0x08,0x08,0x7F}, {0x00,0x41,0x7F,0x41,0x00},
+        {0x20,0x40,0x41,0x3F,0x01}, {0x7F,0x08,0x14,0x22,0x41}, {0x7F,0x40,0x40,0x40,0x40},
+        {0x7F,0x02,0x0C,0x02,0x7F}, {0x7F,0x04,0x08,0x10,0x7F}, {0x3E,0x41,0x41,0x41,0x3E},
+        {0x7F,0x09,0x09,0x09,0x06}, {0x3E,0x41,0x51,0x21,0x5E}, {0x7F,0x09,0x19,0x29,0x46},
+        {0x46,0x49,0x49,0x49,0x31}, {0x01,0x01,0x7F,0x01,0x01}, {0x3F,0x40,0x40,0x40,0x3F},
+        {0x1F,0x20,0x40,0x20,0x1F}, {0x3F,0x40,0x38,0x40,0x3F}, {0x63,0x14,0x08,0x14,0x63},
+        {0x07,0x08,0x70,0x08,0x07}, {0x61,0x51,0x49,0x45,0x43}};
+    constexpr std::array<uint8_t, 5> digits[]{
+        {0x3E,0x51,0x49,0x45,0x3E}, {0x00,0x42,0x7F,0x40,0x00}, {0x42,0x61,0x51,0x49,0x46},
+        {0x21,0x41,0x45,0x4B,0x31}, {0x18,0x14,0x12,0x7F,0x10}, {0x27,0x45,0x45,0x45,0x39},
+        {0x3C,0x4A,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03}, {0x36,0x49,0x49,0x49,0x36},
+        {0x06,0x49,0x49,0x29,0x1E}};
+    if (ch>='A' && ch<='Z') return letters[ch-'A'];
+    if (ch>='0' && ch<='9') return digits[ch-'0'];
+    switch (ch) {
+        case '+': return {0x08,0x08,0x3E,0x08,0x08};
+        case '-': return {0x08,0x08,0x08,0x08,0x08};
+        case '.': return {0,0x60,0x60,0,0};
+        case '/': return {0x20,0x10,0x08,0x04,0x02};
+        default: return {};
+    }
+}
 }
 
 struct HandViewerXr::Impl {
@@ -94,6 +125,8 @@ struct HandViewerXr::Impl {
     XrEnvironmentBlendMode blend = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
     PFN_xrConvertTimespecTimeToTimeKHR convertTime = nullptr;
     std::atomic<bool> running{false};  // also read by headPoseAt on the worker
+    mutable std::mutex capturePoseMutex;
+    uint64_t spaceChanges=0;
     VkInstance vk_instance = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
@@ -160,7 +193,7 @@ struct HandViewerXr::Impl {
             if ((bits&(1u<<i)) && (properties.memoryTypes[i].propertyFlags&flags)==flags) return i;
         throw std::runtime_error("no suitable Vulkan memory type");
     }
-    void createInstance() {
+    void createInstance(const char* appName) {
         uint32_t count=0;
         check(xrEnumerateInstanceExtensionProperties(nullptr,0,&count,nullptr),"xrEnumerateInstanceExtensionProperties");
         std::vector<XrExtensionProperties> available(count,{XR_TYPE_EXTENSION_PROPERTIES});
@@ -172,7 +205,7 @@ struct HandViewerXr::Impl {
         const bool timespec=has(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME);
         if (timespec) extensions.push_back(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME);
         XrInstanceCreateInfo info{XR_TYPE_INSTANCE_CREATE_INFO};
-        std::strcpy(info.applicationInfo.applicationName,"Frame Hand Joints");
+        std::strncpy(info.applicationInfo.applicationName,appName,sizeof(info.applicationInfo.applicationName)-1);
         info.applicationInfo.apiVersion = XR_MAKE_VERSION(1,0,0);
         info.enabledExtensionCount = uint32_t(extensions.size()); info.enabledExtensionNames = extensions.data();
         check(xrCreateInstance(&info,&instance),"xrCreateInstance");
@@ -181,13 +214,13 @@ struct HandViewerXr::Impl {
         XrSystemGetInfo get{XR_TYPE_SYSTEM_GET_INFO}; get.formFactor=XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
         check(xrGetSystem(instance,&get,&system),"xrGetSystem");
     }
-    void createDevice() {
+    void createDevice(const char* appName) {
         XrGraphicsRequirementsVulkan2KHR requirements{XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN2_KHR};
         check(proc<PFN_xrGetVulkanGraphicsRequirements2KHR>(instance,"xrGetVulkanGraphicsRequirements2KHR")(
             instance,system,&requirements),"xrGetVulkanGraphicsRequirements2KHR");
         const auto vkVersion=[](XrVersion v) { return VK_MAKE_API_VERSION(0,XR_VERSION_MAJOR(v),XR_VERSION_MINOR(v),XR_VERSION_PATCH(v)); };
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-        app.pApplicationName="Frame Hand Joints";
+        app.pApplicationName=appName;
         app.apiVersion=std::max(vkVersion(requirements.minApiVersionSupported),std::min(VK_API_VERSION_1_1,vkVersion(requirements.maxApiVersionSupported)));
         VkInstanceCreateInfo vi{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; vi.pApplicationInfo=&app;
         XrVulkanInstanceCreateInfoKHR xvi{XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR};
@@ -358,7 +391,7 @@ struct HandViewerXr::Impl {
             VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; fi.flags=VK_FENCE_CREATE_SIGNALED_BIT;
             check(vkCreateFence(device,&fi,nullptr,&f.fence),"vkCreateFence");
             VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-            bi.size=kMaxHands*kVerticesPerHand*sizeof(Vertex); bi.usage=VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+            bi.size=(kMaxHands*kVerticesPerHand+kHudVertices)*sizeof(Vertex); bi.usage=VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
             check(vkCreateBuffer(device,&bi,nullptr,&f.vertices),"vkCreateBuffer");
             VkMemoryRequirements needs{}; vkGetBufferMemoryRequirements(device,f.vertices,&needs);
             VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize=needs.size;
@@ -369,9 +402,9 @@ struct HandViewerXr::Impl {
             f.mapped=static_cast<Vertex*>(mapped);
         }
     }
-    void initialize() {
+    void initialize(const char* appName) {
         if (sphere.size()!=kSphereVertices) throw std::runtime_error("hand sphere template size");
-        createInstance(); createDevice(); createSession(); createRenderPass(); createPipeline(); createEyes(); createFrames();
+        createInstance(appName); createDevice(appName); createSession(); createRenderPass(); createPipeline(); createEyes(); createFrames();
         std::cout << "[Hand OpenXR] Session created, eyes " << eyes[0].width << 'x' << eyes[0].height
                   << (convertTime ? ", world-locked at capture time\n" : ", head-locked\n");
     }
@@ -380,6 +413,9 @@ struct HandViewerXr::Impl {
         XrResult result;
         while ((result=xrPollEvent(instance,&event))==XR_SUCCESS) {
             if (event.type==XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) return false;
+            if (event.type==XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING &&
+                reinterpret_cast<XrEventDataReferenceSpaceChangePending*>(&event)->referenceSpaceType==XR_REFERENCE_SPACE_TYPE_LOCAL)
+                ++spaceChanges;
             if (event.type==XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
                 state=reinterpret_cast<XrEventDataSessionStateChanged*>(&event)->state;
                 std::cout << "[Hand OpenXR] state=" << state << '\n';
@@ -387,7 +423,10 @@ struct HandViewerXr::Impl {
                     XrSessionBeginInfo begin{XR_TYPE_SESSION_BEGIN_INFO}; begin.primaryViewConfigurationType=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                     check(xrBeginSession(session,&begin),"xrBeginSession"); running=true;
                 } else if (state==XR_SESSION_STATE_STOPPING && running) {
-                    check(xrEndSession(session),"xrEndSession"); running=false;
+                    running=false;
+                    const std::lock_guard<std::mutex> lock(capturePoseMutex);
+                    check(xrEndSession(session),"xrEndSession");
+                    ++spaceChanges;
                 } else if (state==XR_SESSION_STATE_EXITING || state==XR_SESSION_STATE_LOSS_PENDING) return false;
             }
             event={XR_TYPE_EVENT_DATA_BUFFER};
@@ -395,18 +434,20 @@ struct HandViewerXr::Impl {
         if (result!=XR_EVENT_UNAVAILABLE) check(result,"xrPollEvent");
         return true;
     }
-    bool locate(XrTime time, XrPosef& pose) const {
+    bool locate(XrTime time, XrPosef& pose, bool requireTracked=false) const {
         XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
         if (XR_FAILED(xrLocateSpace(view,local,time,&location))) return false;
-        const XrSpaceLocationFlags required=XR_SPACE_LOCATION_POSITION_VALID_BIT|XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+        XrSpaceLocationFlags required=XR_SPACE_LOCATION_POSITION_VALID_BIT|XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+        if (requireTracked) required|=XR_SPACE_LOCATION_POSITION_TRACKED_BIT|XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
         if ((location.locationFlags&required)!=required) return false;
         pose=location.pose; return true;
     }
-    bool headPoseAt(uint64_t ns, HeadPose& out) const {
+    bool headPoseAt(uint64_t ns, HeadPose& out, bool requireTracked) const {
+        const std::lock_guard<std::mutex> lock(capturePoseMutex);
         if (!convertTime || !running) return false;
         timespec when{}; when.tv_sec=time_t(ns/1000000000ull); when.tv_nsec=long(ns%1000000000ull);
         XrTime time=0; XrPosef pose{};
-        if (XR_FAILED(convertTime(instance,&when,&time)) || !locate(time,pose)) return false;
+        if (XR_FAILED(convertTime(instance,&when,&time)) || !locate(time,pose,requireTracked)) return false;
         out.orientation={pose.orientation.x,pose.orientation.y,pose.orientation.z,pose.orientation.w};
         out.position={pose.position.x,pose.position.y,pose.position.z};
         return true;
@@ -420,6 +461,36 @@ struct HandViewerXr::Impl {
             auto& v=out[n++];
             std::memcpy(v.position,p.data(),12); std::memcpy(v.normal,normal.data(),12); v.rgba=color;
         };
+        if (!scene.hud.front().empty()) {
+            if (scene.local_space && !locate(display,head)) return 0;
+            const auto orientation=head.orientation;
+            const Vec3 eye{head.position.x,head.position.y,head.position.z};
+            const Vec3 normal=rotate(orientation,{0,0,1});
+            auto quad=[&](float x, float y, float width, float height, float z, uint32_t color) {
+                const Vec3 a=eye+rotate(orientation,{x,y,z}), b=eye+rotate(orientation,{x+width,y,z});
+                const Vec3 c=eye+rotate(orientation,{x+width,y-height,z}), d=eye+rotate(orientation,{x,y-height,z});
+                emit(a,normal,color); emit(b,normal,color); emit(c,normal,color);
+                emit(a,normal,color); emit(c,normal,color); emit(d,normal,color);
+            };
+            const auto& rgb=scene.hud_color;
+            const uint32_t accent=rgba(rgb[0],rgb[1],rgb[2]);
+            quad(-.32f,-.14f,.64f,.118f,-1.005f,rgba(17,25,34));
+            quad(-.32f,-.14f,.005f,.118f,-1.f,accent);
+            for (size_t line=0; line<scene.hud.size(); ++line) {
+                const float pixel=line==0?.0028f:.0021f;
+                const float top=-.155f-float(line)*.034f;
+                const auto& message=scene.hud[line];
+                const size_t columns=line==0?35:kHudColumns;
+                for (size_t i=0; i<std::min(message.size(),columns); ++i) {
+                    const auto glyph=hudGlyph(message[i]);
+                    for (size_t col=0; col<glyph.size(); ++col)
+                        for (int row=0; row<7; ++row)
+                            if (glyph[col]&(1u<<row))
+                                quad(-.296f+float(i*6+col)*pixel,top-float(row)*pixel,pixel,pixel,-1.f,
+                                     line==0?accent:rgba(233,241,248));
+                }
+            }
+        }
         const size_t count=std::min(scene.hands.size(),size_t(kMaxHands));
         for (size_t h=0;h<count;++h) {
             const auto& hand=scene.hands[h];
@@ -542,8 +613,12 @@ struct HandViewerXr::Impl {
 };
 HandViewerXr::HandViewerXr() : impl_(std::make_unique<Impl>()) {}
 HandViewerXr::~HandViewerXr()=default;
-void HandViewerXr::initialize() { impl_->initialize(); }
+void HandViewerXr::initialize(const char* appName) { impl_->initialize(appName); }
 bool HandViewerXr::pollEvents() { return impl_->poll(); }
 bool HandViewerXr::active() const { return impl_->running && (impl_->state==XR_SESSION_STATE_VISIBLE || impl_->state==XR_SESSION_STATE_FOCUSED); }
-bool HandViewerXr::headPoseAt(uint64_t ns, HeadPose& pose) const { return impl_->headPoseAt(ns,pose); }
+bool HandViewerXr::capturePoseSupported() const { return impl_->convertTime != nullptr; }
+uint64_t HandViewerXr::referenceSpaceChanges() const { return impl_->spaceChanges; }
+bool HandViewerXr::headPoseAt(uint64_t ns, HeadPose& pose, bool requireTracked) const {
+    return impl_->headPoseAt(ns,pose,requireTracked);
+}
 void HandViewerXr::render(const HandScene& scene) { impl_->render(scene); }

@@ -17,20 +17,23 @@ for argument in "$@"; do
     fi
 done
 
-if [ -z "$remote_dir" ]; then
-    if [[ "$is_nir" == "true" ]]; then
-        if ssh "$host" 'test -d /home/steamos/nirhands-npu/depth-runtime || test -d /home/steamos/nirhands-npu/runtime'; then
-            remote_dir="/home/steamos/nirhands-npu"
-        else
-            remote_dir="/home/steamos/frame-spatial-runtime"
-        fi
-    elif ssh "$host" 'test -d /home/steamos/hexecutor-hand-viewer/depth-runtime || test -d /home/steamos/hexecutor-hand-viewer/runtime'; then
-        remote_dir="/home/steamos/hexecutor-hand-viewer"
-    else
-        remote_dir="/home/steamos/frame-spatial-runtime"
-    fi
+quote() { printf "'%s'" "${1//\'/\\\'\'}"; }
+runtime_candidates=()
+if [[ -n "$remote_dir" ]]; then
+    runtime_candidates+=("$remote_dir/depth-runtime" "$remote_dir/runtime")
+elif [[ "$is_nir" == "true" ]]; then
+    runtime_candidates+=(/home/steamos/nirhands-npu/{depth-runtime,runtime}
+                        /home/steamos/frame-spatial-runtime/{depth-runtime,runtime})
+else
+    runtime_candidates+=(/home/steamos/frame-spatial-runtime/depth-runtime
+                        /home/steamos/hexecutor-hand-viewer/{depth-runtime,runtime}
+                        /home/steamos/frame-spatial-runtime/runtime)
 fi
-quote() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
-command="if test -d $(quote "$remote_dir/depth-runtime"); then cd $(quote "$remote_dir/depth-runtime"); else cd $(quote "$remote_dir/runtime"); fi && exec $script"
-for argument in "${args[@]}"; do command+=" $(quote "$argument")"; done
+viewer=frame_hand_viewer
+if [[ "$is_nir" == "true" ]]; then viewer=frame_nir_hand_viewer; fi
+command="for runtime in"
+for candidate in "${runtime_candidates[@]}"; do command+=" $(quote "$candidate")"; done
+command+="; do if test -x \"\$runtime/$script\" && test -x \"\$runtime/bin/$viewer\"; then cd \"\$runtime\" && exec $script"
+for argument in ${args[@]+"${args[@]}"}; do command+=" $(quote "$argument")"; done
+command+="; fi; done; echo 'No installed $viewer found on Frame.' >&2; exit 1"
 exec ssh -t "$host" "$command"
