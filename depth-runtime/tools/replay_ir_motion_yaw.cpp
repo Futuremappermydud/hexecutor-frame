@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -188,13 +189,20 @@ std::vector<std::uint8_t> readRaw(const std::string& path) {
     return data;
 }
 
+std::string referencePath(const std::filesystem::path& problemDirectory, const std::string& path) {
+    const std::filesystem::path reference(path);
+    if (!reference.is_relative()) return path;
+    const auto relativeToProblem = problemDirectory / reference;
+    return std::filesystem::exists(relativeToProblem) ? relativeToProblem.string() : path;
+}
+
 void writeSamples(const std::string& path, const std::vector<FrameSpatial::MotionYaw::Sample>& samples) {
     std::FILE* out = std::fopen(path.c_str(), "w");
     if (!out) fail("cannot write " + path);
-    std::fprintf(out, "i,t_s,u,v,distance,expected,d0,d1,s0,sweep_score\n");
+    std::fprintf(out, "i,t_s,u,v,distance,expected,d0,d1,s0,sweep_score,dy0\n");
     for (const auto& s : samples) {
-        std::fprintf(out, "%d,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g\n", s.i, s.tS, s.u, s.v,
-                     s.distance, s.expected, s.d0, s.d1, s.s0, s.sweepScore);
+        std::fprintf(out, "%d,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g\n", s.i, s.tS, s.u, s.v,
+                     s.distance, s.expected, s.d0, s.d1, s.s0, s.sweepScore, s.dy0);
     }
     if (std::fclose(out) != 0) fail("error closing " + path);
 }
@@ -221,8 +229,10 @@ int main(int argc, char** argv) {
     try {
         ParsedProblem parsed = readProblem(argv[1]);
         const Problem& problem = parsed.problem;
-        const auto loader = [&parsed](std::size_t index, bool right) {
-            return readRaw(right ? parsed.rightPaths[index] : parsed.leftPaths[index]);
+        const auto directory = std::filesystem::absolute(argv[1]).parent_path();
+        const auto loader = [&parsed, &directory](std::size_t index, bool right) {
+            const auto& path = right ? parsed.rightPaths[index] : parsed.leftPaths[index];
+            return readRaw(referencePath(directory, path));
         };
         const auto result = FrameSpatial::MotionYaw::runMotionYaw(problem, loader);
         writeSamples(argv[2], result.samples);

@@ -204,6 +204,24 @@ target_compile_options(frame_hand_viewer PRIVATE -O3 -Wall -Wextra)
 set_target_properties(frame_hand_viewer PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set_property(TARGET frame_hand_viewer PROPERTY BUILD_RPATH "/opt/steamvr/bin/linuxarm64")
 
+add_executable(frame_yaw_viewer tools/frame_yaw_viewer.cpp src/yaw_scan.cpp src/hand_viewer_xr.cpp
+    src/ir_pair_capture.cpp src/v4l2_capture_clock.cpp ../samples/hand-tracking/nirhands/src/geometry.cpp)
+target_include_directories(frame_yaw_viewer PRIVATE ../samples/hand-tracking/nirhands/include)
+target_link_libraries(frame_yaw_viewer PRIVATE OpenMP::OpenMP_CXX openxr_loader pthread vulkan)
+target_compile_options(frame_yaw_viewer PRIVATE -O3 -Wall -Wextra -ffp-contract=off)
+set_target_properties(frame_yaw_viewer PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin" BUILD_RPATH "/opt/steamvr/bin/linuxarm64")
+
+add_executable(replay_ir_motion_yaw tools/replay_ir_motion_yaw.cpp)
+target_compile_options(replay_ir_motion_yaw PRIVATE -O3 -Wall -Wextra -ffp-contract=off)
+target_link_libraries(replay_ir_motion_yaw PRIVATE OpenMP::OpenMP_CXX)
+
+add_executable(fit_yaw_scan tools/fit_yaw_scan.cpp src/yaw_scan.cpp ../samples/hand-tracking/nirhands/src/geometry.cpp)
+target_include_directories(fit_yaw_scan PRIVATE ../samples/hand-tracking/nirhands/include)
+target_compile_options(fit_yaw_scan PRIVATE -O3 -Wall -Wextra -ffp-contract=off)
+set_target_properties(fit_yaw_scan PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+set_target_properties(replay_ir_motion_yaw PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
 find_program(GLSLC glslc)
 set(HAND_SHADER_OUTPUTS)
 foreach(SHADER_FILE hand_joints.vert hand_joints.frag)
@@ -222,6 +240,7 @@ endforeach()
 if(GLSLC)
     add_custom_target(hand_viewer_shaders ALL DEPENDS ${HAND_SHADER_OUTPUTS})
     add_dependencies(frame_hand_viewer hand_viewer_shaders)
+    add_dependencies(frame_yaw_viewer hand_viewer_shaders)
 endif()
 
 set(NIR_ORT "$ENV{NIR_ORT}" CACHE PATH "Path to ONNX Runtime directory for NIR viewer")

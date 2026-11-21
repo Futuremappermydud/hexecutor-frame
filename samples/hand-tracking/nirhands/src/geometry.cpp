@@ -151,9 +151,17 @@ Pose pose(const Json& d, double position_scale) {
     return p;
 }
 
-}  // namespace
+template<size_t N>
+std::array<double, N> numbers(const Json& a) {
+    if (a.type != Json::Array || a.array.size() != N)
+        throw std::runtime_error("calibration JSON: wrong array length");
+    std::array<double, N> out{};
+    for (size_t i = 0; i < N; ++i) out[i] = a.array[i].num();
+    return out;
+}
 
-Rig load_rig(const std::string& xrservice_json_path, const std::string& device_config_json_path) {
+Rig load(const std::string& xrservice_json_path, const std::string& device_config_json_path,
+         std::array<KbSplineCalibration, 2>* splines) {
     const Json cal = load_json(xrservice_json_path);
     const Json dev = load_json(device_config_json_path);
     std::map<std::string, const Json*> entries;
@@ -167,10 +175,14 @@ Rig load_rig(const std::string& xrservice_json_path, const std::string& device_c
     const Pose head_from_right = cad_from_head.inverse() * cad_from_right;
     Rig rig;
     for (const char* name : {"slam_left", "slam_right"}) {
+        const bool left = std::string(name) == "slam_left";
         const Json& e = *entries[name];
         const Json* kb = nullptr;
-        for (const auto& intr : e["intrinsics"].array)
+        const Json* spline = nullptr;
+        for (const auto& intr : e["intrinsics"].array) {
             if (intr["cameraModel"].string == "kb") kb = &intr;
+            if (intr["cameraModel"].string == "kb_spline") spline = &intr;
+        }
         if (!kb) throw std::runtime_error(std::string("no Kannala-Brandt intrinsics for ") + name);
         KbCamera cam;
         cam.fx = (*kb)["fx"].num(); cam.fy = (*kb)["fy"].num();
@@ -178,13 +190,38 @@ Rig load_rig(const std::string& xrservice_json_path, const std::string& device_c
         cam.k = {(*kb)["k1"].num(), (*kb)["k2"].num(), (*kb)["k3"].num(), (*kb)["k4"].num()};
         cam.width = int(e["width"].num());
         cam.height = int(e["height"].num());
-        const Pose right_from_cam = std::string(name) == "slam_right" ? Pose{} : right_from_left;
+        const Pose right_from_cam = left ? right_from_left : Pose{};
         const Pose cam_from_head = (head_from_right * right_from_cam).inverse();
         cam.R_cw = cam_from_head.R;
         cam.t_cw = cam_from_head.t;
-        (std::string(name) == "slam_left" ? rig.left : rig.right) = cam;
+        (left ? rig.left : rig.right) = cam;
+        if (splines) {
+            if (!spline || numbers<2>((*spline)["gridSize"]) != std::array<double, 2>{5, 5})
+                throw std::runtime_error(std::string("no 5x5 KB spline intrinsics for ") + name);
+            auto& out = (*splines)[left ? 0 : 1];
+            out.fx = (*spline)["fx"].num(); out.fy = (*spline)["fy"].num();
+            out.cx = (*spline)["cx"].num(); out.cy = (*spline)["cy"].num();
+            for (size_t i = 0; i < out.k.size(); ++i) {
+                const auto key = "k" + std::to_string(i + 1);
+                if (spline->has(key)) out.k[i] = (*spline)[key].num();
+            }
+            out.spacing = numbers<2>((*spline)["nodeSpacing"]);
+            out.sU = numbers<25>((*spline)["sU"]);
+            out.sV = numbers<25>((*spline)["sV"]);
+        }
     }
     return rig;
+}
+
+}  // namespace
+
+Rig load_rig(const std::string& xrservice_json_path, const std::string& device_config_json_path) {
+    return load(xrservice_json_path, device_config_json_path, nullptr);
+}
+
+Rig load_rig(const std::string& xrservice_json_path, const std::string& device_config_json_path,
+             std::array<KbSplineCalibration, 2>& splines) {
+    return load(xrservice_json_path, device_config_json_path, &splines);
 }
 
 }  // namespace nirhands

@@ -87,4 +87,15 @@ struct Rig {
 // OpenVR head frame (+x right, +y up, -z forward), so results go straight to the viewer.
 Rig load_rig(const std::string& xrservice_json_path, const std::string& device_config_json_path);
 
+struct KbSplineCalibration {
+    double fx = 0, fy = 0, cx = 0, cy = 0;
+    std::array<double, 4> k{};
+    std::array<double, 2> spacing{};
+    std::array<double, 25> sU{}, sV{};
+};
+
+// Also load the factory spline intrinsics, in left/right order.
+Rig load_rig(const std::string& xrservice_json_path, const std::string& device_config_json_path,
+             std::array<KbSplineCalibration, 2>& splines);
+
 }  // namespace nirhands

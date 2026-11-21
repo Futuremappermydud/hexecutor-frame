@@ -43,9 +43,18 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <tuple>
 #include <vector>
+
+// Point loops run in parallel when built with OpenMP. Each iteration writes only its own
+// output slot and results are gathered in point order, so the output is unchanged.
+#if defined(_OPENMP)
+#define FRAME_MOTION_YAW_PARALLEL_FOR _Pragma("omp parallel for schedule(dynamic)")
+#else
+#define FRAME_MOTION_YAW_PARALLEL_FOR
+#endif
 
 namespace FrameSpatial {
 namespace MotionYaw {
@@ -87,6 +96,9 @@ struct Problem {
 struct Sample {
     int i = 0;
     double tS = 0, u = 0, v = 0, distance = 0, expected = 0, d0 = 0, d1 = 0, s0 = 0, sweepScore = 0;
+    // Right-minus-left row offset of the rect0 stereo match, in grid pixels. NaN when the
+    // vertical search peaks at its edge. Not part of the Python reference.
+    double dy0 = std::numeric_limits<double>::quiet_NaN();
 };
 
 struct Summary {
@@ -333,6 +345,7 @@ inline SweepResult sweep(const std::vector<float>& reference, const std::vector<
     out.low.assign(points.size() * H, 0.);
     std::vector<double> distance(H);
     for (std::size_t h = 0; h < H; ++h) distance[h] = 1.0 / inverse[h];
+    FRAME_MOTION_YAW_PARALLEL_FOR
     for (std::size_t p = 0; p < points.size(); ++p) {
         const Template tpl = makeTemplate(reference, points[p], K);
         std::vector<double> sum(H, 0.), low(H, 0.);
@@ -495,10 +508,11 @@ inline Summary summarize(const std::vector<Sample>& samples) {
 
 // REF main() after the reference list is built: keyframe loop, partner choice, corners, sweep,
 // fine refinement, stereo search, acceptance, and the summary.
-inline RunResult runMotionYaw(const Problem& prob, const RawLoader& loadRaw) {
+inline RunResult runMotionYaw(const Problem& prob, const RawLoader& loadRaw,
+                              const std::function<bool()>& cancelled = {}) {
     using namespace detail;
     RunResult result;
-    if (prob.references.empty()) return result;
+    if (prob.references.empty() || (cancelled && cancelled())) return result;
     if (prob.keyframes <= 0) throw std::invalid_argument("keyframes must be positive");
     const std::size_t hypotheses = prob.inverse.size();
     if (hypotheses < 3) throw std::invalid_argument("at least three inverse hypotheses required");
@@ -529,6 +543,7 @@ inline RunResult runMotionYaw(const Problem& prob, const RawLoader& loadRaw) {
     };
 
     for (std::size_t i = 0; i < N; i += step) {
+        if (cancelled && cancelled()) return {};
         const Reference& Ri = refs[i];
         // Partner candidates: same time window, baseline in [0.06, 0.45] m, angle < 18 deg.
         std::vector<std::pair<double, std::size_t>> candidates;
@@ -617,9 +632,11 @@ inline RunResult runMotionYaw(const Problem& prob, const RawLoader& loadRaw) {
         const Remapped right0 = remapRaw(rawRight, mapRight0);
         const Remapped right1 = remapRaw(rawRight, mapRight1);
 
-        for (const auto& keptItem : kept) {
-            const std::size_t p = keptItem.first;
-            const std::size_t best = keptItem.second;
+        std::vector<std::optional<Sample>> accepted(kept.size());
+        FRAME_MOTION_YAW_PARALLEL_FOR
+        for (std::size_t keptIndex = 0; keptIndex < kept.size(); ++keptIndex) {
+            const std::size_t p = kept[keptIndex].first;
+            const std::size_t best = kept[keptIndex].second;
             // np.linspace(lo, hi, 21): fine[k] = k * step + lo, last point exactly hi.
             const double lo = prob.inverse[best - 1], hi = prob.inverse[best + 1];
             const double stepFine = (hi - lo) / 20.0;
@@ -686,6 +703,27 @@ inline RunResult runMotionYaw(const Problem& prob, const RawLoader& loadRaw) {
             const Stereo st1 = stereo(right1.image);
             if (!st0.ok || !st1.ok || st0.s < 0.85 || st0.s - st0.side < 0.1) continue;
 
+            // Vertical search at the horizontal match, for roll and pitch from rows alone.
+            constexpr int kRows = 4;
+            std::array<double, 2 * kRows + 1> rowScore{};
+            for (int r = 0; r <= 2 * kRows; ++r) {
+                std::array<double, kPatch> values{};
+                std::array<bool, kPatch> valid{};
+                for (int k = 0; k < kPatch; ++k) {
+                    bool ok = false;
+                    values[k] = sampleImage(right0.image, (points[p][0] + offsetU(k)) - st0.d,
+                                            points[p][1] + offsetV(k) + double(r - kRows), ok);
+                    valid[k] = ok;
+                }
+                rowScore[r] = warpedNcc(tpl, values.data(), valid.data());
+            }
+            std::size_t rowBest = 0;
+            for (std::size_t r = 1; r < rowScore.size(); ++r)
+                if (rowScore[r] > rowScore[rowBest]) rowBest = r;
+            const double dy0 = rowBest == 0 || rowBest + 1 == rowScore.size()
+                ? std::numeric_limits<double>::quiet_NaN()
+                : double(rowBest) - kRows + parabola(rowScore.data(), rowScore.size(), rowBest);
+
             Sample sample;
             sample.i = int(i);
             sample.tS = double(refs[i].when - start) / 1e9;
@@ -696,11 +734,14 @@ inline RunResult runMotionYaw(const Problem& prob, const RawLoader& loadRaw) {
             sample.d0 = st0.d;
             sample.d1 = st1.d;
             sample.s0 = st0.s;
+            sample.dy0 = dy0;
             // REF: float(scores[0].max()) over the fine hypotheses.
             sample.sweepScore = scores[0];
             for (std::size_t k = 1; k < 21; ++k) sample.sweepScore = std::max(sample.sweepScore, scores[k]);
-            result.samples.push_back(sample);
+            accepted[keptIndex] = sample;
         }
+        for (const auto& sample : accepted)
+            if (sample) result.samples.push_back(*sample);
     }
     result.summary = summarize(result.samples);
     return result;

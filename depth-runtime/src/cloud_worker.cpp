@@ -476,6 +476,8 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
     }
     if(gOcclusionOnly) std::cout<<"[Occlusion] temporal="<<(confidenceTemporal?"confidence":"legacy")<<std::endl;
     // This worker consumes luma only. Retain a switch for matched capture A/B runs.
+    const char* rawSetting = std::getenv("FRAME_SAVE_RAW");
+    const bool saveRawLuma = rawSetting && std::strcmp(rawSetting,"1")==0;
     const char* uvSetting = std::getenv("FRAME_CAPTURE_UV");
     const bool captureUV = uvSetting && std::string(uvSetting) == "1";
     std::cout << "[Cloud] capture=" << (captureUV ? "Y+UV" : "Y only") << std::endl;
@@ -743,6 +745,10 @@ void depthWorker(FrameSpatial::DMACapture* capture) {
                 };
                 saved=putNv12("-raw-left.nv12",capture->getLeftBuffer(),capture->getLeftUV()) &&
                       putNv12("-raw-right.nv12",capture->getRightBuffer(),capture->getRightUV());
+            }
+            if(saveRawLuma) {
+                saved=saved && putBytes("-raw-left.u8",capture->getLeftBuffer(),yBytes) &&
+                      putBytes("-raw-right.u8",capture->getRightBuffer(),yBytes);
             }
             const auto& rl=rectifier.getRectifiedLeft();const auto& rr=rectifier.getRectifiedRight();
             const auto& sl=rectifier.getSphericalLeft();const auto& sr=rectifier.getSphericalRight();

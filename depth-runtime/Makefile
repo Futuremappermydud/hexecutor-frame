@@ -82,11 +82,31 @@ clean:
 HAND_NATIVE_BUILD ?= ../build-hand-viewer
 .PHONY: hand-viewer-host hand-viewer
 hand-viewer-host:
-	cmake -S .. -B $(HAND_NATIVE_BUILD) -DCMAKE_BUILD_TYPE=Release
+	cmake -S .. -B $(HAND_NATIVE_BUILD) -DCMAKE_BUILD_TYPE=Release $(if $(MERCURY_EIGEN_INCLUDE),-DMERCURY_EIGEN_INCLUDE="$(MERCURY_EIGEN_INCLUDE)")
 	cmake --build $(HAND_NATIVE_BUILD) --parallel --target hand_tracking_host mercury_executor_networks mercury_hand_tracking hexecutor_host
 
 HAND_SPV = shaders/hand_joints.vert.spv shaders/hand_joints.frag.spv
 hand-viewer: bin/frame_hand_viewer $(HAND_SPV)
+
+NIR_GEOMETRY = ../samples/hand-tracking/nirhands
+YAW_SCAN_SRC = src/yaw_scan.cpp $(NIR_GEOMETRY)/src/geometry.cpp
+.PHONY: yaw-viewer
+yaw-viewer: bin/frame_yaw_viewer bin/replay_ir_motion_yaw bin/fit_yaw_scan $(HAND_SPV)
+
+bin/frame_yaw_viewer: tools/frame_yaw_viewer.cpp src/hand_viewer_xr.o src/ir_pair_capture.o src/v4l2_capture_clock.o $(YAW_SCAN_SRC) include/yaw_scan.hpp include/ir_motion_stereo_yaw.hpp include/ir_kb_spline.hpp $(NIR_GEOMETRY)/include/nirhands/geometry.hpp | dirs
+	$(CXX) $(CXXFLAGS) -ffp-contract=off -I$(NIR_GEOMETRY)/include $(filter %.cpp %.o,$^) \
+		-L/opt/steamvr/bin/linuxarm64 -lopenxr_loader -Wl,-rpath,/opt/steamvr/bin/linuxarm64 -lvulkan -lpthread -o $@
+
+bin/replay_ir_motion_yaw: tools/replay_ir_motion_yaw.cpp include/ir_motion_stereo_yaw.hpp include/ir_kb_spline.hpp | dirs
+	$(CXX) -O3 -ffp-contract=off -std=c++17 -Wall -Wextra -fopenmp -Iinclude $< -o $@
+
+bin/fit_yaw_scan: tools/fit_yaw_scan.cpp $(YAW_SCAN_SRC) include/yaw_scan.hpp include/ir_motion_stereo_yaw.hpp include/ir_kb_spline.hpp $(NIR_GEOMETRY)/include/nirhands/geometry.hpp | dirs
+	$(CXX) -O3 -ffp-contract=off -std=c++17 -Wall -Wextra -Iinclude -I$(NIR_GEOMETRY)/include $(filter %.cpp,$^) -o $@
+
+bin/test_yaw_scan: tools/test_yaw_scan.cpp $(YAW_SCAN_SRC) include/yaw_scan.hpp include/ir_motion_stereo_yaw.hpp include/ir_kb_spline.hpp $(NIR_GEOMETRY)/include/nirhands/geometry.hpp | dirs
+	$(CXX) -O2 -std=c++17 -Wall -Wextra -Iinclude -I$(NIR_GEOMETRY)/include $(filter %.cpp,$^) -o $@
+
+-include src/ir_pair_capture.d src/v4l2_capture_clock.d
 
 NIR_ORT ?= ../samples/hand-tracking/.work/ort/onnxruntime-linux-aarch64-1.24.1
 .PHONY: nir-hand-viewer nir-hand-viewer-host
