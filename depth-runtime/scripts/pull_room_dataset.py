@@ -17,18 +17,17 @@ import argparse
 import fnmatch
 import hashlib
 import json
+import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 
-REPO = (PATHS.repo / 'runtime')
-REMOTE_REPO = '/home/steamos/frame-spatial-runtime'
-REMOTE_ROOT = REMOTE_REPO + '/experiments/room-dataset'
-REMOTE_PYTHON = '/home/steamos/frame-dsp/depth-model/.venv/bin/python'
+REMOTE_REPO = '/home/steamos/frame-spatial-runtime/depth-runtime'
 SAFE = re.compile(r'^[A-Za-z0-9._-]+$')
 SAFE_FRAMES = re.compile(r'^(rgb|ir)/[A-Za-z0-9._*?\[\]-]+$')
-RAW_FRAMES = ('rgb/frame-*-raw-*.nv12', 'ir/pair-*-left.u8', 'ir/pair-*-right.u8')
+RAW_FRAMES = ('rgb/frame-*-raw-*.nv12', 'rgb/frame-*-raw-*.u8', 'ir/pair-*-left.u8', 'ir/pair-*-right.u8')
 
 
 def is_raw_frame(relative):
@@ -54,7 +53,12 @@ def digest(path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--host', default='frame')
+    ap.add_argument('--host', default=os.environ.get('FRAME_HOST', 'frame'))
+    ap.add_argument('--remote-dir', default=os.environ.get('FRAME_REMOTE_RUNTIME', REMOTE_REPO))
+    ap.add_argument('--remote-root', default=os.environ.get('FRAME_DATASET_ROOT'),
+                    help='dataset path on Frame, default REMOTE_DIR/experiments/room-dataset')
+    ap.add_argument('--remote-python', default=os.environ.get('FRAME_DATASET_PYTHON'),
+                    help='Python executable on Frame with the dataset dependencies')
     ap.add_argument('--session', help='one session directory name; default latest complete session')
     ap.add_argument('--all', action='store_true', help='pull all sessions')
     ap.add_argument('--raw-only', action='store_true', help='copy capture files without DSP finalization')
@@ -69,7 +73,17 @@ def main():
         ap.error('choose --session or --all')
     if any(not SAFE_FRAMES.fullmatch(pattern) for pattern in args.frames):
         ap.error('--frames takes a glob under rgb/ or ir/')
-    listing = remote(args.host, f'cd {REMOTE_REPO} && {REMOTE_PYTHON} scripts/room_dataset.py index experiments/room-dataset >/dev/null && cat experiments/room-dataset/dataset.json',
+    remote_root = args.remote_root or f'{args.remote_dir}/experiments/room-dataset'
+    python = shlex.quote(args.remote_python) if args.remote_python else '"$python"'
+    prefix = f'cd {shlex.quote(args.remote_dir)} || exit; '
+    if not args.remote_python:
+        prefix += ('python=python3; '
+                   'for candidate in "$HOME/frame-dsp/depth-model/.venv/bin/python" '
+                   '"$HOME/frame-dsp/quest-depth/.venv/bin/python"; do '
+                   'if test -x "$candidate"; then python="$candidate"; break; fi; done; ')
+    cli = f'{python} scripts/room_dataset.py'
+    root_arg = shlex.quote(remote_root)
+    listing = remote(args.host, f'{prefix}{cli} index {root_arg} >/dev/null && cat {root_arg}/dataset.json',
                      capture_output=True)
     sessions = json.loads(listing.stdout)['sessions']
     allowed = ('captured', 'finalized', 'incomplete') if args.raw_only else ('captured', 'finalized')
@@ -87,7 +101,7 @@ def main():
         if not SAFE.fullmatch(name):
             raise ValueError(f'unsafe session name: {name}')
         if not args.raw_only and (session['status'] != 'finalized' or args.ir_yaw_deg is not None):
-            command = f'cd {REMOTE_REPO} && {REMOTE_PYTHON} scripts/room_dataset.py finalize experiments/room-dataset/{name}'
+            command = f'{prefix}{cli} finalize {root_arg}/{name}'
             if args.ir_yaw_deg is not None:
                 command += f' --skip-inference --ir-yaw-deg {args.ir_yaw_deg}' if session['status'] == 'finalized' else f' --ir-yaw-deg {args.ir_yaw_deg}'
             try:
@@ -96,7 +110,7 @@ def main():
                 failed.append(f'{name}: finalization failed; raw files will still be copied')
         destination = args.local_root / name
         destination.mkdir(parents=True, exist_ok=True)
-        source = f'{args.host}:{REMOTE_ROOT}/{name}/'
+        source = f'{args.host}:{shlex.quote(f"{remote_root}/{name}/")}'
         target = str(destination) + '/'
         # Raw camera frames are large and stay on the Frame unless requested.
         run(['rsync', '-az', '--partial', '--exclude=*.part'] + [f'--exclude={p}' for p in RAW_FRAMES] + [source, target])

@@ -14,8 +14,8 @@ ssh frame "mkdir -p /home/steamos/frame-spatial-runtime"
 
 if [[ ${1:-} == '--qnn' ]]; then
     echo '[Setup] Checking the QNN cDSP boot state...'
-    ssh frame 'for app in depth-runtime runtime; do
-        fault="/home/steamos/frame-spatial-runtime/$app/experiments/room-dataset/.npu-fault-boot-id"
+    ssh frame 'for app in /home/steamos/frame-spatial-runtime{,/depth-runtime,/runtime}; do
+        fault="$app/experiments/room-dataset/.npu-fault-boot-id"
         if [ -f "$fault" ] && [ "$(cat "$fault")" = "$(cat /proc/sys/kernel/random/boot_id)" ]; then
             echo "Prior cDSP cleanup failed in this boot; reboot the Frame first." >&2
             exit 1

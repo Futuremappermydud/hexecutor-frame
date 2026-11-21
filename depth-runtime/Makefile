@@ -46,6 +46,9 @@ $(OPENXR_TARGET): $(OPENXR_OBJ) | dirs $(SPV) $(POINT_SPV) $(MESH_SPV)
 $(MESH_TARGET): $(OPENXR_TARGET) | dirs
 	ln -sf frame_openxr_point_cloud $(MESH_TARGET)
 
+.PHONY: room-dataset
+room-dataset: $(MESH_TARGET) bin/capture_model_inputs bin/record_head_poses bin/mark_surfaces bin/record_ir_pairs bin/model_batch_to_v2 $(ROOM_REPLAY_TARGET)
+
 $(ROOM_REPLAY_TARGET): tools/replay_room_tsdf.cpp src/tsdf_volume.cpp | dirs
 	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread -lm
 

@@ -6,9 +6,11 @@ The dataset harness records raw observations and the provenance needed to replay
 
 `scripts/room_dataset.py capture` coordinates camera/pose recorders and optional controller markers and IR. The Steam launcher (`launch_room_dataset.sh`) uses the live QNN depth viewer so RGB and depth share one acquisition path. Running a second color-camera recorder beside that viewer has caused missed pairs.
 
+Build the recorder on Frame from `depth-runtime/` with `make room-dataset OPENXR_INCLUDE=/path/to/openxr-sdk/include`. Run `python3 scripts/install_room_dataset_menu.py` from that deployment to add the Steam shortcut. After a reboot, run `scripts/setup_frame.sh --qnn` from the Mac to prepare camera access and verify the DSP memory lease. Set `FRAME_DEPTH_PACKAGE` when the validated package is installed outside its default location. The capture coordinator uses a Python environment with NumPy, which can be selected with `FRAME_DATASET_PYTHON`. Live inference stays in the native `frame_depth_worker`.
+
 The launcher records until stopped unless a cap is configured. Holding trigger and grip together requests a clean stop. `FRAME_DATASET_FRAMES`, `FRAME_DATASET_SPACING_MS`, and `FRAME_DATASET_MIN_FREE_GB` configure limits. Raw data can consume roughly 228 MB/s in the recorded RGB-plus-IR configuration; the free-space stop is operationally significant.
 
-For camera-only capture, `room_dataset.py capture --no-color` skips the full-resolution NV12 pair while retaining the rectified, spherical, and pinhole luma used by offline inference and tag detection. `--keep-floods` preserves the current IR flood setting.
+For either capture mode, `room_dataset.py capture --no-color` skips the full-resolution NV12 pair while retaining the rectified, spherical, and pinhole luma used by offline inference and tag detection. `--keep-floods` keeps the current IR flood mode throughout capture. Otherwise, the recorder restores the mode it read at startup.
 
 Controller marks store poses, timestamps, a class, and strokes. A controller's device origin is not a measured surface-contact point. Supply a measured `--controller-tip` offset before using those marks as a metric reference.
 
@@ -37,7 +39,7 @@ python3 tools/mesh_viewer.py --root DATASET_ROOT --open
 
 Use the configured model Python environment for inference. Offline batch inference now defaults to `prepared-qnn`; it no longer invokes the removed hybrid path. `--skip-inference` reuses supplied outputs and preserves their recorded backend provenance when available. Validation checks sizes/replay compatibility and refreshes the manifest; it is not an accuracy certificate.
 
-The pull tool resumes copies and checks copied files against hashes. Large raw camera files stay on the headset unless explicitly requested. Older FFV1-packed sessions can be decoded by `room_video.py`; current capture retains individual raw files. Partial sessions remain partial rather than being filled with synthetic observations.
+The pull tool defaults to the recorder's `depth-runtime/experiments/room-dataset` directory on Frame. Use `--remote-dir`, `--remote-root`, and `--remote-python` for a custom deployment. The pull tool resumes copies and checks copied files against available manifest hashes. Large raw camera files stay on the headset unless explicitly requested. Older FFV1-packed sessions can be decoded by `room_video.py`; current capture retains individual raw files. Partial sessions remain partial rather than being filled with synthetic observations.
 
 ## IR emitter and refinement
 

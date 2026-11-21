@@ -2,7 +2,13 @@
 # Steam menu target. A controller trigger+grip hold requests a clean stop.
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-PYTHON=${FRAME_DATASET_PYTHON:-$HOME/frame-dsp/depth-model/.venv/bin/python}
+PYTHON=${FRAME_DATASET_PYTHON:-}
+if [[ -z "$PYTHON" ]]; then
+    for candidate in "$HOME/frame-dsp/depth-model/.venv/bin/python" "$HOME/frame-dsp/quest-depth/.venv/bin/python"; do
+        if [[ -x "$candidate" ]]; then PYTHON=$candidate; break; fi
+    done
+    PYTHON=${PYTHON:-python3}
+fi
 OUT_ROOT=${FRAME_DATASET_ROOT:-$ROOT/experiments/room-dataset}
 mkdir -p "$OUT_ROOT"
 exec 9>"$OUT_ROOT/.capture.lock"
@@ -16,16 +22,13 @@ mkdir "$SESSION"
 LAUNCH_LOG="$OUT_ROOT/$SESSION_ID-launcher.log"
 printf '%s\n' "$SESSION_ID" > "$OUT_ROOT/active-session"
 cleanup() {
-    # A live capture restores its own floods; this covers one that died first.
-    if [[ -n "$CAPTURE_PID" && ${FRAME_DATASET_KEEP_FLOODS:-0} != 1 ]] && ! kill -0 "$CAPTURE_PID" 2>/dev/null; then
-        VR=/opt/steamvr/bin/linuxarm64
-        LD_LIBRARY_PATH=$VR "$VR/vrcmd" --set-settings-int driver_cv.infraredEmittersMode 2 >/dev/null 2>&1 || true
-    fi
     if [[ -f "$LAUNCH_LOG" ]]; then mv -f "$LAUNCH_LOG" "$SESSION/launcher.log"; fi
     rm -f "$OUT_ROOT/active-session"
 }
 CAPTURE_PID=
+STOP_REQUESTED=0
 stop_capture() {
+    STOP_REQUESTED=1
     if [[ -n "$CAPTURE_PID" ]]; then kill -TERM "$CAPTURE_PID" 2>/dev/null || true; fi
 }
 trap stop_capture INT TERM
@@ -62,9 +65,16 @@ trap cleanup EXIT
     if [[ ${FRAME_DATASET_NO_DOTS:-0} != 1 ]]; then ARGS+=(--dots); fi
     if [[ ${FRAME_DATASET_NO_MARKERS:-0} == 1 ]]; then ARGS+=(--no-markers); fi
     if [[ ${FRAME_DATASET_KEEP_FLOODS:-0} == 1 ]]; then ARGS+=(--keep-floods); fi
+    if (( STOP_REQUESTED )); then exit 130; fi
     "$PYTHON" "$ROOT/scripts/room_dataset.py" "${ARGS[@]}" &
     CAPTURE_PID=$!
-    wait "$CAPTURE_PID"
+    if (( STOP_REQUESTED )); then stop_capture; fi
+    while :; do
+        status=0
+        wait "$CAPTURE_PID" || status=$?
+        if ! kill -0 "$CAPTURE_PID" 2>/dev/null; then break; fi
+    done
+    if (( status != 0 )); then exit "$status"; fi
     echo "Capture finished: $(date -u +%FT%TZ)"
     echo "Pull from Mac: python3 scripts/pull_room_dataset.py --session $SESSION_ID"
 } > "$LAUNCH_LOG" 2>&1

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Record a synchronized room scan and finalize its replayable depth/mesh dataset.
 
-Capture runs on Frame, without DSP inference. Finalize runs one offline Model
+Capture runs on Frame, optionally with a native live depth worker. Finalize runs one offline Model
 session, preserves both raw model outputs, converts depth with the runtime C++
 geometry, detects tags, and rebuilds a TSDF mesh from exposure-aligned poses.
 """
@@ -35,17 +35,17 @@ from pathlib import Path
 
 import numpy as np
 
-REPO = (PATHS.repo / 'runtime')
+REPO = PATHS.repo / 'depth-runtime'
 THERMAL = Path('/sys/class/thermal')
-MODEL_PY = Path.home() / 'frame-dsp/depth-model/.venv/bin/python'
-MODEL_PACKAGE = Path.home() / 'frame-dsp/depth-model/wave1-20261101'
+MODEL_PY = Path(os.environ.get('FRAME_DATASET_PYTHON', sys.executable))
+MODEL_PACKAGE = Path(os.environ.get('FRAME_DEPTH_PACKAGE', Path.home() / 'frame-dsp/depth-model/wave1-20261101'))
 TAG_TOOL = Path.home() / 'frame-spatial-components/build/frame_apriltag'
 BELICE_PY = Path.home() / 'Documents/belice/.venv/bin/python'
 BELICE_FLASH = Path.home() / 'Documents/belice/belice_flash.py'
 DEFAULT_PULSE_LEAD_MS = 8.0  # unmeasured; scripts/ir_pulse_sweep.py replaces it
 VRCMD = Path('/opt/steamvr/bin/linuxarm64/vrcmd')
 FLOOD_SETTING = 'driver_cv.infraredEmittersMode'
-FLOODS_DISABLED, FLOODS_AUTO = 0, 2
+FLOODS_DISABLED = 0
 RECT_PIXELS = 616 * 616
 MODEL_PIXELS = 256 * 320
 
@@ -113,15 +113,24 @@ def event(path, event_name, **fields):
         out.write(json.dumps({'clock': now_clocks(), 'event': event_name, **fields}) + '\n')
 
 
+def flood_mode():
+    env = {**os.environ, 'LD_LIBRARY_PATH': str(VRCMD.parent)}
+    output = subprocess.check_output([str(VRCMD), '--settings-int', FLOOD_SETTING],
+                                     env=env, stderr=subprocess.DEVNULL, text=True, timeout=15)
+    for field in output.split():
+        key, _, value = field.partition('=')
+        if key == FLOOD_SETTING:
+            return int(value)
+    raise RuntimeError(f'could not read {FLOOD_SETTING}: {output.strip()}')
+
+
 def set_floods(mode):
     """Apply the headset flood mode and confirm SteamVR holds the new value."""
     env = {**os.environ, 'LD_LIBRARY_PATH': str(VRCMD.parent)}
     subprocess.run([str(VRCMD), '--set-settings-int', FLOOD_SETTING, str(mode)], env=env, check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-    current = subprocess.run([str(VRCMD), '--settings-int', FLOOD_SETTING], env=env, check=True,
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15).stdout
-    if f'{FLOOD_SETTING}={mode}' not in current.split():
-        raise RuntimeError(f'{FLOOD_SETTING} did not change to {mode}: {current.strip()}')
+    if flood_mode() != mode:
+        raise RuntimeError(f'{FLOOD_SETTING} did not change to {mode}')
 
 
 def select_lit_pairs(observations, cycles, min_shams=20):
@@ -186,7 +195,10 @@ def capture(args):
         tools['marks'] = (PATHS.repo / 'depth-runtime/bin/mark_surfaces')
     if args.ir:
         tools['ir'] = (PATHS.repo / 'depth-runtime/bin/record_ir_pairs')
-    missing = [str(p) for p in tools.values() if not p.is_file()]
+    required = list(tools.values())
+    if args.live_viewer:
+        required.append(Path(os.environ.get('FRAME_DEPTH_WORKER', REPO / 'bin/frame_depth_worker')))
+    missing = [str(path) for path in required if not path.is_file() or not os.access(path, os.X_OK)]
     if not args.keep_floods and not VRCMD.is_file():
         missing.append(str(VRCMD))
     if missing:
@@ -201,6 +213,10 @@ def capture(args):
         if prior.get('scene') == args.scene and prior.get('split') != args.split:
             raise ValueError(f'scene {args.scene} already belongs to {prior.get("split")} in {existing.parent}')
     out.mkdir(parents=True, exist_ok=True)
+    min_free_bytes = args.min_free_gb * 1024**3
+    free = shutil.disk_usage(out).free
+    if free < min_free_bytes:
+        raise RuntimeError(f'only {free / 1024**3:.2f} GiB free; capture requires {args.min_free_gb:g} GiB')
     (out / 'rgb').mkdir(); (out / 'ir').mkdir()
     duration_ms = 0 if args.frames == 0 else 12000 + args.frames * (args.spacing_ms + 250)
     session = {'version': 1, 'status': 'capturing', 'scene': args.scene, 'split': args.split,
@@ -242,9 +258,11 @@ def capture(args):
     events = out / 'events.jsonl'
     event(events, 'capture_start', frame_target=args.frames)
     processes = {}
+    previous_flood_mode = None
     with (out / 'capture.log').open('w') as capture_log:
         try:
             if not args.keep_floods:
+                previous_flood_mode = flood_mode()
                 set_floods(FLOODS_DISABLED)
                 event(events, 'floods_disabled')
             sidecars = [('pose', [str(tools['pose']), str(out / 'head_pose.csv'), str(duration_ms)], 'pose.log')]
@@ -268,8 +286,7 @@ def capture(args):
             env['FRAME_CAPTURE_TIMING'] = 'v4l2'
             env['FRAME_DEPTH_SPHERICAL'] = '1'
             env['FRAME_SAVE_COLOR'] = '0' if args.no_color else '1'
-            if args.save_raw:
-                env['FRAME_SAVE_RAW'] = '1'
+            env['FRAME_SAVE_RAW'] = '1' if args.save_raw else '0'
             if args.live_viewer:
                 env['FRAME_DEPTH_RECORD_V2'] = str(out / 'depth')
                 env['FRAME_DEPTH_RECORD_FRAMES'] = str(args.frames)
@@ -277,7 +294,7 @@ def capture(args):
                 env['FRAME_DEPTH_RECORD_CLOSE_EACH_REPLY'] = '0'
                 env['FRAME_ROOM_RGB_DIR'] = str(out / 'rgb')
                 env['FRAME_ROOM_STOP_FILE'] = str(stop_file)
-                env['FRAME_CAPTURE_UV'] = '1'
+                env['FRAME_CAPTURE_UV'] = env['FRAME_SAVE_COLOR']
                 command = [str(tools['rgb']), '--depth-model-qnn', '--tsdf']
             else:
                 command = [str(tools['rgb']), str(out / 'rgb'), str(args.frames), str(args.spacing_ms)]
@@ -295,7 +312,7 @@ def capture(args):
                 if time.monotonic() >= next_space_check:
                     next_space_check = time.monotonic() + 1
                     free = shutil.disk_usage(out).free
-                    if free < args.min_free_gb * 1024**3 and not stop_file.exists():
+                    if free < min_free_bytes and not stop_file.exists():
                         stop_file.write_text('storage_low\n')
                         event(events, 'storage_low', free_bytes=free)
                         warnings.append(f'recording stopped with {free / 1024**3:.1f} GiB free')
@@ -333,7 +350,7 @@ def capture(args):
                 rgb_code = rgb.wait(timeout=30 if args.live_viewer else 3)
             except subprocess.TimeoutExpired:
                 rgb.kill(); rgb_code = rgb.wait()
-            if rgb_code and not stopped_by_user and not failures:
+            if rgb_code and (args.live_viewer or not stopped_by_user) and not failures:
                 failures.append(f'RGB capture exited {rgb_code}')
             event(events, 'recorder_exit', name='rgb', returncode=rgb_code)
             if stopped_by_user and not list((out / 'rgb').glob('frame-*.json')):
@@ -376,12 +393,12 @@ def capture(args):
                 if not session['dot_pulses_succeeded']:
                     warnings.append('no successful dot pulse; no lit IR pairs')
                     event(events, 'warning', message='no successful dot pulse; no lit IR pairs')
-            if not args.keep_floods:
+            if previous_flood_mode is not None:
                 try:
-                    set_floods(FLOODS_AUTO)
+                    set_floods(previous_flood_mode)
                     event(events, 'floods_restored')
                 except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-                    warnings.append(f'floods may still be disabled; set {FLOOD_SETTING} to {FLOODS_AUTO}: {error}')
+                    warnings.append(f'floods may still be disabled; set {FLOOD_SETTING} to {previous_flood_mode}: {error}')
                     event(events, 'floods_restore_failed', error=str(error))
             session['end'] = now_clocks()
             session['stopped_from_headset'] = stop_source == 'controller'
@@ -394,13 +411,17 @@ def capture(args):
             session['failures'] = failures
             session['warnings'] = warnings
             capture_text = (out / 'capture.log').read_text()
+            if '[RoomDataset] RGB recording failed' in capture_text:
+                failures.append('live viewer could not write the RGB recording')
+                session['status'] = 'incomplete'
             if any(message in capture_text for message in (
                     'Persistent DSP workers did not exit', 'DSP state retained',
                     'explicit recovery is required')):
                 session['npu_cleanup_failed'] = True
+                session['status'] = 'incomplete'
+                failures.append('cDSP cleanup incomplete; reboot before another NPU scan')
                 (out.parent / '.npu-fault-boot-id').write_text(
                     Path('/proc/sys/kernel/random/boot_id').read_text())
-                warnings.append('cDSP cleanup incomplete; reboot before another NPU scan')
             event(events, 'capture_end', status=session['status'], failures=failures)
             write_json(out / 'session.json', session)
             signal.signal(signal.SIGTERM, old_term)

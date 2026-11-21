@@ -22,7 +22,7 @@ from pathlib import Path
 
 import numpy as np
 
-REPO = (PATHS.repo / 'runtime')
+REPO = PATHS.repo / 'depth-runtime'
 
 
 def write(path, value):
