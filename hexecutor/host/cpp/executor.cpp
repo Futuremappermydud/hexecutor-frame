@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "detail.hpp"
+#include "hexecutor/cdsp_mem.h"
 #include "hexecutor/workload_memory.hpp"
 #include "tensor/graph.h"
 #include "qnn16/program.h"
@@ -187,7 +188,7 @@ HxGraph preflight_tensor(const Bytes &image, const Bytes &constants) {
     if (const size_t state = persistent_state_extent(image))
         hx_graph_set_state(&graph, const_cast<uint8_t *>(image.data()), uint32_t(state));
     uint32_t error = hx_graph_open(&graph, image.data(), uint32_t(image.size()), constants.data(),
-                                   uint32_t(constants.size()), nullptr, 0x1000000u, &bad);
+                                   uint32_t(constants.size()), nullptr, HXFG_MAX_ARENA_BYTES, &bad);
     require(error == HX_OK, "tensor preflight failed: error " + std::to_string(error) + " at op " +
                                 std::to_string(bad));
     std::array<uint8_t, 32> digest{};
@@ -263,6 +264,7 @@ struct Session::Impl {
     std::vector<Bytes> tensor_images, tensor_constants;
     std::vector<HxGraph> graphs;
     std::vector<Q16Program> q16;
+    uint32_t q16_spill_bytes = 0;
     HxSessionConfig tensor_config{};
     ExecutionProfile profile;
     Artifacts artifacts;
@@ -282,7 +284,7 @@ struct Session::Impl {
     std::array<uint32_t, 4> inputs{}, input_bytes{};
     std::array<uint32_t, 2> outputs{}, output_bytes{};
     std::vector<std::pair<uint32_t, uint32_t>> guards;
-    bool high_constants = false;
+    bool high_constants = false, low_q16_spill = false;
     uint32_t cursor = 1 << 20, allocation_limit = (32u << 20) - 128, commands = 0;
     bool preserving = false, l2 = false, fourth = false, closed = false, initialized = false;
     static bool feature(const Bytes &b, const std::string &s) {
@@ -321,6 +323,7 @@ struct Session::Impl {
                 tensor_constants.push_back(read_file(p.constants));
                 q16.push_back(preflight_qnn16(tensor_images.back(), tensor_constants.back()));
                 const auto *h = q16.back().header;
+                q16_spill_bytes = std::max(q16_spill_bytes, h->reserved[1]);
                 require(p.inputs.size() == h->inputs && p.outputs.size() == h->outputs,
                         "Q16P program I/O count differs from image");
                 for (uint32_t i = 0; i < h->inputs + h->outputs; i++) {
@@ -335,6 +338,11 @@ struct Session::Impl {
             fourth = feature(boot, std::string("QDTHRD51\1\0\0\0", 12));
             engine = load_elf(read_file(artifacts.engine), 0xa0000000, 1 << 20);
             require(feature(engine, "HXQ16E01"), "Q16P engine feature missing");
+            if (q16_spill_bytes) {
+                require(feature(engine, "HXQ16SP3"), "Q16P engine lacks DDR spill/fill support");
+                require(!artifacts.persistent_state_bytes && !artifacts.persistent_state_offset,
+                        "Q16P spill/fill uses the session's state region");
+            }
             require(fourth && feature(engine, "HXTPART4"),
                     "Q16P engine and bootstrap must both use four workers");
             preserving = true;
@@ -419,14 +427,67 @@ struct Session::Impl {
     }
     void open() {
 #ifdef __linux__
-        verify_chunk_map(artifacts);
+        const bool qnn16 = program.backend == Backend::qnn16_f16;
+        if (!qnn16)
+            verify_chunk_map(artifacts);
+        size_t engine_window_mb = 128;
+        if (const char *env = std::getenv("HEXECUTOR_CHUNK_WINDOW_MB")) {
+            char *end = nullptr;
+            errno = 0;
+            unsigned long v = std::strtoul(env, &end, 10);
+            require(errno == 0 && end != env && *end == '\0' && v >= 128 && v <= 4095,
+                    "HEXECUTOR_CHUNK_WINDOW_MB must be an integer in [128, 4095]");
+            if (qnn16)
+                require(v <= CDSP_MEM_MAX_SIZE_MB && v % 16 == 0,
+                        "Q16P window must be a multiple of 16 in [128, 1536]");
+            engine_window_mb = v;
+        }
+        if (qnn16) {
+            if (engine_window_mb > 128 &&
+                std::any_of(q16.begin(), q16.end(), [](const Q16Program &p) {
+                    return p.header->ops > Q16P_WIDE_PROFILE_CYCLES;
+                }))
+                require(feature(engine, "HXQ16PC1"),
+                        "Q16P engine profiling overlaps the wide-window JTLB state");
+            const std::string marker = "QDWIND01";
+            const std::string expected = marker + char(engine_window_mb / 16);
+            const auto matches_window = [&](const Bytes &bytes) {
+                return feature(bytes, expected) ||
+                       (engine_window_mb == 128 && !feature(bytes, marker));
+            };
+            require(matches_window(engine) && matches_window(read_file(artifacts.bootstrap)) &&
+                        matches_window(read_file(artifacts.chunk_probe)),
+                    "Q16P engine, bootstrap and chunk probe must match HEXECUTOR_CHUNK_WINDOW_MB");
+        }
+        low_q16_spill = q16_spill_bytes && engine_window_mb == 128 && feature(engine, "HXQ16SP1");
+        if (q16_spill_bytes) {
+            uint64_t constant_bytes = 0;
+            for (const auto &pool : tensor_constants)
+                constant_bytes += ((uint64_t(pool.size()) + 127u) & ~uint64_t(127)) + 512u;
+            if (low_q16_spill) {
+                require(constant_bytes <= (24u << 20) && q16_spill_bytes <= Q16P_LOW_SPILL_END - Q16P_LOW_SPILL_START - 8192u,
+                        "Q16P constants or spill backing exceed their baseline DDR regions");
+                require(!artifacts.persistent_state_offset && !artifacts.persistent_state_bytes,
+                        "Q16P baseline spill cannot use a caller-specified persistent state region");
+            } else {
+                const uint64_t required = uint64_t(HXFG_HIGH_CONSTANT_START) + q16_spill_bytes + 8192u + 512u + constant_bytes;
+                require(required <= (uint64_t(engine_window_mb) << 20),
+                        "Q16P constants and spill backing exceed the mapped high-DDR window");
+            }
+        }
         size_t workload_mb = calculate_workload_size_mb(programs, artifacts);
+        if (qnn16)
+            workload_mb = std::max(workload_mb, engine_window_mb);
         lease = WorkloadMemoryManager::instance().acquire_lease(workload_mb);
         size_t lease_mb = WorkloadMemoryManager::instance().current_size_mb();
         mapped_bytes = lease_mb << 20;
 
-        transport = std::make_unique<Transport>(artifacts, artifacts.bootstrap, fourth);
-        transport->set_exit_check([this] { verify_exit(true); });
+        const auto open_transport = [this] {
+            transport = std::make_unique<Transport>(artifacts, artifacts.bootstrap, fourth);
+            transport->set_exit_check([this] { verify_exit(true); });
+        };
+        if (!qnn16)
+            open_transport();
         require(lease_mb >= 128, "requires a cdsp_mem allocation of at least 128 MB");
         require(lease_mb >= workload_mb, "cdsp_mem reservation smaller than workload requirement");
         require(std::stoull(read_text("/sys/module/cdsp_mem/parameters/iova")) == 0xa0000000,
@@ -441,19 +502,21 @@ struct Session::Impl {
             require(false, std::string("cdsp_mem pin failed: ") + std::strerror(e));
         }
         pin_fd = fd;
+        if (qnn16) {
+            bool restored = true;
+            try {
+                verify_chunk_map(artifacts, &restored);
+            } catch (...) {
+                if (!restored)
+                    lease.retain_size_on_release();
+                throw;
+            }
+            open_transport();
+        }
         void *mapped = mmap(nullptr, mapped_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         require(mapped != MAP_FAILED, "cannot map cdsp_mem");
         memory = static_cast<uint8_t *>(mapped);
         std::copy(engine.begin(), engine.end(), memory);
-        size_t engine_window_mb = 128;
-        if (const char *env = std::getenv("HEXECUTOR_CHUNK_WINDOW_MB")) {
-            char *end = nullptr;
-            errno = 0;
-            unsigned long v = std::strtoul(env, &end, 10);
-            require(errno == 0 && end != env && *end == '\0' && v >= 128 && v <= 4095,
-                    "HEXECUTOR_CHUNK_WINDOW_MB must be an integer in [128, 4095]");
-            engine_window_mb = v;
-        }
         engine_mapped_bytes = std::min(mapped_bytes, engine_window_mb << 20);
         if (program.backend == Backend::tensor_f32 || program.backend == Backend::qnn16_f16) {
             const bool q = program.backend == Backend::qnn16_f16;
@@ -483,14 +546,14 @@ struct Session::Impl {
             /* Tensor graphs may use relative [32, 96) MiB for constants (or higher when the loaded engine maps > 128 MiB);
              * the Q16P engine keeps its scratch in [56, 64) MiB. */
             allocation_limit = q ? (56u << 20) - 128 : (96u << 20) - 4096; /* above 96 MiB: VTCM backup, L2, guards */
-            max_allocation = q ? 32u << 20 : HXFG_MAX_CONSTANT_BYTES + 1u;
-            /* Pools that do not fit [32, 96) MiB go above the first 128 MiB, inside the engine's mapped
+            max_allocation = HXFG_MAX_CONSTANT_BYTES + 1u;
+            /* Pools that do not fit the low region go above the first 128 MiB, inside the engine's mapped
              * window; the persistent state follows them there. */
-            if (!q && engine_mapped_bytes > (128u << 20)) {
+            if (engine_mapped_bytes > (128u << 20)) {
                 uint64_t need = 0;
                 for (const auto &c : tensor_constants)
                     need += ((c.size() + 127) & ~size_t(127)) + 512;
-                if (need > allocation_limit - cursor || std::getenv("HEXECUTOR_HIGH_CONSTANTS")) { /* the variable forces it, for tests */
+                if (q16_spill_bytes || need > allocation_limit - cursor || std::getenv("HEXECUTOR_HIGH_CONSTANTS")) {
                     require(engine_mapped_bytes > size_t(HXFG_HIGH_CONSTANT_START) + 8192,
                             "engine window too small for the high constant region");
                     cursor = HXFG_HIGH_CONSTANT_START;
@@ -505,7 +568,9 @@ struct Session::Impl {
                 std::copy(tensor_constants[i].begin(), tensor_constants[i].end(),
                           memory + c.constants);
             }
-            size_t max_state_bytes = 0;
+            const uint32_t constants_end = cursor;
+            // Q16P jobs share temporary spill backing in the session state region.
+            size_t max_state_bytes = q16_spill_bytes;
             /* Persistent tensors carry a name hash (reserved[1]); graphs that use the same name share one
              * place, and each distinct name gets its own, so stages of one model never alias. Tensors
              * without a name keep the offset the lowering gave them, below all named ones. */
@@ -542,6 +607,10 @@ struct Session::Impl {
                 max_state_bytes = std::max(max_state_bytes, artifacts.persistent_state_bytes);
             if (max_state_bytes > 0) {
                 max_state_bytes = (max_state_bytes + 127) & ~127u;
+                if (low_q16_spill) {
+                    cursor = Q16P_LOW_SPILL_START;
+                    allocation_limit = Q16P_LOW_SPILL_END - 4096u;
+                }
                 if (artifacts.persistent_state_offset > 0) {
                     tensor_config.state = artifacts.persistent_state_offset;
                 } else {
@@ -565,7 +634,7 @@ struct Session::Impl {
                 }
             }
             require(hx_session_config_valid(&tensor_config), "invalid tensor memory config");
-            guard_floor = high_constants ? 0 : cursor; /* canaries in [64, 96) MiB must not overwrite constants */
+            guard_floor = high_constants ? 0 : low_q16_spill ? constants_end : cursor;
             install_guards();
             auto *arena = transport->arena();
             std::memset(arena, 0, 32768);
@@ -618,7 +687,8 @@ struct Session::Impl {
                  {uint32_t(engine_mapped_bytes - 4096), 4096},
                  {(96u << 20) - 128, 128},
                  {104u << 20, 128}})
-            if (g.first >= guard_floor)
+            if (g.first >= guard_floor && (!low_q16_spill ||
+                g.first + g.second <= tensor_config.state || g.first >= tensor_config.state + tensor_config.state_bytes))
                 guards.push_back(g);
         if (l2) {
             for (uint32_t offset : {0u, 0x40000u, 0x58000u, 0x68000u, 0x78000u})
@@ -759,8 +829,12 @@ struct Session::Impl {
         profile.blocked_fp16 = true;
         /* Runs re-stage everything, so every run predicts the next one. */
         last_dsp_time[index] = std::chrono::microseconds(profile.timer_ticks * 10 / 192);
-        profile.op_cycles.resize(std::min<uint32_t>(h->ops, 2048));
-        std::memcpy(profile.op_cycles.data(), arena + 16384, profile.op_cycles.size() * 8);
+        const uint32_t profile_limit = engine_mapped_bytes > (128u << 20)
+                                           ? Q16P_WIDE_PROFILE_CYCLES
+                                           : Q16P_PROFILE_CYCLES;
+        profile.op_cycles.resize(std::min(h->ops, profile_limit));
+        std::memcpy(profile.op_cycles.data(), arena + Q16P_PROFILE_OFFSET,
+                    profile.op_cycles.size() * sizeof(uint64_t));
         std::vector<Bytes> out;
         for (size_t i = 0; i < p.outputs.size(); i++) {
             const auto &io = q.io[h->inputs + i];
@@ -852,6 +926,8 @@ struct Session::Impl {
                 } catch (...) {
                 }
             }
+            if (program.backend == Backend::qnn16_f16)
+                lease.retain_size_on_release();
             release_memory();
             closed = true;
             std::rethrow_exception(failure);
@@ -860,6 +936,8 @@ struct Session::Impl {
             if (transport)
                 transport->close();
         } catch (...) {
+            if (program.backend == Backend::qnn16_f16)
+                lease.retain_size_on_release();
             release_memory();
             closed = true;
             throw;
@@ -887,7 +965,7 @@ struct Session::Impl {
         }
     }
     void reset_state() {
-        if (tensor_config.state_bytes) {
+        if (!q16_spill_bytes && tensor_config.state_bytes) {
             if (memory) {
                 std::memset(memory + tensor_config.state, 0, tensor_config.state_bytes);
             }
@@ -916,7 +994,7 @@ struct Session::Impl {
         }
     }
     size_t state_bytes() const {
-        return tensor_config.state_bytes;
+        return q16_spill_bytes ? 0 : tensor_config.state_bytes;
     }
 };
 Session::Session(Program p, Artifacts a)

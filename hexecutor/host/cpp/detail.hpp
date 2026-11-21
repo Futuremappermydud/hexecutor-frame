@@ -59,5 +59,5 @@ class Transport {
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
-void verify_chunk_map(const Artifacts &);
+void verify_chunk_map(const Artifacts &, bool *restored = nullptr);
 } // namespace hexecutor::detail

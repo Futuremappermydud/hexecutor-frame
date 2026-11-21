@@ -156,6 +156,15 @@ int main() {
     }
     std::cout << "  ✓ RAII WorkloadLease dynamic growth, nesting, move, and shrinking passed" << std::endl;
 
+    {
+        auto lease = mgr.acquire_lease(512);
+        lease.retain_size_on_release();
+        lease.release();
+        check(!lease.active(), "Release should deactivate the lease");
+        check(mgr.current_size_mb() == 512, "Unverified DSP cleanup should retain the reservation size");
+        check(mgr.shrink(128), "Explicit shrink should succeed after recovery");
+    }
+
     // 7. Allocation failure and rollback safety
     {
         mgr.reset_mock_stats();

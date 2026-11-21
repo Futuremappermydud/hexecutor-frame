@@ -47,6 +47,7 @@ class WorkloadLease {
     size_t size_mb() const { return size_mb_; }
     size_t size_bytes() const { return size_mb_ << 20; }
     bool active() const { return active_; }
+    void retain_size_on_release() noexcept { auto_shrink_ = false; }
     void release();
 
   private:

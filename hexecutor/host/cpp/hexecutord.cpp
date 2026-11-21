@@ -72,6 +72,8 @@ class SessionBackend : public broker::Backend {
     broker::GraphInfo register_graph(const Bytes &image, const Bytes &constants) override {
         if (!failed_.empty())
             throw std::runtime_error("device session failed earlier: " + failed_);
+        if (!programs_.empty() && programs_.front().backend == hexecutor::Backend::qnn16_f16)
+            throw std::runtime_error("dynamic HXFG registration is unavailable in a Q16P session");
         if (graphs_.size() >= 8)
             throw std::runtime_error("at most eight graphs share one tensor session");
         char dir[] = "/tmp/hexecutord-graph-XXXXXX";
@@ -271,7 +273,8 @@ void watch_xrservice(std::atomic<bool> &stop, const std::function<void(const std
 [[noreturn]] void usage(int code) {
     std::cerr
         << "usage: hexecutord --socket PATH --loader ELF --engine ELF --bootstrap ELF\n"
-           "         --chunk-probe ELF --graph NAME=IMAGE.hxfg,CONSTANTS.bin [--graph ...]\n"
+           "         --chunk-probe ELF [--graph NAME=IMAGE.hxfg,CONSTANTS.bin ...]\n"
+           "         [--qnn16-graph NAME=PROGRAM.q16p,CONSTANTS.q16c ...] (Q16P-only session)\n"
            "         [--xrservice-featurenn GRAPH]  (serve the built-in XRService stereoFeatureNN job 8)\n"
            "         [--xrservice-stereofeaturenn GRAPH]  (alias for --xrservice-featurenn)\n"
            "         [--xrservice-gazenet GRAPH]  (serve stock Gazenet image evaluation)\n"
@@ -315,17 +318,24 @@ int main(int argc, char **argv) {
                 artifacts.bootstrap = value();
             else if (arg == "--chunk-probe")
                 artifacts.chunk_probe = value();
-            else if (arg == "--graph") {
+            else if (arg == "--graph" || arg == "--qnn16-graph") {
                 auto v = value();
                 auto eq = v.find('='), comma = v.find(',', eq);
                 if (eq == std::string::npos || comma == std::string::npos || eq == 0)
-                    throw std::runtime_error("--graph expects NAME=IMAGE,CONSTANTS");
+                    throw std::runtime_error(arg + " expects NAME=IMAGE,CONSTANTS");
                 auto name = v.substr(0, eq);
                 for (auto &g : graphs)
                     if (g.name == name)
                         throw std::runtime_error("duplicate graph name " + name);
-                graphs.push_back({name, load_tensor_program(v.substr(eq + 1, comma - eq - 1),
-                                                            v.substr(comma + 1))});
+                const auto image = v.substr(eq + 1, comma - eq - 1);
+                const auto constants = v.substr(comma + 1);
+                const bool qnn16 = arg == "--qnn16-graph";
+                const auto backend = qnn16 ? hexecutor::Backend::qnn16_f16 : hexecutor::Backend::tensor_f32;
+                if (!graphs.empty() && graphs.front().program.backend != backend)
+                    throw std::runtime_error("cannot mix Q16P and HXFG startup graphs");
+                auto program = qnn16 ? load_qnn16_program(image, constants)
+                                     : load_tensor_program(image, constants);
+                graphs.push_back({name, std::move(program)});
             } else if (arg == "--xrservice-featurenn" ||
                        arg == "--xrservice-stereofeaturenn" ||
                        arg == "--xrservice-stereo-featurenn")
@@ -362,11 +372,18 @@ int main(int argc, char **argv) {
                 throw std::runtime_error(std::string(what) + " graph is not registered");
         };
         require_registered(adapter_options.featurenn_graph, "XRService stereoFeatureNN");
+        if (!adapter_options.featurenn_graph.empty())
+            throw std::runtime_error("XRService FeatureNN takes CDSP ownership before posting job 8; "
+                                     "the stock mailbox adapter cannot serve it. Register the graph "
+                                     "and use the version-pinned XRService inline shim instead");
         require_registered(adapter_options.gazenet_graph, "Gazenet image");
         require_registered(adapter_options.gazenet_vector_graph, "Gazenet vector");
         bool adapting = !adapter_options.featurenn_graph.empty() ||
                         !adapter_options.gazenet_graph.empty() ||
                         !adapter_options.gazenet_vector_graph.empty();
+        if (adapting && !graphs.empty() &&
+            graphs.front().program.backend == hexecutor::Backend::qnn16_f16)
+            throw std::runtime_error("XRService adapters require an HXFG session");
         artifacts.keep_eye_running = !adapter_options.gazenet_graph.empty() ||
                                      !adapter_options.gazenet_vector_graph.empty();
 

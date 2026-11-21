@@ -798,7 +798,9 @@ void Transport::close() { impl_->close(); }
 bool Transport::has_run() const { return impl_->active || impl_->persistent || impl_->calls != 0; }
 bool Transport::worker_errors() const { return impl_->any_worker_errors(); }
 
-void verify_chunk_map(const Artifacts &artifacts) {
+void verify_chunk_map(const Artifacts &artifacts, bool *restored) {
+    if (restored)
+        *restored = true;
 #ifdef __linux__
     auto text = [](const char *p) {
         auto b = read_file(p);
@@ -835,6 +837,8 @@ void verify_chunk_map(const Artifacts &artifacts) {
         for (unsigned i = 0; i < chunks; i++)
             put<uint32_t>(p, size_t(i) << 21, (i << 21) ^ nonce);
         auto *arena = probe.arena();
+        if (restored)
+            *restored = false;
         probe.invoke(
             [&](uint32_t seq) {
                 std::memset(arena, 0, 4096);
@@ -859,10 +863,16 @@ void verify_chunk_map(const Artifacts &artifacts) {
             });
     } catch (...) {
         munmap(p, window);
+        if (restored) {
+            probe.close();
+            *restored = true;
+        }
         throw;
     }
     munmap(p, window);
     probe.close();
+    if (restored)
+        *restored = true;
 #else
     (void)artifacts;
     throw std::runtime_error("Frame memory verification requires Linux");

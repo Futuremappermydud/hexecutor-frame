@@ -1,13 +1,19 @@
 # CDSP broker
 
-`hexecutord` is the native C++ daemon for sharing one HXFG tensor session. It serves frame hand trackers, dynamically registered graphs such as ExecuTorch delegates, and optional XRService adapters. The application depth worker uses its own prepared QDRX/NPRG engine. A combined prepared-depth and tensor engine would require a shared dispatch and private-memory layout. [Native API](api.md), [XRService bridge](xrservice-broker-bridge.md)
+`hexecutord` is the native C++ daemon for sharing one HXFG tensor session or one Q16P session. It serves frame hand trackers, dynamically registered graphs such as ExecuTorch delegates, and optional XRService adapters. The application depth worker uses its own prepared QDRX/NPRG engine. A combined prepared-depth and tensor engine would require a shared dispatch and private-memory layout. [Native API](api.md), [XRService bridge](xrservice-broker-bridge.md)
 
 ## Client and scheduling contract
 
 - Clients connect on a Unix stream socket and send length-prefixed messages with inline input/output bytes. A client opens a `StreamSpec` against a registered graph and can use `submit`/`wait` or synchronous `run`. The public API is in [broker.hpp](../../hexecutor/include/hexecutor/broker.hpp).
-- The daemon preflights startup `--graph NAME=IMAGE,CONSTANTS` programs and supports runtime registration by image and constant identity. At most eight graphs fit one session. The device session opens on the first job and can be rebuilt when a graph is added. Verify stateful-client recovery across registration. [Daemon](../../hexecutor/host/cpp/hexecutord.cpp)
+- The daemon preflights startup `--graph NAME=IMAGE,CONSTANTS` programs and supports HXFG runtime registration by image and constant identity. At most eight graphs fit one session. The device session opens on the first job and can be rebuilt when a graph is added. Verify stateful-client recovery across registration. [Daemon](../../hexecutor/host/cpp/hexecutord.cpp)
 - One executor runs jobs by earliest deadline, with tracking, interactive and bulk priority used as a tie-breaker. It expires queued jobs before dispatch and can replace an older queued job for a latest-only stream. Graphs run to completion. Admission uses measured in-process cost or the client's cost hint and the configured utilization limit (default 0.7). [Scheduler](../../hexecutor/host/cpp/broker.cpp)
 - `--idle-close-ms` defaults to 2000. Idle close can release an ordinary tensor session. Adapter holds and persistent-state graphs keep it open. A disconnect drops that client's queued work and streams. Fatal device errors trigger restoration and leave the daemon refusing further work. [Failure handling](operations.md#failure-handling)
+
+## Q16P sessions
+
+Pass `--qnn16-graph NAME=PROGRAM.q16p,CONSTANTS.q16c` for each startup graph and supply the QNN16 engine with the preserving four-worker tensor bootstrap. A Q16P session accepts only startup Q16P graphs. XRService adapters and dynamic registration require an HXFG session.
+
+When the constants exceed the low DDR region, build [the QNN16 engine](../../hexecutor/build-scripts/build_qnn16.sh), [the tensor bootstrap, and its chunk probe](../../hexecutor/build-scripts/build_tensor.sh) with the same `HEXECUTOR_QDO_SLOTS`. Each slot maps 16 MiB. Set `HEXECUTOR_CHUNK_WINDOW_MB` to the matching size at launch. The Q16P session checks the artifact slot counts, requests and pins a lease covering that window, and then runs the probe. It can place constants at or above 128 MiB. The fixed private QNN16 scratch region is just under 8 MiB, and all graphs share just under 16 MiB for float32 exchange buffers. These limits are independent of the DDR window. A Q16P session skips automatic lease shrink when device cleanup cannot be verified.
 
 ## Persistent state
 
