@@ -47,7 +47,28 @@ int main(void) {
     assert(q16_program_open(&p, &image, sizeof image, 8, &bad) == Q16_SCRATCH);
     image.h.scratch_bytes = 256; image.h.version = Q16P_VERSION;
     assert(q16_program_open(&p, &image, sizeof image, 8, &bad) == Q16_HEADER);
+    /* Compact U16 ingress clips and rounds; egress uses the same scale and zero point. */
+    image.h.version = Q16P_ARENA_VERSION;
+    image.h.constant_bytes = 0;
+    image.t[0].dtype = Q16_U16;
+    image.t[0].bytes = 4;
+    image.op[0] = (Q16Op){.kind = Q16_INPUT_U16, .out = 0, .p = {0, 0, 0, 0, 0x3e800000u, 10}};
+    image.op[1] = (Q16Op){.kind = Q16_OUTPUT_U16, .x = 0, .p = {0, 0, 0, 0, 0x3e800000u, 10}};
+    float raw_input[] = {-10.0f, 1.125f};
+    memcpy(exchange, raw_input, sizeof raw_input);
+    assert(q16_program_open(&p, &image, sizeof image, 0, &bad) == Q16_OK);
+    assert(q16_exec_op(&e, 0) == Q16_OK);
+    const uint16_t expected_codes[] = {0, 15};
+    assert(!memcmp(scratch, expected_codes, sizeof expected_codes));
+    assert(q16_exec_op(&e, 1) == Q16_OK);
+    const float expected_output[] = {-2.5f, 1.25f};
+    assert(!memcmp(exchange + 128, expected_output, sizeof expected_output));
+    image.op[0].p[2] = 1;
+    assert(q16_program_open(&p, &image, sizeof image, 0, &bad) == Q16_OPERATOR && bad == 0);
+    image.op[0].p[2] = 0;
+    image.op[1].p[4] = 0x7f800000u;
+    assert(q16_program_open(&p, &image, sizeof image, 0, &bad) == Q16_OPERATOR && bad == 1);
     free(vtcm);
-    puts("PASS Q16P persistent arena");
+    puts("PASS Q16P persistent arena and quantized exchange");
     return 0;
 }

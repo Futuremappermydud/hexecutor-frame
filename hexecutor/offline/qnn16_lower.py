@@ -15,9 +15,9 @@ import math
 from pathlib import Path
 
 try:
-    from .qnn16_oracle import load, map_entries, read_trace
+    from .qnn16_oracle import load, map_entries, read_trace, read_worker_checkpoints
 except ImportError:
-    from qnn16_oracle import load, map_entries, read_trace
+    from qnn16_oracle import load, map_entries, read_trace, read_worker_checkpoints
 
 BLOCK = 2048
 VTCM_BYTES = 8 << 20
@@ -103,6 +103,9 @@ def write_tensor_config(graph, rows, entries, destination):
                 # QAIRT 2.50 HMX conv op stores its tensor handles in the
                 # extended argument area; direct pool-2 Fi inputs use slot 8.
                 slot = 8
+            elif kind == "layernorm_q16_va_normvals_fixedpoint.tcm@Fi.t.ni.nf*3.Fi*2" and input_index == 0:
+                # The variadic normvals wrapper exposes the epsilon tensor in slot 5.
+                slot = 5
             else:
                 # Elementwise and format adapters store one tensor handle per
                 # input in the standard argument vector.
@@ -152,7 +155,7 @@ def lower(context_dir, trace_dir, pool2_path, output_prefix, known=None, tensor_
     context_dir, trace_dir = Path(context_dir), Path(trace_dir)
     graph = load(context_dir / "graph.json")
     rows = read_trace(trace_dir)
-    entries = map_entries(graph, rows, known)
+    entries = map_entries(graph, rows, known, read_worker_checkpoints(trace_dir))
     tensors = {t["id"]: t for t in graph["tensors"]}
     if bool(pool2_path) == bool(tensor_dumps):
         raise ValueError("provide exactly one of pool2_path or tensor_dumps")
@@ -276,7 +279,9 @@ def main():
     a = ap.parse_args()
     graph = load(a.context / "graph.json")
     rows = read_trace(a.trace)
-    entries = map_entries(graph, rows, load(a.known) if a.known else None)
+    entries = map_entries(
+        graph, rows, load(a.known) if a.known else None, read_worker_checkpoints(a.trace)
+    )
     if a.write_tensor_config:
         count = write_tensor_config(graph, rows, entries, a.write_tensor_config)
         print(f"{count} constant tensor capture entries -> {a.write_tensor_config}")

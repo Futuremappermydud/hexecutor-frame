@@ -30,7 +30,8 @@ VTCM = 8 << 20
 KINDS = ["COPY", "ZERO", "CONV1X1", "DW1X1", "DW3X3", "CONV3X3", "S2D", "DW3X3_S2", "IM2COL",
          "INPUT", "OUTPUT", "FORMAT", "CAST_F32", "CAST_F16", "MUL", "MINMAX", "SIGMOID",
          "RESHAPE", "CONCAT", "SLICE", "SHUFFLE", "TRANSPOSE", "AVGPOOL", "X2S", "ZAP", "PW1X1", "SWISH", "WELFORD_PARTIAL", "CONV3X3_S2", "WELFORD_MERGE", "MOVE", "ADD_SWISH", "GROUP_MOMENTS", "DECIMATE", "SLICE_F32", "INSTANCE_NORM", "RESIZE_BILINEAR", "SOFTMAX", "PW_SWISH", "REDUCE_SUM", "RESIZE_NEAREST",
-         "L2NORM", "REDUCE_MEAN", "PW_TANH", "AFFINE"]
+         "L2NORM", "REDUCE_MEAN", "PW_TANH", "AFFINE", "INPUT_U16", "OUTPUT_U16", "SLICE_U16", "SPILL_FILL", "REARRANGE_U16", "MOMENTS_U16", "NORMVALS_U16", "NORMALIZE_U16", "PW_XSB_U16", "LINCLIP_U16", "PACK_XPB_U16", "XPB_BIAS", "XPB_FI", "PW_XPB_U16",
+         "SOFTMAX_U16", "MUL_U16", "ADD_U16", "GELU_U16"]
 
 
 def build(tmp):
@@ -44,6 +45,7 @@ def build(tmp):
     lib = C.CDLL(str(so))
     lib.q16_host_open.argtypes = [C.c_void_p, C.c_uint32, C.c_uint32, C.POINTER(C.c_uint32)]
     lib.q16_host_bind.argtypes = [C.c_void_p] * 4
+    lib.q16_host_bind_spill.argtypes = [C.c_void_p]
     lib.q16_host_step.argtypes = [C.c_uint32]
     return lib
 
@@ -73,6 +75,9 @@ def main():
         exchange = np.zeros(exchange_bytes, np.uint8)
         scratch = np.zeros(scratch_bytes, np.uint8)
         lib.q16_host_bind(vtcm.ctypes.data, exchange.ctypes.data, scratch.ctypes.data, constants.ctypes.data)
+        spill = np.zeros(int.from_bytes(image[100:104], "little"), np.uint8)
+        if spill.size:
+            lib.q16_host_bind_spill(spill.ctypes.data)
         input_names, output_names = metadata_names(a.run)
         values = model_inputs(a.run, a.inputs)
         for slot, (dims, name) in enumerate(zip(summary["inputs"], input_names)):

@@ -25,6 +25,7 @@ static const uint8_t qds_boot_features[12] __attribute__((used)) = {'Q','D','B',
 #ifdef HEXECUTOR_TENSOR_BOOT
 #include "tensor/graph.h"
 static const char hx_boot_feature[] __attribute__((used))="HXTBOOT1";
+static const uint8_t hx_boot_window[] __attribute__((used)) = QDO_WINDOW_FEATURE;
 #define boot_config_valid(c) hx_session_config_valid((const HxSessionConfig *)(c))
 #define boot_code_bytes(c) (((const HxSessionConfig *)(c))->code_bytes)
 #define boot_config_error(c) (!boot_config_valid(c))

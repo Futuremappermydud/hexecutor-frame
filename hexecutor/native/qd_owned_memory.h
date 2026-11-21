@@ -14,6 +14,8 @@
 #define QDO_SLOTS 8u
 #endif
 #define QDO_BYTES (QDO_SLOTS * 0x01000000u)
+/* ELF marker lets the host check the window before activating a DSP payload. */
+#define QDO_WINDOW_FEATURE {'Q','D','W','I','N','D','0','1',QDO_SLOTS}
 #ifndef QDO_FIRST
 #define QDO_FIRST (QDO_SLOTS > 64u ? (128u - QDO_SLOTS) : 64u)
 #endif

@@ -18,6 +18,7 @@ entries, found by alignment against known function offsets.
 
 import argparse
 from collections import Counter, defaultdict
+from itertools import groupby
 import json
 from pathlib import Path
 
@@ -51,6 +52,50 @@ def read_trace(trace_dir):
         rows.append((int(seq), int(lst), int(idx), fn, int(n)))
     rows.sort()
     return rows
+
+
+def read_worker_checkpoints(trace_dir):
+    """Read optional QAIRT 2.50 worker descriptor checkpoint addresses."""
+    checkpoints = {}
+    with (Path(trace_dir) / "trace.log").open() as trace:
+        for line in trace:
+            if not line.startswith("# worker-checkpoints "):
+                continue
+            _, _, index, wait, done = line.split()
+            index = int(index)
+            if index in checkpoints:
+                raise ValueError(f"duplicate worker checkpoint entry {index}")
+            checkpoints[index] = (int(wait, 0), int(done, 0))
+    return checkpoints
+
+
+def _align_worker_checkpoints(work_rows, worker, addresses):
+    """Match checkpoint pairs in list order, allowing one node to have several workers."""
+    if not worker or set(addresses) != {row[2] for row in work_rows}:
+        raise ValueError("worker checkpoint coverage does not match the trace")
+    if any(len(node.get("checkpoints", ())) != 2 for node in worker):
+        raise ValueError("worker checkpoint mapping requires a serialized wait and done pair")
+    base = addresses[work_rows[0][2]][0] - 4 * worker[0]["checkpoints"][0]
+    if base <= 0 or base % 4:
+        raise ValueError("invalid worker checkpoint base")
+
+    def expected(node):
+        return tuple(base + 4 * index for index in node["checkpoints"])
+
+    graph_groups = groupby(worker, expected)
+    trace_groups = groupby(work_rows, lambda row: addresses[row[2]])
+    mapped = {}
+    for (graph_pair, graph_group), (trace_pair, trace_group) in zip(
+            graph_groups, trace_groups, strict=True):
+        nodes, rows = list(graph_group), list(trace_group)
+        if graph_pair != trace_pair or len(rows) < len(nodes):
+            raise ValueError(f"worker checkpoints do not match at trace entry {rows[0][2]}")
+        if len(rows) != len(nodes):
+            if len(nodes) != 1 or len({row[3] for row in rows}) != 1:
+                raise ValueError(f"ambiguous worker checkpoint group at trace entry {rows[0][2]}")
+            nodes *= len(rows)
+        mapped.update((row[2], node) for row, node in zip(rows, nodes))
+    return mapped
 
 
 def _align_worker(work_rows, worker):
@@ -91,14 +136,17 @@ def _align_worker(work_rows, worker):
     raise ValueError(f"worker list has {W} entries, graph {V}: ambiguous or unhandled split (candidates: {valid_splits})")
 
 
-def map_entries(graph, rows, known=None):
+def map_entries(graph, rows, known=None, worker_checkpoints=None):
     """Return {(list, idx): node or None for executor-only entries}."""
     nodes = graph["nodes"]
     main_rows = sorted((r for r in rows if r[1] == 0), key=lambda r: r[2])
     work_rows = sorted((r for r in rows if r[1] == 1), key=lambda r: r[2])
     worker = [n for n in nodes if n["flags"] in (4, 6)]
     main = [n for n in nodes if n["flags"] not in (4, 6) and executable(n)]
-    worker_map = _align_worker(work_rows, worker)
+    worker_map = (
+        _align_worker_checkpoints(work_rows, worker, worker_checkpoints)
+        if worker_checkpoints else _align_worker(work_rows, worker)
+    )
     known = known or {}
 
     # Align main rows to main nodes; only rows may be skipped (executor-only).
@@ -211,7 +259,7 @@ class Oracle:
         self.graph = load(Path(context_dir) / "graph.json")
         self.tensors = {t["id"]: t for t in self.graph["tensors"]}
         self.rows = read_trace(trace_dir)
-        self.nodes = map_entries(self.graph, self.rows, known)
+        self.nodes = map_entries(self.graph, self.rows, known, read_worker_checkpoints(trace_dir))
         self.writes = read_writes(trace_dir)
 
     def run(self, want=None):

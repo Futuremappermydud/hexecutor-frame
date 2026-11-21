@@ -382,6 +382,13 @@ int main(int argc, char **argv) {
     }
     uint8_t *exchange = memalign(128, h->exchange_bytes);
     uint8_t *scratch = memalign(128, h->scratch_bytes);
+    uint8_t *spill = h->reserved[1] ? memalign(128, h->reserved[1]) : NULL;
+    if (h->reserved[1] && !spill) {
+        printf("FAIL cannot allocate spill backing\n");
+        return 1;
+    }
+    if (spill)
+        memset(spill, 0, h->reserved[1]);
     memset(exchange, 0, h->exchange_bytes);
     for (uint32_t i = 0; i < h->inputs; i++) {
         uint32_t n = 0;
@@ -392,7 +399,7 @@ int main(int argc, char **argv) {
         }
         memcpy(exchange + program.io[i].offset, in, n);
     }
-    Q16Exec e = {&program, (uint8_t *)base, exchange, scratch, constants, qnn16_conv1x1, qnn16_hmx_finish, emulate, 0, 0};
+    Q16Exec e = {&program, (uint8_t *)base, exchange, scratch, constants, qnn16_conv1x1, qnn16_hmx_finish, emulate, 0, 0, spill};
     static uint64_t kind_cycles[Q16_KIND_END];
     static uint32_t kind_count[Q16_KIND_END];
     qnn16_hmx_reset();

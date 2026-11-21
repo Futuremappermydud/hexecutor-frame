@@ -8,6 +8,8 @@
 #include "program.h"
 #include "qnn16_f32.h"
 #ifdef __HVX__
+#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
 #include "qnn16_tile.h"
 #endif
 #include <string.h>
@@ -57,6 +59,257 @@ static uint8_t *bump(uint8_t **cursor, uint64_t bytes) {
     *cursor += (bytes + 127u) & ~(uint64_t)127u;
     return at;
 }
+
+typedef struct {
+    Q16Exec *exec;
+    const Q16Op *op;
+} U16PointwiseJob;
+
+static uint16_t pw_u16_requant(int64_t value, float scale, uint32_t zero) {
+    double code = value * (double)scale + zero + 0.5;
+    return code <= 0 ? 0 : code >= UINT16_MAX ? UINT16_MAX : (uint16_t)code;
+}
+
+#ifdef __HVX__
+typedef union {
+    HVX_Vector vector;
+    int32_t lane[32];
+} U16DotLanes;
+
+/* Split four U16 activations into two unsigned byte dot products. Keeping
+ * the byte sums separate avoids 32-bit overflow even at K=4096. */
+static void pw_accum_four(U16DotLanes sums[4], const uint16_t *in, const int8_t *packed) {
+    HVX_Vector weights = *(const HVX_UVector *)packed;
+    for (uint32_t token = 0; token < 2u; ++token) {
+        uint32_t lo = 0, hi = 0;
+        for (uint32_t k = 0; k < 4u; ++k) {
+            uint32_t code = in[2u * k + token];
+            lo |= (code & 255u) << (8u * k);
+            hi |= (code >> 8) << (8u * k);
+        }
+        sums[token * 2u].vector = Q6_Vw_vrmpyacc_VwVubVb(
+            sums[token * 2u].vector, Q6_V_vsplat_R(lo), weights);
+        sums[token * 2u + 1u].vector = Q6_Vw_vrmpyacc_VwVubVb(
+            sums[token * 2u + 1u].vector, Q6_V_vsplat_R(hi), weights);
+    }
+}
+
+static int64_t pw_dot(const U16DotLanes sums[4], uint32_t token, uint32_t lane) {
+    return sums[token * 2u].lane[lane] + (int64_t)sums[token * 2u + 1u].lane[lane] * 256;
+}
+#endif
+
+static void pw_xsb_task(void *ctx, uint32_t part, uint32_t parts) {
+    const U16PointwiseJob *job = ctx;
+    Q16Exec *e = job->exec;
+    const Q16Op *o = job->op;
+    const Q16Tensor *t = e->program->tensors;
+    const uint32_t *a = e->program->words + t[o->x].block_first;
+    const uint32_t *c = e->program->words + t[o->out].block_first;
+    const int8_t *weights = at(e, o->y);
+    const int32_t *epilogue = at(e, o->z);
+    uint32_t kb = t[o->x].dims.c / 32u, nb = t[o->out].dims.c / 32u;
+    float scale;
+    memcpy(&scale, &o->p[0], sizeof(scale));
+    /* Fi lane scales are constant across the 19 token tiles. Decode them once
+     * per output block, not once for every tile assigned to this worker. */
+    for (uint32_t n = 0; n < nb; ++n) {
+        const int32_t *fi = epilogue + n * 128u;
+        float scales[32];
+        for (uint32_t j = 0; j < 32u; ++j) {
+            uint32_t lane = (j & 1u) * 64u + (j & ~1u);
+            const int exponent = ((uint32_t)fi[lane] >> 10) & 31u;
+            const uint32_t mantissa = 1024u + ((uint32_t)fi[lane + 1u] & 1023u);
+            scales[j] = o->p[2] ? ldexpf((float)mantissa, exponent - 26) : scale;
+        }
+        for (uint32_t m = part; m < 19u; m += parts) {
+            uint16_t *out = (uint16_t *)(e->vtcm + c[m * nb + n]);
+            for (uint32_t pair = 0; pair < 16u; ++pair) {
+#ifdef __HVX__
+                U16DotLanes sums[4];
+                for (uint32_t i = 0; i < 4u; ++i)
+                    sums[i].vector = Q6_V_vzero();
+                for (uint32_t k = 0; k < kb; ++k) {
+                    const uint16_t *in = (const uint16_t *)(e->vtcm + a[m * kb + k]) + pair * 64u;
+                    const int8_t *w = weights + (k * nb + n) * 1024u;
+                    for (uint32_t g = 0; g < 8u; ++g)
+                        pw_accum_four(sums, in + g * 8u, w + g * 128u);
+                }
+                for (uint32_t j = 0; j < 32u; ++j) {
+                    int32_t bias = fi[(j & 1u) * 64u + 32u + (j & ~1u)];
+                    for (uint32_t token = 0; token < 2u; ++token)
+                        out[pair * 64u + j * 2u + token] =
+                            pw_u16_requant((pw_dot(sums, token, j) >> 8) + bias, scales[j], o->p[1]);
+                }
+#else
+                int64_t dot0[32] = {0}, dot1[32] = {0};
+                for (uint32_t k = 0; k < kb; ++k) {
+                    const uint16_t *in = (const uint16_t *)(e->vtcm + a[m * kb + k]) + pair * 64u;
+                    const int8_t *w = weights + (k * nb + n) * 1024u;
+                    int32_t tile0[32] = {0}, tile1[32] = {0};
+                    for (uint32_t g = 0; g < 8u; ++g)
+                        for (uint32_t j = 0; j < 32u; ++j)
+                            for (uint32_t r = 0; r < 4u; ++r) {
+                                int32_t b = w[g * 128u + j * 4u + r];
+                                tile0[j] += (int32_t)in[g * 8u + r * 2u] * b;
+                                tile1[j] += (int32_t)in[g * 8u + r * 2u + 1u] * b;
+                            }
+                    for (uint32_t j = 0; j < 32u; ++j) {
+                        dot0[j] += tile0[j];
+                        dot1[j] += tile1[j];
+                    }
+                }
+                for (uint32_t j = 0; j < 32u; ++j) {
+                    int32_t bias = fi[(j & 1u) * 64u + 32u + (j & ~1u)];
+                    out[pair * 64u + j * 2u] = pw_u16_requant((dot0[j] >> 8) + bias, scales[j], o->p[1]);
+                    out[pair * 64u + j * 2u + 1u] = pw_u16_requant((dot1[j] >> 8) + bias, scales[j], o->p[1]);
+                }
+#endif
+            }
+        }
+    }
+}
+
+static void pw_xpb_task(void *ctx, uint32_t part, uint32_t parts) {
+    const U16PointwiseJob *job = ctx;
+    Q16Exec *e = job->exec;
+    const Q16Op *o = job->op;
+    const Q16Tensor *t = e->program->tensors;
+    const uint32_t *a = e->program->words + t[o->x].block_first;
+    const uint32_t *c = e->program->words + t[o->out].block_first;
+    const int8_t *weights = at(e, o->y);
+    const int32_t *epilogue = at(e, o->z);
+    uint32_t kb = t[o->x].full.c / 32u, nb = t[o->out].full.c / 32u;
+    uint32_t k_groups = t[o->y].full.w / 4u, n_groups = t[o->y].full.c / 32u;
+    float scale;
+    memcpy(&scale, &o->p[0], sizeof(scale));
+    for (uint32_t m = part; m < t[o->x].dims.w / 4u; m += parts)
+        for (uint32_t n = 0; n < n_groups; ++n) {
+            uint16_t *out = (uint16_t *)(e->vtcm + c[m * nb + n / 2u]) + (n % 2u) * 32u;
+            const int32_t *fi = epilogue + n * 64u + 32u;
+            for (uint32_t pair = 0; pair < 16u; ++pair) {
+#ifdef __HVX__
+                U16DotLanes sums[4];
+                for (uint32_t i = 0; i < 4u; ++i)
+                    sums[i].vector = Q6_V_vzero();
+                for (uint32_t k = 0; k < k_groups; ++k) {
+                    const uint16_t *in = (const uint16_t *)(e->vtcm + a[m * kb + k / 8u]) +
+                                         pair * 64u + (k % 8u) * 8u;
+                    pw_accum_four(sums, in, weights + (n * k_groups + k) * 128u);
+                }
+                /* Xpb interleaves signed low and high weight bytes in adjacent vector lanes. */
+                for (uint32_t j = 0; j < 16u; ++j)
+                    for (uint32_t token = 0; token < 2u; ++token) {
+                        int64_t dot = pw_dot(sums, token, j * 2u) +
+                                      pw_dot(sums, token, j * 2u + 1u) * 256;
+                        out[pair * 64u + j * 2u + token] =
+                            pw_u16_requant((dot >> 16) + fi[j * 2u], scale, o->p[1]);
+                    }
+#else
+                int64_t dot0[16] = {0}, dot1[16] = {0};
+                for (uint32_t k = 0; k < k_groups; ++k) {
+                    const uint16_t *in = (const uint16_t *)(e->vtcm + a[m * kb + k / 8u]) + pair * 64u + (k % 8u) * 8u;
+                    const int8_t *w = weights + (n * k_groups + k) * 128u;
+                    for (uint32_t j = 0; j < 16u; ++j)
+                        for (uint32_t r = 0; r < 4u; ++r) {
+                            int32_t b = w[j * 8u + r] + w[j * 8u + r + 4u] * 256;
+                            dot0[j] += (int64_t)in[r * 2u] * b;
+                            dot1[j] += (int64_t)in[r * 2u + 1u] * b;
+                        }
+                }
+                for (uint32_t j = 0; j < 16u; ++j) {
+                    int32_t bias = fi[j * 2u];
+                    out[pair * 64u + j * 2u] = pw_u16_requant((dot0[j] >> 16) + bias, scale, o->p[1]);
+                    out[pair * 64u + j * 2u + 1u] = pw_u16_requant((dot1[j] >> 16) + bias, scale, o->p[1]);
+                }
+#endif
+            }
+        }
+}
+
+static void softmax_u16(Q16Exec *e, const Q16Op *o) {
+    const Q16Program *p = e->program;
+    const uint32_t *a = p->words + p->tensors[o->x].block_first;
+    const uint32_t *b = p->words + p->tensors[o->out].block_first;
+    float scale;
+    memcpy(&scale, &o->p[0], sizeof(scale));
+    const uint32_t groups = 19u, channels = 577u;
+    float row[577];
+    for (uint32_t strip = 0; strip < p->tensors[o->x].dims.w / 4u; strip++)
+        for (uint32_t token = 0; token < 32u; token++) {
+            uint32_t lane = (token / 2u) * 64u + (token % 2u);
+            float max = 0;
+            for (uint32_t c = 0; c < channels; c++) {
+                const uint16_t *in = (const uint16_t *)(e->vtcm + a[strip * groups + c / 32u]);
+                float value = in[lane + (c % 32u) * 2u];
+                row[c] = value;
+                if (value > max)
+                    max = value;
+            }
+            /* Reference softmax with the captured input encoding. QAIRT's
+             * fixed-point exponential and reciprocal are approximate. */
+            double sum = 0;
+            for (uint32_t c = 0; c < channels; c++)
+                sum += row[c] = expf((row[c] - max) * scale);
+            double ratio = 65536.0 / sum;
+            for (uint32_t c = 0; c < groups * 32u; c++) {
+                uint16_t *out = (uint16_t *)(e->vtcm + b[strip * groups + c / 32u]);
+                double v = c < channels ? row[c] * ratio + 0.5 : 0;
+                out[lane + (c % 32u) * 2u] = v >= UINT16_MAX ? UINT16_MAX : (uint16_t)v;
+            }
+        }
+}
+
+static void ew_u16(Q16Exec *e, const Q16Op *o) {
+    const Q16Program *p = e->program;
+    const Q16Tensor *x = &p->tensors[o->x], *out = &p->tensors[o->out];
+    const uint32_t *a = p->words + x->block_first, *d = p->words + out->block_first;
+    const uint32_t *b = 0;
+    uint16_t broadcast[64];
+    float scales[2];
+    if (o->kind == Q16_GELU_U16)
+        memcpy(scales, o->p, sizeof(scales));
+    else
+        b = p->words + p->tensors[o->y].block_first;
+    if (o->kind == Q16_MUL_U16)
+        for (uint32_t c = 0; c < x->dims.c; c++) {
+            const uint16_t *tile = (const uint16_t *)(e->vtcm + b[c / 32u]);
+            broadcast[c] = tile[(c % 32u) * 2u];
+        }
+
+    for (uint32_t block = 0; block < out->block_count; block++) {
+        const uint16_t *in = (const uint16_t *)(e->vtcm + a[block]);
+        uint16_t *dest = (uint16_t *)(e->vtcm + d[block]);
+        if (o->kind == Q16_ADD_U16) {
+            const uint16_t *other = (const uint16_t *)(e->vtcm + b[block]);
+            uint32_t shift = o->p[2];
+            int64_t offset = (int64_t)(int32_t)o->p[3] * 2 + ((int64_t)1 << shift);
+            for (uint32_t i = 0; i < 1024u; i++) {
+                int64_t v = ((int64_t)in[i] * o->p[0] + (int64_t)other[i] * o->p[1] + offset) >> (shift + 1u);
+                dest[i] = v < 0 ? 0 : v > UINT16_MAX ? UINT16_MAX : (uint16_t)v;
+            }
+        } else if (o->kind == Q16_MUL_U16) {
+            const uint16_t *channels = broadcast + (block % (x->dims.c / 32u)) * 32u;
+            uint32_t lo = o->p[0] & 65535u, hi = o->p[0] >> 16;
+            for (uint32_t i = 0; i < 1024u; i++) {
+                uint32_t u = in[i], v = channels[(i / 2u) % 32u];
+                int32_t centered = (int32_t)(u * v + o->p[3] - (v * o->p[1] + u * o->p[2]));
+                int64_t mixed = ((int64_t)centered * lo) >> 16;
+                int64_t q = ((mixed + (int64_t)centered * hi) >> 15) + (int32_t)o->p[4];
+                q = (q + 4) >> 3;
+                dest[i] = q < 0 ? 0 : q > UINT16_MAX ? UINT16_MAX : (uint16_t)q;
+            }
+        } else {
+            for (uint32_t i = 0; i < 1024u; i++) {
+                double v = ((int32_t)in[i] - (int32_t)o->p[2]) * (double)scales[0];
+                /* Exact GELU formula, compared with QAIRT's approximation. */
+                double q = 0.5 * v * (1.0 + erff((float)(v * 0.70710678118654752))) * scales[1] + o->p[3] + 0.5;
+                dest[i] = q < 0 ? 0 : q > UINT16_MAX ? UINT16_MAX : (uint16_t)q;
+            }
+        }
+    }
+}
+
 typedef struct {
     const Q16Op *o;
     Qnn16Tensor xin, yout;
@@ -783,7 +1036,7 @@ uint32_t q16_exec_op(Q16Exec *e, uint32_t index) {
     const Q16Program *p = e->program;
     const Q16Op *o = &p->ops[index];
     const Q16Tensor *T = p->tensors;
-    uint8_t *cursor = e->scratch + (p->header->version == Q16P_ARENA_VERSION ? p->header->reserved[0] : 0u);
+    uint8_t *cursor = e->scratch + (p->header->version >= Q16P_ARENA_VERSION ? p->header->reserved[0] : 0u);
     int bad = 0;
     switch (o->kind) {
     case Q16_COPY:
@@ -859,6 +1112,45 @@ uint32_t q16_exec_op(Q16Exec *e, uint32_t index) {
         float *base = (float *)(e->exchange + io->offset) + (uint64_t)o->p[3] * io->dims.h * io->dims.w * io->dims.c;
         bad |= qnn16_place_f32(base, dest, src, T[o->x].dims, o->p[1],
                                o->p[2]);
+        break;
+    }
+    case Q16_INPUT_U16: {
+        const Q16Io *io = &p->io[o->p[0]];
+        const Qnn16Shape tile = T[o->out].dims;
+        const float *src = (const float *)(e->exchange + io->offset);
+        uint16_t *dst = (uint16_t *)at(e, o->out);
+        float scale;
+        memcpy(&scale, &o->p[4], sizeof scale);
+        for (uint32_t b = 0; b < tile.b; b++)
+            for (uint32_t y = 0; y < tile.h; y++) {
+                size_t offset = (((size_t)(b + o->p[3]) * io->dims.h + y + o->p[1]) *
+                                 io->dims.w + o->p[2]) * io->dims.c;
+                for (size_t i = 0; i < (size_t)tile.w * tile.c; i++) {
+                    /* Preserve QNN's U16 decision thresholds at large zero points. */
+                    double scaled = (double)src[offset + i] / scale + o->p[5];
+                    if (isnan(scaled))
+                        scaled = o->p[5];
+                    *dst++ = scaled <= 0 ? 0 : scaled >= UINT16_MAX ? UINT16_MAX : (uint16_t)(scaled + 0.5);
+                }
+            }
+        break;
+    }
+    case Q16_OUTPUT_U16: {
+        const Q16Io *io = &p->io[p->header->inputs + o->p[0]];
+        const Qnn16Shape tile = T[o->x].dims;
+        uint16_t *src = (uint16_t *)cursor;
+        float *dst = (float *)(e->exchange + io->offset);
+        float scale;
+        memcpy(&scale, &o->p[4], sizeof scale);
+        if (gather(e, src, o->x))
+            return Q16_SHAPE;
+        for (uint32_t b = 0; b < tile.b; b++)
+            for (uint32_t y = 0; y < tile.h; y++) {
+                size_t offset = (((size_t)(b + o->p[3]) * io->dims.h + y + o->p[1]) *
+                                 io->dims.w + o->p[2]) * io->dims.c;
+                for (size_t i = 0; i < (size_t)tile.w * tile.c; i++)
+                    dst[offset + i] = ((int32_t)*src++ - (int32_t)o->p[5]) * scale;
+            }
         break;
     }
     case Q16_FORMAT: {
@@ -1136,6 +1428,245 @@ uint32_t q16_exec_op(Q16Exec *e, uint32_t index) {
         for (uint32_t i = 0; i < rows; i++)
             for (uint32_t c = 0; c < T[o->out].dims.c; c++)
                 dst[i * T[o->out].dims.c + c] = src[i * T[o->x].dims.c + o->p[0] + c];
+        break;
+    }
+    case Q16_MOMENTS_U16: {
+        const Q16Tensor *in = &T[o->x];
+        const uint32_t *blocks = p->words + in->block_first;
+        uint32_t *out = (uint32_t *)at(e, o->out), tokens = in->dims.w * 8u;
+        uint32_t groups = in->dims.c / 32u;
+        /* Each strip emits 32 tokens in physical row order. Each 128-byte
+         * slice interleaves the channels of two adjacent pixels. */
+        for (uint32_t strip = 0; strip < in->dims.w / 4u; strip++)
+            for (uint32_t pair = 0; pair < 16u; pair++) {
+                uint32_t sum0 = 0, sum1 = 0;
+                uint64_t sq0 = 0, sq1 = 0;
+                for (uint32_t g = 0; g < groups; g++) {
+                    const uint16_t *values = (const uint16_t *)(e->vtcm + blocks[strip * groups + g] + pair * 128u);
+                    for (uint32_t c = 0; c < 32u; c++) {
+                        uint32_t a = values[2u * c], b = values[2u * c + 1u];
+                        sum0 += a;
+                        sum1 += b;
+                        sq0 += a * a;
+                        sq1 += b * b;
+                    }
+                }
+                uint32_t lane = strip * 32u + pair * 2u;
+                out[lane] = sum0;
+                out[lane + 1u] = sum1;
+                out[tokens + lane] = (uint32_t)sq0;
+                out[tokens + lane + 1u] = (uint32_t)sq1;
+                out[2u * tokens + lane] = (uint32_t)(sq0 >> 32);
+                out[2u * tokens + lane + 1u] = (uint32_t)(sq1 >> 32);
+            }
+        break;
+    }
+    case Q16_LINCLIP_U16: {
+        const Q16Tensor *in = &T[o->x], *out = &T[o->out];
+        uint32_t blocks = in->direct ? 1u : in->block_count;
+        uint32_t count = in->direct ? q16_tensor_elements(in) : 1024u;
+        for (uint32_t block = 0; block < blocks; ++block) {
+            const uint16_t *src = in->direct ? at(e, o->x) :
+                (const uint16_t *)(e->vtcm + p->words[in->block_first + block]);
+            uint16_t *dst = out->direct ? at(e, o->out) :
+                (uint16_t *)(e->vtcm + p->words[out->block_first + block]);
+            for (uint32_t i = 0; i < count; ++i) {
+                int64_t v = ((int64_t)src[i] - o->p[2]) * o->p[0] + o->p[4];
+                v = (v >> o->p[1]) + o->p[3];
+                dst[i] = v < 0 ? 0 : v > UINT16_MAX ? UINT16_MAX : (uint16_t)v;
+            }
+        }
+        break;
+    }
+    case Q16_PACK_XPB_U16: {
+        const uint16_t *src = at(e, o->x);
+        uint8_t *dst = at(e, o->out);
+        uint32_t k = T[o->x].dims.w, n = T[o->x].dims.c;
+        uint32_t full_k = T[o->out].full.w, full_n = T[o->out].full.c / 2u;
+        for (uint32_t ng = 0; ng < full_n; ng += 16u)
+            for (uint32_t kg = 0; kg < full_k; kg += 4u)
+                for (uint32_t col = ng; col < ng + 16u; ++col) {
+                    for (uint32_t row = 0; row < 4u; ++row) {
+                        int32_t v = (kg + row < k && col < n) ? (int32_t)src[(kg + row) * n + col] - 32768 : 0;
+                        /* The greatest code representable by two signed base-256 digits. */
+                        if (v > 32639)
+                            v = 32639;
+                        int32_t hi = (v + 128) >> 8;
+                        dst[row] = (uint8_t)(v - hi * 256);
+                        dst[4u + row] = (uint8_t)hi;
+                    }
+                    dst += 8;
+                }
+        break;
+    }
+    case Q16_XPB_BIAS: {
+        const int8_t *w = at(e, o->x);
+        int32_t *bias = at(e, o->out);
+        uint32_t full_n = T[o->x].full.c / 2u;
+        for (uint32_t n = 0; n < full_n; n++) {
+            int32_t sum = 0;
+            const int8_t *col = w + (n / 16u * 16u * 16u + n % 16u) * 8u;
+            for (uint32_t kg = 0; kg < 16u; ++kg) {
+                const int8_t *group = col + kg * 128u;
+                for (uint32_t j = 0; j < 4u; ++j)
+                    sum += group[j] + group[j + 4u] * 256;
+            }
+            bias[n] = (int32_t)((-(int64_t)sum * o->p[0] + 32768) >> 16);
+        }
+        memset(bias + full_n, 0, (T[o->out].dims.c - full_n) * sizeof(*bias));
+        break;
+    }
+    case Q16_XPB_FI: {
+        const int32_t *bias = at(e, o->x);
+        const uint32_t *scales = p->words + o->p[0];
+        uint32_t *fi = at(e, o->out);
+        for (uint32_t n = 0; n < T[o->x].dims.c; n += 16u) {
+            memcpy(fi, scales + n * 2u, 32u * sizeof(*fi));
+            for (uint32_t i = 0; i < 16u; ++i) {
+                fi[32u + i * 2u] = (uint32_t)bias[n + i];
+                fi[33u + i * 2u] = 0;
+            }
+            fi += 64;
+        }
+        break;
+    }
+    case Q16_NORMVALS_U16: {
+        const uint32_t *in[] = {at(e, o->x), at(e, o->y), at(e, o->z), at(e, o->p[0])};
+        uint32_t lanes = T[o->out].dims.c;
+        int32_t *out = at(e, o->out);
+        float params[4];
+        memcpy(params, &o->p[1], sizeof(params));
+        double epsilon = (double)params[0] / ((double)params[1] * params[1]);
+        double gain_scale = (double)params[3] / params[2];
+        const uint64_t max_sum = 256u * UINT16_MAX;
+        const uint64_t max_square = max_sum * UINT16_MAX;
+        for (uint32_t lane = 0; lane < lanes; ++lane) {
+            uint64_t sum = 0, square = 0;
+            for (uint32_t i = 0; i < 4u; ++i) {
+                uint32_t partial_sum = in[i][lane];
+                uint64_t partial_square = (uint64_t)in[i][lanes * 2u + lane] << 32 |
+                                          in[i][lanes + lane];
+                if (partial_sum > max_sum || partial_square > max_square)
+                    return Q16_OPERATOR;
+                sum += partial_sum;
+                square += partial_square;
+            }
+            if (sum * sum > square * 1024u)
+                return Q16_OPERATOR;
+            double variance = (double)(square * 1024u - sum * sum) / (1024u * 1024u);
+            /* Reference arithmetic. QAIRT's Qf32 reciprocal sqrt and
+             * conversions can differ in the least significant output bits. */
+            double gain = gain_scale / sqrt(variance + epsilon);
+            int exponent;
+            double mantissa = frexp(gain, &exponent);
+            if (exponent > 16 || exponent < -15)
+                return Q16_OPERATOR;
+            int32_t fixed_gain = (int32_t)(mantissa * 65536.0 + 0.5);
+            if (fixed_gain == 65536) {
+                fixed_gain = 32768;
+                if (++exponent > 16)
+                    return Q16_OPERATOR;
+            }
+            out[lane] = -(int32_t)(sum * 32u);
+            out[lanes + lane] = fixed_gain;
+            out[lanes * 2u + lane] = exponent;
+        }
+        break;
+    }
+    case Q16_PW_XSB_U16: case Q16_PW_XPB_U16: {
+        U16PointwiseJob job = {e, o};
+        void (*task)(void *, uint32_t, uint32_t) = o->kind == Q16_PW_XSB_U16 ? pw_xsb_task : pw_xpb_task;
+        if (e->parallel)
+            e->parallel(task, &job);
+        else
+            task(&job, 0, 1);
+        break;
+    }
+    case Q16_SOFTMAX_U16:
+        softmax_u16(e, o);
+        break;
+    case Q16_ADD_U16: case Q16_MUL_U16: case Q16_GELU_U16:
+        ew_u16(e, o);
+        break;
+    case Q16_NORMALIZE_U16: {
+        const Q16Tensor *src = &T[o->x], *dst = &T[o->out];
+        const uint32_t *src_blocks = p->words + src->block_first, *dst_blocks = p->words + dst->block_first;
+        const int32_t *norm = at(e, o->y), *beta = at(e, o->p[0]);
+        const int16_t *gamma = at(e, o->z);
+        uint32_t lanes = src->dims.w * 8u;
+        for (uint32_t lane = 0; lane < lanes; ++lane)
+            if (norm[lane] > 0 || norm[lanes + lane] < 0 || norm[lanes + lane] > 65535 ||
+                norm[2u * lanes + lane] < -15 || norm[2u * lanes + lane] > 16)
+                return Q16_OPERATOR;
+        for (uint32_t strip = 0; strip < src->dims.w / 4u; ++strip)
+            for (uint32_t group = 0; group < 8u; ++group) {
+                const uint16_t *in = (const uint16_t *)(e->vtcm + src_blocks[strip * 8u + group]);
+                uint16_t *out = (uint16_t *)(e->vtcm + dst_blocks[strip * 8u + group]);
+                for (uint32_t pair = 0; pair < 16u; ++pair) {
+                    uint32_t lane = strip * 32u + pair * 2u;
+                    for (uint32_t pixel = 0; pixel < 2u; ++pixel) {
+                        uint32_t token = lane + pixel;
+                        uint32_t shift = 31 - norm[2u * lanes + token];
+                        int64_t rounding = (int64_t)1 << (shift - 1u);
+                        for (uint32_t c = 0; c < 32u; ++c) {
+                            uint32_t index = pair * 64u + c * 2u + pixel;
+                            uint32_t channel = group * 32u + c;
+                            int64_t centered = (int64_t)in[index] * 32768 + norm[token];
+                            int64_t scaled = centered * norm[lanes + token] * gamma[channel * 2u + pixel];
+                            int64_t code = ((scaled + rounding) >> shift) + beta[channel];
+                            out[index] = code < 0 ? 0 : code > 65535 ? 65535 : (uint16_t)code;
+                        }
+                    }
+                }
+            }
+        break;
+    }
+    case Q16_REARRANGE_U16: {
+        int inverse = T[o->out].dims.h == 1u;
+        const Q16Tensor *narrow = &T[inverse ? o->out : o->x];
+        const Q16Tensor *wide = &T[inverse ? o->x : o->out];
+        uint32_t groups = narrow->dims.c / 32u, columns = narrow->full.w / 4u;
+        const uint32_t *narrow_blocks = p->words + narrow->block_first;
+        const uint32_t *wide_blocks = p->words + wide->block_first;
+        for (uint32_t column = 0; column < columns; column++)
+            for (uint32_t c = 0; c < groups; c++) {
+                uint8_t *packed = e->vtcm + narrow_blocks[column * groups + c] + narrow->padding.h * 256u;
+                uint8_t *spread = e->vtcm + wide_blocks[(column / 8u) * groups + c] + (column % 8u) * 256u;
+                /* Inverse tail writes one pixel pair. Keep the other pair
+                 * and the unused rows byte-identical to their prior contents. */
+                if (inverse)
+                    memcpy(packed, spread, column + 1u == columns ? 128u : 256u);
+                else
+                    memcpy(spread, packed, 256u);
+            }
+        break;
+    }
+    case Q16_SPILL_FILL: {
+        if (!e->spill)
+            return Q16_RANGE;
+        const uint32_t *copy = p->words + o->p[0];
+        for (uint32_t k = 0; k < o->p[1]; k++, copy += 3) {
+            uint8_t *vtcm = e->vtcm + copy[0];
+            uint8_t *ddr = e->spill + copy[1];
+            if (o->p[2])
+                memcpy(ddr, vtcm, copy[2]);
+            else
+                memcpy(vtcm, ddr, copy[2]);
+        }
+        break;
+    }
+    case Q16_SLICE_U16: {
+        const Qnn16Shape in = T[o->x].dims, out = T[o->out].dims;
+        const uint16_t *src = (const uint16_t *)at(e, o->x);
+        uint16_t *dst = (uint16_t *)at(e, o->out);
+        for (uint32_t b = 0; b < out.b; b++)
+            for (uint32_t y = 0; y < out.h; y++)
+                for (uint32_t x = 0; x < out.w; x++) {
+                    size_t origin = (((size_t)(b + o->p[0]) * in.h + y + o->p[1]) *
+                                     in.w + x + o->p[2]) * in.c + o->p[3];
+                    memcpy(dst, src + origin, (size_t)out.c * sizeof(*dst));
+                    dst += out.c;
+                }
         break;
     }
     case Q16_ADD_SWISH: {

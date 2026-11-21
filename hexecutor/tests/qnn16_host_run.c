@@ -23,4 +23,6 @@ void q16_host_bind(uint8_t *vtcm, uint8_t *exchange, uint8_t *scratch, const uin
     exec.conv1x1 = q16_conv1x1_reference;
 }
 
+void q16_host_bind_spill(uint8_t *spill) { exec.spill = spill; }
+
 uint32_t q16_host_step(uint32_t op) { return q16_exec_op(&exec, op); }

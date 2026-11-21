@@ -21,9 +21,9 @@ from pathlib import Path
 import struct
 
 try:
-    from .qnn16_oracle import load, map_entries, read_trace
+    from .qnn16_oracle import load, map_entries, read_trace, read_worker_checkpoints
 except ImportError:
-    from qnn16_oracle import load, map_entries, read_trace
+    from qnn16_oracle import load, map_entries, read_trace, read_worker_checkpoints
 
 BLOCK = 2048
 VTCM = 8 << 20
@@ -33,7 +33,8 @@ MAGIC, VERSION = 0x50363151, 1
 KINDS = ["COPY", "ZERO", "CONV1X1", "DW1X1", "DW3X3", "CONV3X3", "S2D", "DW3X3_S2", "IM2COL",
          "INPUT", "OUTPUT", "FORMAT", "CAST_F32", "CAST_F16", "MUL", "MINMAX", "SIGMOID",
          "RESHAPE", "CONCAT", "SLICE", "SHUFFLE", "TRANSPOSE", "AVGPOOL", "X2S", "ZAP", "PW1X1", "SWISH", "WELFORD_PARTIAL", "CONV3X3_S2", "WELFORD_MERGE", "MOVE", "ADD_SWISH", "GROUP_MOMENTS", "DECIMATE", "SLICE_F32", "INSTANCE_NORM", "RESIZE_BILINEAR", "SOFTMAX", "PW_SWISH", "REDUCE_SUM", "RESIZE_NEAREST",
-         "L2NORM", "REDUCE_MEAN", "PW_TANH", "AFFINE"]
+         "L2NORM", "REDUCE_MEAN", "PW_TANH", "AFFINE", "INPUT_U16", "OUTPUT_U16", "SLICE_U16", "SPILL_FILL", "REARRANGE_U16", "MOMENTS_U16", "NORMVALS_U16", "NORMALIZE_U16", "PW_XSB_U16", "LINCLIP_U16", "PACK_XPB_U16", "XPB_BIAS", "XPB_FI", "PW_XPB_U16",
+         "SOFTMAX_U16", "MUL_U16", "ADD_U16", "GELU_U16"]
 KIND = {name: i + 1 for i, name in enumerate(KINDS)}
 SKIP = ("@DmaCheckpointSet", "@DmaCheckpointWait", "@SyncOp", "@Dummy", "Const", "Shape")
 
@@ -97,6 +98,7 @@ class Lowering:
         self.ops = []
         self.constants = bytearray()
         self.constant_at = {}
+        self.fi_words = {}
         self.op_nodes = []
         self.current = None
         self.produced = {tid for n in graph["nodes"] if n["type_name"] not in ("Const", "Shape")
@@ -126,14 +128,17 @@ class Lowering:
         self.pool3_end = align(pool3_end)
         self.indirect_arena = self.pool3_base + self.pool3_end
         self.arena_bytes = 0
+        self.spill_bytes = 0
         self.copy_const = {}  # COPY op index -> pool-2 tensor id
 
     # ----- tensors -----
     def dtype(self, t):
-        if t["class_name"].startswith("X") or t["class_name"] in ("Fi", "fi"):
+        if t["class_name"].startswith("X") or t["class_name"] in ("Fi", "fi", "Fs"):
             return 2  # packed weights or scale/bias tables: raw bytes
         if t.get("dtype") == "float32":
             return 1
+        if t.get("dtype") == "uint16":
+            return 3
         if t.get("element_bytes") == 2:
             return 0
         raise ValueError(f"tensor {t['id']} ({t['class_name']}) is neither FP16 nor float32")
@@ -147,10 +152,14 @@ class Lowering:
             raise ValueError(f"tensor {tid} has no shape")
         store = t.get("storage") or {}
         dims, full, pad = shape["dimensions"], shape["max_dimensions"], shape["padding"]
+        if (t["class_name"] == "F5H" and t["dtype"] == "uint16" and store.get("direct")
+                and len(dims) == 5 and dims == full and not any(pad)):
+            dims = full = [dims[0] * dims[1], *dims[2:]]
+            pad = [0] * 4
         if len(dims) != 4:
             raise ValueError(f"tensor {tid} is not rank 4")
         dtype = self.dtype(t)
-        esize = (2, 4, t.get("element_bytes") or 1)[dtype]
+        esize = (2, 4, t.get("element_bytes") or 1, 2)[dtype]
         direct = store.get("direct")
         if direct:
             pool = direct["pool"]
@@ -173,8 +182,8 @@ class Lowering:
                 self.arena_bytes = max(self.arena_bytes, align(offset + nbytes))
                 row = [2, dtype, offset, nbytes, 0, 0]
         else:
-            if dtype != 0 or t["class_name"][0] not in "Cc":  # crouton FP16 only
-                raise ValueError(f"tensor {tid} ({t['class_name']}) is not an FP16 crouton tensor")
+            if dtype not in (0, 3) or t["class_name"][0] not in "Cc":
+                raise ValueError(f"tensor {tid} ({t['class_name']}) is not a supported 16-bit crouton tensor")
             count = full[0] * -(-full[1] // 8) * -(-full[2] // 4) * -(-full[3] // 32)
             start = store.get("slice_offset", 0)
             blocks = store.get("blocks") or []
@@ -218,7 +227,7 @@ class Lowering:
                     raise ValueError(f"tensor {tid}: indirect pool-{ent.get('pool')} constant requires capture")
                 else:
                     self.words.append(NONE)
-            row = [0, 0, 0, 0, first, count]
+            row = [0, dtype, 0, 0, first, count]
         row += list(dims) + list(full) + list(pad) + [0, 0]
         self.tensor_index[tid] = len(self.tensor_rows)
         self.tensor_rows.append(row)
@@ -341,6 +350,178 @@ class Lowering:
         T = self.T
         if name.startswith(SKIP):
             return
+        if name == "layernorm_q16_2d_moments_reshaped.tcm@Fi.CH":
+            src, dst = T[ins[0]], T[outs[0]]
+            if src["dtype"] != "uint16" or src["class_name"] != "CH" or dst["dtype"] != "int32" or dst["class_name"] != "Fi":
+                raise ValueError("U16 LayerNorm moments require Crouton input and dense int32 output")
+            self.op("MOMENTS_U16", self.tensor(ins[0]), out=self.tensor(outs[0]))
+            return
+        if name == "layernorm_q16_va_normvals_fixedpoint.tcm@Fi.t.ni.nf*3.Fi*2":
+            if len(ins) != 9 or len(outs) != 1 or T[ins[1]].get("scalar") != 1024:
+                raise ValueError("U16 LayerNorm normvals requires four 256-channel partials")
+            if T[ins[0]]["dtype"] != "float32" or len(self.dumps.get(ins[0], b"")) != 4:
+                raise ValueError("U16 LayerNorm normvals requires captured float32 epsilon")
+            if any(T[t]["dtype"] != "int32" or T[t]["class_name"] != "Fi" for t in ins[5:] + outs):
+                raise ValueError("U16 LayerNorm normvals requires dense int32 tables")
+            epsilon, = struct.unpack("<I", self.dumps[ins[0]])
+            scales = [T[t]["scalar_word"] for t in ins[2:5]]
+            partials = [self.tensor(t) for t in ins[5:]]
+            self.op("NORMVALS_U16", *partials[:3], out=self.tensor(outs[0]),
+                    p=(partials[3], epsilon, *scales))
+            return
+        if name == "space_rearrange@CH*2":
+            src, dst = T[ins[0]], T[outs[0]]
+            if any(t["dtype"] != "uint16" or t["class_name"] != "CH" for t in (src, dst)):
+                raise ValueError("space_rearrange requires U16 Crouton tensors")
+            if not src.get("quantization") or src["quantization"] != dst.get("quantization"):
+                raise ValueError("space_rearrange input and output encodings differ")
+            self.op("REARRANGE_U16", self.tensor(ins[0]), out=self.tensor(outs[0]))
+            return
+        if name == "layernorm_q16_2d_normalize_fixedpoint.tcm@CH*2.Fi.Fh.Fi":
+            if [(T[t]["class_name"], T[t]["dtype"]) for t in ins + outs] != [
+                ("CH", "uint16"), ("Fi", "int32"), ("Fh", "int16"), ("Fi", "int32"), ("CH", "uint16"),
+            ]:
+                raise ValueError("U16 LayerNorm normalize requires Crouton input/output and typed dense tables")
+            src, norms, gamma, beta = [self.tensor(t) for t in ins]
+            self.op("NORMALIZE_U16", src, norms, gamma, self.tensor(outs[0]), p=(beta,))
+            return
+        if name in ("ConvLayer_s1.opt@CH*2.Xsb.Fi.t.fi", "ConvLayer_s1.opt@CH*2.Xpb.Fi.t.fi"):
+            split = "Xpb" in name
+            weights = "Xpb" if split else "Xsb"
+            if [(T[t]["class_name"], T[t]["dtype"]) for t in ins[:3] + outs] != [
+                ("CH", "uint16"), (weights, "int8"), ("Fi", "int32"), ("CH", "uint16"),
+            ] or len(ins) != 5 or T[ins[3]].get("scalar") != (197 if split else 8):
+                raise ValueError(f"{weights} convolution requires the SHARP U16 pointwise layout")
+            source, weight, target = [T[t].get("quantization") for t in (*ins[:2], outs[0])]
+            if not source or not weight or not target or weight["zero_point"]:
+                raise ValueError(f"{weights} convolution requires asymmetric activations and symmetric weights")
+            scale = (65536 if split else 256) * source["scale"] * weight["scale"] / target["scale"]
+            scale_bits, = struct.unpack("<I", struct.pack("<f", scale))
+            params = (scale_bits, target["zero_point"])
+            if not split:
+                # Xsb Fi stores one exponent and mantissa per output lane.
+                producer = self.graph["nodes"][T[ins[2]]["producer"]]
+                if (producer["type_name"] != "ConvLayer.opt.weights_to_vtcm@Fi.fi."
+                        or len(producer["inputs"]) != 1
+                        or producer["inputs"][0] not in self.dumps):
+                    raise ValueError("Xsb Fi lane scales require a captured constant table")
+                fi = self.const_values(producer["inputs"][0], "I")
+                if not fi or len(fi) % 128:
+                    raise ValueError("Xsb Fi table must contain full 128-word groups")
+                lanes = [(fi[group + half + lane], fi[group + half + lane + 1])
+                         for group in range(0, len(fi), 128) for half in (0, 64)
+                         for lane in range(0, 32, 2)]
+                values = [math.ldexp(1024 + (man & 1023), ((exp >> 10) & 31) - 26)
+                          for exp, man in lanes]
+                if (len({man >> 10 for _, man in lanes}) != 1
+                        or min(abs(value / scale - 1) for value in values) > 0.0015):
+                    raise ValueError("unsupported Xsb Fi lane scale encoding")
+                params += (1,)
+            self.op("PW_XPB_U16" if split else "PW_XSB_U16", *[self.tensor(t) for t in ins[:3]], out=self.tensor(outs[0]),
+                    p=params)
+            return
+        if name in ("linearclip@FH*2.fi", "linearclip_simple_rq@CH*2.fi"):
+            source, target = T[ins[0]], T[outs[0]]
+            if source["dtype"] != "uint16" or target["dtype"] != "uint16":
+                raise ValueError("linearclip requires U16 input and output")
+            fi = self.const_values(ins[1], "I")
+            if len(fi) != 13 or fi[0] != 514 or fi[12] != 1 or fi[6] & 0x80000000:
+                raise ValueError("unsupported U16 linearclip descriptor")
+            multiplier, shift = fi[10] & 65535, 15 - (fi[10] >> 24)
+            input_zero, output_zero = fi[11] & 65535, fi[11] >> 16
+            if (not multiplier or not 1 <= shift <= 31
+                    or input_zero != source["quantization"]["zero_point"]
+                    or output_zero != target["quantization"]["zero_point"]):
+                raise ValueError("U16 linearclip constants disagree with tensor encodings")
+            if name == "linearclip@FH*2.fi":
+                if fi[1] > 1 << 18 or fi[2] > 0xffff:
+                    raise ValueError("unsupported flat U16 linearclip coefficients")
+                # The flat kernel rounds once to Q3, adds its Q3 bias,
+                # then rounds back to an integer output.
+                params = (fi[1], 18, 0, 0, ((fi[2] + 4) << 15) + (1 << 14))
+            else:
+                params = (multiplier, shift, input_zero, output_zero, 1 << (shift - 1))
+            self.op("LINCLIP_U16", self.tensor(ins[0]), out=self.tensor(outs[0]), p=params)
+            return
+        if name == "ConvLayer.opt.convert_weights_to_signed.packed.tcm@Xpb.FH.t.fs.t":
+            source, output = T[ins[0]], T[outs[0]]
+            source_q, output_q = source.get("quantization"), output.get("quantization")
+            if (source["class_name"] != "FH" or source["dtype"] != "uint16" or output["class_name"] != "Xpb"
+                    or output["dtype"] != "int8" or not source_q or not output_q
+                    or source_q["zero_point"] != 32768 or output_q["zero_point"] != 0
+                    or source_q["scale"] != output_q["scale"] or T[ins[1]].get("shape_values") != [1] * 4
+                    or T[ins[3]].get("scalar") != 1):
+                raise ValueError("Xpb packing requires symmetric weights with the SHARP pointwise layout")
+            scales = self.const_values(ins[2], "i")
+            if len(scales) < source["shape"]["dimensions"][-1] or any(v != 65536 for v in scales):
+                raise ValueError("Xpb packing requires unity Q16 weight scales")
+            self.op("PACK_XPB_U16", self.tensor(ins[0]), out=self.tensor(outs[0]))
+            return
+        if name == "ConvLayer.opt.bias_weight_update@Fs.Xpb.ni*2.t.fs":
+            weight, seed, output = (T[t] for t in (ins[0], ins[4], outs[0]))
+            input_zero, mode, code = (T[t].get("scalar") for t in ins[1:4])
+            if (weight["class_name"] != "Xpb" or mode != 2 or code != 197
+                    or not isinstance(input_zero, int) or not 0 <= input_zero <= 65535
+                    or seed["dtype"] != "int32_quantized" or output["dtype"] != "int32_quantized"
+                    or seed["shape"]["dimensions"] != output["shape"]["dimensions"]
+                    or seed.get("quantization") != output.get("quantization")):
+                raise ValueError("unsupported Xpb bias update descriptor")
+            seed_bytes = self.dumps.get(ins[4])
+            if seed_bytes is None or len(seed_bytes) != 4 * math.prod(seed["shape"]["dimensions"]) or any(seed_bytes):
+                raise ValueError("Xpb bias update requires a captured zero base bias")
+            self.op("XPB_BIAS", self.tensor(ins[0]), out=self.tensor(outs[0]), p=(input_zero,))
+            return
+        if name == "ConvLayer.opt.bias_scale_shuff@Fi.fi.Fs.t":
+            if T[ins[2]].get("scalar") != 2 or [T[t]["class_name"] for t in ins[:2] + outs] != ["fi", "Fs", "Fi"]:
+                raise ValueError("unsupported Xpb Fi shuffle mode")
+            if ins[0] not in self.fi_words:
+                scales = self.const_values(ins[0], "I")
+                channels = T[ins[1]]["shape"]["dimensions"][-1]
+                if len(scales) != channels * 2:
+                    raise ValueError("Xpb Fi scale and bias table sizes differ")
+                self.fi_words[ins[0]] = len(self.words)
+                self.words.extend(scales)
+            self.op("XPB_FI", self.tensor(ins[1]), out=self.tensor(outs[0]), p=(self.fi_words[ins[0]],))
+            return
+        if name in ("Softmax_Crouton@CH*2.t", "mul_op_crt@CH*3.fi", "Add.tcm@CH*3", "gelu_16_crt@CH*2"):
+            binary = name in ("mul_op_crt@CH*3.fi", "Add.tcm@CH*3")
+            values = ins[:2] if binary else ins[:1]
+            if any(T[t]["dtype"] != "uint16" or T[t]["class_name"] != "CH" or not T[t].get("quantization")
+                   for t in values + outs):
+                raise ValueError(f"{name} requires quantized U16 Crouton tensors")
+            encodings = [T[t]["quantization"] for t in values + outs]
+            src, dst = encodings[0], encodings[-1]
+            if name == "Softmax_Crouton@CH*2.t":
+                if self.dumps.get(ins[1]) != struct.pack("<f", 1.0) or dst != {"scale": 2 ** -16, "zero_point": 0}:
+                    raise ValueError("U16 softmax requires unity beta and Q0.16 output")
+                kind = "SOFTMAX_U16"
+                params = struct.unpack("<I", struct.pack("<f", src["scale"]))
+            elif name == "gelu_16_crt@CH*2":
+                kind = "GELU_U16"
+                scales = struct.unpack("<2I", struct.pack("<2f", src["scale"], 1 / dst["scale"]))
+                params = (*scales, src["zero_point"], dst["zero_point"])
+            elif name == "mul_op_crt@CH*3.fi":
+                kind = "MUL_U16"
+                fi = self.const_values(ins[2], "I")
+                if (len(fi) != 6 or fi[0] != 0xA0302 or fi[1] or fi[3] != (
+                        src["zero_point"] | (encodings[1]["zero_point"] << 16))):
+                    raise ValueError("unsupported U16 multiplication descriptor")
+                params = (fi[2], fi[3] & 65535, fi[3] >> 16, fi[4], fi[5])
+            else:
+                kind = "ADD_U16"
+                ratios = [v["scale"] / dst["scale"] for v in encodings[:2]]
+                shift = 14 - math.frexp(max(ratios))[1]
+                if not 1 <= shift <= 30:
+                    raise ValueError("unsupported U16 addition scale")
+                multipliers = [math.floor(math.ldexp(r, shift + 1) + 0.5) for r in ratios]
+                offset = int((math.ldexp(dst["zero_point"], shift + 1) -
+                              sum(m * v["zero_point"] for m, v in zip(multipliers, encodings))) / 2)
+                params = (*multipliers, shift, offset)
+            self.op(kind, *[self.tensor(t) for t in values], out=self.tensor(outs[0]), p=params)
+            return
+        if name in ("@Spill", "@Fill") and "spill_groups" in node:
+            self.spill_fill(node)
+            return
         if name == "@BlockZap":
             for table in node["zap_tables"]:
                 code = table["code"]
@@ -454,20 +635,36 @@ class Lowering:
         if base in ("*InputSlicePad", "*InputSlice"):
             pad, start = self.s4(node, 0), self.s4(node, 1)
             slot = self.s4(node, 4 if base == "*InputSlicePad" else 3)[-1]
-            self.op("INPUT", out=self.contiguous_f32(outs[0]),
-                    p=(slot, start[1] - pad[1], start[2] - pad[2], start[0] - pad[0]))
+            origin = (start[1] - pad[1], start[2] - pad[2], start[0] - pad[0])
             self.check_io_slot("inputs", slot, self.s4(node, -1))
+            if T[outs[0]].get("dtype") == "uint16":
+                if base != "*InputSlice" or any(pad) or any(x < 0 for x in origin):
+                    raise ValueError("U16 input requires an unpadded slice")
+                params = self.io_quantization("inputs", slot, outs[0])
+                self.op("INPUT_U16", out=self.tensor(outs[0]), p=(slot, *origin, *params))
+            else:
+                self.op("INPUT", out=self.contiguous_f32(outs[0]), p=(slot, *origin))
             return
         if base in ("*OutputSlice", "*OutputCast_fp16_to_fp32"):
             origin = self.s4(node, 3 if base == "*OutputCast_fp16_to_fp32" else 2)
             slot = self.s4(node, -1)[-1]
-            x = self.contiguous_f32(ins[0]) if base == "*OutputSlice" else self.tensor(ins[0])
-            if base == "*OutputCast_fp16_to_fp32" and self.dtype(T[ins[0]]) != 0:
-                raise ValueError("output cast source is not FP16")
-            self.op("OUTPUT", x, p=(slot, origin[1], origin[2], origin[0]))
             self.check_io_slot("outputs", slot, self.s4(node, 1))
+            params = (slot, origin[1], origin[2], origin[0])
+            if base == "*OutputSlice" and T[ins[0]].get("dtype") == "uint16":
+                self.op("OUTPUT_U16", self.tensor(ins[0]),
+                        p=(*params, *self.io_quantization("outputs", slot, ins[0])))
+            else:
+                x = self.contiguous_f32(ins[0]) if base == "*OutputSlice" else self.tensor(ins[0])
+                if base == "*OutputCast_fp16_to_fp32" and self.dtype(T[ins[0]]) != 0:
+                    raise ValueError("output cast source is not FP16")
+                self.op("OUTPUT", x, p=params)
             return
         if base.startswith("ForceFormat_"):
+            source, output = T[ins[0]], T[outs[0]]
+            if "uint16" in (source["dtype"], output["dtype"]) and (
+                    source["dtype"] != output["dtype"] or not source.get("quantization")
+                    or source["quantization"] != output.get("quantization")):
+                raise ValueError("U16 format conversion requires matching quantization")
             self.op("FORMAT", self.tensor(ins[0]), out=self.tensor(outs[0]))
             return
         if base.startswith("Cast_fp16_to_fp32"):
@@ -575,16 +772,58 @@ class Lowering:
                 raise ValueError("unsupported decimation stride")
             self.op("DECIMATE", self.tensor(ins[0]), out=self.tensor(outs[0]), p=stride[1:3])
             return
+        if name == "Slice_reduce_batch@FH.F5H.s5.s4":
+            source, output = T[ins[0]], T[outs[0]]
+            start, size = (self.s4(node, i) for i in (1, 2))
+            shape = source["shape"]["dimensions"]
+            if (source["dtype"] != "uint16" or output["dtype"] != "uint16"
+                    or not source.get("quantization") or source["quantization"] != output.get("quantization")
+                    or len(shape) != 5 or size != output["shape"]["dimensions"] or size != shape[1:]
+                    or len(start) != 5 or any(start[1:]) or not 0 <= start[0] < shape[0]):
+                raise ValueError("U16 batch reduction requires a complete outer slice")
+            self.op("SLICE_U16", self.tensor(ins[0]), out=self.tensor(outs[0]), p=(start[0] * shape[1], 0, 0, 0))
+            return
+        if name == "Slice_contig.tcm@FH*2.s4*2":
+            source, output = T[ins[0]], T[outs[0]]
+            start, end = (self.s4(node, i) for i in (1, 2))
+            if (source["dtype"] != "uint16" or output["dtype"] != "uint16"
+                    or not source.get("quantization") or source["quantization"] != output.get("quantization")
+                    or len(start) != 4 or any(end)):
+                raise ValueError("U16 contiguous slice requires matching encodings and an unpadded crop")
+            self.op("SLICE_U16", self.tensor(ins[0]), out=self.tensor(outs[0]), p=start)
+            return
         if base == "SlicePad_shape_inplace":
             pad, start, end = (self.s4(node, i) for i in (1, 2, 3))
-            if any(pad) or any(end) or any(start[:3]):
-                raise ValueError("unsupported SlicePad offsets")
-            self.op("SLICE_F32", self.contiguous_f32(ins[0]), out=self.contiguous_f32(outs[0]), p=(start[3],))
+            if name == "SlicePad_shape_inplace@FH*2.s4*3.cH":
+                src, dst = T[ins[0]], T[outs[0]]
+                if any(pad) or any(end) or src["dtype"] != "uint16" or dst["dtype"] != "uint16":
+                    raise ValueError("U16 SlicePad requires an unpadded crop")
+                if not src.get("quantization") or src["quantization"] != dst.get("quantization"):
+                    raise ValueError("U16 SlicePad input and output encodings differ")
+                for tensor in (src, dst):
+                    shape = tensor["shape"]
+                    if (not tensor["storage"].get("direct") or shape["dimensions"] != shape["max_dimensions"]
+                            or any(shape["padding"])):
+                        raise ValueError("U16 SlicePad requires compact direct tensors")
+                if any(offset < 0 or offset + size > extent for offset, size, extent in zip(
+                        start, dst["shape"]["dimensions"], src["shape"]["dimensions"])):
+                    raise ValueError("U16 SlicePad crop is outside the input")
+                self.op("SLICE_U16", self.tensor(ins[0]), out=self.tensor(outs[0]), p=start)
+            else:
+                if any(pad) or any(end) or any(start[:3]):
+                    raise ValueError("unsupported SlicePad offsets")
+                self.op("SLICE_F32", self.contiguous_f32(ins[0]), out=self.contiguous_f32(outs[0]), p=(start[3],))
             return
         if base == "Reshape":
             self.op("RESHAPE", self.tensor(ins[0]), out=self.tensor(outs[0]))
             return
         if base in ("Concat", "Concat_1h"):
+            operands = [T[t] for t in ins[1:] + outs]
+            if any(t["dtype"] == "uint16" for t in operands) and (
+                    not operands[-1].get("quantization") or
+                    any(t["dtype"] != "uint16" or t.get("quantization") != operands[-1]["quantization"]
+                        for t in operands)):
+                raise ValueError("U16 concatenation requires matching encodings")
             if "scalar" in T[ins[0]]:
                 axis = T[ins[0]]["scalar"]
             else:
@@ -613,7 +852,16 @@ class Lowering:
             self.op("SHUFFLE", self.tensor(ins[0]), out=self.tensor(outs[0]), p=(T[ins[1]]["scalar"],))
             return
         if base == "Transpose.2D" or base.startswith("Transpose_impl"):
-            perm = self.const_values(ins[2 if base.startswith("Transpose_impl") else 1], "i")
+            if name == "Transpose_impl^010@FH*2.fi.t" and T[ins[0]]["dtype"] == "uint16":
+                source, output = T[ins[0]], T[outs[0]]
+                dims = source["shape"]["dimensions"]
+                if (len(dims) != 4 or len(set(dims)) != 4 or output["dtype"] != "uint16"
+                        or not source.get("quantization") or source["quantization"] != output.get("quantization")
+                        or output["shape"]["dimensions"] != [dims[0], dims[1], dims[3], dims[2]]):
+                    raise ValueError("unsupported U16 transpose")
+                perm = [0, 1, 3, 2]
+            else:
+                perm = self.const_values(ins[2 if base.startswith("Transpose_impl") else 1], "i")
             if sorted(perm) != [0, 1, 2, 3]:
                 raise ValueError(f"transpose {node['sequence']}: perm {perm}")
             self.op("TRANSPOSE", self.tensor(ins[0]), out=self.tensor(outs[0]), p=perm)
@@ -648,6 +896,40 @@ class Lowering:
         self.words.extend(a + c)
         self.op("CONV1X1", xi, self.tensor(w), self.tensor(fi), oi, (M, K, N, tables, first))
 
+    def spill_fill(self, node):
+        first = len(self.words)
+        words = []
+        extent = self.spill_bytes
+        for group in node["spill_groups"]:
+            offset = group["offset"]
+            if offset < 0 or offset % BLOCK or not group["transfers"]:
+                raise ValueError("invalid Q16P spill group offset or count")
+            for tagged, size in group["transfers"]:
+                vtcm = tagged & ~(BLOCK - 1)
+                if (tagged % BLOCK != 2 or vtcm < 0 or size <= 0 or size % BLOCK
+                        or vtcm + size > COMPLETION or offset + size > 0x20000000):
+                    raise ValueError("unsupported Q16P spill/fill transfer")
+                words.extend((vtcm, offset, size))
+                offset += size
+            extent = max(extent, offset)
+        if not words:
+            raise ValueError("empty Q16P spill/fill")
+        self.words.extend(words)
+        self.spill_bytes = extent
+        self.op("SPILL_FILL", p=(first, len(words) // 3, int(node["type_name"] == "@Spill")))
+
+    def io_quantization(self, kind, slot, tid):
+        port = self.T[self.graph["graph_" + kind][slot]]
+        tile = self.T[tid]
+        quant = port.get("quantization")
+        if port["dtype"] != "uint16" or not quant or tile.get("quantization") != quant:
+            raise ValueError(f"U16 {kind} slot {slot} and tensor {tid} encodings differ")
+        scale = struct.unpack("<I", struct.pack("<f", quant["scale"]))[0]
+        zero = quant["zero_point"]
+        if not 0x00800000 <= scale < 0x77800000 or not 0 <= zero <= 65535:
+            raise ValueError(f"invalid U16 {kind} slot {slot} encoding")
+        return scale, zero
+
     def check_io_slot(self, kind, slot, dims):
         ids = self.graph["graph_inputs" if kind == "inputs" else "graph_outputs"]
         if slot >= len(ids) or self.T[ids[slot]]["shape"]["dimensions"] != list(dims):
@@ -670,7 +952,7 @@ def lower(context_dir, trace_dir, tensors_path, output_prefix, known=None, conte
     else:
         context_binary = find_context_binary(context_dir, graph)
     rows = read_trace(trace_dir)
-    entries = map_entries(graph, rows, known)
+    entries = map_entries(graph, rows, known, read_worker_checkpoints(trace_dir))
     L = Lowering(graph, read_dumps(tensors_path), context_binary)
     seen = set()
     for row in rows:
@@ -698,11 +980,12 @@ def lower(context_dir, trace_dir, tensors_path, output_prefix, known=None, conte
     total = io_offset + 32 * len(io)
     constants = bytes(L.constants)
     scratch = scratch_bytes(L) + L.arena_bytes
-    header = struct.pack("<16I", MAGIC, (2 if L.arena_bytes else VERSION), total, len(L.tensor_rows), len(L.ops), len(L.words),
+    version = 3 if L.spill_bytes else 2 if L.arena_bytes else VERSION
+    header = struct.pack("<16I", MAGIC, version, total, len(L.tensor_rows), len(L.ops), len(L.words),
                          len(graph["graph_inputs"]), len(graph["graph_outputs"]),
                          tensor_offset, op_offset, word_offset, io_offset,
                          len(constants), scratch, exchange, VTCM)
-    header += hashlib.sha256(constants).digest() + struct.pack("<8I", L.arena_bytes, 0, 0, 0, 0, 0, 0, 0)
+    header += hashlib.sha256(constants).digest() + struct.pack("<8I", L.arena_bytes, L.spill_bytes, 0, 0, 0, 0, 0, 0)
     body = b"".join(struct.pack("<20I", *r) for r in L.tensor_rows)
     body += b"".join(struct.pack("<16I", *o) for o in L.ops)
     body += struct.pack(f"<{len(L.words)}I", *L.words)
@@ -716,10 +999,10 @@ def lower(context_dir, trace_dir, tensors_path, output_prefix, known=None, conte
     counts = {}
     for o in L.ops:
         counts[KINDS[o[0] - 1]] = counts.get(KINDS[o[0] - 1], 0) + 1
-    summary = {"format": "Q16P-1", "context_sha256": graph["context_sha256"],
+    summary = {"format": "Q16P-3" if L.spill_bytes else "Q16P-1", "context_sha256": graph["context_sha256"],
                "image_bytes": total, "image_sha256": hashlib.sha256(image).hexdigest(),
                "constant_bytes": len(constants), "constant_sha256": hashlib.sha256(constants).hexdigest(),
-               "scratch_bytes": scratch, "exchange_bytes": exchange, "tensors": len(L.tensor_rows),
+               "scratch_bytes": scratch, "exchange_bytes": exchange, "spill_bytes": L.spill_bytes, "tensors": len(L.tensor_rows),
                "ops": len(L.ops), "op_counts": counts,
                "inputs": [r[:4] for r in io[:len(graph["graph_inputs"])]],
                "outputs": [r[:4] for r in io[len(graph["graph_inputs"]):]],
@@ -774,7 +1057,9 @@ def scratch_bytes(L):
         elif kind == "CAST_F16":
             n = logical(out)
         elif kind == "OUTPUT":
-            n = align(elements(R[x]) * 4)
+            n = f32(elements(R[x]))
+        elif kind == "OUTPUT_U16":
+            n = logical(x)
         elif kind == "CONV1X1":
             n = align(8 * (o[5] * o[6] + o[5] * o[7])) + 128
         else:

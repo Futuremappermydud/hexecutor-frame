@@ -4,6 +4,7 @@
 #include <hvx_hexagon_protos.h>
 #include "../native/qd_conv.h"
 #include "../native/qd_owned_memory.h"
+static const uint8_t qd_probe_window[] __attribute__((used)) = QDO_WINDOW_FEATURE;
 #define ARENA 0xf1800000u
 static uint64_t cycles(void){uint64_t c;__asm__ volatile("%0=upcycle":"=r"(c));return c;}
 __attribute__((section(".text.entry"))) void payload(void) {

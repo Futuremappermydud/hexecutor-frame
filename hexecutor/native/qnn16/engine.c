@@ -12,7 +12,7 @@
 #include "../qd_conv.h"
 static uint64_t cycles(void);
 #include "../qd_hmx_power.h"
-#define QDO_BASE 0xa0000000u
+#include "../qd_owned_memory.h"
 #define QDS_OP_RUN 3u
 #include "../qd_protocol.h"
 #include <stddef.h>
@@ -24,7 +24,7 @@ static uint64_t cycles(void);
 #define SHARED ((Shared *)0x300f0000u)
 #define VTCM ((uint8_t *)0x31000000u)
 /* Scratch lives in private DDR page 3 (L1 write-back; page 1, which holds
- * the host exchange, is uncached). The host keeps constants below 56 MiB and
+ * the host exchange, is uncached). The host keeps low constants below 56 MiB and
  * guards from 64 MiB - 4 KiB. HVX bypasses L1, so nothing vectorized may
  * touch this range: the engine builds with -fno-vectorize and memcpy/memset
  * take the scalar path here. */
@@ -43,6 +43,21 @@ static int in_scratch(const void *p, size_t n) {
 
 static const char q16_engine_feature[] __attribute__((used, section(".rodata.hexecutor_features"))) =
     "HXQ16E01";
+static const char q16_profile_feature[] __attribute__((used, section(".rodata.hexecutor_features"))) =
+    "HXQ16PC1";
+static const char q16_low_spill_feature[] __attribute__((used, section(".rodata.hexecutor_features"))) =
+    "HXQ16SP1";
+#if QDO_SLOTS > 8
+#define Q16_PROFILE_CYCLES Q16P_WIDE_PROFILE_CYCLES
+_Static_assert(Q16P_PROFILE_OFFSET + Q16_PROFILE_CYCLES * sizeof(uint64_t) <= QDO_STATE,
+               "Q16P profiling must leave the JTLB restoration state intact");
+#else
+#define Q16_PROFILE_CYCLES Q16P_PROFILE_CYCLES
+#endif
+static const char q16_spill_feature[] __attribute__((used, section(".rodata.hexecutor_features"))) =
+    "HXQ16SP3";
+static const uint8_t q16_engine_window[] __attribute__((used, section(".rodata.hexecutor_features"))) =
+    QDO_WINDOW_FEATURE;
 static const char q16_engine_parts[] __attribute__((used, section(".rodata.hexecutor_features"))) =
     "HXTPART4";
 
@@ -180,9 +195,23 @@ while ((gen = s->generation) == seen)
         const HxGraphConfig *c = &cfg->graph[i];
         init_error = q16_program_open(&programs[i], (const void *)(QDO_BASE + c->image), c->image_bytes,
                                       c->constant_bytes, &bad);
-        if (!init_error && (programs[i].header->scratch_bytes > SCRATCH_BYTES ||
-                            c->constants + c->constant_bytes > SCRATCH_OFFSET))
-            init_error = Q16_RANGE;
+        /* The bootstrap validates the generic regions. Keep scratch disjoint
+         * and reject high constants outside this build's mapped window. */
+        const uint64_t constant_end = (uint64_t)c->constants + c->constant_bytes;
+        const int constants_fit = c->constants >= HXFG_HIGH_CONSTANT_START
+                                      ? constant_end <= QDO_BYTES
+                                      : constant_end <= SCRATCH_OFFSET;
+        if (!init_error) {
+            const Q16Header *h = programs[i].header;
+            uint32_t spill_bytes = h->reserved[1];
+            const uint64_t state_end = (uint64_t)cfg->state + cfg->state_bytes;
+            const int low_spill = cfg->state >= Q16P_LOW_SPILL_START && state_end <= Q16P_LOW_SPILL_END;
+            const int high_spill = cfg->state >= HXFG_HIGH_CONSTANT_START && state_end <= QDO_BYTES;
+            int spill_fits = !spill_bytes ||
+                (spill_bytes <= cfg->state_bytes && (low_spill || high_spill));
+            if (h->scratch_bytes > SCRATCH_BYTES || !constants_fit || !spill_fits)
+                init_error = Q16_RANGE;
+        }
     }
     barrier();
     s->ready = 1;
@@ -208,8 +237,12 @@ while ((gen = s->generation) == seen)
             const HxGraphConfig *c = &cfg->graph[graph];
             const Q16Program *p = &programs[graph];
             uint8_t *arena = (uint8_t *)(QDO_BASE + c->arena);
+            uint8_t *spill = p->header->reserved[1] ? (uint8_t *)(QDO_BASE + cfg->state) : NULL;
+            if (spill)
+                memset(spill, 0, p->header->reserved[1]);
             Q16Exec e = {p, VTCM, arena, SCRATCH,
-                         (const uint8_t *)(QDO_BASE + c->constants), qnn16_conv1x1, qnn16_hmx_finish, parallel, 0, 0};
+                         (const uint8_t *)(QDO_BASE + c->constants), qnn16_conv1x1, qnn16_hmx_finish,
+                         parallel, 0, 0, spill};
             s->sequence = seq;
             qnn16_hmx_reset();
             uint32_t since_check = 8u;
@@ -229,8 +262,9 @@ while ((gen = s->generation) == seen)
                  * its cycles go to its first op. */
                 error = q16_exec_run(&e, op, &ran);
 #ifndef Q16_NO_OP_PROFILE
-                for (uint32_t k = 0; k < ran && op + k < 2048u; k++)
-                    ((volatile uint64_t *)((uint8_t *)SERVICE + 16384))[op + k] = k ? 0 : cycles() - began;
+                for (uint32_t k = 0; k < ran && op + k < Q16_PROFILE_CYCLES; k++)
+                    ((volatile uint64_t *)((uint8_t *)SERVICE + Q16P_PROFILE_OFFSET))[op + k] =
+                        k ? 0 : cycles() - began;
 #else
                 (void)began;
 #endif

@@ -21,6 +21,11 @@ extern "C" {
 #define Q16P_MAGIC 0x50363151u /* "Q16P" */
 #define Q16P_VERSION 1u
 #define Q16P_ARENA_VERSION 2u
+#define Q16P_SPILL_VERSION 3u
+#define Q16P_SPILL_MAX_BYTES 0x20000000u
+/* Uncached DDR after the private scratch and before the VTCM backup. */
+#define Q16P_LOW_SPILL_START 0x4000000u
+#define Q16P_LOW_SPILL_END 0x6000000u
 #define Q16P_VTCM_BYTES 0x800000u
 /* The last VTCM tile is never placed by QNN; it holds the HMX completion store. */
 #define Q16P_COMPLETION_OFFSET (Q16P_VTCM_BYTES - 2048u)
@@ -28,6 +33,9 @@ extern "C" {
 #define Q16P_MAX_OPS 4096u
 #define Q16P_MAX_WORDS (1u << 20)
 #define Q16P_MAX_IO 16u
+#define Q16P_PROFILE_OFFSET 16384u
+#define Q16P_PROFILE_CYCLES 2048u
+#define Q16P_WIDE_PROFILE_CYCLES 1536u
 #define Q16P_NONE 0xffffffffu
 
 enum {
@@ -82,9 +90,28 @@ enum {
     Q16_PW_TANH, /* x, packed pointwise weights, six-table Fi, out; p0 input channels, p1 float32 bits of the
                   * table-3 slope that stands for a convolution scale of 1 */
     Q16_AFFINE, /* x FP16, out FP16 or contiguous float32, same dims; p0 scale, p1 bias (float32 bits) */
+    Q16_INPUT_U16, /* compact U16 out; p0 slot, p1/p2 y/x origin, p3 batch origin, p4 float scale, p5 zero point */
+    Q16_OUTPUT_U16, /* U16 tile x; same parameters as Q16_INPUT_U16 */
+    Q16_SLICE_U16, /* compact U16 x to compact U16 out, p0..p3 crop origin in NHWC order */
+    Q16_SPILL_FILL, /* p0 first word, p1 transfer count, p2: 1 spill, 0 fill.
+                     * Each word triple: VTCM byte offset, spill byte offset, byte count. */
+    Q16_REARRANGE_U16, /* SHARP Crouton 1x577 <-> 8x76 spatial tile rows */
+    Q16_MOMENTS_U16, /* SHARP U16 Crouton -> U32 sum and split U64 sum-of-squares planes */
+    Q16_NORMVALS_U16, /* SHARP four moments tables: x/y/z/p0, p1 epsilon, p2..p4 scales (f32 bits) */
+    Q16_NORMALIZE_U16, /* SHARP Crouton x/out, y normvals, z interleaved int16 gamma, p0 int32 beta */
+    Q16_PW_XSB_U16, /* x/out Crouton, y packed int8 weights, z Fi, p0 scale, p1 zero, p2 Fi lane scales */
+    Q16_LINCLIP_U16, /* x/out, p0 multiplier, p1 shift, p2/p3 input/output offsets, p4 fixed-point bias */
+    Q16_PACK_XPB_U16, /* compact U16 x -> Xpb 4K x 16N groups of signed low/high bytes */
+    Q16_XPB_BIAS, /* x packed Xpb weights -> dense int32 biases correcting for p0 activation zero */
+    Q16_XPB_FI, /* x dense int32 biases -> Fi; p0 first word of captured scale words */
+    Q16_PW_XPB_U16, /* x/out Crouton, y packed split weights, z Fi, p0 scale, p1 zero point */
+    Q16_SOFTMAX_U16, /* SHARP U16 Q0.16 softmax over 577 channels; p0 source scale (F32) */
+    Q16_MUL_U16, /* Crouton x and channel-broadcast y; p0 multiplier, p1/p2 zero points, p3/p4 biases */
+    Q16_ADD_U16, /* Crouton x/y/out; p0/p1 multipliers, p2 shift minus 1, p3 signed offset */
+    Q16_GELU_U16, /* Crouton x/out; p0/p1 input/inverse output scales, p2/p3 zero points */
     Q16_KIND_END
 };
-enum { Q16_F16 = 0, Q16_F32 = 1, Q16_RAW = 2 };
+enum { Q16_F16 = 0, Q16_F32 = 1, Q16_RAW = 2, Q16_U16 = 3 };
 enum {
     Q16_OK = 0,
     Q16_HEADER,
@@ -100,11 +127,11 @@ typedef struct {
     uint32_t tensor_offset, op_offset, word_offset, io_offset;
     uint32_t constant_bytes, scratch_bytes, exchange_bytes, vtcm_bytes;
     uint8_t constant_sha256[32];
-    uint32_t reserved[8]; /* v2: reserved[0] is persistent arena bytes within scratch */
+    uint32_t reserved[8]; /* v2+: [0] persistent arena bytes; v3: [1] separate DDR spill bytes */
 } Q16Header; /* 128 bytes */
 
 /* direct=1: contiguous NHWC at VTCM `offset`, `bytes` long; v2 direct=2:
- * contiguous in the persistent prefix of scratch at `offset`. Otherwise FP16
+ * contiguous in the persistent prefix of scratch at `offset`. Otherwise 16-bit
  * crouton blocks: words[block_first .. +block_count) hold VTCM offsets in
  * [b][h/8][w/4][c/32] order of `full`, Q16P_NONE for an absent block. */
 typedef struct {
@@ -158,6 +185,7 @@ struct Q16Exec {
     Q16ParallelFn parallel;
     uint32_t matrix_ops;
     uint32_t flags; /* Q16_EXEC_* */
+    uint8_t *spill; /* v3 scratch backing, disjoint from VTCM and constants */
 };
 /* Use the float32 gather/compute/scatter path even where an HVX tile form exists. */
 #define Q16_EXEC_NO_TILE 1u
