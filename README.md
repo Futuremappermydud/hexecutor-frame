@@ -1,22 +1,37 @@
-# Hexecutor for Steam Frame
+# Hexecutor and Frame spatial runtime
 
-Hexecutor is a native Hexagon DSP engine for Steam Frame. This repo includes its C++ host and DSP kernels, the Frame depth application, and model samples.
+This repository contains **Hexecutor**, a reusable native execution engine for Qualcomm Hexagon DSPs, alongside a Steam Frame depth application and model development samples. Hexecutor provides host transport, DSP programs, kernels, memory management, and scheduling. Projects with supported Hexagon workloads can use its C++ API with their own model contracts, artifacts, inputs, and outputs.
 
-**[Read the documentation](docs/README.md)** — architecture, build/run, runtime components, DSP memory/clocks/optimizations, and model development.
+## Components
 
-| Directory | Purpose |
+| Component | Role |
 | --- | --- |
-| `hexecutor/` | Hexagon transport, native programs, HVX/HMX kernels, and scheduling |
-| `depth-runtime/` | C++ application, camera/geometry, GPU depth, rendering, recording/replay |
-| `samples/depth-model/`, `samples/hand-tracking/` | Model contracts, reference/training tools, local artifact workspaces |
-| `samples/controller-tracking/` | StereoFeatureNN reference and export tools |
-| `docs/` | Maintained program documentation |
-| `tools/` | Repository/artifact policy |
+| [`hexecutor/`](hexecutor/) | Generic C++17 host API, Hexagon DSP code, broker, ExecuTorch delegate, and offline lowering tools. Start with the [executor architecture](docs/hexecutor/README.md) and [C++ API](docs/hexecutor/api.md). |
+| [`depth-runtime/`](depth-runtime/) | Steam Frame C++17 application for camera capture, stereo depth, fusion, and OpenXR presentation. Learned depth can use Hexecutor through a separate model adapter and native worker. See the [runtime guide](docs/runtime/README.md). |
+| [`samples/depth-model/`](samples/depth-model/) | Depth model contracts, reference implementations, deployment packages, and offline tooling. See the [depth model guide](docs/model-development/depth.md). |
+| [`samples/hand-tracking/`](samples/hand-tracking/) | RGB, stereo, and NIR hand tracking experiments and model tooling. See the [hand tracking guide](docs/model-development/hand-tracking.md). |
+| [`samples/controller-tracking/`](samples/controller-tracking/) | Controller tracking reference models and export tooling. See the [FeatureNN guide](docs/model-development/controller-featurenn.md). |
 
-Weights, model dumps, generated model headers, and datasets remain local and ignored. The history was sanitized; do not reintroduce unfiltered refs. See [artifact policy](docs/model-development/training-and-artifacts.md).
+The [system architecture](docs/architecture.md) shows how the Frame application uses these components. The [documentation index](docs/README.md) lists the maintained guides by topic.
 
-The top-level `research/` and `research_notes/` directories are local and ignored. The [temporal-fusion report](reports/Temporal%20depth%20fusion%20for%20Frame.md) and [executor fusion handoff](hexecutor/frame/handoffs/HANDOFF_FUSION.md) are tracked.
+## Build and check
 
-Root development commands: `make build-host`, `make check`, `make check-model`, `make build-runtime`, and `make build-dsp`. `make help` lists the tasks. The live depth pipeline uses the C++ worker; Python remains available through `make run SCRIPT=...` for offline tools.
+To build Hexecutor's host targets independently of the depth application:
 
-To build only Hexecutor's native host tools, run `cmake -S hexecutor -B build-hexecutor` and `cmake --build build-hexecutor`.
+```sh
+cmake -S hexecutor -B build-hexecutor
+cmake --build build-hexecutor --parallel
+ctest --test-dir build-hexecutor --output-on-failure
+```
+
+From the repository root, `make build-host` builds the native host, depth worker, and portable tests; `make check` runs those tests and repository checks. `make build-runtime` builds the Frame application on a configured headset, and `make build-dsp` requires a Hexagon toolchain. Run `make help` for the full command list and see [build and run](docs/getting-started.md) for device setup.
+
+The live depth host and worker use C++17. Python tools are for offline development and validation.
+
+## Models and artifacts
+
+Weights, generated model headers, execution packages, captures, and datasets are provisioned separately and are excluded from Git history. Use explicit paths for model resources; see [training and artifacts](docs/model-development/training-and-artifacts.md). The Frame depth application selects its model through `--depth-model` and `FRAME_DEPTH_*` settings. These settings belong to the Frame application.
+
+## License
+
+Hexecutor is `LGPL-3.0-or-later`; its kernel modules have separate `GPL-2.0` terms. See the [Hexecutor license and distribution terms](hexecutor/LICENSE.md). Model weights, datasets, and third-party components retain their own upstream licenses and attribution.
